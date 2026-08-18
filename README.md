@@ -2,7 +2,7 @@
 
 > **🎲 100% vibecode** — this whole toolchain was built by prompting an AI.
 > It's not a polished distro tool. That said, The Prompter
-> actually runis it on his own BLFS/LFS system.
+> actually runs it on his own BLFS/LFS system.
 > Still, read the code and test on something
 > disposable before you point it at yours.
 
