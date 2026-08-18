@@ -1,5 +1,11 @@
 # pkgusr package manager for BLFS / LFS
 
+> **🎲 100% vibecode** — this whole toolchain was built by prompting an AI, not
+> hand-written line by line. It's not a polished distro tool. That said, I
+> actually run it on my own BLFS/LFS system, so it's vibecode I trust enough to
+> point at my own machine — still, read the code and test on something
+> disposable before you point it at yours.
+
 A small toolchain for building and maintaining a BLFS/LFS system with the
 **package-user** scheme: every package is built and owned by its own user, so
 you always know which package installed which file, and removing a package is
@@ -7,6 +13,20 @@ just removing its files.
 
 It works **offline** from a downloaded copy of the BLFS book — no network needed
 to resolve dependencies, versions, or build commands.
+
+## The package-user scheme
+
+Instead of installing everything as `root`, each package gets its own
+unprivileged user that owns that package's files. Because ownership maps 1:1 to a
+package, you can list exactly what a package installed (via `find` / the
+`pkg.lst` manifest), spot stray files, and uninstall by removing one user's
+files — no separate package database to drift out of sync. Shared write access to
+install directories is granted through an `install` group, and packages that drop
+files into another package's tree are tracked with **collector groups**.
+
+This is the classic LFS "More Control and Package Management" hint; if the idea
+is new to you, read it first:
+<https://www.linuxfromscratch.org/hints/downloads/files/more_control_and_pkg_man.txt>
 
 ## The three programs
 
@@ -63,8 +83,30 @@ packagemanager errors                   # failures from the last run + log paths
 
 ## Configuration
 
-`packagemanager config` shows and sets: collector-group prefix, shared-user
-prefix, your main login account, `$EDITOR`, and the diff tool for migrations.
+`packagemanager config` shows and sets a few things once, up front:
+
+- **`--collector-prefix`** — the prefix for *collector groups*. When package A
+  needs to install files into package B's directory, those files are made
+  group-owned by a collector group named `<prefix>_<owner>` (e.g.
+  `nimgnu_python-modules`), and A is added to it. This is how cross-package
+  installs stay tracked under the package-user scheme instead of silently
+  becoming root-owned. Pick a short, distinctive prefix — it namespaces every
+  collector group on your system.
+- **`--user-prefix`** — the prefix for *shared users* you create to **run**
+  software (as opposed to the package-users that **build** it). A shared user is
+  named `<prefix>_<name>` (e.g. `u_media`) and can be granted supplementary
+  groups. Keeps run-time accounts clearly separate from package accounts.
+- **`--main-user`** — your normal login account (used as a sensible default in a
+  few places).
+- **`--editor`** / **`--difftool`** — the editor for `verify --set-validate-command`
+  and the diff tool for `migrate-scripts` (default `vimdiff`).
+
+Set them once, e.g.:
+
+```sh
+packagemanager config --collector-prefix nimgnu --user-prefix u --main-user <you>
+```
+
 Storage locations are shown by `packagemanager paths`.
 
 ## Notes
