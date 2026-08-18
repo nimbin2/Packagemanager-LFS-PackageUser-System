@@ -1,0 +1,12 @@
+#!/bin/bash
+# Compatibility shim.  The parser now lives in the unified `blfs` tool;
+# `blfs_parse_page <target>` == `blfs script <target>`.
+#   <target> may be a package name/anchor  (e.g.  vim  /  docutils)
+#         or a BLFS url                     (e.g.  .../general/vim.html
+#                                                  .../python-modules.html#docutils)
+# Writes install_<name-version> into the current directory (override with -o DIR).
+here="$(cd "$(dirname "$0")" && pwd)"
+if [ -x "$here/blfs" ] && "$here/blfs" --help >/dev/null 2>&1; then
+  exec "$here/blfs" script "$@"       # normal case: blfs is directly runnable
+fi
+exec python3 "$here/blfs" script "$@" # fallback (e.g. noexec dir / no +x bit)

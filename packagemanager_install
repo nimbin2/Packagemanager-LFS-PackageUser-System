@@ -1,0 +1,465 @@
+#!/bin/bash
+#
+# packagemanager_install -- privileged install engine for the pkgusr model.
+# Copyright (C) 2025  packagemanager contributors
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 2 of the License, or (at your option) any later
+# version.  This program is distributed WITHOUT ANY WARRANTY; see the GNU
+# General Public License <https://www.gnu.org/licenses/> for details.
+#
+#
+# the package_short_name is the name for te created user
+# packagemanager_install package_short_name path_to_install_file
+#
+
+
+
+skel=/etc/pkgusr/skel-package
+user_name=""
+install_script=""
+install_script_basename=""
+install_user_dir="/usr/src/$user_name"
+sourced=false
+date_log="$(date +%Y-%m-%d_%H-%m-%S)"
+home_user="n76310"
+home_user_dir="/home/${home_user}"
+
+echoRed() {
+    echo -e "\033[0;31m$1\033[0m"
+}
+
+echoGreen() {
+    echo -e "\033[0;32m$1\033[0m"
+}
+
+echoOrange() {
+    echo -e "\033[0;33m$1\033[0m"
+}
+
+echoBlue() {
+    echo -e "\033[0;34m$1\033[0m"
+}
+
+addUser() {
+    if [ $# -eq 1 ]; then
+        set -- "$1" "$1" "$1"
+    fi
+    if [ $UID -ne 0 ]; then echo Please run this script as root. ; exit 1; fi
+    add_package_user "${1}" $2 10000 20000 $3 10000 20000 || exit  1
+}
+
+addCollectorGroup() {
+    group_name="$1"
+    if ! echo "$group_name" | grep -qw "audio"; then
+        if ! echo "$group_name" | grep -q "^u_"; then
+            echo "$group_name" | grep -q "^nimgnu_" ||
+                group_name="nimgnu_$1"
+        fi
+    fi
+
+    echoBlue "\n\nCreate Collector group $group_name"
+    if awk --field-separator=":" '{print $1}' /etc/group | grep $group_name && 
+            awk --field-separator=":" '{print $1}' /etc/passwd | grep $group_name; then
+        echoGreen "\nGroup and user exist";
+        return
+    fi
+    echo "$group_name" | grep -w "nimgnu_" && 
+        echoRed "\ngroup_name missing" &&
+        return
+
+    echo "addUser "$group_name""
+    echo -n "[y/N]: "
+    read check
+    [ "$check" != "y" ] && exit
+    addUser "$group_name"
+    echo "Created whyle installing $user_name" > info.txt
+    echo "Check groups by running group command" >> info.txt
+}
+
+addUerToCollectorGroup() {
+    group_name="$1"
+    if ! echo "$group_name" | grep -qw "audio"; then
+        if ! echo "$group_name" | grep -q "^u_"; then
+            if ! echo "$group_name" | grep -q "^nimgnu_"; then
+                group_name="nimgnu_$1"
+            fi
+        fi
+    fi
+
+    echoBlue "\n\nAdding user $username to group $group_name"
+    if ! echo "$group_name" | grep -q "^u_"; then
+        echo "$group_name" | grep -qw "nimgnu_" && 
+            echoRed "group_name missing" &&
+            return
+    fi
+    [ "$user_name" == "" ] && echoRed "user_name missing" && exit 
+    checkIfUserInGroup $user_name $group_name &&
+        echoGreen "$user_name is already a part of $group_name group." &&
+        return
+
+    usermod -a -G $group_name $user_name
+
+    checkIfUserInGroup $user_name $group_name &&
+        echoGreen "$user_name is now a part of $group_name group." &&
+        return
+}
+
+checkIfUserInGroup() {
+    username="$1"
+    groupname="$2"
+    cat /etc/group | grep  "^$groupname:" | sed "s/.*://g;s/,/\n/g" | grep -w "^$username$"
+}
+
+checkGroups() {
+    ! grep -q "^install_groups=(.*)" $install_script &&
+        return
+    ! $sourced && eval "$(grep --color=never "^install_groups=(.*)" $install_script)"
+    echoOrange "\n\nThis user may need to be added to collector groups:"
+
+    for group in "${install_groups[@]}"; do
+        if [ "$group" == "python-dependencies" ]; then
+            group="nimgnu_python-modules"
+        fi
+        # resolve to the collector-prefixed group if that's the one that exists
+        if ! grep -q -E "^$group:" /etc/group && grep -q -E "^nimgnu_$group:" /etc/group; then
+            group="nimgnu_$group"
+        fi
+        # already a member? nothing to do.
+        if checkIfUserInGroup "$user_name" "$group" >/dev/null 2>&1; then
+            echoGreen "$user_name is already in $group"
+            continue
+        fi
+        grep -q -E "^$group:" /etc/group ||
+            addCollectorGroup "$group"
+        if [ "${PM_YES:-}" == "1" ]; then
+            echoOrange " usermod -a -G $group $user_name  (--yes)"
+            addUerToCollectorGroup "$group"
+        else
+            echoOrange "By adding to a group the user gets access to all files of the group"
+            echo -e " usermod -a -G $group $user_name"
+            echo -n "[y/N]: "
+            read check
+            [ "$check" == "y" ] && [ "$group $user_name" != " " ] &&
+                addUerToCollectorGroup "$group"
+        fi
+    done
+}
+
+findAllGroupsOfDir() {
+    dir="$1"
+    for d in $(find $dir/* -maxdepth 0); do ls -ald "$d" | awk '{print $4}'; done | sort | uniq
+}
+
+addUserToGroup() {
+    change_name="$1"
+    change_group="$2"
+    change_dir="$3"
+    if [ "$3" == "" ]; then
+        echo "ERROR"
+        echo "change_name=$1"
+        echo "change_group=$2"
+        echo "change_dir=$3"
+        exit
+    fi
+    checkIfUserInGroup $change_name $change_group &&
+        return
+    echo "$change_group to $change_name" | tee /usr/src/$change_name/log/install_nimgnu_group-$date_log.log
+
+    echoBlue "\n\n##########################\n"
+    find $change_dir -group $change_name
+    echoBlue "\n\n##########################\n"
+    echo "$dir"
+    echo -e " usermod -a -G $change_group $change_name"
+    if [ "${PM_YES:-}" == "1" ]; then
+        check="y"
+    else
+        echo -n "[y/N]: "
+        read check
+    fi
+
+    [ "$check" == "y" ] && (
+        usermod -a -G $change_group $change_name 
+    )
+
+}
+
+installNimgnuGroup() {
+    echo -e "\n\nInstall groups for nimgnu_group"
+    echo "###${nimgnu_groups_dir[@]}##"
+    
+    for dir in "${nimgnu_groups_dir[@]}"; do
+        old_group="$(ls -ald $dir | awk '{print $4}')"
+        dir_groups=($(findAllGroupsOfDir $dir))
+        echo "Found groups in $dir:"
+        echo -e "${dir_groups[@]}\n"
+        for g in ${dir_groups[@]}; do
+            if [ "$g" == "$old_group" ]; then
+                echo "nothing to change"
+            else
+                echo "addUserToGroup $g $user_name $dir"
+                addUserToGroup $g $user_name $dir
+            fi
+        done
+        for f in $dir/*; do
+            echo "############################"
+            echo "## Add user rights to group"
+            ls -ald $f
+            user_perms=$(stat -c "%A" $f | cut -c2-4)
+            chmod g=$user_perms $f
+            ls -ald $f
+        done
+
+
+        dirs_a=$(echo $dir)
+        echo "## $dir" 
+        su -c "mkdir -p $dir" $user_name
+        if [ -d "$dir" ]; then
+            ls -ald $dir
+            parameter=""
+            if [ "$nimgnu_groups_dir_recrusive" == "true" ]; then
+                echo ""
+                echo "change permission recrusive for $user_name on;"
+                echo "$dir"
+                echo -n "[y/N]: "
+                read check
+
+                [ "$check" == "y" ] && 
+                    parameter="-R"
+            fi
+            (chgrp -v $parameter "$user_name" "$dir" &&
+                chmod -v 775 $parameter "$dir" && ls -ald "$dir") ||
+                echoRed "ERROR: Failed to do\nchgrp -v $user_name $dir &&\nchmod -v 775 $dir"
+        else
+            echo "$dir: is not a valid directory (installNimgnuGroup)"
+        fi
+
+        if ! [ "$old_group" == "" ] && ! [ "$user_name" == "install" ] && ! [ "$user_name" == "root" ] &&  
+                ! [ "$old_group" == "root" ] && ! [ "$user_name" == "$old_group" ]; then
+            addUserToGroup $user_name $old_group $dir
+        fi
+    done
+}
+
+installNimbinUser() {
+    echo -e "\n\nInstall user for local package for the user (u_user)"
+    linenumber="$(cat /etc/pam.d/su_u_user | wc -l)"
+    if sed "${linenumber}q;d" /etc/pam.d/su_u_user | grep -q "success=1 default=ignore"; then
+        t="success=ignore default=1"
+    else
+        t="success=1 default=ignore"
+    fi
+
+    echo "Make HOME 0750"
+    chmod -R 0750 "$install_user_dir"
+
+    grep -q "$user_name).*USER.*\<$user_name\>.*\<$home_user\>" /etc/pam.d/su_u_user ||
+        sed -i "$((1+$(grep -n 'case "$PAM_USER" in' /etc/pam.d/su_u_user | sed "s/\:.*$//g")))i\ \ $user_name) USERS=\"$user_name $home_user\"; ;;" /etc/pam.d/su_u_user
+    echo -e "\n\nModified pam.d/su"
+    cat /etc/pam.d/su_u_user 
+
+    if grep -q "^install_groups=(" $install_script; then
+        eval "$(grep "^install_groups=(" $install_script)"
+        checkGroups
+        if echo "${install_groups[@]}" | grep -wq u_xdg_runtime; then
+            rm -r $install_user_dir/.bash_profile
+            ln -s /etc/pkgusr/skel-u_xdg/.bash_profile $install_user_dir/.bash_profile
+            chmod 755 $install_user_dir/.bash_profile
+            chown $user_name: $install_user_dir/.bash_profile
+        fi 
+    fi
+    if grep -q "^shared=true" $install_script; then
+        s_dir_nam="$(echo "$user_name" | sed "s/^u_//g")"
+        mkdir -p "$install_user_dir/${s_dir_nam^}_shared"
+        chmod g+sw "$install_user_dir/${s_dir_nam^}_shared"
+        chmod 770 "$install_user_dir/${s_dir_nam^}_shared"
+        chown -R $user_name: "$install_user_dir/${s_dir_nam^}_shared"
+        ln -s "$install_user_dir/${s_dir_nam^}_shared" "$home_user_dir/Shared"
+        echo "ln -s $install_user_dir/${s_dir_nam^}_shared $home_user_dir/Shared/"
+        chown -R $home_user: $home_user_dir/Shared/${s_dir_nam^}_shared
+    fi
+
+    if grep -q "^app=" $install_script; then
+        eval "$(grep "^app=" $install_script)"
+        if which "$app"; then
+            ! [ -f "$home_user_dir/bin/$app" ] &&
+            cat > $home_user_dir/bin/$app << EOF
+#!/bin/bash
+
+su - u_$app -c "$app $(echo "${@}" | sed "s/\"/\\\"/g")"
+EOF
+            cat > $home_user_dir/.local/share/applications/$app.desktop << EOF
+[Desktop Entry]
+Name=${app^}
+Exec=script -c "$home_user_dir/bin/$app" /dev/null
+Terminal=false
+Type=Application
+Icon=${app}
+StartupWMClass=${app^}
+EOF
+            chown ${home_user}: $home_user_dir/bin/$app
+            chmod +x $home_user_dir/bin/$app
+            chown ${home_user}: $home_user_dir/.local/share/applications/$app.desktop
+            echoGreen "Creating:"
+        else
+            echoRed "!!! Error: $app not found !!!"
+            echo "Not creating:"
+        fi
+        echo -e "\t$home_user_dir/bin/$app"
+        echo -e "\t$home_user_dir/.local/share/applications/$app.desktop"
+    fi
+
+    usermod -a -G $user_name $home_user
+    echo -e "\n\n"
+}
+
+
+installPkg() {
+    user_name="$1"
+    install_user_dir="/usr/src/$user_name"
+    install_dir=/etc/pkgusr/install_scripts
+    install_script="$2"
+    install_script_basename="$(basename $2)"
+    install_log_dir=$install_user_dir/log
+    mkdir -p $install_log_dir
+    touch $install_log_dir/$install_$user_name-$date_log.diff
+
+    [ -z "$install_script" ] && echo "Please provide an install script with \$2"
+    [ -z "$install_script" ] && exit
+    [ -f $install_script ] || echo "The install script \"$install_script\" doese not exist"
+    [ -f $install_script ] || exit
+
+    echo -e "\033[0;34m"
+    echo "–––––––––––––––––––––––––––––––"
+    echo -e "Install \033[0;32m$user_name\033[0;34m"
+    echo "–––––––––––––––––––––––––––––––"
+    echo
+    echo -e "\033[0;31mFirst check the install file for:\n\033[0;33mlink, name, wrong commands like permission changes\ncheck if \"$user_name\" is the right username\n\033[0m"
+    echo -e "\033[0;36minstall file: $install_script\033[0m"
+    if [ "${PM_YES:-}" != "1" ]; then
+        echo -e "\033[0;33mPress enter to continue\033[0m"
+        read -n1
+    fi
+    echo
+
+
+    ####################
+    # source the install file
+    if grep -q "^install_pkg() {" "$install_script"; then
+        sourced=true
+        source $install_script
+    fi
+
+
+    ####################
+    # install user
+    id "$user_name" ||
+       addUser $user_name
+
+    id "$user_name" ||
+       echo "The user $user_name could not be created."
+    
+
+    ####################
+    # check for install_groups
+    checkGroups
+
+    ####################
+    # copy install script
+    # special for old install scripts:
+    if grep -q "^source installBaseScript" $install_script; then
+        if ! [ -f $install_user_dir/installBaseScript ]; then
+            ln -s /etc/pkgusr/installBaseScript /$install_user_dir/installBaseScript &&
+            chown $user_name: $install_user_dir/installBaseScript
+        fi
+        grep -q "sudo " $install_script &&
+            cat $install_script | sed "s/\<sudo\> //g" > $install_user_dir/install_$user_name
+        vim $install_user_dir/install_$user_name
+    else
+
+    ####################
+    # copy install script
+        touch $install_user_dir/install_$user_name
+        # record a diff vs the previous install_last (before we overwrite it)
+        diff $install_user_dir/install_last $install_script >> $install_user_dir/log/install_$user_name-$date_log.diff 2>/dev/null
+        # the canonical, editable script (edit THIS to keep changes across
+        # re-installs) and the runtime copy the engine executes -> owned by the
+        # package user.  Skip any copy where source and destination are the same
+        # file (e.g. when re-installing from the already-in-home script).
+        [ "$install_script" -ef "$install_user_dir/$install_script_basename" ] ||
+            cp $install_script $install_user_dir/$install_script_basename
+        [ "$install_script" -ef "$install_user_dir/install_$user_name" ] ||
+            cp $install_script $install_user_dir/install_$user_name
+        chown $user_name: "$install_user_dir/$install_script_basename" \
+                          "$install_user_dir/install_$user_name" 2>/dev/null || true
+        # install_last is only a read-only record of what was last installed.
+        if [ "$install_script" -ef "$install_user_dir/install_last" ]; then
+            :   # already the record; leave it
+        else
+            rm -f $install_user_dir/install_last 2>/dev/null
+            cp $install_script $install_user_dir/install_last
+            chmod 0444 $install_user_dir/install_last 2>/dev/null || true
+        fi
+    fi
+
+
+
+
+    ####################
+    # install package
+    #
+    # check if install_file installs a nimgnu_group
+    parameter="install"
+    if echo "$user_name" | grep "^nimgnu_"; then
+        installNimgnuGroup
+        parameter=""
+    fi
+    # check if install_file installs a u_user -> groups to run user applications like browser etc.
+    if echo "$user_name" | grep "^u_"; then
+        installNimbinUser
+        parameter=""
+    fi
+
+    # New-style scripts (blfs-generated) are PHASED: the dispatcher takes
+    # all|unpack|build|install|configure|update.  A full install runs "all";
+    # packagemanager sets PM_MODE=update for updates.  nimgnu_/u_ users were
+    # intentionally set to "" above; keep that, otherwise use the mode.
+    if grep -q "^install_pkg() {" "$install_script"; then
+        [ -n "$parameter" ] && parameter="${PM_MODE:-all}"
+    fi
+
+    # logs to $install_user_dir/packagemanager_install.log
+    chown $user_name: $install_user_dir/install_*
+    chown -R $user_name: $install_user_dir/log/
+    # pipefail so tee doesn't hide a failing build/install; capture the real code
+    su - -c "set -o pipefail; bash ~/install_$user_name $parameter 2>&1 | tee ~/log/packagemanager_install-$date_log.log" $user_name
+    install_rc=${PIPESTATUS[0]}
+
+    if echo "$user_name" | grep "^u_"; then
+        gpasswd -d $user_name install # remove install group if nimgnu_group
+    fi
+
+    if [ "$install_rc" != "0" ]; then
+        echo -e "\033[0;31m!! FAILED: $user_name ($parameter) exited $install_rc. See the log above / ~$user_name/log/.\033[0m"
+        exit $install_rc
+    fi
+    ###################
+    # Refresh the man-page db and the package's pkg.lst manifest as DETACHED
+    # background tasks (setsid + disown): they survive this shell exiting and
+    # can't be interrupted with Ctrl-C, so the install itself finishes cleanly.
+    # When PM_NO_REFRESH=1 (packagemanager's --clean), the pkg.lst refresh is
+    # SKIPPED here -- --clean regenerates the manifest itself, after removing old
+    # files, so we avoid a redundant/racing background rebuild.
+    if [ "${PM_NO_REFRESH:-}" = "1" ]; then
+        echo -e "\033[0;33m!! Installed. Refreshing mandb in the background (pkg.lst handled by --clean)...\033[0m"
+        setsid mandb >/dev/null 2>&1 </dev/null & disown 2>/dev/null || true
+    else
+        echo -e "\033[0;33m!! Installed. Refreshing mandb and pkg.lst in the background...\033[0m"
+        setsid mandb >/dev/null 2>&1 </dev/null & disown 2>/dev/null || true
+        setsid su - "$user_name" -c "list_package '$user_name' > pkg.lst.new 2>/dev/null && mv pkg.lst.new pkg.lst" >/dev/null 2>&1 </dev/null & disown 2>/dev/null || true
+    fi
+
+}
+
+installPkg $@

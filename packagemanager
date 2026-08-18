@@ -1,0 +1,4032 @@
+#!/usr/bin/python3
+#
+# packagemanager -- manage packages under the LFS/BLFS "pkgusr" model.
+# Copyright (C) 2025  packagemanager contributors
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program; if not, see <https://www.gnu.org/licenses/>.
+"""
+packagemanager -- one tool for managing packages under the LFS/BLFS "pkgusr"
+model, rewritten to sit on top of the new offline `blfs` tool.
+
+The pkgusr model
+----------------
+Every package is installed by its own dedicated *package-user* whose home is
+/usr/src/<name>.  Because that user runs `make install`, every file the package
+installs ends up owned by that user, so `list_package <name>` records the exact
+manifest into /usr/src/<name>/pkg.lst.  Collector groups (nimgnu_*) share
+directories between package-users; u_* users run GUI apps for the human.
+
+Roadmap (built incrementally, one command at a time)
+----------------------------------------------------
+  info                 [IMPLEMENTED] package-user info table (name/uid/gid/home/pkg_list)
+  check                [TODO] report install state of a package
+  search               [TODO] find a package in the book        -> blfs search
+  dependencies         [TODO] recursive dependency order        -> blfs deps/order
+  install              [TODO] resolve deps, build missing, run packagemanager_install
+  remove               [TODO] remove a package-user + its files (via pkg.lst)
+  reload-pkg-list      [TODO] regenerate /usr/src/<name>/pkg.lst
+  list                 [TODO] list all package-users
+  files_with_broken_id [TODO] find files whose uid/gid don't resolve
+
+Design decisions still open (we'll settle these as we implement the commands):
+  * install: auto-run packagemanager_install per package, or just print/queue?
+  * keep packagemanager_install (bash) as the privileged engine, or fold it in?
+  * fix `check`, implement `remove`; parameterize the hardcoded site values.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+
+try:
+    import readline  # enables arrow-key line editing in input() prompts
+except ImportError:
+    readline = None
+
+try:                      # used by `info` (and later commands) to look up users
+    import pwd
+    import grp
+except ImportError:       # non-unix: degrade gracefully
+    pwd = grp = None
+
+
+# --------------------------------------------------------------------------- #
+# configuration
+# --------------------------------------------------------------------------- #
+
+# /usr/src holds one directory (== home) per package-user.  Overridable so the
+# tool can be exercised against a fixture tree in testing.
+BASE_DIR = os.environ.get("PKGUSR_BASE", "/usr/src")
+INSTALL_SCRIPTS_DIR = os.environ.get("PKGUSR_INSTALL_SCRIPTS", "/etc/pkgusr/install_scripts")
+TMP_DIR = "/tmp/packagemanager"
+
+# Configurable group-name prefixes, stored in a small config file.  The
+# collector prefix names shared install-dir groups (was hard-coded "nimgnu");
+# the user prefix names application-user accounts (was hard-coded "u").
+CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
+# Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
+# changes (so stale plans are ignored); TOOL_VERSION is the program version.
+TOOL_VERSION = "1.0.0"
+PLAN_VERSION = 1
+_DEFAULT_CONFIG = {"collector_prefix": "sysgroup", "user_prefix": "u",
+                   "main_user": ""}
+_config = None
+
+
+def load_config():
+    global _config
+    if _config is not None:
+        return _config
+    _config = dict(_DEFAULT_CONFIG)
+    try:
+        with open(CONFIG_PATH) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, v = line.split("=", 1)
+                    _config[k.strip()] = v.strip()
+    except OSError:
+        pass
+    return _config
+
+
+def save_config(cfg):
+    try:
+        os.makedirs(os.path.dirname(CONFIG_PATH) or ".", exist_ok=True)
+        with open(CONFIG_PATH, "w") as f:
+            f.write("# packagemanager configuration\n")
+            for k, v in cfg.items():
+                f.write(f"{k}={v}\n")
+        return True
+    except OSError:
+        return False
+
+
+def config_exists():
+    return os.path.isfile(CONFIG_PATH)
+
+
+def collector_prefix():
+    return load_config()["collector_prefix"].rstrip("_") + "_"
+
+
+def user_prefix():
+    return load_config()["user_prefix"].rstrip("_") + "_"
+
+
+def main_user():
+    return load_config().get("main_user", "").strip()
+
+
+def editor():
+    return (load_config().get("editor") or os.environ.get("EDITOR") or "vim")
+
+
+def difftool():
+    return (load_config().get("difftool") or "vimdiff")
+
+
+# --------------------------------------------------------------------------- #
+# colored output
+# --------------------------------------------------------------------------- #
+
+_USE_COLOR = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+
+
+class colors:
+    normal = "\033[0m" if _USE_COLOR else ""
+    red = "\033[31m" if _USE_COLOR else ""
+    green = "\033[32m" if _USE_COLOR else ""
+    yellow = "\033[33m" if _USE_COLOR else ""
+    blue = "\033[34m" if _USE_COLOR else ""
+    cyan = "\033[36m" if _USE_COLOR else ""
+    dim = "\033[2m" if _USE_COLOR else ""
+
+
+HEADER_WIDTH = 60
+
+
+def printHeader(msg):
+    inner = f"### {msg} "
+    tail = "#" * max(HEADER_WIDTH - len(inner), 3)
+    print(f"\n{colors.blue}{inner}{tail}{colors.normal}")
+
+
+def printLine():
+    line = f"{colors.blue}{'-' * HEADER_WIDTH}{colors.normal}"
+    print(line)
+    return line
+
+
+def printSuccess(msg): print(f"{colors.green}{msg}{colors.normal}")
+def printInfo(msg):    print(f"{colors.blue}{msg}{colors.normal}")
+def printWarning(msg): print(f"{colors.yellow}{msg}{colors.normal}")
+def printError(msg):   print(f"{colors.red}{msg}{colors.normal}")
+
+
+def ask_yes_no(question):
+    while True:
+        resp = input(f"{question} [y|n]: ").strip().lower()
+        if resp == "y":
+            return True
+        if resp == "n":
+            return False
+        print("Please enter 'y' for yes or 'n' for no.")
+
+
+# --------------------------------------------------------------------------- #
+# shared helpers
+# --------------------------------------------------------------------------- #
+
+def list_all_users():
+    """Every package-user, i.e. every directory directly under BASE_DIR."""
+    try:
+        return sorted(d for d in os.listdir(BASE_DIR)
+                      if os.path.isdir(os.path.join(BASE_DIR, d)))
+    except FileNotFoundError:
+        printError(f"{BASE_DIR} does not exist.")
+        return []
+
+
+# --------------------------------------------------------------------------- #
+# bridge to the `blfs` tool (offline book parser / script generator)
+#
+# packagemanager no longer parses the book itself -- it shells out to `blfs`,
+# which is fast (cached) and knows the real 13.0 structure.  Location/book can
+# be steered with env vars so the same code works in production and in tests:
+#   BLFS_BIN        e.g. "blfs" or "python3 /path/blfs"   (default: auto-detect)
+#   BLFS_BOOK_FILE  passed through as `--book-file <path>` (offline/testing)
+#   BLFS_BOOK       passed through as `--book <selector>`
+# --------------------------------------------------------------------------- #
+
+def find_blfs():
+    override = os.environ.get("BLFS_BIN")
+    if override:
+        return override.split()
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(here, "blfs")
+    if os.path.isfile(local):
+        return [local] if os.access(local, os.X_OK) else ["python3", local]
+    return ["blfs"]                                   # rely on $PATH
+
+
+def _blfs_book_flags():
+    if os.environ.get("BLFS_BOOK_FILE"):
+        return ["--book-file", os.environ["BLFS_BOOK_FILE"]]
+    if os.environ.get("BLFS_BOOK"):
+        return ["--book", os.environ["BLFS_BOOK"]]
+    return []
+
+
+def run_blfs(args):
+    """Run blfs; return (returncode, stdout, stderr).  rc 127 => blfs missing."""
+    cmd = find_blfs() + _blfs_book_flags() + list(args)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        return r.returncode, r.stdout, r.stderr
+    except FileNotFoundError:
+        return 127, "", "blfs executable not found"
+
+
+def book_version(anchor):
+    """Current name-version of a package in the book, or None if unavailable."""
+    rc, out, _ = run_blfs(["debug", anchor])
+    if rc != 0:
+        return None
+    m = re.search(r"^title\s*:\s*(.+)$", out, re.M)
+    return m.group(1).strip() if m else None
+
+
+def book_rdeps(target, no_recommended=False, optional=False):
+    """anchors of packages that recursively depend on `target`, via blfs rdeps."""
+    argv = ["rdeps", target, "--anchors"]
+    if no_recommended:
+        argv.append("--no-recommended")
+    if optional:
+        argv.append("--optional")
+    rc, out, _ = run_blfs(argv)
+    result = {}
+    if rc == 0:
+        for line in out.splitlines():
+            if "\t" in line:
+                a, nv = line.split("\t", 1)
+                if a.strip():
+                    result[a.strip()] = nv.strip()
+    return result
+
+
+def book_versions_all():
+    """Map anchor -> name_version for the whole book, in ONE blfs call (so update
+    doesn't spawn a process per package)."""
+    rc, out, _ = run_blfs(["versions"])
+    versions = {}
+    if rc == 0:
+        for line in out.splitlines():
+            if "\t" in line:
+                a, nv = line.split("\t", 1)
+                a, nv = a.strip(), nv.strip()
+                if a and nv and " " not in a:
+                    versions[a] = nv
+    return versions
+
+
+def cmd_blfs(args):
+    """Pass through to the blfs book tool: books, set-default, search, etc.
+    e.g.  packagemanager blfs books --discover   /   packagemanager blfs set-default svn"""
+    passthrough = args.args
+    if passthrough and passthrough[0] == "--":
+        passthrough = passthrough[1:]
+    cmd = find_blfs() + _blfs_book_flags() + passthrough
+    try:
+        sys.exit(subprocess.run(cmd).returncode)
+    except FileNotFoundError:
+        printError("blfs not found (set BLFS_BIN or put blfs on PATH).")
+        sys.exit(127)
+
+
+def find_pm_install():
+    """The privileged install engine (bash).  Overridable with PM_INSTALL_BIN
+    so tests can substitute a stub."""
+    override = os.environ.get("PM_INSTALL_BIN")
+    if override:
+        return override.split()
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(here, "packagemanager_install")
+    if os.path.isfile(local):
+        return [local] if os.access(local, os.X_OK) else ["bash", local]
+    return ["packagemanager_install"]
+
+
+# =========================================================================== #
+# command: info                                                   [IMPLEMENTED]
+# =========================================================================== #
+#
+# Mirrors the original `info`: a table of package-users with the columns
+# name / uid / gid / home / pkg_list.  A value is shown in red when it is
+# missing, and uid/gid are shown in yellow when they differ.  A user is
+# "broken" when any column is missing (e.g. a /usr/src dir with no matching
+# system user, or a user that has never been installed so has no pkg.lst);
+# broken users are repeated in their own section.
+#
+# Column selection: -name -uid -gid -home -pkg-list pick specific columns;
+# with none given, all columns are shown.  `info all` == every package-user.
+
+# =========================================================================== #
+# command: info                                                   [IMPLEMENTED]
+# =========================================================================== #
+#
+# A table of package-users.  Beyond the system-user facts (name/uid/gid) we also
+# read /usr/src/<name>/install_last -- the install script copied into the user's
+# home at install time -- to show the installed version, and (with -l/--long)
+# the link, md5, info text, and required/recommended/optional deps + groups.
+#
+# State (refined):
+#   installed      user + home dir + non-empty pkg.lst
+#   not installed  user + home dir, but no pkg.lst yet
+#   broken         an inconsistency: a /usr/src dir with no matching system
+#                  user, or a named user with no /usr/src home
+# uid != gid is shown yellow as a warning but is not by itself "broken".
+#
+# Column selection: -name -uid -gid -home -pkg-list -version -state pick an
+# explicit set; with none given the default overview is
+# name/uid/gid/version/state.  `info all` == every package-user.
+
+# fields we read out of an install_last script
+_LAST_SCALARS = ("name", "name_version", "url", "link", "pkg", "md5_sum", "info",
+                 "installed_program", "installed_directory", "validate_cmd")
+_LAST_ARRAYS = ("required", "recommended", "optional",
+                "install_groups", "additional_links",
+                "installed_programs", "installed_libraries",
+                "installed_directories", "installed_content")
+
+
+def _parse_bash_vars(text, scalars=(), arrays=()):
+    """Pull simple  key="value"  and single-line  key=(a b c)  assignments out
+    of a generated install script.  Good enough for our own install_last files
+    (all header vars are single lines at the top)."""
+    out = {}
+    for key in scalars:
+        m = re.search(rf'^{key}="(.*)"[ \t]*$', text, re.M)
+        if m:
+            out[key] = m.group(1)
+    for key in arrays:
+        m = re.search(rf'^{key}=\((.*)\)[ \t]*$', text, re.M)
+        if m:
+            items = re.findall(r"'[^']*'|\"[^\"]*\"|\S+", m.group(1))
+            out[key] = [it.strip("'\"") for it in items]
+    return out
+
+
+def read_install_last(home):
+    """Parsed vars from /usr/src/<name>/install_last (or install_<name>)."""
+    if not home:
+        return {}
+    for candidate in ("install_last",
+                      "install_" + os.path.basename(home)):
+        path = os.path.join(home, candidate)
+        if os.path.isfile(path):
+            try:
+                text = open(path, encoding="utf-8", errors="replace").read()
+            except OSError:
+                return {}
+            return _parse_bash_vars(text, _LAST_SCALARS, _LAST_ARRAYS)
+    return {}
+
+
+class User:
+    __slots__ = ("search", "name", "uid", "gid", "home", "pkg_list", "meta")
+
+    def __init__(self, search):
+        self.search = search
+        self.name = self.uid = self.gid = None
+        self.home = self.pkg_list = None
+        self.meta = {}
+
+    @property
+    def has_user(self):
+        return self.uid is not None
+
+    @property
+    def state(self):
+        """How we decide a package is INSTALLED (same rule everywhere):
+        there must be a package-user AND its /usr/src/<name> home, AND evidence
+        that an install actually completed -- either an 'install_last' recording
+        a version, or a 'pkg.lst' manifest listing at least one path that still
+        exists on disk.  User+home but no such evidence => 'not installed' (the
+        user was created but nothing is installed yet).  Only one of user/home
+        => 'broken'."""
+        if not self.home and not self.has_user:
+            return "not installed"
+        if self.home and self.has_user:
+            if self.meta.get("name_version") or self._manifest_has_real_paths():
+                return "installed"
+            return "not installed"
+        return "broken"
+
+    def _manifest_has_real_paths(self):
+        if not self.pkg_list:
+            return False
+        try:
+            with open(self.pkg_list, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    p = line.strip()
+                    if p.startswith("/") and os.path.lexists(p):
+                        return True
+        except OSError:
+            pass
+        return False
+
+    @property
+    def broken(self):
+        return self.state == "broken"
+
+    @property
+    def uid_gid_mismatch(self):
+        return self.has_user and self.uid != self.gid
+
+    @property
+    def version(self):
+        return self.meta.get("name_version")
+
+
+def gather_user(name):
+    """Populate a User from the system user db, the on-disk package dir, and
+    its install_last script."""
+    u = User(name)
+    if pwd is not None:
+        try:
+            pw = pwd.getpwnam(name)
+            u.name, u.uid, u.gid = pw.pw_name, str(pw.pw_uid), str(pw.pw_gid)
+        except KeyError:
+            pass
+    home = os.path.join(BASE_DIR, name)
+    if os.path.isdir(home):
+        u.home = home
+    pkg_lst = os.path.join(home, "pkg.lst")
+    if os.path.isfile(pkg_lst) and os.path.getsize(pkg_lst) > 0:
+        u.pkg_list = pkg_lst
+    u.meta = read_install_last(u.home)
+    return u
+
+
+def count_pkg_files(pkg_list):
+    if not pkg_list:
+        return None
+    try:
+        with open(pkg_list, encoding="utf-8", errors="replace") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return None
+
+
+_STATE_COLOR = {"installed": colors.green,
+                "unvalidated": colors.cyan,
+                "not installed": colors.yellow,
+                "broken": colors.red}
+
+
+def print_user_details(u):
+    m = u.meta
+    expected = book_version(u.name or u.search)
+    state, why = assess(u, expected)
+    head = f"{u.name or u.search}"
+    if u.version:
+        head += f"  ({u.version})"
+    print(f"\n{colors.cyan}{head}{colors.normal}  "
+          f"[{_STATE_COLOR.get(state, '')}{state}{colors.normal}]")
+    print(f"  {colors.dim}why{colors.normal:<9}: {why}")
+    rows = [
+        ("uid/gid", f"{u.uid}/{u.gid}" if u.has_user else None),
+        ("home", u.home),
+        ("link", m.get("link")),
+        ("md5", m.get("md5_sum")),
+        ("info", m.get("info")),
+        ("required", ", ".join(m.get("required", [])) or None),
+        ("recommended", ", ".join(m.get("recommended", [])) or None),
+        ("optional", ", ".join(m.get("optional", [])) or None),
+        ("groups", ", ".join(m.get("install_groups", [])) or None),
+        ("files", count_pkg_files(u.pkg_list)),
+    ]
+    for label, value in rows:
+        if value is None or value == "":
+            continue
+        if label == "info":
+            lines = [ln.strip() for ln in str(value).replace("\\n", "\n").split("\n")
+                     if ln.strip()]
+            if not lines:
+                continue
+            print(f"  {label:<12}: {lines[0]}")
+            for extra in lines[1:]:
+                print(f"  {'':<12}  {extra}")
+        else:
+            print(f"  {label:<12}: {value}")
+
+
+def print_user_short(users, versions=None):
+    versions = versions or {}
+    width = max((len(u.name or u.search) for u in users), default=4)
+    for u in users:
+        name = (u.name or u.search)
+        anchor = u.meta.get("name") or name
+        st, _ = assess(u, versions.get(anchor), run_cmd=False)
+        color = _STATE_COLOR.get(st, "")
+        print(f"{name.ljust(width)}  {color}{st:<12}{colors.normal} "
+              f"{u.version or ''}".rstrip())
+
+
+def book_info(anchor):
+    """Parse `blfs debug <anchor>` into a dict (works for any book package,
+    installed or not)."""
+    rc, out, _ = run_blfs(["debug", anchor])
+    if rc != 0 or "resolve" in out and "not an installable" in out:
+        # still return whatever fields parsed (title may be absent)
+        pass
+    info = {}
+    for line in (out or "").splitlines():
+        m = re.match(r"^([\w /]+?)\s*:\s*(.*)$", line)
+        if m:
+            info[m.group(1).strip()] = m.group(2).strip()
+    return info or None
+
+
+def print_book_info(anchor):
+    """Show the book's view of a package (version, link, deps, description) --
+    useful when the package isn't installed yet."""
+    bi = book_info(anchor)
+    if not bi or not bi.get("title"):
+        return
+    print(f"  {colors.dim}(from the BLFS book){colors.normal}")
+    for label, key in (("book version", "title"), ("link", "link"),
+                       ("md5", "md5"), ("required", "required"),
+                       ("recommended", "recommended"), ("optional", "optional")):
+        val = bi.get(key)
+        if val and val not in ("[]", ""):
+            print(f"  {label:<12}: {val}")
+
+
+def _script_name_version(path):
+    try:
+        with open(path) as f:
+            for line in f:
+                m = re.match(r'\s*name_version="([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except OSError:
+        pass
+    return None
+
+
+def resolve_script(user, name_version, script_dir, assume_yes=False,
+                   force_regen=False):
+    """Path to the install script to use for `user`.
+
+    By default, if the package user's home has the canonical, edited script
+    'install_<name_version>', that LOCAL one is used (so your edits are kept) and
+    we say so.  'install_last' (a read-only record) and 'install_<user>' (the
+    engine's runtime copy) are never treated as sources.  --regenerate forces a
+    fresh build from the book."""
+    local = os.path.join(BASE_DIR, user, f"install_{name_version}")
+    if (not force_regen and os.path.isfile(local)
+            and _script_name_version(local) == name_version):
+        printInfo(f"  using LOCAL script (your edits, not the book): {local}")
+        try:
+            body = open(local).read()
+        except OSError:
+            body = ""
+        # a real build script has the phased functions or actual build commands;
+        # warn if it looks like a stub so a "reinstall that does nothing" is obvious
+        if ("unpack_pkg" not in body and "build_pkg" not in body
+                and not re.search(r"\b(make|ninja|meson|cmake|configure)\b", body)):
+            printWarning(f"  ^ this script has no build commands -- it may be a "
+                         f"stub. If a reinstall does nothing, rebuild it from the "
+                         f"book with --regenerate.")
+        else:
+            printInfo(f"  -- pass --regenerate to rebuild {name_version} from the book")
+        return local
+
+    # reuse a script a PRIOR DRY-RUN already generated into script_dir, so a
+    # follow-up --run doesn't regenerate all of them (version-keyed = safe).
+    cached = os.path.join(script_dir, f"install_{name_version}")
+    if (not force_regen and os.path.isfile(cached)
+            and _script_name_version(cached) == name_version):
+        return cached
+
+    rc, out, err = run_blfs(["script", user, "-o", script_dir])
+    m = re.search(r"^Created (.+)$", out, re.M)
+    if rc != 0 or not m:
+        printError(f"{name_version}: blfs script failed -- {(err or out).strip()}")
+        return None
+    return m.group(1).strip()
+
+
+def _which_program(prog):
+    """Does an executable `prog` exist (PATH or the usual bindirs)?"""
+    if not prog:
+        return None
+    if "/" in prog:
+        return prog if os.access(prog, os.X_OK) else None
+    for d in os.environ.get("PATH", "").split(":") + [
+            "/usr/bin", "/usr/sbin", "/bin", "/sbin", "/usr/local/bin"]:
+        p = os.path.join(d, prog)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _find_library(lib):
+    """Does a shared library `lib` exist in the usual lib dirs?"""
+    if not lib:
+        return None
+    if "/" in lib:
+        return lib if os.path.exists(lib) else None
+    for d in ("/usr/lib", "/usr/lib64", "/lib", "/lib64", "/usr/local/lib",
+              "/usr/libexec"):
+        p = os.path.join(d, lib)
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def install_targets(meta):
+    """Collect concrete things the install script says it installs:
+    programs, libraries, directories (from installed_program(s)/-libraries/
+    -director(y|ies))."""
+    progs, libs, dirs = [], [], []
+    if meta.get("installed_program"):
+        progs.append(meta["installed_program"])
+    progs += meta.get("installed_programs", [])
+    libs += meta.get("installed_libraries", [])
+    if meta.get("installed_directory"):
+        dirs.append(meta["installed_directory"])
+    dirs += meta.get("installed_directories", [])
+    return ([p for p in progs if p], [l for l in libs if l],
+            [d for d in dirs if d])
+
+
+def run_validate_cmd(user, cmd):
+    """Run a package's validate_cmd AS the user; return its stdout (version), or
+    None on failure."""
+    if not cmd:
+        return None
+    run = ["su", "-", user, "-c", cmd] if _can_su(user) else ["bash", "-c", cmd]
+    try:
+        r = subprocess.run(run, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (r.stdout or r.stderr).strip() if r.returncode == 0 else None
+
+
+def _version_number(name_version):
+    m = re.search(r"[0-9][0-9.]*[0-9]|[0-9]", name_version or "")
+    return m.group(0) if m else None
+
+
+def assess(u, expected=None, run_cmd=True):
+    """Layered install assessment.  Returns (status, reason):
+      installed    -- evidence + validated (files exist / version confirmed)
+      unvalidated  -- evidence it's installed, but we could NOT confirm it
+      not installed / broken
+    `expected` is the book name_version, used for version checks.  With
+    run_cmd=False the (possibly slow) validate command is skipped -- used for
+    bulk/short views."""
+    if not u.home and not u.has_user:
+        return "not installed", "no package-user and no home"
+    if not (u.home and u.has_user):
+        return "broken", ("has a home dir but no user" if u.home
+                          else "has a user but no home dir")
+    m = u.meta
+    if not (m.get("name_version") or u._manifest_has_real_paths()):
+        return "not installed", "user + home exist, but nothing installed yet"
+
+    # 1) strongest signal: a validate command that prints the installed version.
+    #    A per-package 'validate' file in the home persists across versions and
+    #    wins over any validate_cmd inside the (regenerated) install script.
+    vfile = os.path.join(u.home or os.path.join(BASE_DIR, u.name or u.search),
+                         "validate")
+    vcmd = None
+    if os.path.isfile(vfile):
+        vcmd = f"bash {shlex.quote(vfile)}"
+    elif m.get("validate_cmd"):
+        vcmd = m["validate_cmd"]
+    if vcmd and run_cmd:
+        out = run_validate_cmd(u.name or u.search, vcmd)
+        if out is None:
+            return "unvalidated", "validate command failed to run"
+        want = _version_number(expected or m.get("name_version"))
+        if want and want in out:
+            return "installed", f"validate -> {out.splitlines()[0][:60]} (matches {want})"
+        return "unvalidated", (f"validate -> {out.splitlines()[0][:60]} "
+                               f"(expected {want})")
+
+    # 2) check the concrete targets the script says it installs
+    progs, libs, dirs = install_targets(m)
+    missing = []
+    for p in progs:
+        if not _which_program(p):
+            missing.append(f"program {p}")
+    for l in libs:
+        if not _find_library(l):
+            missing.append(f"lib {l}")
+    dir_version_ok = None
+    for d in dirs:
+        if not os.path.isdir(d):
+            missing.append(f"dir {d}")
+        elif expected:                                   # versioned dir check
+            want = _version_number(expected)
+            if want and re.search(r"\d", os.path.basename(d)):
+                dir_version_ok = (want in d)
+    if progs or libs or dirs:
+        if missing:
+            return "unvalidated", "missing: " + ", ".join(missing[:4]) + (
+                " ..." if len(missing) > 4 else "")
+        if dir_version_ok is False:
+            return "unvalidated", "installed dir version differs from the book"
+        return "installed", "all installed_* targets present" + (
+            " (dir version matches)" if dir_version_ok else "")
+
+    # 3) evidence but nothing concrete to check
+    if m.get("name_version"):
+        return "unvalidated", (f"install_last says {m['name_version']} but no "
+                               f"installed_* targets / validate_cmd to confirm")
+    return "unvalidated", "pkg.lst has real files, but no targets to validate"
+
+
+def _install_evidence(u, expected=None):
+    return assess(u, expected)[1]
+
+
+def cmd_verify(args):
+    """Re-check install state for all (or named) package-users, showing WHY each
+    is/ isn't considered installed.  --fix regenerates pkg.lst for users that own
+    files but lack a manifest (which can flip them to 'installed')."""
+    names = args.packages if args.packages else list_all_users()
+
+    # edit a package's persistent validate command in $EDITOR
+    if getattr(args, "set_validate_command", False):
+        if not args.packages:
+            printError("verify --set-validate-command needs a package name.")
+            return
+        for name in args.packages:
+            home = os.path.join(BASE_DIR, name)
+            if not os.path.isdir(home):
+                printError(f"{name}: no /usr/src/{name} -- add-user it first.")
+                continue
+            vfile = os.path.join(home, "validate")
+            if not os.path.isfile(vfile):
+                with open(vfile, "w") as f:
+                    f.write(
+                        "#!/bin/bash\n"
+                        f"# Print the INSTALLED version of {name}.\n"
+                        "# packagemanager marks the package 'installed' if this\n"
+                        "# output contains the book's version number.\n"
+                        "# Example:\n"
+                        "#   ffmpeg -version | grep -oP '(?<=version ).*(?= Copyright)'\n\n")
+                os.chmod(vfile, 0o755)
+                if pwd is not None:
+                    try:
+                        pw = pwd.getpwnam(name)
+                        os.chown(vfile, pw.pw_uid, pw.pw_gid)
+                    except KeyError:
+                        pass
+            printInfo(f"opening {vfile} in {editor()} ...")
+            subprocess.run([editor(), vfile])
+            out = run_validate_cmd(name, f"bash {shlex.quote(vfile)}")
+            printInfo(f"  test run -> {out if out else '(no output / failed)'}")
+        return
+
+    versions = book_versions_all()
+    printHeader("Verify install state")
+    print()
+    print(f"  {colors.dim}installed = evidence + validated (installed_* files "
+          f"exist / validate_cmd matches);\n"
+          f"  unvalidated = looks installed but couldn't confirm; "
+          f"not installed = nothing built{colors.normal}\n")
+    counts = {}
+    for name in sorted(set(names)):
+        u = gather_user(name)
+        anchor = u.meta.get("name") or name
+        st, why = assess(u, versions.get(anchor))
+        counts[st] = counts.get(st, 0) + 1
+        color = _STATE_COLOR.get(st, "")
+        print(f"  {name:<24} {color}{st:<12}{colors.normal} {why}")
+        if args.fix and st == "not installed" and u.has_user and u.home \
+                and not u.meta.get("name_version"):
+            printInfo(f"    fixing: regenerating pkg.lst for {name}...")
+            write_pkg_list(name, background=False)
+    print("\n  " + "   ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+
+
+def cmd_info(args):
+    names = list_all_users() if args.packages == ["all"] else args.packages
+    if not names:
+        printError("No package-users to show.  Try:  packagemanager info all")
+        return
+    users = [gather_user(n) for n in names]
+
+    # short for `info all` (or -s); detailed for named packages (or -l)
+    if args.long:
+        short = False
+    elif args.short:
+        short = True
+    else:
+        short = args.packages == ["all"]
+
+    printHeader("Package-user info")
+    print()
+    versions = book_versions_all()
+    if short:
+        print_user_short(users, versions)
+    else:
+        for u in users:
+            print_user_details(u)
+            st, _ = assess(u, versions.get(u.meta.get("name") or u.name or u.search),
+                           run_cmd=False)
+            if st in ("not installed", "unvalidated") and not args.no_book:
+                print_book_info(u.name or u.search)
+
+    counts = {}
+    for u in users:
+        anchor = u.meta.get("name") or u.name or u.search
+        st, _ = assess(u, versions.get(anchor), run_cmd=False)
+        counts[st] = counts.get(st, 0) + 1
+    print(f"\nTotal: {len(users)}   " +
+          "   ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+
+
+# =========================================================================== #
+# command: nimgnu   (collector groups)                            [IMPLEMENTED]
+# =========================================================================== #
+#
+# nimgnu_* groups let one package install into another package's directories:
+# a shared dir is owned by group nimgnu_<x> and made group-writable, and every
+# package-user that needs to write there is added to nimgnu_<x>.  The prefix
+# "nimgnu_" is fixed; the suffix is free-form.  Mirrors the engine:
+#   create : add_package_user <g> <g> 10000 20000 <g> 10000 20000
+#   add    : usermod -a -G <g> <pkg>
+#   remove : gpasswd -d <pkg> <g>
+
+def nimgnu_name(name):
+    cp = collector_prefix()
+    if name.startswith(cp) or name.startswith(user_prefix()) or name == "audio":
+        return name
+    return cp + name
+
+
+def find_add_package_user():
+    return os.environ.get("ADD_PACKAGE_USER_BIN", "add_package_user").split()
+
+
+def _group_exists(name):
+    try:
+        grp.getgrnam(name)
+        return True
+    except (KeyError, TypeError):
+        return False
+
+
+def _user_exists(name):
+    try:
+        pwd.getpwnam(name)
+        return True
+    except (KeyError, TypeError):
+        return False
+
+
+def _in_group(user, group):
+    try:
+        return user in grp.getgrnam(group).gr_mem
+    except (KeyError, TypeError):
+        return False
+
+
+def cmd_nimgnu_list(args):
+    if grp is None:
+        printError("no group database available.")
+        return
+    rows = [(g.gr_name, g.gr_gid, sorted(g.gr_mem)) for g in grp.getgrall()
+            if g.gr_name.startswith(collector_prefix())]
+    if args.filter:
+        needle = args.filter.lower()
+        rows = [r for r in rows if needle in r[0].lower()]
+    rows.sort()
+    printHeader("collector groups")
+    print()
+    for name, gid, members in rows:
+        manifest = os.path.join(BASE_DIR, name, "pkg.lst")
+        entries = pkglist_entries(manifest)
+        owns = f"  owns {len(entries)} dirs/files" if os.path.isfile(manifest) else ""
+        print(f"  {name:<26} gid {gid:<8} members: "
+              f"{', '.join(members) if members else '-'}{owns}")
+        if args.long:
+            if members:
+                print(f"      members : {', '.join(members)}")
+            if entries:
+                print(f"      manifest: {manifest}")
+                for e in entries[:40]:
+                    print(f"        {e}")
+                if len(entries) > 40:
+                    print(f"        ... (+{len(entries) - 40} more)")
+            else:
+                print("      (no manifest yet -- assign a dir with "
+                      "'add-dir-to-sysgroup', or run 'reload-pkg-list "
+                      f"{name}')")
+    print(f"\n{len(rows)} group(s).")
+
+
+def cmd_nimgnu_create(args):
+    g = nimgnu_name(args.name)
+    if _group_exists(g) and _user_exists(g):
+        printInfo(f"{g}: already exists (group + user).")
+        return
+    printHeader(f"Create collector {g}")
+    print()
+    cmd = find_add_package_user() + [g, g, "10000", "20000", g, "10000", "20000"]
+    printInfo(f"Creating collector group + user: {' '.join(cmd)}")
+    if _run(cmd):
+        printSuccess(f"{g} created (group + collector user).")
+        report_created_user(g, kind="collector user")
+        printInfo(f"  assign directories to it with: "
+                  f"packagemanager add-dir-to-sysgroup {args.name} <dir>")
+
+
+def cmd_nimgnu_add(args):
+    g = nimgnu_name(args.group)
+    if not _group_exists(g):
+        printError(f"{g}: no such collector group "
+                   f"(create it first: packagemanager sysgroup create {args.group}).")
+        return
+    for pkg in args.users:
+        if not _user_exists(pkg):
+            printError(f"{pkg}: no such package-user.")
+            continue
+        if _in_group(pkg, g):
+            printInfo(f"{pkg} is already a member of {g}.")
+            continue
+        if _run(["usermod", "-a", "-G", g, pkg]):
+            printSuccess(f"Added {pkg} to {g} -- {pkg} may now install into "
+                         f"directories owned by group {g}.")
+
+
+def cmd_nimgnu_remove(args):
+    g = nimgnu_name(args.group)
+    for pkg in args.users:
+        if not _in_group(pkg, g):
+            printInfo(f"{pkg} is not a member of {g}.")
+            continue
+        if _run(["gpasswd", "-d", pkg, g]):
+            printSuccess(f"Removed {pkg} from {g}.")
+
+
+def cmd_nimgnu_delete(args):
+    g = nimgnu_name(args.name)
+    if not g.startswith(collector_prefix()):
+        printError(f"refusing to delete '{g}': not a collector (sysgroup) group.")
+        return
+    has_group, has_user = _group_exists(g), _user_exists(g)
+    if not has_group and not has_user:
+        printInfo(f"{g}: does not exist.")
+        return
+    members = sorted(grp.getgrnam(g).gr_mem) if has_group else []
+
+    printHeader(f"Delete collector {g}")
+    print()
+    if has_group:
+        print(f"  group : {g} (gid {grp.getgrnam(g).gr_gid})")
+    if has_user:
+        print(f"  user  : {g} (uid {pwd.getpwnam(g).pw_uid})")
+    if members:
+        printWarning(f"  {len(members)} member(s) still in the group: "
+                     f"{', '.join(members)}")
+        print("  (they will simply lose this group; their own files are untouched)")
+
+    if not args.run:
+        printInfo("\nDry run -- re-run with --run to delete.")
+        return
+    if not args.yes and not ask_yes_no(f"\nReally delete collector group {g}?"):
+        printWarning("Aborted.")
+        return
+
+    # give every node owned by this group back to its file-owner's own group,
+    # so nothing is left with a dangling gid after the group is deleted.
+    printInfo(f"Reassigning nodes owned by group {g} to their owners' groups "
+              f"(runs 'find /', may take a while)...")
+    forall = " ".join(shlex.quote(x) for x in find_forall())
+    reassign = (f"{forall} {shlex.quote(g)} -exec bash -c "
+                f"'for f in \"$@\"; do chgrp \"$(stat -c %U \"$f\")\" \"$f\" "
+                f"2>/dev/null; done' _ {{}} +")
+    subprocess.run(["sh", "-c", reassign], stderr=subprocess.DEVNULL)
+
+    if has_user:
+        _run(["userdel", g])
+    if _group_exists(g):
+        _run(["groupdel", g])
+    printSuccess(f"{g} deleted.")
+
+
+# =========================================================================== #
+# command: make-group-dir / fix-group-dir   (collector & install dirs)
+# =========================================================================== #
+#
+# Two flavours of shared directory (per the package-user hint):
+#   install dir  : chgrp install <dir> ; chmod g+w,o+t <dir>   (STICKY)
+#                  group-writable so package-users can add files, sticky so they
+#                  can't remove each other's.  Files stay user:user (install is
+#                  a supplementary group), so recursion only regroups DIRS.
+#   nimgnu dir   : chgrp nimgnu_<x> <dir> ; chmod g+w,g+s <dir> (SETGID)
+#                  new files/dirs inherit group nimgnu_<x> (owner = creator), so
+#                  members of nimgnu_<x> can install here.  Recursion regroups
+#                  files too (they belong to the collector group).
+#
+# Each nimgnu group also gets a manifest at /usr/src/nimgnu_<x>/pkg.lst listing
+# everything connected to the group (forall_direntries_from by group), refreshed
+# whenever we (re)assign a directory to it.
+
+def _dir_group_name(path):
+    try:
+        return grp.getgrgid(os.stat(path).st_gid).gr_name
+    except (KeyError, OSError, TypeError):
+        return None
+
+
+def _perm_kind(group):
+    if group == "install":
+        return "g+w,o-t", "group-writable"           # no sticky (per your call)
+    if group.startswith(collector_prefix()):
+        return "g+w,g+s,o-t", "setgid"               # trusted: no sticky
+    return "g+w", "group-writable"
+
+
+def _assign_group_dir(path, group, recursive):
+    """chgrp + canonical mode for one dir (optionally its tree)."""
+    mode, _ = _perm_kind(group)
+    is_nimgnu = group.startswith(collector_prefix())
+    if recursive:
+        if is_nimgnu:
+            _run(["chgrp", "-R", group, path])                 # files + dirs
+        else:
+            _run(["find", path, "-type", "d", "-exec", "chgrp", group, "{}", "+"])
+        _run(["find", path, "-type", "d", "-exec", "chmod", mode, "{}", "+"])
+    else:
+        _run(["chgrp", group, path])
+        _run(["chmod", mode, path])
+
+
+def _resolve_group_arg(value):
+    """'install' stays install; anything else becomes a nimgnu_ group."""
+    if value == "install":
+        return "install"
+    return nimgnu_name(value)
+
+
+def write_group_manifest(group, background=True):
+    """Write /usr/src/<group>/pkg.lst = everything owned by that group, via
+    forall_direntries_from (run as root so the whole tree is scanned)."""
+    home = os.path.join(BASE_DIR, group)
+    if not os.path.isdir(home):
+        return False
+    forall = " ".join(shlex.quote(x) for x in find_forall())
+    tmp = shlex.quote(os.path.join(home, "pkg.lst.new"))
+    dst = shlex.quote(os.path.join(home, "pkg.lst"))
+    inner = f"{forall} {shlex.quote(group)} > {tmp} 2>/dev/null && mv {tmp} {dst}"
+    cmd = ["sh", "-c", inner]
+    if background:
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    return subprocess.run(cmd).returncode == 0
+
+
+def cmd_make_group_dir(args):
+    group = _resolve_group_arg(args.group)
+    if group != "install" and not _group_exists(group):
+        printError(f"{group}: no such group "
+                   f"(create it: packagemanager sysgroup create {args.group}).")
+        return
+    _, kind = _perm_kind(group)
+    printHeader(f"Make {'install' if group == 'install' else group} dir "
+                f"({kind})")
+    print()
+    for d in args.dirs:
+        if not os.path.isdir(d):
+            printError(f"{d}: not a directory.")
+            continue
+        _assign_group_dir(d, group, args.recursive)
+        printSuccess(f"{d} -> group {group}, {kind}"
+                     + (" (recursive)" if args.recursive else ""))
+    if group.startswith(collector_prefix()):
+        printInfo(f"Refreshing {group} manifest in the background...")
+        write_group_manifest(group, background=True)
+
+
+def cmd_fix_group_dir(args):
+    forced = _resolve_group_arg(args.group) if args.group else None
+    if forced and forced != "install" and not _group_exists(forced):
+        printError(f"{forced}: no such group.")
+        return
+    touched_nimgnu = set()
+    for d in args.dirs:
+        if not os.path.isdir(d):
+            printError(f"{d}: not a directory.")
+            continue
+        targets = [d]
+        if args.recursive:
+            for root, dirs, _files in os.walk(d):
+                targets.extend(os.path.join(root, sub) for sub in dirs)
+        fixed = 0
+        for path in targets:
+            group = forced or _dir_group_name(path)
+            if not group:
+                continue
+            if group != "install" and not group.startswith(collector_prefix()) \
+                    and not forced:
+                continue                              # leave unrelated dirs alone
+            mode, _ = _perm_kind(group)
+            if forced:
+                _run(["chgrp", group, path])
+            _run(["chmod", mode, path])
+            if group.startswith(collector_prefix()):
+                touched_nimgnu.add(group)
+            fixed += 1
+        printSuccess(f"{d}: re-applied permissions to {fixed} dir(s)"
+                     + (" (recursive)" if args.recursive else ""))
+    for group in touched_nimgnu:
+        write_group_manifest(group, background=True)
+
+def _todo(name):
+    def run(args):
+        printWarning(f"'{name}' is not implemented yet -- coming next.")
+        sys.exit(2)
+    return run
+
+
+# =========================================================================== #
+# command: check                                                  [IMPLEMENTED]
+# =========================================================================== #
+#
+# Report the install state of one or more packages and, when possible, compare
+# the installed version (from install_last) against the current book version
+# (via `blfs debug`).  The package's book anchor is taken from install_last's
+# recorded name when present, else the package-user name.
+#
+# Result per package (also reflected in the exit code):
+#   installed (up to date)      user+home+pkg.lst, installed == book
+#   update: X -> Y              installed, but book has a different version
+#   installed                   installed, book version unknown/unchecked
+#   not installed               user+home exist, no pkg.lst yet
+#   broken                      user/dir inconsistency
+# Exit code: 0 if every requested package is installed & up to date, else 1.
+
+def check_one(name, use_book=True):
+    """Return (User, book_ver, status) for one package."""
+    u = gather_user(name)
+    anchor = u.meta.get("name") or name
+    book_ver = book_version(anchor) if use_book else None
+    if u.state == "broken":
+        status = "broken"
+    elif u.state == "not installed":
+        status = "not installed"
+    elif book_ver and u.version and book_ver != u.version:
+        status = f"update: {u.version} -> {book_ver}"
+    elif book_ver and u.version and book_ver == u.version:
+        status = "installed (up to date)"
+    else:
+        status = "installed"
+    return u, book_ver, status
+
+
+def _status_color(status):
+    if status.startswith("update:"):
+        return colors.cyan
+    if status.startswith("installed"):
+        return colors.green
+    if status == "not installed":
+        return colors.yellow
+    return colors.red                                 # broken
+
+
+def cmd_check(args):
+    all_ok = True
+    for name in args.packages:
+        u, book_ver, status = check_one(name, use_book=not args.no_book)
+        if not status.startswith("installed"):     # update:/not installed/broken
+            all_ok = False
+        color = _status_color(status)
+        tail = ""
+        if u.version and status in ("installed", "broken", "not installed"):
+            tail = f"   [{u.version}]"
+        print(f"{name:<20} {color}{status}{colors.normal}{tail}")
+    sys.exit(0 if all_ok else 1)
+# =========================================================================== #
+# command: search                                                 [IMPLEMENTED]
+# =========================================================================== #
+#
+# `blfs search` hits, each annotated with the book version (the title), the
+# local install state, and the installed version when present.
+
+_SEARCH_RE = re.compile(r"^\s*\[(package|module)\s*\]\s+(\S+)\s+(.+?)\s*$")
+
+
+def install_tag(anchor, book_version_str):
+    """Colored 'installed/update/not installed/broken' tag for an anchor whose
+    current book version is book_version_str."""
+    u = gather_user(anchor)
+    if u.state == "broken":
+        return colors.red + "broken" + colors.normal
+    if u.state != "installed":
+        return colors.yellow + "not installed" + colors.normal
+    if u.version and book_version_str and u.version != book_version_str:
+        return colors.cyan + f"installed {u.version} (update available)" + colors.normal
+    return colors.green + f"installed {u.version or ''}".rstrip() + colors.normal
+
+
+def cmd_search(args):
+    rc, out, err = run_blfs(["search"] + args.packages)
+    if rc == 127:
+        printError("blfs not found (set BLFS_BIN or put blfs on PATH).")
+        sys.exit(1)
+    hits = 0
+    for line in out.splitlines():
+        m = _SEARCH_RE.match(line)
+        if not m:
+            continue                                  # blfs summary / no-match
+        hits += 1
+        kind, anchor, book_ver = m.group(1), m.group(2), m.group(3)
+        print(f"  [{kind:<7}] {anchor:<26} {book_ver:<24} "
+              f"{install_tag(anchor, book_ver)}")
+    if hits == 0:
+        msg = (out or err).strip()
+        print(msg if msg else
+              f"No package matching {', '.join(args.packages)!r}.")
+
+
+# =========================================================================== #
+# command: dependencies                                           [IMPLEMENTED]
+# =========================================================================== #
+#
+# Recursive dependency order, each line annotated with local install state and,
+# for dependency packages, HOW it was pulled in: the kind (required/recommended/
+# optional) and the parent package that required it.  --tree shows blfs's tree
+# verbatim; --no-recommended / --optional pass through.
+
+def blfs_order_anchors(name, no_recommended=False, optional=False):
+    """Return (order, missing): order is [(anchor, name_version, kind, parent)],
+    missing is [(name, kind, parent)], via blfs order --anchors."""
+    argv = ["order", name, "--anchors"]
+    if no_recommended:
+        argv.append("--no-recommended")
+    if optional:
+        argv.append("--optional")
+    rc, out, err = run_blfs(argv)
+    if rc == 127:
+        printError("blfs not found (set BLFS_BIN or put blfs on PATH).")
+        sys.exit(1)
+    if rc != 0:
+        printError((err or out).strip() or f"blfs order {name} failed")
+        sys.exit(1)
+    order, missing = [], []
+    for line in out.splitlines():
+        if "\t" not in line:                          # skip any stray output
+            continue
+        cols = line.split("\t")
+        cols += [""] * (4 - len(cols))
+        left, nv, kind, parent = cols[:4]
+        left = left.strip()
+        if left == "#missing":
+            missing.append((nv.strip(), kind, parent))
+        elif left and " " not in left and nv.strip():
+            order.append((left, nv.strip(), kind, parent))
+    return order, missing
+
+
+def cmd_dependencies(args):
+    name = args.packages[0]
+    if args.tree:
+        argv = ["deps", name, "--tree"]
+        if args.no_recommended:
+            argv.append("--no-recommended")
+        if args.optional:
+            argv.append("--optional")
+        rc, out, err = run_blfs(argv)
+        print(out if rc == 0 else (err or out).strip())
+        return
+
+    order, missing = blfs_order_anchors(name, args.no_recommended, args.optional)
+    # anchor -> name_version, to show the parent by its versioned name
+    nv_of = {a: nv for a, nv, _, _ in order}
+    printHeader(f"Install order for {name} ({len(order)} packages)")
+    print()
+    need = 0
+    for anchor, nv, kind, parent in order:
+        u = gather_user(anchor)
+        if u.state == "installed" and (not u.version or u.version == nv):
+            state = colors.green + "installed" + colors.normal
+        elif u.state == "installed":
+            state = colors.cyan + f"update ({u.version})" + colors.normal
+            need += 1
+        else:
+            state = colors.yellow + "needs install" + colors.normal
+            need += 1
+        origin = ""
+        if kind and parent:
+            origin = f"   ({kind} by {nv_of.get(parent, parent)})"
+        print(f"  {nv:<30} {state}{origin}")
+    if missing:
+        print()
+        printWarning("Out-of-book / missing (handle manually):")
+        for m, kind, parent in sorted(set(missing)):
+            extra = f"  ({kind} by {nv_of.get(parent, parent)})" if kind and parent else ""
+            print(f"  {m}{extra}")
+    print(f"\n{len(order)} in order, {need} to build"
+          + (f", {len(set(m for m, _, _ in missing))} missing" if missing else ""))
+# =========================================================================== #
+# command: install                                                [IMPLEMENTED]
+# =========================================================================== #
+#
+# Resolve the recursive install order (via blfs), work out which packages
+# actually need building (state != installed, or --reinstall), generate an
+# install script for each with `blfs script`, and either print the plan
+# (default, safe) or run packagemanager_install for each in order (--run).
+#
+#   -f/--force            just the named package(s), skip dependency resolution
+#   -r/--reinstall        rebuild even packages that are already up to date
+#   -e/--ignore-recommended   required deps only
+#      --optional         also pull in optional deps
+#   -i/--ignore a,b,c     skip these anchors
+#      --run              actually execute (default is a dry run / plan)
+#      --yes              don't ask for confirmation before --run
+#   -o/--outdir DIR       where to write the generated scripts
+
+def build_install_plan(args):
+    """Return (plan, missing, why).  plan = [(anchor, name_version, reason)] in
+    install order (deps first); reason in {new, update, reinstall}.  why maps
+    anchor -> (kind, parent) so we can show 'required by <parent>'."""
+    ignore = {x for x in (args.ignore or "").split(",") if x}
+    plan, seen, missing_all, why = [], set(), [], {}
+
+    def consider(anchor, nv, kind="", parent=""):
+        if anchor not in why:
+            why[anchor] = (kind, parent)
+        if anchor in seen or anchor in ignore:
+            return
+        seen.add(anchor)
+        u = gather_user(anchor)
+        up_to_date = (u.state == "installed"
+                      and (not u.version or u.version == nv))
+        if args.reinstall:
+            plan.append((anchor, nv, "reinstall" if up_to_date else
+                         ("update" if u.state == "installed" else "new")))
+        elif not up_to_date:
+            plan.append((anchor, nv,
+                         "update" if u.state == "installed" else "new"))
+
+    for target in args.packages:
+        if args.force:
+            nv = book_version(target)
+            if nv is None:
+                printError(f"{target}: not found in book -- skipping")
+                continue
+            consider(target, nv, "requested", "")
+        else:
+            order, missing = blfs_order_anchors(
+                target, args.ignore_recommended, args.optional)
+            missing_all.extend(m for m, _, _ in missing)
+            for anchor, nv, kind, parent in order:
+                consider(anchor, nv,
+                         "requested" if not parent else (kind or "required"),
+                         parent or target)
+            if getattr(args, "dependents", False):    # also rebuild reverse deps
+                for danchor, dnv in book_rdeps(
+                        target, args.ignore_recommended, args.optional).items():
+                    consider(danchor, dnv, "dependent-of", target)
+    return plan, missing_all, why
+
+
+def _select_plan_rows(rows, render):
+    """Interactive subset picker.  Everything is selected by default; type a
+    selection to narrow it.  Syntax:
+        (empty) / all           keep everything
+        none                    keep nothing
+        1,3,5-8                 keep only these
+        all,!4,!7               everything except 4 and 7
+        !4,!7                   (no positives) => everything except 4 and 7
+    """
+    print("\nPlan -- all selected by default. Enter to keep all, or edit the set")
+    print("(e.g. '1,3,5-8'  |  'all,!4,!7'  |  '!4,!7'  |  'none'):")
+    for i, row in enumerate(rows, 1):
+        print(f"  [{i:>3}] {render(row)}")
+
+    def expand(tok):
+        out = set()
+        tok = tok.strip().lstrip("!")
+        if "-" in tok:
+            try:
+                lo, hi = tok.split("-", 1)
+                out.update(range(int(lo), int(hi) + 1))
+            except ValueError:
+                pass
+        elif tok.isdigit():
+            out.add(int(tok))
+        return out
+
+    try:
+        ans = input("select> ").strip().lower()
+    except EOFError:
+        ans = ""
+    if ans in ("", "all", "a"):
+        return rows
+    if ans in ("none", "n", "q"):
+        return []
+
+    parts = [p for p in re.split(r"[,\s]+", ans) if p]
+    positives = [p for p in parts if not p.startswith("!")]
+    negatives = [p for p in parts if p.startswith("!")]
+    numeric_pos = [p for p in positives if p not in ("all", "a")]
+    # start from "all" if no numeric positives were given (or 'all' was typed)
+    if not numeric_pos or "all" in positives or "a" in positives:
+        keep = set(range(1, len(rows) + 1))
+    else:
+        keep = set()
+    for p in numeric_pos:
+        keep |= expand(p)
+    for n in negatives:
+        keep -= expand(n)
+    return [r for i, r in enumerate(rows, 1) if i in keep]
+
+
+def find_local_script(name):
+    """Look for a local install script for `name` (e.g. one made with
+    `template`) in INSTALL_SCRIPTS_DIR or the current directory."""
+    for d in (INSTALL_SCRIPTS_DIR, "."):
+        try:
+            for fn in sorted(os.listdir(d)):
+                if fn == f"install_{name}" or fn.startswith(f"install_{name}-"):
+                    return os.path.abspath(os.path.join(d, fn))
+        except OSError:
+            continue
+    return None
+
+
+def install_local(name, path, run, yes, verb="install", test=False, clean=False):
+    """Build/install a single package from a local install script (custom or
+    git-based).  Used by both install --local and update --local."""
+    if not path or not os.path.isfile(path):
+        printError(f"{name}: no local install script found "
+                   f"(make one with: packagemanager template {name}).")
+        sys.exit(1)
+    printHeader(f"Local {verb}: {name}")
+    print(f"\n  script : {path}")
+    if not run:
+        printInfo("\nDry run -- to proceed, re-run with --run, or execute:\n"
+                  f"  packagemanager_install {name} {path}")
+        return
+    if not _user_exists(name) and (yes or ask_yes_no(
+            f"\nPackage-user {name} doesn't exist -- create it first?")):
+        _run(find_add_package_user() + [name, name, "10000", "20000",
+                                        name, "10000", "20000"])
+    if not yes and not ask_yes_no(f"Build and {verb} {name} now?"):
+        printWarning("Aborted.")
+        return
+    printHeader(f"{verb.capitalize()}ing {name} (local)")
+    env = {**os.environ, "PM_YES": "1" if yes else "0",
+           "PM_MODE": "update" if verb == "update" else "all"}
+    if test:
+        env["PM_TEST"] = "1"
+    old_paths = _pkglist_paths(name) if clean else None
+    t0 = time.time()
+    if clean:
+        env = {**env, "PM_NO_REFRESH": "1"}
+    result = subprocess.run(find_pm_install() + [name, path], env=env)
+    if result.returncode != 0:
+        printError(f"{verb} failed for {name} (exit {result.returncode}).")
+        printInfo(f"  logs: {_pkg_log_dir(name)}")
+        sys.exit(result.returncode)
+    if clean:
+        _clean_after_install(name, old_paths, t0)
+    printSuccess(f"Done -- {name} {verb}ed.  logs: {_pkg_log_dir(name)}")
+
+
+def cmd_install(args):
+    # ---- local package: install a custom script directly, no BLFS ----
+    if args.local or (len(args.packages) == 1 and not args.force
+                      and book_version(args.packages[0]) is None
+                      and find_local_script(args.packages[0])):
+        name = args.packages[0]
+        path = os.path.abspath(args.local) if args.local else find_local_script(name)
+        install_local(name, path, args.run, args.yes, "install",
+                      test=getattr(args, "test", False),
+                      clean=getattr(args, "clean", False))
+        return
+
+    plan, missing, why = build_install_plan(args)
+    if missing:
+        printWarning("Out-of-book / missing (install these manually): "
+                     + ", ".join(sorted(set(missing))))
+    if not plan:
+        printSuccess("Nothing to do -- everything is installed and up to date.")
+        return
+
+    def why_str(anchor):
+        kp = why.get(anchor)
+        if not kp:
+            return ""
+        kind, parent = kp
+        if kind == "requested":
+            return "requested"
+        if kind == "dependent-of":
+            return f"depends on {parent}"
+        return f"{kind} by {parent}"
+
+    if getattr(args, "select", False):
+        plan = _select_plan_rows(
+            plan, lambda r: f"{r[1]:<30} {r[2]:<10} {why_str(r[0])}")
+        if not plan:
+            printWarning("Nothing selected.")
+            return
+
+    script_dir = args.outdir or os.path.join(TMP_DIR, "install_files")
+    os.makedirs(script_dir, exist_ok=True)
+
+    printHeader(f"Install plan ({len(plan)} to build)")
+    print()
+    steps = []                                       # (anchor, nv, reason, path)
+    for anchor, nv, reason in plan:
+        path = resolve_script(anchor, nv, script_dir,
+                              assume_yes=args.yes,
+                              force_regen=getattr(args, "regenerate", False))
+        if not path:
+            sys.exit(1)
+        steps.append((anchor, nv, reason, path))
+        color = {"new": colors.yellow, "update": colors.cyan,
+                 "reinstall": colors.blue}.get(reason, "")
+        w = why_str(anchor)
+        print(f"  {nv:<30} {color}{reason:<10}{colors.normal} "
+              f"{colors.dim}{w}{colors.normal}")
+
+    if not args.run:
+        print()
+        printInfo("Dry run -- to install, re-run with --run, or execute:")
+        for anchor, nv, reason, path in steps:
+            print(f"  packagemanager_install {anchor} {path}")
+        return
+
+    print()
+    if not args.yes and not ask_yes_no(f"Build and install {len(steps)} "
+                                       f"package(s) now?"):
+        printWarning("Aborted.")
+        return
+
+    pm = find_pm_install()
+    env = {**os.environ, "PM_MODE": "all", "PM_YES": "1" if args.yes else "0"}
+    if getattr(args, "test", False):
+        env["PM_TEST"] = "1"
+    if getattr(args, "reinstall", False):
+        env["PM_REINSTALL"] = "1"
+    total = len(steps)
+    errors = 0
+    run_log = start_run_log("install", ",".join(args.packages))
+    for i, (anchor, nv, reason, path) in enumerate(steps, 1):
+        set_status(f"[{i}/{total}] installing {nv}"
+                   + (f"  ({errors} error(s))" if errors else ""))
+        printHeader(f"({i}/{total}) Installing {nv}  ({reason})")
+        cleaning = getattr(args, "clean", False)
+        old_paths = _pkglist_paths(anchor) if cleaning else None
+        t0 = time.time()
+        penv = {**env, "PM_NO_REFRESH": "1"} if cleaning else env
+        result = subprocess.run(pm + [anchor, path], env=penv)
+        add_run_entry(run_log, anchor, "install", result.returncode == 0,
+                      result.returncode, _pkg_log_dir(anchor))
+        if result.returncode != 0:
+            errors += 1
+            clear_status()
+            printError(f"install failed for {nv} (exit {result.returncode}); "
+                       f"stopping ({i - 1}/{total} done).")
+            printInfo(f"  logs: {_pkg_log_dir(anchor)}   "
+                      f"(see all: packagemanager errors)")
+            printInfo(f"  After fixing the problem you can re-run ONLY the "
+                      f"install step (no recompile):\n"
+                      f"    packagemanager script install {anchor}")
+            sys.exit(result.returncode)
+        if getattr(args, "clean", False):
+            _clean_after_install(anchor, old_paths, t0)
+    clear_status()
+    printSuccess(f"Done -- {total} package(s) installed.")
+    printInfo(f"  results: packagemanager errors     logs: "
+              f"{os.path.join(BASE_DIR, '<pkg>', 'log')}")
+
+
+# =========================================================================== #
+# command: update                                                 [IMPLEMENTED]
+# =========================================================================== #
+#
+# Update installed packages whose book version differs from what's installed.
+# With no arguments it checks EVERY installed package-user; with package names it
+# checks those packages plus their (recursive) dependencies.  Required and
+# recommended deps are followed by default (-e to skip recommended, --optional to
+# add optional).  Dry-run by default; --run rebuilds each outdated package via
+# the engine.
+
+_PROTECTED_PREFIXES = ("/etc/", "/var/", "/boot/", "/home/", "/root/", "/srv/",
+                       "/opt/etc/")
+
+
+def _pkglist_paths(user):
+    pl = os.path.join(BASE_DIR, user, "pkg.lst")
+    return {p for p in pkglist_entries(pl) if p.startswith("/")}
+
+
+def _orphan_sweep(user, old_paths, since):
+    """Remove files that were in the package's OLD manifest but were NOT rewritten
+    by the new version (mtime older than the install start `since`).  Only old-
+    manifest files are considered; config paths + the source tree are kept.  Does
+    NOT regenerate the manifest (caller does, after any reapply).  Returns the
+    number of files removed."""
+    if old_paths is None:
+        return 0
+    protected = _PROTECTED_PREFIXES + (BASE_DIR.rstrip("/") + "/",)
+    victims = []
+    for p in sorted(old_paths):
+        if any(p == pre.rstrip("/") or p.startswith(pre) for pre in protected):
+            continue
+        if not os.path.lexists(p):
+            continue
+        try:
+            if os.path.getmtime(p) < since:
+                victims.append(p)
+        except OSError:
+            continue
+    if victims:
+        printInfo(f"  --clean: removing {len(victims)} old-version file(s) the "
+                  f"upgrade no longer installs (configs / source kept)")
+        remove_paths_as_user(user, victims)
+    else:
+        printInfo("  --clean: no leftover files from the old version.")
+    return len(victims)
+
+
+def _reapply_install(user):
+    """Re-run ONLY the install phase (no recompile), as the user, to restore any
+    current-version files that --clean may have removed (e.g. files installed
+    with preserved timestamps).  Orphans stay removed."""
+    inner = f"cd ~ && bash {shlex.quote(f'install_{user}')} install"
+    cmd = (["su", "-", user, "-c", inner] if _can_su(user)
+           else ["sh", "-c", inner])
+    printInfo("  --clean: reapplying the install step to restore current files...")
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def _clean_after_install(user, old_paths, since):
+    """Full --clean sequence run AFTER a successful install: remove old-version
+    orphans, reapply install (to undo any over-removal), then regenerate the
+    manifest so it reflects the final state."""
+    removed = _orphan_sweep(user, old_paths, since)
+    if removed:
+        _reapply_install(user)
+    printInfo("  --clean: regenerating the file manifest...")
+    write_pkg_list(user, background=False)
+    return removed
+
+
+def _is_git_package(name):
+    """A package whose install script builds from a git repo (is_git=1, or it
+    clones/pulls) rather than a book tarball."""
+    p = (_canonical_script_path(name)
+         or os.path.join(BASE_DIR, name, f"install_{name}"))
+    if not p or not os.path.isfile(p):
+        return False
+    try:
+        t = open(p, encoding="utf-8", errors="replace").read(8000)
+    except OSError:
+        return False
+    return bool(re.search(r'is_git="?1"?', t)
+                or re.search(r'\bgit\s+(clone|pull|fetch)\b', t))
+
+
+def cmd_update(args):
+    # --local: update a single package from a custom/local install script
+    # (e.g. a git-based package).
+    if getattr(args, "local", None):
+        name = args.packages[0] if args.packages else None
+        if not name:
+            printError("update --local needs a package name.")
+            return
+        path = os.path.abspath(args.local)
+        install_local(name, path, args.run, args.yes, "update",
+                      test=getattr(args, "test", False),
+                      clean=getattr(args, "clean", False))
+        return
+
+    # git-repo packages (not from the book): update by re-running their own
+    # git-based install script (git fetch + rebuild), bypassing book versions.
+    if args.packages and all(_is_git_package(p) or book_version(p) is None
+                             for p in args.packages) \
+            and any(_is_git_package(p) for p in args.packages):
+        for name in args.packages:
+            script = _canonical_script_path(name) \
+                or os.path.join(BASE_DIR, name, f"install_{name}")
+            if not _is_git_package(name):
+                printWarning(f"{name}: not a git package and not in the book -- "
+                             f"skipping (check the name, or use --local).")
+                continue
+            if "unpack_pkg" not in open(script, errors="replace").read():
+                printWarning(f"{name}: git script isn't phased -- it won't fetch/"
+                             f"rebuild cleanly. Regenerate it with:\n"
+                             f"    packagemanager template {name} --git <repo-url>")
+            printInfo(f"{name}: git package -- updating from its repo.")
+            install_local(name, script, args.run, args.yes, "update",
+                          test=getattr(args, "test", False),
+                          clean=getattr(args, "clean", False))
+        return
+
+    flag_sig = "".join([
+        "f" if args.force else "", "R" if args.dependents else "",
+        "e" if args.ignore_recommended else "", "o" if args.optional else "",
+        "c" if getattr(args, "clean", False) else "",
+        "i" if getattr(args, "reinstall", False) else ""])
+    base = ",".join(sorted(args.packages)) if args.packages else "all"
+    plan_key = base + (("#" + flag_sig) if flag_sig else "")
+    kind_of = {}                                     # anchor -> required/recommended/...
+
+    cached = use_stored_plan("update", plan_key, assume_yes=args.yes) if args.run else None
+
+    if cached is not None:
+        plan = [tuple(x) for x in cached]
+    else:
+        if args.packages and args.force:
+            # -f: just the named packages, no dependency walk
+            vers = book_versions_all()
+            vlookup = {t: vers.get(t) for t in args.packages}
+            names = list(args.packages)
+        elif args.packages:
+            vlookup = {}
+            for target in args.packages:
+                order, _missing = blfs_order_anchors(
+                    target, args.ignore_recommended, args.optional)
+                for anchor, nv, kind, parent in order:
+                    vlookup.setdefault(anchor, nv)
+                    if anchor not in kind_of:
+                        if not parent:                   # the requested target
+                            kind_of[anchor] = ("requested", target)
+                        else:
+                            kind_of[anchor] = (kind or "required", parent)
+                if args.dependents:                  # super-recursive: also rebuild
+                    for anchor, nv in book_rdeps(     # everything that depends on it
+                            target, args.ignore_recommended, args.optional).items():
+                        vlookup.setdefault(anchor, nv)
+                        kind_of.setdefault(anchor, ("dependent-of", target))
+            names = list(vlookup.keys())
+        else:
+            vlookup = book_versions_all()
+            names = list_all_users()
+
+        printInfo(f"Checking {len(names)} package(s) against the book...")
+        named = set(args.packages) if args.packages else set()
+        plan, not_installed, uptodate = [], [], []
+        for name in names:
+            u = gather_user(name)
+            anchor = u.meta.get("name") or name
+            bv = vlookup.get(anchor)
+            if u.state != "installed":
+                if name in named or anchor in named:
+                    not_installed.append(name)
+                continue
+            if not bv:
+                continue
+            outdated = u.version and bv != u.version
+            if outdated:
+                plan.append((anchor, name, u.version or "?", bv))
+            elif getattr(args, "reinstall", False):
+                plan.append((anchor, name, "(reinstall)", bv))
+            else:
+                uptodate.append((anchor, name, u.version, bv))
+
+        # tell the user plainly about named packages that aren't installed
+        for name in not_installed:
+            if book_version(name) is None:
+                printWarning(f"{name} is NOT in the book (check the name, e.g. "
+                             f"'libjpeg-turbo' vs 'libjpeg') -- "
+                             f"try: packagemanager search {name}")
+            else:
+                printWarning(f"{name} is NOT installed (no completed install "
+                             f"found) -- use:  packagemanager install {name}")
+
+        # named packages that are already current: offer to re-apply
+        for anchor, name, iv, bv in uptodate:
+            if name not in named and anchor not in named:
+                continue                              # only prompt for named ones
+            if getattr(args, "no_reinstall", False):
+                printInfo(f"{name} is already up to date ({bv}); skipping "
+                          f"(--no-reinstall).")
+                continue
+            if args.yes or ask_yes_no(f"{name} is already up to date ({bv}). "
+                                      f"Re-apply the update anyway?"):
+                plan.append((anchor, name, "(reinstall)", bv))
+
+    if not plan:
+        printSuccess("Nothing to update -- all matching installed packages are "
+                     "current.")
+        clear_plan("update", plan_key)
+        return
+
+    def reason_str(anchor):
+        kp = kind_of.get(anchor)
+        if not kp:
+            return ""
+        kind, parent = kp
+        if kind == "requested":
+            return "requested"
+        if kind == "dependent-of":
+            return f"depends on {parent}"
+        return f"{kind} by {parent}"
+
+    if args.select:
+        plan = _select_plan_rows(
+            plan, lambda r: f"{r[1]:<24} {r[2]} -> {r[3]:<20} "
+                            f"{reason_str(r[0])}")
+        if not plan:
+            printWarning("Nothing selected.")
+            return
+
+    save_plan("update", plan_key, plan)
+
+    script_dir = args.outdir or os.path.join(TMP_DIR, "install_files")
+    os.makedirs(script_dir, exist_ok=True)
+    printHeader(f"Update plan ({len(plan)} package(s))")
+    print()
+    steps = []
+    for anchor, name, iv, bv in plan:
+        path = resolve_script(name, bv, script_dir, assume_yes=args.yes,
+                              force_regen=getattr(args, "regenerate", False))
+        if not path:
+            continue
+        steps.append((anchor, name, iv, bv, path))
+        reason = reason_str(anchor)
+        rc_col = f"  {colors.dim}({reason}){colors.normal}" if reason else ""
+        print(f"  {name:<22} {iv}  ->  {colors.cyan}{bv}{colors.normal}{rc_col}")
+
+    # loud warning if any package would build from an OLD-format script
+    if not getattr(args, "regenerate", False):
+        cur_v = _current_script_version()
+        outdated = [name for _a, name, _i, _b, _p in steps
+                    if _package_script_outdated(name, cur_v)]
+        if outdated:
+            bar = colors.red + "!" * 58 + colors.normal
+            print(f"\n{bar}")
+            printWarning(f"!! {len(outdated)} package(s) still use an OLD-format "
+                         f"install script:")
+            printWarning("!!   " + ", ".join(outdated[:12])
+                         + (" ..." if len(outdated) > 12 else ""))
+            printWarning("!! A reinstall/update may not run your edits correctly "
+                         "and could lose them.")
+            printWarning("!! MIGRATE FIRST (merges your edits, backs up .bak):")
+            printWarning("!!   packagemanager migrate-scripts "
+                         + " ".join(outdated[:12])
+                         + (" ..." if len(outdated) > 12 else "") + " --run")
+            printWarning("!! or add --regenerate here to rebuild scripts from the "
+                         "book (discards edits).")
+            print(f"{bar}")
+
+    if not args.run:
+        print()
+        if args.select:
+            printInfo(f"Dry run -- you narrowed this to {len(steps)} package(s). "
+                      f"It's cached under key '{plan_key}'.\n"
+                      f"    Run the SAME set with:  packagemanager update "
+                      + " ".join(list(args.packages) +
+                                 (["--reinstall"] if args.reinstall else []) +
+                                 ["--run --yes"]) +
+                      "\n    (don't re-add --select unless you want to re-pick).")
+        else:
+            exact = "packagemanager update " + " ".join(
+                list(args.packages) + [f for f in (
+                    "-f" if args.force else "", "-R" if args.dependents else "",
+                    "--reinstall" if args.reinstall else "",
+                    "--clean" if getattr(args, "clean", False) else "",
+                    "-e" if args.ignore_recommended else "",
+                    "--optional" if args.optional else "") if f] + ["--run"])
+            printInfo(f"Dry run -- this exact command runs THIS plan ({len(steps)} "
+                      f"package(s)):\n    {exact}")
+            printInfo(f"(cached under key '{plan_key}', so --run reuses/resumes it).")
+        if args.reinstall:
+            printInfo("Note: --reinstall reuses each package's edited "
+                      "install_<ver> script if present; add --regenerate to "
+                      "rebuild the scripts from the book instead.")
+        return
+
+    print()
+    if not args.yes and not ask_yes_no(f"Update {len(steps)} package(s) now?"):
+        printWarning("Aborted.")
+        return
+    pm = find_pm_install()
+    install_only = getattr(args, "install_only", False)
+    env = {**os.environ, "PM_MODE": "install" if install_only else "update",
+           "PM_YES": "1" if args.yes else "0"}
+    if getattr(args, "test", False):
+        env["PM_TEST"] = "1"
+    if getattr(args, "reinstall", False):
+        env["PM_REINSTALL"] = "1"
+    remaining = list(plan)
+    total = len(steps)
+    errors = 0
+    run_log = start_run_log("update", plan_key)
+    for i, (anchor, name, iv, bv, path) in enumerate(steps, 1):
+        set_status(f"[{i}/{total}] updating {name} {iv} -> {bv}"
+                   + (f"  ({errors} error(s) so far)" if errors else ""))
+        verb = "Installing" if install_only else "Updating"
+        printHeader(f"({i}/{total}) {verb} {name}: {iv} -> {bv}")
+        cleaning = getattr(args, "clean", False)
+        old_paths = _pkglist_paths(name) if cleaning else None
+        t0 = time.time()
+        penv = {**env, "PM_NO_REFRESH": "1"} if cleaning else env
+        result = subprocess.run(pm + [name, path], env=penv)
+        add_run_entry(run_log, name, "update", result.returncode == 0,
+                      result.returncode, _pkg_log_dir(name))
+        if result.returncode != 0:
+            errors += 1
+            save_plan("update", plan_key, remaining)   # resume-able
+            clear_status()
+            printError(f"update failed for {name} (exit {result.returncode}); "
+                       f"stopping ({i - 1}/{total} done, {errors} error(s)).")
+            printInfo(f"  logs: {_pkg_log_dir(name)}   "
+                      f"(see all: packagemanager errors)")
+            base = ("packagemanager update " + " ".join(list(args.packages)))
+            printInfo("  The plan is saved. To resume after fixing the problem:\n"
+                      f"    - if the BUILD was fine and only install failed "
+                      f"(perms, a missing dir): retry just install (no recompile):\n"
+                      f"        {base} --install-only --run\n"
+                      f"      (or for one package:  packagemanager script install "
+                      f"{name})\n"
+                      f"    - to REBUILD from scratch: {base} --run "
+                      f"(add --regenerate to rebuild the script from the book)")
+            sys.exit(result.returncode)
+        if getattr(args, "clean", False):
+            _clean_after_install(name, old_paths, t0)
+        _maybe_remove_old_sources(name, bv, args.yes)
+        remaining = [p for p in remaining if p[0] != anchor]
+        save_plan("update", plan_key, remaining)
+    clear_status()
+    clear_plan("update", plan_key)
+    printSuccess(f"Done -- {total} package(s) updated"
+                 + (f", {errors} error(s)." if errors else "."))
+    printInfo(f"  results: packagemanager errors     logs: "
+              f"{os.path.join(BASE_DIR, '<pkg>', 'log')}")
+# =========================================================================== #
+# command: remove                                                 [IMPLEMENTED]
+# =========================================================================== #
+#
+# Default `remove <pkg>` UNINSTALLS the package's files (everything it put on
+# the system, from pkg.lst) but KEEPS the package-user and its /usr/src/<pkg>
+# home -- so reinstalling is easy and anything special you keep in that home is
+# preserved.  The file removal runs AS THE PACKAGE USER (su -), so the kernel
+# only lets it delete what that user is allowed to (its own files in the
+# install-group dirs); it can never remove another package's or root's files by
+# accident.  `--purge` additionally deletes the user, its group and the home.
+#
+#   (default)   uninstall files, keep user + /usr/src/<pkg>
+#   --purge     also remove the user/group and /usr/src/<pkg>
+#   --run       actually do it (default is a dry-run plan); --yes skips prompt
+#
+# Later helpers noted for the nimgnu_ collector-group layer (not yet built):
+#   make a dir an install-group dir, fix install-group dir permissions,
+#   add a dir to a nimgnu_* group.
+
+# --------------------------------------------------------------------------- #
+# dry-run plan cache
+#
+# A dry run stores what it computed (with a timestamp) so the matching --run can
+# reuse it instead of recomputing -- e.g. re-scanning the filesystem for a
+# package's files.  Before reusing a stored plan you are shown when it was made
+# and asked to confirm.
+# --------------------------------------------------------------------------- #
+
+def _plans_dir():
+    d = os.path.join(TMP_DIR, "plans")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _run_log_path():
+    return os.path.join(TMP_DIR, "last_run.json")
+
+
+def start_run_log(kind, key):
+    """Begin recording a fresh install/update run (overwrites the previous one)."""
+    os.makedirs(TMP_DIR, exist_ok=True)
+    data = {"kind": kind, "key": key, "started": time.time(), "entries": []}
+    try:
+        with open(_run_log_path(), "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+    return data
+
+
+def add_run_entry(log, pkg, action, ok, exit_code, log_dir):
+    log["entries"].append({"pkg": pkg, "action": action, "ok": ok,
+                           "exit": exit_code, "log_dir": log_dir,
+                           "time": time.time()})
+    try:
+        with open(_run_log_path(), "w") as f:
+            json.dump(log, f)
+    except OSError:
+        pass
+
+
+def read_run_log():
+    try:
+        with open(_run_log_path()) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def cmd_plan(args):
+    """List or clear cached dry-run plans (install/update/remove/fix-install)."""
+    d = _plans_dir()
+    files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
+    if args.action == "clear":
+        targets = [f for f in files if (not args.key or args.key in f)]
+        for f in targets:
+            try:
+                os.remove(os.path.join(d, f))
+            except OSError:
+                pass
+        printSuccess(f"cleared {len(targets)} plan(s).")
+        return
+    if not files:
+        printInfo("No cached plans.")
+        return
+    printHeader("Cached plans")
+    print()
+    for f in files:
+        try:
+            data = json.load(open(os.path.join(d, f)))
+            n = len(data.get("data") or [])
+            when = _ago(data.get("time", 0))
+            kind = data.get("kind", "?")
+            key = data.get("key", "")
+            print(f"  {kind:<12} {key:<24} {n:>4} item(s)   {when}   [{f}]")
+        except (OSError, ValueError):
+            print(f"  {f}  (unreadable)")
+    printInfo("\nclear one:  packagemanager plan clear <file-or-key>\n"
+              "clear all:  packagemanager plan clear")
+
+
+def cmd_errors(args):
+    """Show which packages failed in the LAST install/update run, with their log
+    locations.  With --all, show every package's result."""
+    log = read_run_log()
+    if not log:
+        printInfo("No install/update run recorded yet.")
+        return
+    entries = log.get("entries", [])
+    fails = [e for e in entries if not e["ok"]]
+    oks = [e for e in entries if e["ok"]]
+    printHeader(f"Last run: {log.get('kind')} {log.get('key', '')}")
+    print(f"\n  {_ago(log.get('started', 0))} -- "
+          f"{len(oks)} ok, {colors.red}{len(fails)} failed{colors.normal}, "
+          f"{len(entries)} total\n")
+    show = entries if getattr(args, "all", False) else fails
+    if not show:
+        printSuccess("No errors in the last run.")
+        return
+    for e in show:
+        mark = (f"{colors.green}ok{colors.normal}" if e["ok"]
+                else f"{colors.red}FAILED (exit {e['exit']}){colors.normal}")
+        print(f"  {e['pkg']:<26} {e['action']:<8} {mark}")
+        print(f"      log: {e['log_dir']}")
+    if fails:
+        newest = max(fails, key=lambda e: e["time"])
+        printInfo(f"\n  tip: view the newest failing log with:\n"
+                  f"    ls -t {newest['log_dir']} | head -1   # then less that file")
+
+
+def set_status(msg):
+    """Show a persistent one-line status at the bottom (progress across many
+    packages).  No-op when stdout isn't a terminal so it can't corrupt logs."""
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[K" + msg[:120])
+        sys.stdout.flush()
+
+
+def clear_status():
+    if sys.stdout.isatty():
+        sys.stdout.write("\r\033[K")
+        sys.stdout.flush()
+
+
+def _pkg_log_dir(user):
+    return os.path.join(BASE_DIR, user, "log")
+
+
+def _maybe_remove_old_sources(user, keep_name_version, assume_yes):
+    """After a successful upgrade, offer to delete OLD unpacked source dirs and
+    downloaded archives in the package user's home, keeping the current version.
+    Auto-removes when --yes."""
+    home = os.path.join(BASE_DIR, user)
+    keep = keep_name_version
+    victims = []
+    try:
+        for fn in os.listdir(home):
+            p = os.path.join(home, fn)
+            if fn.startswith(".") or fn.startswith("install_") or fn == "log":
+                continue
+            if fn == "pkg.lst" or fn == "pkg.lst.new":
+                continue
+            if fn == keep:                              # current source dir
+                continue
+            # old source dir or archive (tarball/zip) that isn't the current one
+            is_archive = fn.endswith((".tar", ".tgz", ".tar.gz", ".tar.bz2",
+                                      ".tar.xz", ".zip"))
+            if (os.path.isdir(p) or is_archive) and keep.split("-")[0].lower() \
+                    in fn.lower():
+                if fn.startswith(keep):                 # current version's archive
+                    continue
+                victims.append(p)
+    except OSError:
+        return
+    if not victims:
+        return
+    if not assume_yes:
+        print(f"  Old source/archives for {user} (keeping {keep}):")
+        for p in victims:
+            print(f"    {p}")
+        if not ask_yes_no("  remove these to save space?"):
+            return
+    for p in victims:
+        try:
+            if os.path.isdir(p):
+                shutil.rmtree(p)
+            else:
+                os.remove(p)
+        except OSError as e:
+            printWarning(f"    could not remove {p}: {e}")
+    printInfo(f"  removed {len(victims)} old source item(s) for {user}.")
+
+
+def _plan_path(kind, key):
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", key)
+    return os.path.join(_plans_dir(), f"{kind}__{safe}.json")
+
+
+def save_plan(kind, key, data):
+    try:
+        with open(_plan_path(kind, key), "w") as f:
+            json.dump({"plan_version": PLAN_VERSION, "time": time.time(),
+                       "kind": kind, "key": key, "data": data}, f)
+    except OSError:
+        pass
+
+
+def load_plan(kind, key):
+    try:
+        with open(_plan_path(kind, key)) as f:
+            plan = json.load(f)
+        if plan.get("plan_version") != PLAN_VERSION:  # structure changed -> ignore
+            return None
+        return plan
+    except (OSError, ValueError):
+        return None
+
+
+def clear_plan(kind, key):
+    try:
+        os.remove(_plan_path(kind, key))
+    except OSError:
+        pass
+
+
+def _ago(t):
+    s = max(0, int(time.time() - t))
+    if s < 90:
+        return f"{s}s ago"
+    if s < 5400:
+        return f"{s // 60}m ago"
+    if s < 172800:
+        return f"{s // 3600}h ago"
+    return f"{s // 86400}d ago"
+
+
+def use_stored_plan(kind, key, assume_yes=False):
+    """Return the stored plan's data if one exists and the user confirms using
+    it (given its age), else None."""
+    plan = load_plan(kind, key)
+    if not plan:
+        return None
+    n = len(plan.get("data") or [])
+    when = _ago(plan.get("time", 0))
+    if assume_yes:
+        printInfo(f"Using stored dry-run from {when} ({n} item(s)).")
+        return plan["data"]
+    if ask_yes_no(f"Found a dry-run from {when} ({n} item(s)). Use it "
+                  f"(skip re-scanning)?"):
+        return plan["data"]
+    return None
+
+
+def find_forall():
+    return os.environ.get("FORALL_BIN", "forall_direntries_from").split()
+
+
+def owned_entries(name):
+    """All filesystem entries owned by user OR group `name`, scanned as root via
+    forall_direntries_from.  None if the tool isn't available.  Used for the
+    install-group and nimgnu-group scans."""
+    try:
+        r = subprocess.run(find_forall() + [name], capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def pkglist_entries(pkg_list):
+    try:
+        with open(pkg_list, encoding="utf-8", errors="replace") as f:
+            return [ln.strip() for ln in f if ln.strip()]
+    except OSError:
+        return []
+
+
+def scan_owned_as_user(user):
+    """Files/dirs owned by `user`, found by running forall_direntries_from AS
+    that user (su -), so the search only descends where the user can go instead
+    of walking the whole filesystem as root.  Returns a list, or None if forall
+    is unavailable."""
+    forall = " ".join(shlex.quote(x) for x in find_forall())
+    inner = f"{forall} {shlex.quote(user)}"
+    cmd = ["su", "-", user, "-c", inner] if _can_su(user) else ["sh", "-c", inner]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        return None
+    return [ln for ln in r.stdout.splitlines() if ln.strip()]
+
+
+def remove_paths_as_user(user, paths, as_user=True):
+    """Delete `paths`: files/symlinks first, then now-empty directories deepest-
+    first, streaming a live progress line.  By default runs AS the package user
+    (su -) so the kernel enforces what may be removed; with as_user=False it runs
+    as the current (root) process -- the thorough fallback for files the user
+    itself can't reach.  Returns the number of entries removed."""
+    paths = [p for p in paths if p]
+    if not paths:
+        return 0
+    listfile = os.path.join(_plans_dir(),
+                            re.sub(r"[^A-Za-z0-9_.-]+", "_", user) + ".rmlist")
+    with open(listfile, "w") as f:
+        f.write("\n".join(paths) + "\n")
+    os.chmod(listfile, 0o644)
+    lf = shlex.quote(listfile)
+    inner = (
+        f'while IFS= read -r p; do '
+        f'if [ -L "$p" ] || {{ [ -f "$p" ] && [ ! -d "$p" ]; }}; then '
+        f'rm -f -- "$p" 2>/dev/null && echo "$p"; fi; done < {lf}; '
+        f"awk '{{print length\"\\t\"$0}}' {lf} | sort -rn | cut -f2- | "
+        f'while IFS= read -r p; do [ -d "$p" ] && rmdir -- "$p" 2>/dev/null && echo "$p"; done'
+    )
+    if as_user and _can_su(user):
+        cmd = ["su", "-", user, "-c", inner]
+    else:
+        cmd = ["sh", "-c", inner]
+    count = 0
+    tty = sys.stdout.isatty()
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             text=True, bufsize=1)
+        for line in p.stdout:
+            e = line.strip()
+            if not e:
+                continue
+            count += 1
+            if tty and (count % 5 == 0 or count == 1):
+                sys.stdout.write(f"\r  removed {count}... {os.path.basename(e)[:40]:<40}")
+                sys.stdout.flush()
+        p.wait()
+    finally:
+        if tty:
+            sys.stdout.write("\r" + " " * 70 + "\r")
+            sys.stdout.flush()
+        try:
+            os.remove(listfile)
+        except OSError:
+            pass
+    return count
+
+
+def user_supplementary_groups(name):
+    if grp is None:
+        return []
+    return sorted(g.gr_name for g in grp.getgrall() if name in g.gr_mem)
+
+
+_STATE = {"verbose": False}
+
+
+def _run(cmd, show_output=False):
+    """Run a command, always echoing the command line so the user sees the
+    system change being made.  With --verbose (or show_output=True) the command's
+    own output is shown too; otherwise it's captured and surfaced only on error."""
+    print(f"  {colors.blue}$ "
+          f"{' '.join(shlex.quote(c) for c in cmd)}{colors.normal}")
+    if _STATE["verbose"] or show_output:
+        r = subprocess.run(cmd)
+    else:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            printError(f"  {' '.join(cmd)} -> {r.stderr.strip() or r.returncode}")
+    return r.returncode == 0
+
+
+def remove_one(name, args):
+    u = gather_user(name)
+    home = os.path.join(BASE_DIR, name)
+    has_home = os.path.isdir(home)
+    if not u.has_user and not has_home:
+        printWarning(f"{name}: nothing to remove (no user, no home).")
+        return
+
+    # safety: for --purge, never remove a user whose home isn't under /usr/src
+    if args.purge and u.has_user:
+        pw_dir = pwd.getpwnam(name).pw_dir if pwd else ""
+        if not pw_dir.startswith(BASE_DIR.rstrip("/") + "/"):
+            printError(f"{name}: user home {pw_dir} is not under {BASE_DIR}; "
+                       f"refusing to purge (not a package-user).")
+            return
+
+    groups = user_supplementary_groups(name)
+
+    def header():
+        printHeader(f"{'Purge' if args.purge else 'Remove'} {name}")
+        print()
+        tag = "   (will be removed)" if args.purge \
+            else "   (kept -- use --purge to remove)"
+        if has_home:
+            print(f"  home directory  : {home}{tag}")
+        if u.has_user:
+            print(f"  user/group      : {name} (uid {u.uid}, gid {u.gid}){tag}")
+        if groups:
+            print(f"  member of       : {', '.join(groups)}")
+
+    def do_scan():
+        if getattr(args, "root", False):
+            printInfo(f"Scanning the whole filesystem for files owned by {name}, "
+                      f"as root (thorough; may take a while)...")
+            return owned_entries(name)
+        printInfo(f"Searching for files owned by {name}, as {name} "
+                  f"(su - {name}; may take a moment)...")
+        return scan_owned_as_user(name)
+
+    # DRY RUN: search and store the result for a fast --run later
+    if not args.run:
+        entries = do_scan()
+        if entries is None:
+            printError("forall_direntries_from not found; cannot search.")
+            return
+        save_plan("remove", name, entries)
+        header()
+        print(f"  installed files : {len(entries)} (owned by {name})")
+        printInfo("\nDry run -- re-run with --run (it will offer to reuse this "
+                  "search instead of scanning again).")
+        return
+
+    # RUN
+    header()
+    what = f"purge {name} (all its files + user + home)" if args.purge \
+        else f"uninstall all files owned by {name} (keep user + home)"
+    if not args.yes and not ask_yes_no(f"\nReally {what}?"):
+        printWarning("Aborted.")
+        return
+
+    # reuse a stored dry-run if the user confirms; otherwise search now
+    entries = use_stored_plan("remove", name, assume_yes=args.yes)
+    if entries is None:
+        entries = do_scan() or []
+    total = remove_paths_as_user(name, entries,
+                                 as_user=not getattr(args, "root", False))
+    clear_plan("remove", name)
+    printInfo(f"  uninstalled {total} files owned by {name}")
+
+    if args.purge:
+        if u.has_user:
+            _run(["userdel", name])
+            if grp is not None:
+                try:
+                    grp.getgrnam(name)
+                    _run(["groupdel", name])
+                except KeyError:
+                    pass
+        if has_home and os.path.isdir(home):
+            try:
+                shutil.rmtree(home)
+            except OSError as e:
+                printError(f"  rmtree {home}: {e}")
+        printSuccess(f"{name} purged.")
+    else:
+        for fname in ("pkg.lst", "pkg.lst.new"):     # manifest now meaningless
+            try:
+                os.remove(os.path.join(home, fname))
+            except OSError:
+                pass
+        printSuccess(f"{name} uninstalled (user kept" +
+                     (f", {home} kept)." if has_home else ")."))
+
+
+def cmd_remove(args):
+    for name in args.packages:
+        remove_one(name, args)
+# =========================================================================== #
+# command: reload-pkg-list                                        [IMPLEMENTED]
+# =========================================================================== #
+#
+# Regenerate /usr/src/<name>/pkg.lst from `list_package <name>`.  By default the
+# work runs as a DETACHED (disowned) background task -- new session, no
+# controlling terminal -- so it survives this process exiting and can't be
+# interrupted with Ctrl-C.  Use --foreground to wait for it.
+# LIST_PACKAGE_BIN overrides the `list_package` command (for testing).
+
+def find_list_package():
+    return os.environ.get("LIST_PACKAGE_BIN", "list_package").split()
+
+
+def _can_su(user):
+    """We can su to the user only if we're root and the user exists."""
+    if os.geteuid() != 0 or pwd is None:
+        return False
+    try:
+        pwd.getpwnam(user)
+        return True
+    except KeyError:
+        return False
+
+
+def write_pkg_list(user, background=True):
+    """Regenerate /usr/src/<user>/pkg.lst.  Runs list_package AS the package
+    user (su -) when possible, so it only scans directories that user owns --
+    much faster than scanning the whole filesystem as root."""
+    home = os.path.join(BASE_DIR, user)
+    if not os.path.isdir(home):
+        printError(f"{user}: no package home at {home}")
+        return False
+    lp = " ".join(shlex.quote(x) for x in find_list_package())
+    quser = shlex.quote(user)
+
+    if _can_su(user):
+        # su - starts in the user's home, so pkg.lst.new/pkg.lst are ~/...
+        inner = f"{lp} {quser} > pkg.lst.new 2>/dev/null && mv pkg.lst.new pkg.lst"
+        cmd = ["su", "-", user, "-c", inner]
+    else:
+        tmp = shlex.quote(os.path.join(home, "pkg.lst.new"))
+        dst = shlex.quote(os.path.join(home, "pkg.lst"))
+        cmd = ["sh", "-c", f"{lp} {quser} > {tmp} 2>/dev/null && mv {tmp} {dst}"]
+
+    if background:                                    # detached / disowned
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+        return True
+    return subprocess.run(cmd).returncode == 0
+
+
+def cmd_reload_pkg_list(args):
+    for user in args.packages:
+        ok = write_pkg_list(user, background=not args.foreground)
+        if ok:
+            where = "foreground" if args.foreground else "disowned background task"
+            printInfo(f"{user}: pkg.lst regeneration started ({where}).")
+
+
+# =========================================================================== #
+# command: add-user                                               [IMPLEMENTED]
+# =========================================================================== #
+
+def report_created_user(name, kind="package-user"):
+    """After creating a user, tell the person exactly what now exists / changed
+    on the system (uid/gid, home, and the databases that were written)."""
+    try:
+        pw = pwd.getpwnam(name)
+    except (KeyError, TypeError):
+        printWarning(f"  {name}: created, but not found in the user database?")
+        return
+    printInfo(f"  {kind} '{name}': uid {pw.pw_uid}, gid {pw.pw_gid}")
+    printInfo(f"    recorded in: /etc/passwd, /etc/group, /etc/shadow")
+    home = pw.pw_dir
+    if os.path.isdir(home):
+        printInfo(f"    home directory created: {home}")
+    else:
+        printInfo(f"    home directory (not present): {home}")
+    groups = user_supplementary_groups(name)
+    if groups:
+        printInfo(f"    supplementary groups: {', '.join(groups)}")
+
+
+def cmd_add_user(args):
+    for name in args.packages:
+        if _user_exists(name):
+            printInfo(f"{name}: already exists.")
+            continue
+        cmd = find_add_package_user() + [name, name, "10000", "20000",
+                                         name, "10000", "20000"]
+        printInfo(f"Creating package-user {name}: {' '.join(cmd)}")
+        if _run(cmd):
+            printSuccess(f"Created package-user {name}.")
+            report_created_user(name)
+
+
+# =========================================================================== #
+# first-run setup + config command
+# =========================================================================== #
+
+def first_run_setup():
+    cfg = load_config()
+    printHeader("First-run setup")
+    print()
+    printInfo("packagemanager needs a few settings (saved so you're only asked once):")
+    print("  - collector groups own shared install directories, so several")
+    print("    package-users can install into the same place;")
+    print("  - shared users run apps under a separate account;")
+    print("  - the main user is your own human login account.")
+    print("  (Existing users: enter your current values, e.g. 'nimgnu', 'u'.)")
+    print()
+    guess = cfg.get("main_user") or _guess_main_user() or "none"
+    try:
+        cp = input(f"  Collector-group prefix [{cfg['collector_prefix']}]: ").strip()
+        up = input(f"  Application-user prefix [{cfg['user_prefix']}]: ").strip()
+        mu = input(f"  Main (human) user name [{guess}]: ").strip()
+    except EOFError:
+        cp = up = mu = ""
+    cfg["collector_prefix"] = (cp or cfg["collector_prefix"]).rstrip("_")
+    cfg["user_prefix"] = (up or cfg["user_prefix"]).rstrip("_")
+    mu = mu or guess
+    if mu and mu.lower() != "none":
+        cfg["main_user"] = mu
+    if save_config(cfg):
+        printSuccess(f"Saved {CONFIG_PATH} (change later with: packagemanager config).")
+    else:
+        printWarning("Could not save config; using these values for this run only.")
+    print()
+
+
+def _guess_main_user():
+    su = os.environ.get("SUDO_USER")
+    if su and su != "root":
+        return su
+    if pwd is not None:
+        for p in sorted(pwd.getpwall(), key=lambda x: x.pw_uid):
+            if 1000 <= p.pw_uid < 9999:
+                return p.pw_name
+    return ""
+
+
+def _blfs_store_lines():
+    rc, out, _ = run_blfs(["books"])
+    store = default = None
+    for line in (out or "").splitlines():
+        if line.startswith("Store:"):
+            store = line.split(":", 1)[1].strip()
+        elif line.startswith("Default:"):
+            default = line.split(":", 1)[1].strip()
+    return store, default
+
+
+def cmd_script(args):
+    """Run one phase of a package's install script AS the package user, e.g.
+    'packagemanager script nano install' to re-run only the install step after
+    fixing permissions (no recompile)."""
+    name = args.package
+    phase = args.phase
+    home = os.path.join(BASE_DIR, name)
+    if not _user_exists(name):
+        printError(f"{name}: no such package user.")
+        return
+    home_script = os.path.join(home, f"install_{name}")
+
+    # (re)generate if asked, missing, or the on-disk script predates the current
+    # phased format (old scripts can't find the build dir for install).
+    needs_regen = args.regenerate or not os.path.isfile(home_script)
+    if not needs_regen:
+        try:
+            with open(home_script) as f:
+                head = f.read(6000)
+            if not _script_is_current(head):          # old/un-stamped format
+                needs_regen = True
+                printInfo("(install script is an older format -- regenerating)")
+        except OSError:
+            needs_regen = True
+    if needs_regen:
+        printInfo(f"Generating install script for {name}...")
+        script_dir = os.path.join(TMP_DIR, "install_files")
+        os.makedirs(script_dir, exist_ok=True)
+        rc, out, err = run_blfs(["script", name, "-o", script_dir])
+        m = re.search(r"^Created (.+)$", out, re.M)
+        if rc != 0 or not m:
+            printError(f"blfs script failed for {name} -- {(err or out).strip()}")
+            return
+        gen = m.group(1).strip()
+        try:
+            shutil.copy(gen, home_script)
+            if pwd is not None:
+                pw = pwd.getpwnam(name)
+                os.chown(home_script, pw.pw_uid, pw.pw_gid)
+        except OSError as e:
+            printError(f"could not place script in {home}: {e}")
+            return
+
+    printHeader(f"{name}: {phase}")
+    inner = f"cd ~ && bash {shlex.quote(f'install_{name}')} {shlex.quote(phase)}"
+    cmd = ["su", "-", name, "-c", inner] if _can_su(name) else ["sh", "-c", inner]
+    printInfo(f"  $ su - {name} -c 'bash ~/install_{name} {phase}'")
+    env = {**os.environ}
+    if getattr(args, "test", False):
+        env["PM_TEST"] = "1"
+    old_paths = (_pkglist_paths(name)
+                 if getattr(args, "clean", False) and phase in ("all", "install", "update")
+                 else None)
+    t0 = time.time()
+    result = subprocess.run(cmd, env=env)
+    if result.returncode != 0:
+        printError(f"phase '{phase}' failed for {name} (exit {result.returncode}).")
+        printInfo(f"  logs: {_pkg_log_dir(name)}")
+        sys.exit(result.returncode)
+    if old_paths is not None:
+        _clean_after_install(name, old_paths, t0)
+    printSuccess(f"{name}: {phase} done.  logs: {_pkg_log_dir(name)}")
+
+
+def cmd_paths(args):
+    printHeader("Where packagemanager keeps things")
+    print()
+    def row(label, path):
+        exists = os.path.exists(path)
+        mark = "" if exists else "   (not present)"
+        print(f"  {label:<22}: {path}{mark}")
+
+    row("config file", CONFIG_PATH)
+    row("package-user homes", BASE_DIR)
+    row("install scripts", INSTALL_SCRIPTS_DIR)
+    row("generated scripts", os.path.join(TMP_DIR, "install_files"))
+    row("dry-run plans", os.path.join(TMP_DIR, "plans"))
+
+    store, default = _blfs_store_lines()
+    print()
+    if store:
+        print(f"  blfs store            : {store}")
+        row("  book files", os.path.join(store, "books"))
+        row("  parsed cache", os.path.join(store, "cache"))
+        row("  blfs config", os.path.join(store, "config.json"))
+        if default:
+            print(f"  blfs default book     : {default}")
+    else:
+        printWarning("  blfs store            : (could not query blfs)")
+
+    print()
+    print(f"  blfs binary           : {' '.join(find_blfs())}")
+    print(f"  install engine        : {' '.join(find_pm_install())}")
+    print(f"  forall tool           : {' '.join(find_forall())}")
+    print(f"  list_package          : {' '.join(find_list_package())}")
+    print(f"  add_package_user      : {' '.join(find_add_package_user())}")
+    print()
+    cfg = load_config()
+    print(f"  collector prefix      : {cfg['collector_prefix']}_")
+    print(f"  shared-user prefix    : {cfg['user_prefix']}_")
+    print(f"  main user             : {main_user() or '(unset)'}")
+
+
+def cmd_config(args):
+    cfg = load_config()
+    changed = False
+    if args.collector_prefix:
+        cfg["collector_prefix"] = args.collector_prefix.rstrip("_")
+        changed = True
+    if args.user_prefix:
+        cfg["user_prefix"] = args.user_prefix.rstrip("_")
+        changed = True
+    if getattr(args, "editor", None):
+        cfg["editor"] = args.editor
+        changed = True
+    if getattr(args, "difftool", None):
+        cfg["difftool"] = args.difftool
+        changed = True
+    if args.main_user:
+        cfg["main_user"] = args.main_user
+        changed = True
+    if changed:
+        if save_config(cfg):
+            printSuccess(f"Saved {CONFIG_PATH}")
+        else:
+            printError("could not save config.")
+    printHeader("Configuration")
+    print()
+    where = CONFIG_PATH + ("" if config_exists() else "  (not created yet -- defaults)")
+    print(f"  config file      : {where}")
+    print(f"  collector prefix : {cfg['collector_prefix']}_   "
+          f"(shared install-dir groups)")
+    print(f"  user prefix      : {cfg['user_prefix']}_   (shared users)")
+    print(f"  main user        : {cfg.get('main_user') or '(not set)'}   "
+          f"(your human login account)")
+    print(f"  editor           : {editor()}")
+    print(f"  difftool         : {difftool()}")
+
+
+# =========================================================================== #
+# command: user   (shared users -- the u_* accounts)         [IMPLEMENTED]
+# =========================================================================== #
+#
+# Application users run programs under a separate account (e.g. u_firefox).  No
+# install file is needed -- they install nothing; they exist to run an app and
+# to carry supplementary groups (audio, video, u_xdg_runtime, ...).
+#   create  : make the account (add_package_user)
+#   delete  : remove account + group + home
+#   list    : list shared users and their groups
+#   allow   : add supplementary group(s) to a user (usermod -a -G)
+#   disallow: remove supplementary group(s) (gpasswd -d)
+
+def _user_prefixed(app):
+    up = user_prefix()
+    return app if app.startswith(up) else up + app
+
+
+def _add_groups(user, groups):
+    for g in groups:
+        if not _group_exists(g):
+            printWarning(f"{g}: no such group -- skipping "
+                         f"(create a collector group with 'sysgroup create', or "
+                         f"it must be an existing system group).")
+            continue
+        if _in_group(user, g):
+            printInfo(f"{user} is already in {g}.")
+            continue
+        if _run(["usermod", "-a", "-G", g, user]):
+            printSuccess(f"Added {user} to {g}.")
+
+
+def cmd_user_list(args):
+    up = user_prefix()
+    if pwd is None:
+        return
+    names = sorted(p.pw_name for p in pwd.getpwall() if p.pw_name.startswith(up))
+    if args.filter:
+        names = [n for n in names if args.filter.lower() in n.lower()]
+    printHeader("shared users")
+    print()
+    for n in names:
+        groups = user_supplementary_groups(n)
+        print(f"  {n:<26} groups: {', '.join(groups) if groups else '-'}")
+    print(f"\n{len(names)} user(s).")
+
+
+def cmd_user_create(args):
+    u = _user_prefixed(args.name)
+    if _user_exists(u):
+        printInfo(f"{u}: already exists.")
+    else:
+        printHeader(f"Create shared user {u}")
+        print()
+        cmd = find_add_package_user() + [u, u, "10000", "20000",
+                                         u, "10000", "20000"]
+        printInfo(f"Creating shared user: {' '.join(cmd)}")
+        if not _run(cmd):
+            return
+        printSuccess(f"{u} created.")
+        report_created_user(u, kind="shared user")
+    if args.groups:
+        _add_groups(u, [g for g in re.split(r"[,\s]+", args.groups) if g])
+
+
+def cmd_user_allow(args):
+    user = args.user
+    up = user_prefix()
+    if not user.startswith(up):
+        printWarning(f"'{user}' has no '{up}' prefix -- shared users are "
+                     f"usually named '{up}{user}'.")
+        if not _user_exists(user) and _user_exists(up + user):
+            printInfo(f"Using '{up}{user}' instead.")
+            user = up + user
+    if not _user_exists(user):
+        printError(f"{user}: no such user.")
+        return
+    _add_groups(user, args.groups)
+
+
+def cmd_user_disallow(args):
+    for g in args.groups:
+        if _in_group(args.user, g):
+            if _run(["gpasswd", "-d", args.user, g]):
+                printSuccess(f"Removed {args.user} from {g}.")
+        else:
+            printInfo(f"{args.user} is not in {g}.")
+
+
+def cmd_user_delete(args):
+    u = _user_prefixed(args.name)
+    home = os.path.join(BASE_DIR, u)
+    has_home = os.path.isdir(home)
+    if not _user_exists(u) and not has_home:
+        printInfo(f"{u}: does not exist.")
+        return
+    if _user_exists(u):
+        pw_dir = pwd.getpwnam(u).pw_dir if pwd else ""
+        if not pw_dir.startswith(BASE_DIR.rstrip("/") + "/"):
+            printError(f"{u}: user home {pw_dir} is not under {BASE_DIR}; "
+                       f"refusing to delete.")
+            return
+    printHeader(f"Delete shared user {u}")
+    print()
+    if _user_exists(u):
+        print(f"  user : {u} (uid {pwd.getpwnam(u).pw_uid})")
+    if has_home:
+        print(f"  home : {home}")
+    if not args.run:
+        printInfo("\nDry run -- re-run with --run to delete.")
+        return
+    if not args.yes and not ask_yes_no(f"\nReally delete {u}?"):
+        printWarning("Aborted.")
+        return
+    if _user_exists(u):
+        _run(["userdel", u])
+    if _group_exists(u):
+        _run(["groupdel", u])
+    if has_home and os.path.isdir(home):
+        try:
+            shutil.rmtree(home)
+        except OSError as e:
+            printError(f"  rmtree {home}: {e}")
+    printSuccess(f"{u} deleted.")
+
+
+# =========================================================================== #
+# command: template                                               [IMPLEMENTED]
+# =========================================================================== #
+#
+# Write an install-script skeleton for a package that isn't in the BLFS book,
+# in the exact shape packagemanager_install expects (header vars + install_pkg()
+# [+ configure_pkg()] + the sourced-safe install/update dispatcher).
+
+_TEMPLATE = '''\
+#!/bin/bash
+############################################
+### {name_version}
+### phased install script: all|unpack|build|install|configure|update
+
+url=""                     # optional: where this came from
+name="{name}"
+name_version="{name_version}"
+link="{link}"              # tarball URL, OR a git URL (see is_git below)
+pkg="{pkg}"                # tarball filename (leave empty for git)
+is_git="{is_git}"          # "1" to clone $link with git instead of fetching a tarball
+git_ref=""                 # optional git tag/branch/commit to check out
+md5_sum=""                 # optional md5 of $pkg (tarball only)
+additional_links=()
+info=""
+required=()                # e.g. ('GTK-3.24.51')
+recommended=()
+optional=()
+installed_content=()
+# --- how packagemanager confirms this is really installed (optional) ---
+installed_program=""       # e.g. "ffmpeg"      (checked on PATH)
+installed_programs=()      # e.g. ('gst-launch-1.0' 'gst-inspect-1.0')
+installed_libraries=()     # e.g. ('libnice.so')  (checked in /usr/lib,...)
+installed_directory=""     # e.g. "/usr/lib/ffmpeg-7.1" (version in the name is checked)
+installed_directories=()
+# best signal: a command that prints the installed version. If its output
+# contains the book version, packagemanager marks the package "installed";
+# otherwise "unvalidated".  Example for ffmpeg:
+#   validate_cmd="ffmpeg -version | grep -oP '(?<=version ).*(?= Copyright)'"
+validate_cmd=""
+# install_groups=('{collector}_...')   # if it installs into collector dirs
+
+BUILD_ROOT="${{BUILD_ROOT:-$PWD}}"
+pkg_dir=""
+
+_enter_build() {{
+\tcd "$BUILD_ROOT" || exit 1
+\tif [ -z "$pkg_dir" ]; then
+\t\tpkg_dir="$name_version"
+\t\t[ -d "$pkg_dir" ] || pkg_dir="$(ls -d */ 2>/dev/null | head -n1)"
+\tfi
+\tif [ -n "$pkg_dir" ] && [ -d "$pkg_dir" ]; then cd "$pkg_dir" || exit 1
+\telse echo "no source in $BUILD_ROOT -- run: $0 unpack" && exit 1; fi
+}}
+
+unpack_pkg() {{
+#### UNPACK ####
+\tcd "$BUILD_ROOT" || exit 1
+\tif [ "$is_git" = "1" ]; then
+\t\tpkg_dir="$name_version"
+\t\tif [ -d "$pkg_dir/.git" ]; then
+\t\t\tgit -C "$pkg_dir" fetch --all --tags --prune
+\t\telse
+\t\t\trm -rf "$pkg_dir" && git clone --recurse-submodules "$link" "$pkg_dir"
+\t\tfi
+\t\tif [ -n "$git_ref" ]; then git -C "$pkg_dir" checkout "$git_ref"; fi
+\t\tgit -C "$pkg_dir" submodule update --init --recursive
+\telse
+\t\t[ -f "$pkg" ] || {{ [ -n "$link" ] && wget -4 "$link"; }}
+\t\tif [ -n "$md5_sum" ] && ! grep -wq "$md5_sum" <<< "$(md5sum "$pkg")"; then
+\t\t\techo "ERROR: md5sum check failed" && exit 1
+\t\tfi
+\t\trm -rf tmp && mkdir tmp && cd tmp && tar -xf ../"$pkg"
+\t\tif [ "$(ls | wc -w)" = "1" ]; then pkg_dir="$(ls)"; else pkg_dir="$name_version"; fi
+\t\tcd .. && [ -d "$pkg_dir" ] && rm -rf "$pkg_dir"
+\t\tif [ "$(ls tmp | wc -w)" = "1" ]; then mv tmp/* . ; else mv tmp "$pkg_dir"; fi
+\t\trm -rf tmp
+\tfi
+\tfor li in "${{additional_links[@]}}"; do wget -4 "$li"; done
+\techo "source ready in $BUILD_ROOT/$pkg_dir"
+#### UNPACK DONE ####
+}}
+
+build_pkg() {{
+#### BUILD ####
+\t_enter_build
+\tfor _d in build builddir _build; do [ -d "$_d" ] && rm -rf "$_d"; done
+\t# >>> your CONFIGURE + COMPILE commands go here (no install yet) <<<
+\t# meson setup build --prefix=/usr && ninja -C build
+\t# ./configure --prefix=/usr && make
+\tpwd > "$BUILD_ROOT/.pm_build_cwd" 2>/dev/null || true
+#### BUILD DONE ####
+}}
+
+install_pkg() {{
+#### INSTALL ####
+\t_enter_build
+\tif [ -f "$BUILD_ROOT/.pm_build_cwd" ] && [ -d "$(cat "$BUILD_ROOT/.pm_build_cwd" 2>/dev/null)" ]; then
+\t\tcd "$(cat "$BUILD_ROOT/.pm_build_cwd")"
+\telif [ ! -e build.ninja ] && [ ! -e Makefile ]; then
+\t\tfor _d in build builddir _build; do [ -e "$_d/build.ninja" ] || [ -e "$_d/Makefile" ] && cd "$_d" && break; done
+\tfi
+\t# >>> your INSTALL commands go here (the step that writes into system dirs) <<<
+\t# ninja install   /   make install
+#### INSTALL DONE ####
+}}
+
+configure_pkg() {{
+#### CONFIGURE ####
+\techo "## Configuration"
+\t# >>> optional post-install configuration goes here <<<
+#### CONFIGURE DONE ####
+}}
+
+if [ "${{BASH_SOURCE[0]}}" = "${{0}}" ]; then
+case "${{1:-all}}" in
+\tall)       unpack_pkg && build_pkg && install_pkg && configure_pkg ;;
+\tunpack)    unpack_pkg ;;
+\tbuild)     build_pkg ;;
+\tinstall)   install_pkg ;;
+\tconfigure) configure_pkg ;;
+\tupdate)    unpack_pkg && build_pkg && install_pkg ;;
+\t*) echo "usage: $0 {{all|unpack|build|install|configure|update}}" ;;
+esac
+fi
+'''
+
+
+def _between(text, a, b):
+    m = re.search(re.escape(a) + r"\n?(.*?)" + re.escape(b), text, re.S)
+    return m.group(1) if m else None
+
+
+def _strip_lines(region, prefixes):
+    out = []
+    for ln in region.splitlines():
+        s = ln.strip()
+        if any(s.startswith(p) for p in prefixes):
+            continue
+        out.append(ln)
+    return "\n".join(out).strip("\n")
+
+
+_BUILD_SCAFFOLD = ("_enter_build", "# clean any stale",
+                   "for _d in build builddir _build; do [ -d",
+                   "# remember where the build", "# install phase can resume",
+                   'pwd > "$BUILD_ROOT/.pm_build_cwd"',
+                   ": # (no separate build step)")
+_INSTALL_SCAFFOLD = ("_enter_build", "# resume where", '# "ninja install"',
+                     "# tree was built by an older script.",
+                     ": # (this package installs")
+_CONFIG_SCAFFOLD = ('echo "## Configuration"', "# >>> optional", ": ;")
+_AUTODETECT_RE = re.compile(
+    r'[ \t]*if \[ -f "\$BUILD_ROOT/\.pm_build_cwd".*?\n[ \t]*fi\n', re.S)
+
+
+def extract_phase_cmds(text, phase):
+    """Pull the user's actual commands (scaffolding removed) out of a phased
+    install script for build|install|configure.  None if that phase isn't in
+    this script format."""
+    if phase == "build":
+        r = _between(text, "#### BUILD ####", "#### BUILD DONE ####")
+        return _strip_lines(r, _BUILD_SCAFFOLD) if r is not None else None
+    if phase == "install":
+        r = _between(text, "#### INSTALL ####", "#### INSTALL DONE ####")
+        if r is None:
+            return None
+        r = _AUTODETECT_RE.sub("", r)
+        return _strip_lines(r, _INSTALL_SCAFFOLD)
+    if phase == "configure":
+        r = (_between(text, "#### CONFIGURE ####", "#### CONFIGURE DONE ####")
+             or _between(text, "#### CONFIGURATION ####",
+                         "#### CONFIGURATION DONE ####"))
+        return _strip_lines(r, _CONFIG_SCAFFOLD) if r is not None else None
+    return None
+
+
+def _current_script_version():
+    """Ask blfs for the current generated-script format version (int)."""
+    rc, out, _ = run_blfs(["--version"])
+    m = re.search(r"script v(\d+)", out or "")
+    return int(m.group(1)) if m else None
+
+
+def _script_format_version(text):
+    m = re.search(r"script format v(\d+)", text or "")
+    return int(m.group(1)) if m else None
+
+
+def _script_is_current(text, current=None):
+    """Current if the stamped format version matches blfs's. Un-stamped
+    (very old / hand-written) scripts are treated as NOT current."""
+    fv = _script_format_version(text)
+    if fv is None:
+        return False
+    if current is None:
+        current = _current_script_version()
+    return current is not None and fv >= current
+
+
+def script_edited(text):
+    """Has the user edited a blfs-generated script since it was created?
+    Compares the embedded '### pm_md5=' checksum to the script's actual content.
+    Returns True (edited), False (pristine), or None (no checksum -- unknown,
+    e.g. a very old or hand-written script)."""
+    m = re.search(r'^### pm_md5=([0-9a-f]+)\s*$', text, re.M)
+    if not m:
+        return None
+    stored = m.group(1)
+    body = re.sub(r'\n### pm_md5=[0-9a-f]+', '', text, count=1)
+    return hashlib.md5(body.encode()).hexdigest() != stored
+
+
+# old non-phased scripts fetched+unpacked+built+installed all inside install_pkg();
+# this drops the fetch/unpack preamble (the new unpack_pkg handles that) and keeps
+# the user's real build+install commands.
+_OLD_FETCH_RE = re.compile(
+    r'\s*if \[ -n "\$link" \].*?\n\s*fi\n', re.S)
+
+
+def old_install_body(text):
+    """Extract the user's commands from an OLD non-phased script -- either the
+    '#### INSTALLATION ####' block or the install_pkg() function body -- with the
+    fetch/unpack preamble removed.  None if neither is present."""
+    r = _between(text, "#### INSTALLATION ####", "#### INSTALLATION DONE ####")
+    if r is None:
+        m = re.search(r'install_pkg\s*\(\)\s*\{(.*?)\n\}', text, re.S)
+        r = m.group(1) if m else None
+    if r is None:
+        return None
+    r = _OLD_FETCH_RE.sub("\n", r)
+    # drop a leading `cd "$pkg_dir"` left over from the old unpack preamble
+    r = re.sub(r'^\s*cd "\$pkg_dir"\s*\n', "", r, count=1)
+    return r.strip("\n")
+
+
+def _migration_log_path():
+    """Persistent, human-readable record of script migrations."""
+    for cand in (os.path.dirname(CONFIG_PATH), TMP_DIR):
+        try:
+            os.makedirs(cand, exist_ok=True)
+            return os.path.join(cand, "migrations.log")
+        except OSError:
+            continue
+    return os.path.join(TMP_DIR, "migrations.log")
+
+
+def log_migration(pkg, nv, action, kept, backup):
+    line = (f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {action:<9} {pkg:<24} "
+            f"{(nv or ''):<20} kept={','.join(kept) or '-'}  backup={backup}\n")
+    try:
+        with open(_migration_log_path(), "a") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def _canonical_script_path(name):
+    """The canonical, editable install script for a package -- the SAME file
+    resolve_script/update use: /usr/src/<name>/install_<name_version>.  Prefers
+    the file for the currently-installed version; otherwise the versioned file
+    whose name matches its own name_version (not the runtime 'install_<user>'
+    copy or 'install_last')."""
+    home = os.path.join(BASE_DIR, name)
+    if not os.path.isdir(home):
+        return None
+    u = gather_user(name)
+    if u.version:
+        p = os.path.join(home, f"install_{u.version}")
+        if os.path.isfile(p):
+            return p
+    try:
+        files = [f for f in os.listdir(home)
+                 if f.startswith("install_") and f != "install_last"
+                 and not f.endswith(".bak") and not f.endswith(".book")]
+    except OSError:
+        return None
+    for f in sorted(files):                          # versioned canonical
+        p = os.path.join(home, f)
+        if os.path.isfile(p):
+            nv = _script_name_version(p)
+            if nv and f == f"install_{nv}":
+                return p
+    for f in sorted(files):                          # else any with a name_version
+        p = os.path.join(home, f)
+        if os.path.isfile(p) and _script_name_version(p):
+            return p
+    return None
+
+
+def _restamp_script(path):
+    """After a hand-merge, set the current format stamp + a fresh checksum so the
+    script is recognized as CURRENT and becomes the new pristine baseline (so it
+    stops triggering migrate warnings)."""
+    cur = _current_script_version()
+    if cur is None:
+        return False
+    try:
+        text = open(path, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return False
+    text = re.sub(r'\n### pm_md5=[0-9a-f]+', '', text)     # drop old checksum
+    if re.search(r'### generated by blfs.*script format v\d+', text):
+        text = re.sub(r'(### generated by blfs.*script format v)\d+',
+                      lambda m: m.group(1) + str(cur), text, count=1)
+    else:
+        text = text.replace(
+            '#!/bin/bash',
+            f'#!/bin/bash\n### generated by blfs (hand-merged) -- '
+            f'script format v{cur}', 1)
+    digest = hashlib.md5(text.encode()).hexdigest()
+    text = re.sub(r'(### generated by blfs[^\n]*script format v\d+)',
+                  lambda m: m.group(1) + f'\n### pm_md5={digest}', text, count=1)
+    try:
+        with open(path, "w") as f:
+            f.write(text)
+        return True
+    except OSError:
+        return False
+
+
+def _package_script_outdated(name, current_ver):
+    """True if this package's canonical install_<ver> script predates the current
+    format (so a reinstall would reuse an old script / risk losing edits)."""
+    p = _canonical_script_path(name)
+    if not p:
+        return False
+    try:
+        txt = open(p, encoding="utf-8", errors="replace").read(6000)
+    except OSError:
+        return False
+    return not _script_is_current(txt, current_ver)
+
+
+def _script_norm(text):
+    """Script content for comparison: drop the derived checksum line."""
+    return re.sub(r'\n### pm_md5=[0-9a-f]+', '', text or '')
+
+
+def classify_script(name, script_dir):
+    """Compare a package's canonical install script to a freshly-generated book
+    script.  Returns (status, cand_path, book_path, book_nv):
+      up-to-date  -- matches the book exactly
+      edited      -- you changed it (differs, and it's not pristine)
+      outdated    -- book has newer commands, but you made no edits (safe to adopt)
+      no-baseline -- differs and has no checksum (can't tell -- treat like edited)
+      no-script / not-in-book -- nothing to compare
+    """
+    cand = _canonical_script_path(name)
+    if not cand:
+        return ("no-script", None, None, None)
+    old = open(cand, encoding="utf-8", errors="replace").read()
+    rc, out, err = run_blfs(["script", name, "-o", script_dir])
+    m = re.search(r"^Created (.+)$", out, re.M)
+    if rc != 0 or not m:
+        return ("not-in-book", cand, None, None)
+    book_path = m.group(1).strip()
+    book = open(book_path, encoding="utf-8", errors="replace").read()
+    book_nv = _script_name_version(book_path) or _script_name_version(cand)
+    if _script_norm(old) == _script_norm(book):
+        return ("up-to-date", cand, book_path, book_nv)
+    ed = script_edited(old)
+    if ed is False:
+        return ("outdated", cand, book_path, book_nv)     # book changed, no edits
+    if ed is None:
+        return ("no-baseline", cand, book_path, book_nv)
+    return ("edited", cand, book_path, book_nv)
+
+
+_SCRIPT_STATUS_COLOR = {"up-to-date": colors.green, "outdated": colors.cyan,
+                        "edited": colors.yellow, "no-baseline": colors.yellow,
+                        "no-script": colors.dim, "not-in-book": colors.dim}
+
+
+def cmd_script_status(args):
+    """Report whether each package's install script has been changed from the
+    book's version (edited), is behind the book (outdated), or matches it."""
+    names = args.packages if args.packages else list_all_users()
+    script_dir = os.path.join(TMP_DIR, "install_files")
+    os.makedirs(script_dir, exist_ok=True)
+    printHeader("Install-script status")
+    print(f"\n  {colors.dim}up-to-date=matches book  edited=you changed it  "
+          f"outdated=book newer (no edits)  no-baseline=can't tell{colors.normal}\n")
+    counts = {}
+    for name in sorted(set(names)):
+        st, cand, _bp, _nv = classify_script(name, script_dir)
+        if st == "no-script":
+            continue
+        counts[st] = counts.get(st, 0) + 1
+        color = _SCRIPT_STATUS_COLOR.get(st, "")
+        print(f"  {name:<24} {color}{st:<12}{colors.normal} {cand or ''}")
+    print("\n  " + "   ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
+    if counts.get("edited") or counts.get("no-baseline") or counts.get("outdated"):
+        printInfo("Migrate the changed/outdated ones:  "
+                  "packagemanager migrate-scripts <pkgs> --run")
+
+
+def cmd_migrate_scripts(args):
+    """Upgrade install scripts written by an OLDER packagemanager to the current
+    phased format, MERGING in your edited build/install/configure commands so
+    they aren't lost.  Dry-run by default; --run rewrites (backing up the old
+    script as install_<ver>.bak).  --deps also migrates each package's book
+    dependencies.  --vimdiff opens every script that couldn't be auto-merged in
+    vimdiff (old vs freshly-generated) so you can finish it by hand.  --log shows
+    the history of past migrations instead of migrating."""
+    if getattr(args, "log", False):
+        path = _migration_log_path()
+        printHeader("Migration history")
+        try:
+            with open(path) as f:
+                lines = f.read().splitlines()
+        except OSError:
+            lines = []
+        if not lines:
+            printInfo(f"No migrations recorded yet ({path}).")
+            return
+        tail = lines if getattr(args, "all", False) else lines[-40:]
+        print()
+        for ln in tail:
+            print("  " + ln)
+        print(f"\n  {len(lines)} migration(s) total  --  log: {path}")
+        return
+
+    names = list(args.packages) if args.packages else list_all_users()
+    if getattr(args, "deps", False) and args.packages:
+        expanded = set(names)
+        for target in args.packages:
+            order, _missing = blfs_order_anchors(target, False, False)
+            for anchor, _nv, _kind, _parent in order:
+                expanded.add(anchor)
+        names = sorted(expanded)
+
+    script_dir = os.path.join(TMP_DIR, "install_files")
+    os.makedirs(script_dir, exist_ok=True)
+    current_ver = _current_script_version()
+
+    pristine, edited, already, cannot = [], [], 0, 0
+    for name in sorted(set(names)):
+        if not os.path.isdir(os.path.join(BASE_DIR, name)):
+            continue
+        st, cand, book_path, book_nv = classify_script(name, script_dir)
+        if st == "no-script":
+            continue
+        if st == "not-in-book":
+            cannot += 1
+            continue
+        if st == "up-to-date":
+            already += 1
+            continue
+        # where the migrated script should live: named for the BOOK version, so
+        # it's the default script the next update/reinstall picks up.
+        out_path = os.path.join(BASE_DIR, name, f"install_{book_nv}")
+        if st == "outdated":            # book changed, you made no edits -> safe
+            pristine.append((name, cand, book_path, book_nv, out_path))
+        else:                           # edited / no-baseline -> hand-merge
+            edited.append((name, cand, book_path, book_nv, out_path, st))
+
+    # ---- compact report (no per-package warning spam) ----
+    printHeader("migrate-scripts")
+    print(f"\n  {len(pristine)} to auto-migrate  (book changed, no local edits)")
+    print(f"  {len(edited)} to hand-merge in {difftool()}  (you edited them)")
+    print(f"  {already} up to date" + (f"   {cannot} not in book" if cannot else ""))
+    for name, _c, _b, _nv, _o, reason in edited:
+        print(f"    - {name:<22} ({'you edited it' if reason == 'edited' else 'no baseline'})")
+
+    if not args.run and not args.vimdiff:
+        print()
+        printInfo("Dry run -- re-run with --run to auto-migrate the unedited ones "
+                  "and open the edited ones in " + difftool() + ".")
+        return
+
+    def _finalize(name, cand, out_path, source, backup_note):
+        """Back up the old script, install `source` as install_<book_nv>, restamp."""
+        try:
+            shutil.copy(cand, cand + ".bak")
+            if out_path != cand:
+                shutil.copy(cand, out_path + ".bak") if os.path.exists(out_path) \
+                    else None
+            shutil.copy(source, out_path)
+        except OSError as e:
+            printError(f"  {name}: could not write -- {e}")
+            return None
+        _restamp_script(out_path)
+        _chown_to(out_path, name)
+        # if the canonical was under a different (old-version) name, drop it so the
+        # book-versioned one is unambiguously the default.
+        if out_path != cand:
+            try:
+                os.remove(cand)
+            except OSError:
+                pass
+        return out_path
+
+    # ---- auto-migrate the unedited-but-outdated ones (only with --run) ----
+    if args.run:
+        for name, cand, book_path, book_nv, out_path in pristine:
+            res = _finalize(name, cand, out_path, book_path, "book")
+            if res:
+                printSuccess(f"  {name:<22} migrated -> {os.path.basename(res)}"
+                             f"  (backup: {cand}.bak)")
+                log_migration(name, book_nv, "migrated", ["book"], cand + ".bak")
+
+    # ---- hand-merge the edited ones in vimdiff (NEW on left, OLD on right) ----
+    if edited and (args.run or args.vimdiff):
+        tool = difftool()
+        mtmp = os.path.join(TMP_DIR, "migrate")
+        os.makedirs(mtmp, exist_ok=True)
+        print()
+        printInfo(f"Opening {len(edited)} script(s) in {tool}:  the NEW book "
+                  f"version is on the LEFT (keep it) -- pull your changes in from "
+                  f"your OLD version on the RIGHT, then save the LEFT (:wqa).")
+        for i, (name, cand, book_path, book_nv, out_path, _st) in enumerate(edited, 1):
+            work = os.path.join(mtmp, f"install_{name}.merge")
+            try:
+                shutil.copy(book_path, work)             # LEFT = new book (editable)
+            except OSError as e:
+                printError(f"  {name}: {e}")
+                continue
+            printInfo(f"[{i}/{len(edited)}] {name}:  LEFT=new book   RIGHT={cand}")
+            try:
+                subprocess.run(tool.split() + [work, cand])
+            except OSError as e:
+                printError(f"could not launch {tool}: {e}  "
+                           f"(set one: packagemanager config --difftool ...)")
+                break
+            if args.yes or ask_yes_no(f"  adopt the merged (LEFT) version for "
+                                      f"{name} as install_{book_nv}?"):
+                res = _finalize(name, cand, out_path, work, "merge")
+                if res:
+                    printSuccess(f"  {name}: merged -> {os.path.basename(res)}"
+                                 f"  (backup: {cand}.bak)")
+                    log_migration(name, book_nv, "merged", ["hand-merge"],
+                                  cand + ".bak")
+            else:
+                printInfo(f"  {name}: kept your old script (skipped)")
+
+    printHeader("migrate-scripts summary")
+    print(f"\n  {len(pristine) if args.run else 0} auto-migrated,  "
+          f"{len(edited) if (args.run or args.vimdiff) else 0} hand-merged,  "
+          f"{already} up to date.")
+    if args.run or args.vimdiff:
+        printInfo(f"logged to {_migration_log_path()}  "
+                  f"(view: packagemanager migrate-scripts --log)")
+
+
+def _chown_to(path, user):
+    if pwd is None:
+        return
+    try:
+        pw = pwd.getpwnam(user)
+        os.chown(path, pw.pw_uid, pw.pw_gid)
+    except (KeyError, OSError):
+        pass
+
+
+def cmd_template(args):
+    name = args.name
+    version = args.version or "1.0"
+    name_version = f"{name}-{version}"
+    is_git = "1" if args.git else ""
+    link = args.git or args.link or ""
+    pkg = "" if args.git else (args.pkg or f"{name}-{version}.tar.xz")
+    text = _TEMPLATE.format(name=name, version=version, name_version=name_version,
+                            link=link, pkg=pkg, is_git=is_git,
+                            collector=collector_prefix().rstrip("_"))
+    outdir = args.outdir or "."
+    os.makedirs(outdir, exist_ok=True)
+    path = os.path.join(outdir, f"install_{name_version}")
+    with open(path, "w") as f:
+        f.write(text)
+    os.chmod(path, 0o755)
+    printSuccess(f"Wrote template {path}")
+    if args.git:
+        printInfo(f"git-based: it will clone {args.git}\n"
+                  f"  set git_ref= in the file to pin a tag/branch/commit.")
+    printInfo("Edit the build/install commands, then:\n"
+              f"  packagemanager install {name} --local {path} --run\n"
+              f"  (or:  packagemanager add-user {name}; "
+              f"packagemanager_install {name} {path})")
+
+
+# =========================================================================== #
+# command: add-dir-to-nimgnu                                      [IMPLEMENTED]
+# =========================================================================== #
+
+def cmd_add_dir_to_nimgnu(args):
+    args.group = nimgnu_name(args.group)              # force a nimgnu_ group
+    cmd_make_group_dir(args)
+
+
+# =========================================================================== #
+# command: list                                                   [IMPLEMENTED]
+# =========================================================================== #
+
+def cmd_list(args):
+    names = list_all_users()
+    if not names:
+        printInfo("No package-users found.")
+        return
+    width = max(len(n) for n in names) + 2
+    per_row = max(1, 78 // width)
+    printHeader("Package-users")
+    print()
+    for i in range(0, len(names), per_row):
+        print("  " + "".join(n.ljust(width) for n in names[i:i + per_row]))
+    print(f"\n{len(names)} package-user(s).")
+
+
+# =========================================================================== #
+# command: files_with_broken_id                                   [IMPLEMENTED]
+# =========================================================================== #
+#
+# DIAGNOSTIC (finds, does not change anything): lists files whose owning uid or
+# gid no longer maps to a name -- i.e. orphaned files left behind when a user or
+# group was deleted while its files still existed (e.g. a --purge without
+# removing the files first, or an old manual userdel).  Writes the paths to a
+# file so you can review and decide what to do (reassign, remove, or ignore).
+
+def cmd_files_with_broken_id(args):
+    out_file = args.outfile or "/tmp/invalid_files.txt"
+    printInfo("Scanning for orphaned files (uid/gid with no matching name); "
+              "this runs 'find /' and may take a while. Nothing is changed.")
+    cmd = ["find", "/",
+           "(", "-path", "/proc", "-o", "-path", "/sys", "-o", "-path", "/dev",
+           "-o", "-path", "/run", "-o", "-path", "/mnt", ")", "-prune", "-o",
+           "(", "-nouser", "-o", "-nogroup", ")", "-print"]
+    try:
+        with open(out_file, "w") as f:
+            subprocess.run(cmd, stdout=f, stderr=subprocess.DEVNULL)
+        n = sum(1 for _ in open(out_file))
+    except OSError as e:
+        printError(f"scan failed: {e}")
+        return
+    if n:
+        printWarning(f"Found {n} orphaned file(s) (unresolved uid/gid). "
+                     f"List written to {out_file} for you to review.")
+    else:
+        printSuccess("No orphaned files found (all uid/gid resolve).")
+
+
+# =========================================================================== #
+# command: init                                                   [IMPLEMENTED]
+# =========================================================================== #
+#
+# Turn an existing system into a package-user system: create the `install`
+# group (gid 9999 by default, per the hint) and turn the given directories into
+# install dirs (group install, group-writable, sticky).  Every command is shown
+# and confirmed before running (y = yes, n = skip, a = yes-to-all, q = quit).
+#
+# Per the hint, the sticky bit should be OFF while a temporary owner user still
+# needs to overwrite files -- use --no-sticky for that phase, then run
+# 'fix-install' afterwards to set sticky everywhere.
+
+_CONFIRM = {"all": False}
+
+
+def confirm_run(display, func):
+    if _CONFIRM["all"]:
+        print(f"  + {display}")
+        return func()
+    while True:
+        ans = input(f"  run: {display}   [y/N/a/q]? ").strip().lower()
+        if ans in ("y", "yes"):
+            return func()
+        if ans in ("", "n", "no"):
+            print("      skipped")
+            return None
+        if ans in ("a", "all"):
+            _CONFIRM["all"] = True
+            return func()
+        if ans in ("q", "quit"):
+            printWarning("quit.")
+            sys.exit(0)
+
+
+def cmd_init(args):
+    gid = args.gid
+    mode = "g+w" if args.no_sticky else "g+w,o-t"    # install dirs: no sticky
+
+    # build the list of commands this would run
+    steps = []                                       # (display, argv)
+    if not _group_exists("install"):
+        steps.append((f"groupadd -g {gid} install",
+                      ["groupadd", "-g", str(gid), "install"]))
+    dirs = list(args.dirs)
+    if args.from_file:
+        try:
+            with open(args.from_file) as f:
+                dirs += [ln.strip() for ln in f
+                         if ln.strip() and not ln.lstrip().startswith("#")]
+        except OSError as e:
+            printError(f"could not read {args.from_file}: {e}")
+    for d in dirs:
+        if not os.path.isdir(d):
+            printWarning(f"  {d}: not a directory -- skipping.")
+            continue
+        steps.append((f"chgrp install {d} && chmod {mode} {d}",
+                      ("compound", d)))
+
+    printHeader("Initialise package-user system")
+    print()
+    if _group_exists("install"):
+        printInfo("install group already exists.")
+    if not steps:
+        printInfo("Nothing to do. Pass dirs (or --from-file installdirs.lst) "
+                  "to make install dirs.")
+        return
+
+    # DRY RUN (default): just show the commands
+    if not args.run:
+        print("Would run:")
+        for display, _ in steps:
+            print(f"  {display}")
+        printInfo("\nDry run -- re-run with --run to execute "
+                  "(you'll confirm each command, or use --yes).")
+        return
+
+    # RUN: confirm each command (y = yes, n = skip, a = all, q = quit)
+    if args.yes:
+        _CONFIRM["all"] = True
+    done = 0
+    for display, action in steps:
+        if isinstance(action, tuple) and action[0] == "compound":
+            d = action[1]
+
+            def do(d=d):
+                return _run(["chgrp", "install", d]) and _run(["chmod", mode, d])
+            if confirm_run(display, do):
+                done += 1
+        else:
+            if confirm_run(display, lambda a=action: _run(a)):
+                done += 1
+    printSuccess(f"init done ({done} command(s) run).")
+
+
+# =========================================================================== #
+# command: fix-install                                            [IMPLEMENTED]
+# =========================================================================== #
+#
+# Scan the whole filesystem for directories owned by group 'install' and make
+# sure each is group-writable + sticky (the correct install-dir permissions).
+# Dry-run by default (lists what it would change); --run applies the fix.
+
+# Scan the whole filesystem for directories owned by group 'install' and make
+# sure each is correctly group-writable and NOT sticky.  Dry-run by default
+# (lists what it would change and stores the list); --run applies the fix and
+# can reuse the stored dry-run instead of re-scanning.
+
+def cmd_fix_install(args):
+    if not _group_exists("install"):
+        printError("no 'install' group -- run 'packagemanager init' first.")
+        return
+
+    want_sticky = args.sticky
+    mode = "g+w,o+t" if want_sticky else "g+w,o-t"
+
+    def scan_wrong():
+        printInfo("Scanning for directories owned by group 'install' "
+                  "(runs 'find /', may take a while)...")
+        entries = owned_entries("install")
+        if entries is None:
+            printError("forall_direntries_from not found; cannot scan.")
+            return None
+        wrong = []
+        for path in entries:
+            try:
+                st = os.stat(path)
+            except OSError:
+                continue
+            if not stat.S_ISDIR(st.st_mode):
+                continue
+            gw = bool(st.st_mode & stat.S_IWGRP)
+            sticky = bool(st.st_mode & stat.S_ISVTX)
+            if (not gw) or (want_sticky and not sticky) or \
+                    ((not want_sticky) and sticky):
+                wrong.append(path)
+        return wrong
+
+    if not args.run:
+        wrong = scan_wrong()
+        if wrong is None:
+            return
+        save_plan("fix-install", "install", wrong)
+        for path in wrong:
+            print(f"  would fix {path}")
+        printInfo(f"\n{len(wrong)} install dir(s) need fixing. Re-run with --run "
+                  f"(it can reuse this scan).")
+        return
+
+    wrong = use_stored_plan("fix-install", "install", assume_yes=args.yes)
+    if wrong is None:
+        wrong = scan_wrong()
+        if wrong is None:
+            return
+    for path in wrong:
+        _run(["chmod", mode, path])
+    clear_plan("fix-install", "install")
+    printSuccess(f"Fixed {len(wrong)} install dir(s).")
+
+
+# --------------------------------------------------------------------------- #
+# cli
+# --------------------------------------------------------------------------- #
+
+def main():
+    ap = argparse.ArgumentParser(prog="packagemanager",
+                                 description="pkgusr-model package manager")
+    ap.add_argument("-V", "--version", action="version",
+                    version=f"packagemanager {TOOL_VERSION} (plan cache v{PLAN_VERSION})")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="show the system commands being run and their output")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    # ---- info (implemented) ----
+    p = sub.add_parser("verify", help="recheck install state of all/named "
+                       "package-users (shows WHY; --fix regenerates pkg.lst)")
+    p.add_argument("packages", nargs="*", help="default: all package-users")
+    p.add_argument("--fix", action="store_true",
+                   help="regenerate pkg.lst for users that own files but have no "
+                        "manifest (can flip them to 'installed')")
+    p.add_argument("--set-validate-command", action="store_true",
+                   help="create/edit a package's persistent 'validate' script "
+                        "(in /usr/src/<pkg>/validate) in your editor")
+    p.set_defaults(func=cmd_verify)
+
+    p = sub.add_parser("info", help="package-user info (short for 'all', "
+                       "detailed for named packages)")
+    p.add_argument("packages", nargs="*", default=["all"],
+                   help="package-user name(s), or 'all'")
+    p.add_argument("-s", "--short", action="store_true",
+                   help="force the short one-line-per-package view")
+    p.add_argument("-l", "--long", action="store_true",
+                   help="force the detailed view (link, md5, info, deps, groups)")
+    p.add_argument("--no-book", action="store_true",
+                   help="don't look up book details for not-installed packages")
+    p.set_defaults(func=cmd_info)
+
+    # ---- the rest (stubbed for now) ----
+    p = sub.add_parser("check", help="report install state of a package")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("--no-book", action="store_true",
+                   help="skip the book version comparison (offline, faster)")
+    p.set_defaults(func=cmd_check)
+
+    p = sub.add_parser("search", help="find a package in the book")
+    p.add_argument("packages", nargs="+")
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("dependencies", aliases=["deps"], help="recursive deps")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("--tree", action="store_true", help="show blfs dependency tree")
+    p.add_argument("--no-recommended", action="store_true",
+                   help="required deps only (skip recommended)")
+    p.add_argument("--optional", action="store_true",
+                   help="also follow optional dependencies")
+    p.set_defaults(func=cmd_dependencies)
+
+    p = sub.add_parser("install", help="resolve deps + build/install missing")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("-r", "--reinstall", action="store_true",
+                   help="rebuild even packages already up to date")
+    p.add_argument("-i", "--ignore", help="comma-separated anchors to skip")
+    p.add_argument("-e", "--ignore-recommended", action="store_true",
+                   help="required deps only (skip recommended)")
+    p.add_argument("--optional", action="store_true",
+                   help="also pull in optional deps")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="just the named package(s), skip dependency resolution")
+    p.add_argument("--local", metavar="SCRIPT",
+                   help="install a custom package from a local install script "
+                        "(made with 'template'); skips BLFS")
+    p.add_argument("--select", action="store_true",
+                   help="interactively pick which packages of the plan to build "
+                        "(all selected by default; use with --run to build the "
+                        "chosen set, or on a dry-run to preview/cache it)")
+    p.add_argument("--test", action="store_true",
+                   help="also run the package's test suite (between build and install)")
+    p.add_argument("--clean", action="store_true",
+                   help="after install, remove stale files from a previous "
+                        "version (configs and the source tree kept)")
+    p.add_argument("--regenerate", action="store_true",
+                   help="rebuild scripts from the book, ignoring any edited "
+                        "script in the package user's home")
+    p.add_argument("--run", action="store_true",
+                   help="actually build/install (default is a dry-run plan)")
+    p.add_argument("--yes", action="store_true",
+                   help="skip the confirmation prompt when using --run")
+    p.add_argument("-o", "--outdir", metavar="DIR",
+                   help="where to write generated scripts "
+                        "(default: /tmp/packagemanager/install_files)")
+    p.set_defaults(func=cmd_install)
+
+    p = sub.add_parser("update", help="update installed packages to current book "
+                       "versions. 'installed' = package-user + /usr/src/<name> + "
+                       "(install_last version OR an existing pkg.lst path). "
+                       "Not-installed named packages are reported, not silently "
+                       "skipped; use 'verify' to recheck all.")
+    p.add_argument("packages", nargs="*",
+                   help="packages to update (with deps); default: all installed")
+    p.add_argument("-f", "--force", action="store_true",
+                   help="just the named package(s), skip dependency resolution")
+    p.add_argument("-R", "--dependents", action="store_true",
+                   help="also update everything that (recursively) depends on the "
+                        "named package(s) -- rebuild reverse deps too")
+    p.add_argument("--select", action="store_true",
+                   help="interactively pick which packages of the plan to update "
+                        "(all selected by default; combine with --run to update the "
+                        "chosen set; on a dry-run it previews and caches the choice)")
+    p.add_argument("--regenerate", action="store_true",
+                   help="rebuild scripts from the book, ignoring any edited "
+                        "script in the package user's home")
+    p.add_argument("--clean", action="store_true",
+                   help="before installing each new version, remove the old "
+                        "files (except configs under /etc,/var,... and the source "
+                        "tree) so no stale files are left behind")
+    p.add_argument("--test", action="store_true",
+                   help="also run the package's test suite (between build and install)")
+    p.add_argument("--local", metavar="SCRIPT",
+                   help="update one package from a local install script "
+                        "(custom or git-based); skips BLFS")
+    p.add_argument("--reinstall", action="store_true",
+                   help="rebuild even packages that are already up to date")
+    p.add_argument("--install-only", action="store_true",
+                   help="run only the install phase (no recompile) -- use to "
+                        "retry after an install-step failure without rebuilding")
+    p.add_argument("--no-reinstall", action="store_true",
+                   help="with --yes, do NOT re-apply already-up-to-date packages "
+                        "(otherwise --yes accepts the re-apply prompt)")
+    p.add_argument("-e", "--ignore-recommended", action="store_true",
+                   help="required deps only (skip recommended)")
+    p.add_argument("--optional", action="store_true", help="also follow optional deps")
+    p.add_argument("--run", action="store_true",
+                   help="actually update (default is a dry-run plan)")
+    p.add_argument("--yes", action="store_true", help="skip prompts / reuse cache")
+    p.add_argument("-o", "--outdir", metavar="DIR",
+                   help="where to write generated scripts "
+                        "(default: /tmp/packagemanager/install_files)")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser("remove", help="uninstall a package's files "
+                       "(keep user+home; --purge to remove those too)")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("--purge", action="store_true",
+                   help="also remove the package-user, its group and /usr/src/<name>")
+    p.add_argument("--root", action="store_true",
+                   help="scan/remove as root (thorough: finds files the user "
+                        "itself can't reach) instead of as the package user")
+    p.add_argument("--run", action="store_true",
+                   help="actually do it (default is a dry-run plan)")
+    p.add_argument("--yes", action="store_true",
+                   help="skip the confirmation prompt when using --run")
+    p.set_defaults(func=cmd_remove)
+
+    p = sub.add_parser("reload-pkg-list", help="regenerate /usr/src/<name>/pkg.lst")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("--foreground", action="store_true",
+                   help="wait for it instead of running as a disowned task")
+    p.set_defaults(func=cmd_reload_pkg_list)
+
+    p = sub.add_parser("add-user",
+                       help="create a PACKAGE user (installs files; home /usr/src/<n>)")
+    p.add_argument("packages", nargs="+")
+    p.set_defaults(func=cmd_add_user)
+
+    p = sub.add_parser("script", help="run one phase of a package's install "
+                       "script as the package user (unpack/build/install/...)")
+    p.add_argument("phase", choices=["all", "unpack", "build", "test", "install",
+                                     "configure", "update"],
+                   help="which phase to run")
+    p.add_argument("package")
+    p.add_argument("--regenerate", action="store_true",
+                   help="regenerate the script from the book before running")
+    p.add_argument("--test", action="store_true",
+                   help="also run the test suite (for the 'all'/'update' phase)")
+    p.add_argument("--clean", action="store_true",
+                   help="after install, remove stale files from the old version "
+                        "(configs and source tree kept)")
+    p.set_defaults(func=cmd_script)
+
+    p = sub.add_parser("errors", help="show which packages failed in the last "
+                       "install/update run (with log locations)")
+    p.add_argument("--all", action="store_true",
+                   help="show every package's result, not just failures")
+    p.set_defaults(func=cmd_errors)
+
+    p = sub.add_parser("plan", help="list or clear cached dry-run plans")
+    p.add_argument("action", nargs="?", default="list",
+                   choices=["list", "clear"], help="list (default) or clear")
+    p.add_argument("key", nargs="?", help="for clear: a specific plan file name")
+    p.set_defaults(func=cmd_plan)
+
+    p = sub.add_parser("paths", help="show where everything is stored "
+                       "(config, books, scripts, cache, plans, tools)")
+    p.set_defaults(func=cmd_paths)
+
+    p = sub.add_parser("config", help="show or change the prefixes / main user")
+    p.add_argument("--collector-prefix", help="prefix for shared install-dir groups")
+    p.add_argument("--user-prefix", help="prefix for shared users")
+    p.add_argument("--main-user", help="your human login account (e.g. n76310)")
+    p.add_argument("--editor", help="editor for 'verify --set-validate-command' "
+                   "(default: $EDITOR or vim)")
+    p.add_argument("--difftool", help="diff tool for 'migrate-scripts --vimdiff' "
+                   "(default: vimdiff)")
+    p.set_defaults(func=cmd_config)
+
+    p = sub.add_parser("blfs", help="run the blfs book tool "
+                       "(books, set-default, search, ...)")
+    p.add_argument("args", nargs=argparse.REMAINDER,
+                   help="arguments passed straight to blfs")
+    p.set_defaults(func=cmd_blfs)
+
+    # ---- user: shared users (u_*) ----
+    p = sub.add_parser("user", aliases=["shared-user"],
+                       help="manage SHARED users (u_* accounts) that run applications")
+    usub = p.add_subparsers(dest="uaction", required=True)
+    q = usub.add_parser("list", help="list shared users and their groups")
+    q.add_argument("filter", nargs="?")
+    q.set_defaults(func=cmd_user_list)
+    q = usub.add_parser("create", help="create an shared user (u_<name>)")
+    q.add_argument("name")
+    q.add_argument("--groups", help="also add these groups, e.g. audio,video")
+    q.set_defaults(func=cmd_user_create)
+    q = usub.add_parser("delete", help="delete an shared user + group + home")
+    q.add_argument("name")
+    q.add_argument("--run", action="store_true", help="actually delete (default dry-run)")
+    q.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    q.set_defaults(func=cmd_user_delete)
+    q = usub.add_parser("allow", help="add supplementary group(s) to a user "
+                        "(e.g. audio video)")
+    q.add_argument("user")
+    q.add_argument("groups", nargs="+")
+    q.set_defaults(func=cmd_user_allow)
+    q = usub.add_parser("disallow", help="remove supplementary group(s) from a user")
+    q.add_argument("user")
+    q.add_argument("groups", nargs="+")
+    q.set_defaults(func=cmd_user_disallow)
+
+    p = sub.add_parser("init", help="set up the install group + make install dirs "
+                       "(dry-run unless --run; shows/confirms each command)")
+    p.add_argument("dirs", nargs="*", help="directories to turn into install dirs")
+    p.add_argument("--from-file", help="also read dir list from this file "
+                   "(e.g. installdirs.lst)")
+    p.add_argument("--gid", type=int, default=9999, help="install group gid (default 9999)")
+    p.add_argument("--no-sticky", action="store_true",
+                   help="plain group-writable (this is the default now)")
+    p.add_argument("--run", action="store_true",
+                   help="execute (default just lists what it would do)")
+    p.add_argument("--yes", action="store_true", help="answer yes to every command")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("fix-install",
+                       help="check/fix permissions on all group-'install' dirs")
+    p.add_argument("--run", action="store_true",
+                   help="apply the fixes (default lists what would change)")
+    p.add_argument("--sticky", action="store_true",
+                   help="also set the sticky bit (default: group-writable, no sticky)")
+    p.add_argument("--yes", action="store_true",
+                   help="reuse a stored dry-run without asking")
+    p.set_defaults(func=cmd_fix_install)
+
+    p = sub.add_parser("script-status", help="check whether each package's install "
+                       "script is changed from the book (edited), behind the book "
+                       "(outdated), or matches it")
+    p.add_argument("packages", nargs="*", help="default: all package-users")
+    p.set_defaults(func=cmd_script_status)
+
+    p = sub.add_parser("migrate-scripts", help="upgrade older install scripts to "
+                       "the current format, merging in your edited build/install "
+                       "commands (dry-run unless --run; backs up as .bak)")
+    p.add_argument("packages", nargs="*", help="default: all package-users")
+    p.add_argument("--deps", action="store_true",
+                   help="also migrate each named package's book dependencies "
+                        "(the same set an update would touch)")
+    p.add_argument("--run", action="store_true",
+                   help="rewrite the scripts (default lists what would change)")
+    p.add_argument("--vimdiff", action="store_true",
+                   help="open every script that couldn't be auto-merged in "
+                        "vimdiff (old vs new) to finish by hand, one at a time")
+    p.add_argument("--yes", action="store_true",
+                   help="auto-adopt each merged (LEFT) version without prompting")
+    p.add_argument("--log", action="store_true",
+                   help="show the history of past migrations (what/when) and exit")
+    p.add_argument("--all", action="store_true",
+                   help="with --log, show the full history (default: last 40)")
+    p.set_defaults(func=cmd_migrate_scripts)
+
+    p = sub.add_parser("template", help="write an install-script skeleton for a "
+                       "package not in the BLFS book (tarball or git)")
+    p.add_argument("name")
+    p.add_argument("--version", help="version string (default 1.0)")
+    p.add_argument("--git", metavar="URL",
+                   help="make a git-based script that clones this repo "
+                        "(e.g. https://gitlab.freedesktop.org/libnice/libnice.git)")
+    p.add_argument("--link", metavar="URL", help="tarball URL (non-git)")
+    p.add_argument("--pkg", metavar="FILE", help="tarball filename (non-git)")
+    p.add_argument("-o", "--outdir", help="where to write it (default .)")
+    p.set_defaults(func=cmd_template)
+
+    p = sub.add_parser("make-group-dir",
+                       help="turn a directory into an install/sysgroup group dir")
+    p.add_argument("dirs", nargs="+")
+    p.add_argument("--group", default="install",
+                   help="'install' (sticky, default) or a nimgnu name (setgid)")
+    p.add_argument("-R", "--recursive", action="store_true")
+    p.set_defaults(func=cmd_make_group_dir)
+
+    p = sub.add_parser("fix-group-dir",
+                       help="re-apply correct permissions to group dir(s)")
+    p.add_argument("dirs", nargs="+")
+    p.add_argument("--group", help="force this group (else keep each dir's group)")
+    p.add_argument("-R", "--recursive", action="store_true")
+    p.set_defaults(func=cmd_fix_group_dir)
+
+    p = sub.add_parser("add-dir-to-sysgroup", aliases=["add-dir-to-nimgnu"],
+                       help="assign directory(ies) to a sysgroup collector group")
+    p.add_argument("group")
+    p.add_argument("dirs", nargs="+")
+    p.add_argument("-R", "--recursive", action="store_true")
+    p.set_defaults(func=cmd_add_dir_to_nimgnu)
+
+    # ---- sysgroup collector groups (formerly 'nimgnu') ----
+    p = sub.add_parser("sysgroup", aliases=["nimgnu"],
+                       help="manage sysgroup collector groups (shared install dirs)")
+    nsub = p.add_subparsers(dest="action", required=True)
+    q = nsub.add_parser("list", help="list collector groups and members")
+    q.add_argument("filter", nargs="?", help="only groups whose name contains this")
+    q.add_argument("-l", "--long", action="store_true",
+                   help="also list each group's owned dirs/files (its manifest)")
+    q.set_defaults(func=cmd_nimgnu_list)
+    q = nsub.add_parser("create", help="create a nimgnu_<name> group + collector user")
+    q.add_argument("name")
+    q.set_defaults(func=cmd_nimgnu_create)
+    q = nsub.add_parser("add",
+                        help="let package-user(s) install into a collector group's dirs")
+    q.add_argument("group")
+    q.add_argument("users", nargs="+", help="package-user(s) to add to the group")
+    q.set_defaults(func=cmd_nimgnu_add)
+    q = nsub.add_parser("remove", help="remove package-user(s) from a collector group")
+    q.add_argument("group")
+    q.add_argument("users", nargs="+")
+    q.set_defaults(func=cmd_nimgnu_remove)
+    q = nsub.add_parser("delete", help="delete a collector group + its user")
+    q.add_argument("name")
+    q.add_argument("--run", action="store_true",
+                   help="actually delete (default is a dry-run)")
+    q.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    q.set_defaults(func=cmd_nimgnu_delete)
+
+    p = sub.add_parser("list", help="list all package-users")
+    p.add_argument("packages", nargs="*", default=["all"])
+    p.set_defaults(func=cmd_list)
+
+    p = sub.add_parser("files_with_broken_id",
+                       help="find files whose uid/gid don't resolve")
+    p.add_argument("packages", nargs="*", default=[])
+    p.add_argument("-o", "--outfile", help="where to write the list "
+                   "(default /tmp/invalid_files.txt)")
+    p.set_defaults(func=cmd_files_with_broken_id)
+
+    args = ap.parse_args()
+    _STATE["verbose"] = getattr(args, "verbose", False)
+    # first run: ask for the group-name prefixes (once), unless we're already
+    # running the config command or there's no terminal to prompt at.
+    if (not config_exists() and args.command != "config"
+            and sys.stdin.isatty() and sys.stdout.isatty()):
+        first_run_setup()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        sys.exit(0)

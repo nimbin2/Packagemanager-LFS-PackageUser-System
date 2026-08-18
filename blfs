@@ -1,0 +1,1886 @@
+#!/usr/bin/python3
+#
+# blfs -- offline BLFS book parser / install-script generator.
+# Copyright (C) 2025  packagemanager contributors
+#
+# This program is free software; you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation; either version 2 of the License, or (at your option) any later
+# version.  This program is distributed WITHOUT ANY WARRANTY; see the GNU
+# General Public License <https://www.gnu.org/licenses/> for details.
+#
+"""
+blfs -- one tool for working with the BLFS book (nochunks single-file edition).
+
+Subcommands
+-----------
+  blfs books                       list known/cached books and the default
+  blfs books --discover            probe the live site for available versions
+  blfs set-default <selector|url>  choose the default book
+  blfs search <name>               find packages, including python modules
+  blfs script <name|url> [-o dir]  write install_<name-version> (install/update)
+  blfs deps   <name> [--tree] [--no-recommended] [--optional]
+  blfs order  <name> [--scripts] [--no-recommended] [--optional]
+  blfs debug  <name|url>           show how an anchor resolves (for reporting bugs)
+
+By default deps/order follow required + recommended dependencies; add --optional
+to also pull in optional ones, or --no-recommended for required-only.
+
+A "selector" is either a full nochunks URL, or "<track>-<init>", e.g.
+  stable-systemd   svn-systemd   stable-sysv   13.0-systemd
+
+Books are cached under /usr/share/blfs/books (falls back to ~/.cache/blfs when
+that isn't writable).  The book is downloaded on first use and reused after;
+svn books are re-checked with a conditional request, stable books are immutable.
+
+Parsing the 12 MB book is the slow part, so the FIRST command on a given book
+indexes it once into <store>/cache and every command after reads that cache
+(sub-second).  The cache re-indexes automatically when the book file changes;
+force it with 'blfs books --rebuild-cache'.  Installing lxml makes the one-time
+index step markedly faster.
+"""
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tarfile
+import time
+import warnings
+from urllib.parse import urlsplit, unquote
+
+import requests
+from bs4 import BeautifulSoup
+
+# The nochunks book is XHTML; silence the (correct but noisy) heads-up.
+try:
+    from bs4 import XMLParsedAsHTMLWarning
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+except Exception:
+    pass
+
+
+# --------------------------------------------------------------------------- #
+# store / config
+# --------------------------------------------------------------------------- #
+
+SITE = os.environ.get("BLFS_SITE", "https://www.linuxfromscratch.org")
+DEFAULT_SELECTOR = "stable-systemd"
+VALID_INITS = ("systemd", "sysv")
+
+# Bump whenever the extracted-data shape or extraction logic changes, so stale
+# on-disk caches are rebuilt automatically.
+CACHE_VERSION = 3
+# tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
+# of generated install scripts changes (phases, dispatcher, ...), and
+# CACHE_VERSION when the parsed/cached data structure changes.
+BLFS_VERSION = "1.0.0"
+SCRIPT_VERSION = 4
+
+
+def store_dir():
+    for candidate in (os.environ.get("BLFS_STORE"),
+                      "/usr/share/blfs",
+                      os.path.expanduser("~/.cache/blfs")):
+        if not candidate:
+            continue
+        try:
+            os.makedirs(os.path.join(candidate, "books"), exist_ok=True)
+            # writability probe
+            test = os.path.join(candidate, ".w")
+            open(test, "w").close()
+            os.remove(test)
+            return candidate
+        except Exception:
+            continue
+    # last resort
+    d = "/tmp/blfs"
+    os.makedirs(os.path.join(d, "books"), exist_ok=True)
+    return d
+
+
+def books_dir():
+    return os.path.join(store_dir(), "books")
+
+
+def config_path():
+    return os.path.join(store_dir(), "config.json")
+
+
+def load_config():
+    try:
+        with open(config_path()) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    with open(config_path(), "w") as f:
+        json.dump(cfg, f, indent=2)
+
+
+def default_selector():
+    return load_config().get("default", DEFAULT_SELECTOR)
+
+
+# --------------------------------------------------------------------------- #
+# resolving a selector to a concrete nochunks URL + local filename
+# --------------------------------------------------------------------------- #
+
+def downloads_index_url():
+    return f"{SITE}/blfs/downloads/"
+
+
+def view_index_url():
+    return f"{SITE}/blfs/view/"
+
+
+def parse_book_filename(filename):
+    """'BLFS-BOOK-13.0-systemd-nochunks.html' -> ('13.0', 'systemd')."""
+    m = re.match(r"BLFS-BOOK-(.+?)-(systemd|sysv)-nochunks\.html$", filename)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.match(r"BLFS-BOOK-(.+?)-nochunks\.html$", filename)   # pre-split / sysv
+    if m:
+        return m.group(1), "sysv"
+    return "unknown", "unknown"
+
+
+def _extract_subdirs(html):
+    """Subdirectory names from an Apache autoindex listing."""
+    dirs = []
+    for href in re.findall(r'href="([^"]+)"', html):
+        if href.startswith(("/", "?", "#", "http", "..")):
+            continue
+        if href.endswith("/"):
+            dirs.append(href.rstrip("/"))
+    return sorted(set(dirs))
+
+
+def _extract_nochunks(html):
+    """All plain (non-.xz) nochunks html filenames in a directory listing."""
+    names = re.findall(r'BLFS-BOOK-[\w.+-]+?-nochunks\.html(?!\.xz)', html)
+    return sorted(set(names), key=len)
+
+
+def _looks_like_book_dir(name):
+    n = name.lower()
+    return ("systemd" in n or "sysv" in n or "stable" in n or "svn" in n
+            or bool(re.search(r"\d+\.\d+", n)))
+
+
+# Named books that exist on the site but aren't listed by the downloads
+# autoindex (notably the development book, 'svn').  We probe these explicitly so
+# they're always discoverable.
+KNOWN_NAMED_BOOKS = ["svn", "systemd"]
+
+
+def _find_nochunks_at(base):
+    """Return (filename, url) for a nochunks book under `base`, or None."""
+    try:
+        resp = requests.get(base, timeout=60)
+        resp.raise_for_status()
+    except Exception:
+        return None
+    files = _extract_nochunks(resp.text)
+    if not files:
+        return None
+    filename = next((f for f in files if "systemd" in f), files[0])
+    return filename, base + filename
+
+
+def _find_svn_archive(base):
+    """The development book is published as a dated chunked-HTML tarball
+    (blfs-book-svn-html-YYYY-MM-DD.tar.xz); the date changes over time, so read
+    the directory live and pick the newest.  Returns (filename, url) or None."""
+    try:
+        resp = requests.get(base, timeout=60)
+        resp.raise_for_status()
+    except Exception:
+        return None
+    files = re.findall(r'blfs-book-[\w.+-]*?html-\d{4}-\d{2}-\d{2}\.tar\.xz', resp.text)
+    if not files:
+        files = re.findall(r'blfs-book-[\w.+-]*?html[\w.+-]*\.tar\.xz', resp.text)
+    if not files:
+        return None
+    fn = sorted(set(files))[-1]                       # ISO date sorts newest last
+    return fn, base + fn
+
+
+def discover_dir(selector):
+    """Locate a downloadable book for `selector`.  Released books are a nochunks
+    HTML under downloads/<selector>/; the development book ('svn') is a dated
+    chunked-HTML .tar.xz, so fall back to that."""
+    found = (_find_nochunks_at(f"{SITE}/blfs/downloads/{selector}/")
+             or _find_nochunks_at(f"{SITE}/blfs/view/{selector}/"))
+    if found:
+        filename, url = found
+        version, init = parse_book_filename(filename)
+        if version == "unknown":
+            version = selector
+        return {"selector": selector, "url": url, "filename": filename,
+                "version": version, "init": init, "archive": False}
+
+    arch = _find_svn_archive(f"{SITE}/blfs/downloads/{selector}/")
+    if arch:
+        fn, url = arch
+        return {"selector": selector, "url": url, "filename": fn,
+                "version": selector, "init": "systemd", "archive": True}
+
+    for init in ("systemd", "sysv", ""):
+        fn = f"BLFS-BOOK-{selector}" + (f"-{init}" if init else "") + \
+             "-nochunks.html"
+        for base in (f"{SITE}/blfs/downloads/{selector}/",
+                     f"{SITE}/blfs/view/{selector}/"):
+            url = base + fn
+            try:
+                if requests.head(url, timeout=30,
+                                 allow_redirects=True).status_code == 200:
+                    version, init2 = parse_book_filename(fn)
+                    return {"selector": selector, "url": url, "filename": fn,
+                            "version": version if version != "unknown" else selector,
+                            "init": init2, "archive": False}
+            except Exception:
+                continue
+    raise RuntimeError(f"no book for '{selector}'")
+
+
+def book_record_from_selector(selector):
+    """Build a book record straight from a versioned selector WITHOUT any network
+    request (the nochunks filename follows a fixed pattern).  Returns None for
+    named selectors (stable/svn/systemd/...) whose real filename must be probed."""
+    m = re.match(r"(\d+\.\d+(?:\.\d+)?)(-systemd)?$", selector)
+    if not m:
+        return None
+    ver = m.group(1)
+    init = "systemd" if m.group(2) else "sysv"
+    fn = (f"BLFS-BOOK-{ver}-systemd-nochunks.html" if init == "systemd"
+          else f"BLFS-BOOK-{ver}-nochunks.html")
+    return {"selector": selector, "url": f"{SITE}/blfs/downloads/{selector}/{fn}",
+            "filename": fn, "version": ver, "init": init}
+
+
+# (Named dev books like 'svn' are resolved live to their dated .tar.xz archive
+# by discover_dir; no static fallback URL is kept, since the date changes.)
+_NAMED_FALLBACK = {}
+
+
+def discover_all():
+    """Enumerate downloadable books.  Versioned selectors are derived by pattern
+    (no per-book request -- this is the slow part avoided); only named books
+    (stable, svn, systemd, ...) are probed live for their real filename, with a
+    best-guess fallback so they're always listed."""
+    dirs = set(KNOWN_NAMED_BOOKS)
+    for index in (downloads_index_url(), view_index_url()):
+        try:
+            resp = requests.get(index, timeout=60)
+            resp.raise_for_status()
+            dirs.update(_extract_subdirs(resp.text))
+        except Exception:
+            continue
+    books = {}
+    for d in sorted(dirs):
+        if not _looks_like_book_dir(d):
+            continue
+        rec = book_record_from_selector(d)             # fast path, no request
+        if rec is None:                                # named book -> probe
+            try:
+                rec = discover_dir(d)
+            except Exception:
+                fb = _NAMED_FALLBACK.get(d)
+                if not fb:
+                    continue
+                fn, ver, init = fb
+                rec = {"selector": d, "url": f"{SITE}/blfs/downloads/{d}/{fn}",
+                       "filename": fn, "version": ver, "init": init}
+        books[d] = rec
+    save_available(books)
+    return books
+
+
+def available_path():
+    return os.path.join(store_dir(), "available.json")
+
+
+def load_available():
+    try:
+        with open(available_path()) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_available(books):
+    try:
+        with open(available_path(), "w") as f:
+            json.dump(books, f, indent=2)
+    except Exception:
+        pass
+
+
+def resolve_book(selector):
+    """Return (url, local_path, is_svn, version).  Never guesses directory names:
+    a non-url selector is a real downloads subdirectory, looked up live (or from
+    the cached available.json / a cached book's meta)."""
+    if selector.startswith(("http://", "https://")):
+        url = selector
+        filename = os.path.basename(urlsplit(url).path)
+        version, _ = parse_book_filename(filename)
+        is_svn = "svn" in filename.lower()
+        return url, os.path.join(books_dir(), filename), is_svn, version
+
+    version = None
+    url = None
+
+    # The dev book ('svn') is a dated .tar.xz whose date changes -- always look
+    # it up live so we catch the current one instead of a cached stale date.
+    if "svn" in selector.lower() and not selector.startswith(("http", "/")):
+        rec = discover_dir(selector)
+        url = rec["url"]
+        version = rec.get("version", selector)
+        avail = load_available()
+        avail[selector] = rec
+        save_available(avail)
+        filename = os.path.basename(urlsplit(url).path)
+        return url, os.path.join(books_dir(), filename), True, version
+
+    avail = load_available()
+    if selector in avail:
+        url = avail[selector]["url"]
+        version = avail[selector].get("version")
+
+    if url is None:
+        cached = _cached_for_selector(selector)
+        if cached:
+            meta = _load_meta(cached)
+            url = meta.get("url")
+            version = meta.get("version")
+
+    if url is None:
+        rec = discover_dir(selector)          # live lookup, no name guessing
+        url = rec["url"]
+        version = rec["version"]
+        avail[selector] = rec
+        save_available(avail)
+
+    is_svn = "svn" in selector.lower() or "svn" in str(version).lower()
+    filename = os.path.basename(urlsplit(url).path)
+    return url, os.path.join(books_dir(), filename), is_svn, version
+
+
+def _cached_for_selector(selector):
+    """Best-effort: find a cached file whose .meta records this selector."""
+    try:
+        entries = os.listdir(books_dir())
+    except FileNotFoundError:
+        return None
+    for f in entries:
+        if not f.endswith(".meta"):
+            continue
+        try:
+            meta = json.load(open(os.path.join(books_dir(), f)))
+            if meta.get("selector") == selector:
+                return os.path.join(books_dir(), f[:-5])
+        except Exception:
+            pass
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# download / cache
+# --------------------------------------------------------------------------- #
+
+SVN_MIN_RECHECK = 15 * 60
+
+
+def _meta_path(local):
+    return local + ".meta"
+
+
+def _load_meta(local):
+    try:
+        with open(_meta_path(local)) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_meta(local, meta):
+    try:
+        with open(_meta_path(local), "w") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
+
+
+def _is_archive(path):
+    return path.endswith((".tar.xz", ".tar.gz", ".tgz", ".tar.bz2", ".tar"))
+
+
+def _safe_extract(tar, dest):
+    dest = os.path.abspath(dest)
+    for member in tar.getmembers():
+        target = os.path.abspath(os.path.join(dest, member.name))
+        if not target.startswith(dest + os.sep) and target != dest:
+            raise RuntimeError(f"unsafe path in archive: {member.name}")
+    try:
+        tar.extractall(dest, filter="data")           # py>=3.12
+    except TypeError:
+        tar.extractall(dest)
+
+
+def _chunked_to_anchors(html):
+    """Rewrite chunked cross-reference hrefs ('../gtk3/gtk3.html#gtk3', 'x.html')
+    to nochunks-style in-page anchors ('#gtk3'), so dependency resolution works
+    on the stitched single page."""
+    def repl(m):
+        href = m.group(1)
+        if href.startswith(("http://", "https://", "mailto:", "ftp:", "#")):
+            return m.group(0)
+        frag = ""
+        if "#" in href:
+            href, frag = href.split("#", 1)
+        base = os.path.basename(href)
+        if base.endswith((".html", ".xhtml")):
+            base = base.rsplit(".", 1)[0]
+        anchor = frag or base
+        return f'href="#{anchor}"' if anchor else m.group(0)
+    return re.sub(r'href="([^"]+)"', repl, html)
+
+
+def build_combined_book(tarball_path, combined_path):
+    """Unpack a chunked-HTML book tarball and stitch all its pages into one
+    nochunks-like HTML file at combined_path."""
+    extract_dir = combined_path + ".d"
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    os.makedirs(extract_dir, exist_ok=True)
+    with tarfile.open(tarball_path) as tf:
+        _safe_extract(tf, extract_dir)
+
+    html_files = []
+    for root, _dirs, files in os.walk(extract_dir):
+        for f in sorted(files):
+            if f.endswith((".html", ".xhtml")) and f != "index.html":
+                html_files.append(os.path.join(root, f))
+    html_files.sort()
+    if not html_files:
+        raise RuntimeError(f"no HTML pages inside {tarball_path}")
+
+    tmp = combined_path + ".part"
+    with open(tmp, "w", encoding="utf-8") as out:
+        out.write("<!DOCTYPE html><html><body>\n")
+        for h in html_files:
+            try:
+                txt = open(h, encoding="utf-8", errors="replace").read()
+            except OSError:
+                continue
+            body = re.search(r"<body[^>]*>(.*)</body>", txt, re.S | re.I)
+            txt = body.group(1) if body else txt
+            out.write(_chunked_to_anchors(txt))
+            out.write("\n")
+        out.write("</body></html>\n")
+    os.replace(tmp, combined_path)
+    shutil.rmtree(extract_dir, ignore_errors=True)
+    return combined_path
+
+
+def ensure_book(selector, quiet=False):
+    """Make sure the book for `selector` is present & fresh; return the local
+    path to a parseable single HTML file (stitching a chunked .tar.xz if needed)."""
+    url, local, is_svn, version = resolve_book(selector)
+
+    # ---- archive books (development 'svn': dated chunked-HTML tarball) ----
+    if _is_archive(local):
+        combined = os.path.join(books_dir(),
+                                selector.replace("/", "_") + "-combined-nochunks.html")
+        have_tar = os.path.exists(local) and os.path.getsize(local) > 0
+        have_combined = os.path.exists(combined) and os.path.getsize(combined) > 0
+        if have_tar and have_combined and \
+                (time.time() - os.path.getmtime(combined)) < SVN_MIN_RECHECK:
+            return combined
+        if not have_tar:
+            if not quiet:
+                print(f"Fetching dev book ({selector}) archive: {url}")
+            resp = requests.get(url, timeout=300, stream=True)
+            resp.raise_for_status()
+            tmp = local + ".part"
+            with open(tmp, "wb") as f:
+                for chunk in resp.iter_content(65536):
+                    if chunk:
+                        f.write(chunk)
+            os.replace(tmp, local)
+        if not quiet:
+            print(f"Unpacking + stitching {os.path.basename(local)} ...")
+        build_combined_book(local, combined)
+        _save_meta(combined, {"url": url, "selector": selector, "version": version,
+                              "is_svn": True, "fetched": time.time()})
+        if not quiet:
+            print(f"Ready: {combined}")
+        return combined
+
+    have = os.path.exists(local) and os.path.getsize(local) > 0
+
+    if have and not is_svn:
+        return local
+    if have and is_svn:
+        meta = _load_meta(local)
+        if (time.time() - meta.get("fetched", 0)) < SVN_MIN_RECHECK:
+            return local
+
+    headers = {}
+    if have:
+        meta = _load_meta(local)
+        if meta.get("etag"):
+            headers["If-None-Match"] = meta["etag"]
+        if meta.get("last_modified"):
+            headers["If-Modified-Since"] = meta["last_modified"]
+
+    if not quiet:
+        print(f"Fetching book ({selector}): {url}")
+    resp = requests.get(url, headers=headers, timeout=180, stream=True)
+    if resp.status_code == 304:
+        meta = _load_meta(local)
+        meta["fetched"] = time.time()
+        _save_meta(local, meta)
+        return local
+    resp.raise_for_status()
+
+    tmp = local + ".part"
+    with open(tmp, "wb") as f:
+        for chunk in resp.iter_content(65536):
+            if chunk:
+                f.write(chunk)
+    os.replace(tmp, local)
+    _save_meta(local, {
+        "url": url, "selector": selector, "version": version, "is_svn": is_svn,
+        "etag": resp.headers.get("ETag"),
+        "last_modified": resp.headers.get("Last-Modified"),
+        "fetched": time.time(),
+    })
+    if not quiet:
+        print(f"Saved {local} ({os.path.getsize(local)} bytes, version {version})")
+    return local
+
+
+def load_soup(book_path):
+    with open(book_path, encoding="utf-8", errors="replace") as f:
+        html = f.read()
+    for parser in ("lxml", "html.parser"):
+        try:
+            return BeautifulSoup(html, parser)
+        except Exception:
+            continue
+    return BeautifulSoup(html, "html.parser")
+
+
+def get_book_soup(args):
+    """Resolve the book to use for this invocation and return its soup."""
+    if getattr(args, "book_file", None):
+        return load_soup(args.book_file)
+    selector = getattr(args, "book", None) or default_selector()
+    return load_soup(ensure_book(selector))
+
+
+# --------------------------------------------------------------------------- #
+# parsed-once, cached-to-disk package data
+#
+# Parsing the 12 MB single-file book is the slow part (seconds, and much worse
+# without lxml).  We do it ONCE, extract everything every command needs into a
+# JSON cache keyed by the book file's size+mtime, and read that thereafter.
+# --------------------------------------------------------------------------- #
+
+def cache_dir():
+    d = os.path.join(store_dir(), "cache")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def _book_stamp(path):
+    st = os.stat(path)
+    return f"{st.st_size}:{int(st.st_mtime)}:v{CACHE_VERSION}"
+
+
+def _cache_file_for(path):
+    h = hashlib.sha1(os.path.abspath(path).encode()).hexdigest()[:16]
+    return os.path.join(cache_dir(), f"{os.path.basename(path)}.{h}.json")
+
+
+class Book:
+    """A parsed book, represented as {anchor: package-data}.  The heavy soup is
+    parsed lazily and only when a command actually needs raw HTML (debug --raw
+    or diagnosing an unresolved anchor)."""
+
+    def __init__(self, path, packages):
+        self.path = path
+        self.packages = packages
+        self._soup = None
+
+    @property
+    def soup(self):
+        if self._soup is None:
+            self._soup = load_soup(self.path)
+        return self._soup
+
+    def get(self, anchor):
+        return self.packages.get(anchor)
+
+
+def build_packages(soup):
+    """Extract data for every resolvable package/module in the book."""
+    packages = {}
+    for anchor in get_index(soup):
+        pkg = resolve_package(soup, anchor)
+        if pkg is None:
+            continue
+        group = module_group(pkg["content"]) if pkg["is_module"] else None
+        packages[anchor] = extract_package_data(
+            pkg["content"], pkg["is_module"], group, anchor)
+    return packages
+
+
+def _book_path(args):
+    if getattr(args, "book_file", None):
+        return args.book_file
+    selector = getattr(args, "book", None) or default_selector()
+    return ensure_book(selector)
+
+
+def get_book(args, rebuild=False):
+    """Return a Book, loading the on-disk cache when it is still valid and
+    (re)building it from the parsed soup otherwise."""
+    path = _book_path(args)
+    stamp = _book_stamp(path)
+    cache_file = _cache_file_for(path)
+
+    if not rebuild:
+        try:
+            with open(cache_file) as f:
+                cached = json.load(f)
+            if cached.get("stamp") == stamp:
+                return Book(path, cached["packages"])
+        except Exception:
+            pass
+
+    # (re)build -- the one slow step, done once per book version
+    sys.stderr.write("blfs: indexing book (first run for this version)... ")
+    sys.stderr.flush()
+    t0 = time.time()
+    soup = load_soup(path)
+    packages = build_packages(soup)
+    sys.stderr.write(f"done ({len(packages)} packages, {time.time() - t0:.1f}s)\n")
+    try:
+        with open(cache_file, "w") as f:
+            json.dump({"stamp": stamp, "packages": packages}, f)
+    except Exception:
+        pass                                   # read-only store: just skip caching
+    book = Book(path, packages)
+    book._soup = soup
+    return book
+
+
+# --------------------------------------------------------------------------- #
+# anchor / section resolution   (the part that was broken)
+# --------------------------------------------------------------------------- #
+
+def anchor_from_input(value):
+    """Reduce a bare name / page url / fragment url to the anchor we look up."""
+    if value.startswith(("http://", "https://")):
+        parts = urlsplit(value)
+        if parts.fragment:
+            return unquote(parts.fragment)
+        base = os.path.basename(parts.path)
+        return base[:-5] if base.endswith(".html") else base
+    return value.strip()
+
+
+H_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+CONTENT_CLASSES = ("sect1", "sect2", "sect3")
+# Header classes that title a thing we can install:
+#   'title'  -> a normal package  (title lives in a <div class="titlepage">,
+#               content is the FOLLOWING sibling <div class="sect1">)
+#   'sectN'  -> a module           (e.g. <h3 class="sect2"><a id="docutils">,
+#               content is the ENCLOSING <div class="sect2">)
+HEADER_CLASSES = ("title", "sect1", "sect2", "sect3", "sect4", "sect5")
+
+# anchor -> header element, built once per parsed book (keyed by id(soup))
+_INDEX_CACHE = {}
+
+
+def _header_classes(tag):
+    return set(tag.get("class", []) or [])
+
+
+def build_index(soup):
+    idx = {}
+    selector = ", ".join(f"{h}.{c}" for h in ("h1", "h2", "h3", "h4", "h5")
+                         for c in HEADER_CLASSES)
+    for header in soup.select(selector):
+        a = header.find(lambda t: t.name == "a" and (t.get("id") or t.get("name")))
+        if a is None:
+            continue
+        anchor = a.get("id") or a.get("name")
+        if anchor and anchor not in idx:
+            idx[anchor] = header
+    return idx
+
+
+def get_index(soup):
+    key = id(soup)
+    if key not in _INDEX_CACHE:
+        _INDEX_CACHE[key] = build_index(soup)
+    return _INDEX_CACHE[key]
+
+
+def resolve_package(soup, anchor):
+    """Resolve an anchor to a package/module.  Returns
+    {anchor, title, content, is_module} or None.
+
+    Handles both real BLFS 13.0 shapes:
+      * package: <div class="titlepage"><hN class="title"><a id>..  then a
+                 sibling <div class="sect1"> holding package/installation/...
+      * module:  <hN class="sect2"><a id>..  inside a <div class="sect2"> that
+                 itself holds package/installation/...
+    """
+    header = get_index(soup).get(anchor)
+    if header is None:
+        return None
+    classes = _header_classes(header)
+    title = " ".join(header.get_text().split())
+
+    if "title" in classes:
+        tp = header.find_parent("div", class_="titlepage")
+        content = None
+        if tp is not None:
+            # a real package's content is the IMMEDIATE next sibling sect;
+            # a Part/Chapter title is followed by intro text or a child
+            # titlepage, so this correctly rejects those.
+            sib = tp.find_next_sibling(True)
+            if (sib is not None and getattr(sib, "name", None) == "div"
+                    and (_header_classes(sib) & set(CONTENT_CLASSES))):
+                content = sib
+        is_module = False
+    elif header.name in H_TAGS and ("sect1" in classes):
+        # chunked-book shape (stitched dev/svn book): the anchor lives in an
+        # <hN class="sect1"> that is a SIBLING immediately before the
+        # <div class="sect1"> holding the package block.
+        content = None
+        sib = header.find_next_sibling(True)
+        while sib is not None and getattr(sib, "name", None) != "div":
+            sib = sib.find_next_sibling(True)
+        if (sib is not None and getattr(sib, "name", None) == "div"
+                and (_header_classes(sib) & set(CONTENT_CLASSES))):
+            content = sib
+        is_module = False
+    else:
+        content = header.find_parent(
+            "div", class_=["sect2", "sect3", "sect4", "sect5", "sect1"])
+        is_module = True
+
+    # A genuine package/module has its own Package-Information block as a direct
+    # child AND a real download link.  Section/chapter/part anchors and index or
+    # setup pages (Python Modules, Running a Git Server, Vulnerabilities, ...)
+    # have no tarball to fetch, so they're rejected here.
+    if content is None or content.find("div", class_="package", recursive=False) is None:
+        return None
+    if not extract_link(content).strip():
+        return None
+    # ...and the anchor must TITLE that content, not merely appear inside it.
+    # This rejects in-package subsection anchors (foo-kernel "Kernel
+    # Configuration", foo-config "Configuring foo", ...) that would otherwise
+    # resolve to their enclosing package's data.
+    if sect_anchor(content) != anchor:
+        return None
+    return {"anchor": anchor, "title": title, "content": content,
+            "is_module": is_module}
+
+
+def _content_title_header(content):
+    """The title header for a content section, for all shapes."""
+    cls = _header_classes(content)
+    if "sect1" in cls:                       # regular package: preceding titlepage
+        tp = content.find_previous_sibling("div", class_="titlepage")
+        if tp is not None:
+            h = tp.find(lambda t: t.name in H_TAGS and "title" in _header_classes(t))
+            if h is not None:
+                return h
+        # chunked/stitched shape: the preceding <hN class="sect1"> sibling is
+        # itself the title header (it carries the <a id=...>).
+        prev = content.find_previous_sibling(True)
+        if (prev is not None and getattr(prev, "name", None) in H_TAGS
+                and (_header_classes(prev) & set(HEADER_CLASSES))
+                and prev.find("a", id=True)):
+            return prev
+    # module (sect2/3) or fallback: first titled header inside the content
+    return content.find(lambda t: t.name in H_TAGS
+                        and (_header_classes(t) & set(HEADER_CLASSES)))
+
+
+def header_text(sec, is_module=False):
+    h = _content_title_header(sec)
+    return " ".join(h.get_text().split()) if h else ""
+
+
+def full_title(sec, is_module=False):
+    return strip_paren(header_text(sec, is_module))
+
+
+def sect_anchor(sec):
+    h = _content_title_header(sec)
+    if h is not None:
+        a = h.find("a")
+        if a is not None:
+            return a.get("id") or a.get("name")
+    return sec.get("id")
+
+
+def module_group(content):
+    """For a module (content is sect2/3), the grouping is the enclosing sect1's
+    anchor (e.g. the 'Python Modules' page).  None for a normal package."""
+    if "sect1" in _header_classes(content):
+        return None
+    sect1 = content.find_parent("div", class_="sect1")
+    if sect1 is not None:
+        return sect_anchor(sect1)
+    return None
+
+
+def find_section(soup, anchor):
+    """Return (content_section, is_module, group_anchor) for an anchor name."""
+    pkg = resolve_package(soup, anchor)
+    if pkg is None:
+        return None, False, None
+    group = module_group(pkg["content"]) if pkg["is_module"] else None
+    return pkg["content"], pkg["is_module"], group
+
+
+# --------------------------------------------------------------------------- #
+# name / version helpers
+# --------------------------------------------------------------------------- #
+
+def strip_paren(name):
+    return re.sub(r"\(.*", "", name).strip()
+
+
+def sanitize(name):
+    return re.sub(r"\s+", "-", name.strip()).strip("-")
+
+
+def split_name_version(title):
+    m = re.search(r"-(\d+(\.\d+)+)$", title)
+    if m:
+        return title[:m.start()], m.group(1)
+    return title, None
+
+
+def short_name(anchor):
+    parts = anchor.split("-")
+    if len(parts) > 1 and parts[-1].replace(".", "").isdigit():
+        return "-".join(parts[:-1])
+    return anchor
+
+
+# --------------------------------------------------------------------------- #
+# field extraction (all scoped to a section)
+# --------------------------------------------------------------------------- #
+
+def package_div(sec):
+    return sec.find(class_="package")
+
+
+def extract_link(sec):
+    pd = package_div(sec)
+    if not pd:
+        return ""
+    ulinks = pd.select("div.itemizedlist a.ulink")
+    for u in ulinks:
+        href = u.get("href")
+        if href and href.startswith("https"):
+            return href
+    return ulinks[0].get("href") if ulinks else ""
+
+
+def extract_md5(sec):
+    pd = package_div(sec)
+    if not pd:
+        return ""
+    for p in pd.find_all("p"):
+        txt = " ".join(p.get_text().split())
+        if re.search(r"Download MD5 sum:", txt, re.IGNORECASE):
+            m = re.search(r"Download MD5 sum:\s*([0-9a-fA-F]{32})", txt, re.IGNORECASE)
+            if m:
+                return m.group(1)
+            return re.sub(r".*Download MD5 sum:\s*", "", txt, flags=re.IGNORECASE).strip()
+    return ""
+
+
+def extract_additional_downloads(sec):
+    pd = package_div(sec)
+    if not pd:
+        return []
+    h3_add = pd.find("h3", string=re.compile(r"\s*Additional Downloads\s*"))
+    h3_dep = pd.find("h3", string=re.compile(r"\s*Dependencies\s*"))
+    if not h3_add:
+        return []
+    out, cur = [], h3_add.find_next_sibling()
+    while cur and cur != h3_dep:
+        for u in cur.find_all("a", class_="ulink"):
+            href = u.get("href")
+            if href:
+                out.append(href)
+        cur = cur.find_next_sibling()
+    return out
+
+
+def _xref_titles(sec, kind):
+    pd = package_div(sec)
+    if not pd:
+        return []
+    out = []
+    for x in pd.select(f"p.{kind} a.xref"):
+        title = " ".join((x.get("title") or "").split())
+        if not title or re.match(r"(Chapter|Part)\b", title):
+            continue
+        out.append(title.replace(" ", "-"))
+    return out
+
+
+def extract_installed_content(sec):
+    content = {}
+    for item in sec.select("div.content div.seglistitem"):
+        for seg in item.find_all("div", class_="seg"):
+            title = seg.find("strong", class_="segtitle")
+            body = seg.find("span", class_="segbody")
+            if title and body:
+                key = re.sub(r"[^a-z0-9]+", "_",
+                             title.get_text().lower()).strip("_")
+                if not key:
+                    continue
+                val = " ".join(body.get_text().split()).replace(" and ", " ")
+                content[key] = val
+    return content
+
+
+def fix_heredocs(text):
+    """BLFS often renders a heredoc terminator with a trailing shell operator,
+    e.g.  `EOF &&`.  Bash requires the closing delimiter to sit alone on its
+    line, so as-written the heredoc never closes and swallows the rest of the
+    script.  Move any trailing operator up onto the opener line, which is the
+    equivalent, valid form (`cat << "EOF" && ... EOF`)."""
+    lines = text.split("\n")
+    opener = re.compile(r'<<-?\s*(["\']?)([A-Za-z_][A-Za-z0-9_]+)\1')
+    i = 0
+    while i < len(lines):
+        m = opener.search(lines[i])
+        if not m:
+            i += 1
+            continue
+        delim = re.escape(m.group(2))
+        term_op = re.compile(r'^(\s*)' + delim + r'\s+(&&|\|\||;|&)\s*$')
+        term_plain = re.compile(r'^\s*' + delim + r'\s*$')
+        j = i + 1
+        while j < len(lines):
+            tm = term_op.match(lines[j])
+            if tm:
+                lines[i] = lines[i].rstrip() + " " + tm.group(2)
+                lines[j] = tm.group(1) + m.group(2)
+                break
+            if term_plain.match(lines[j]):
+                break
+            j += 1
+        i = j + 1
+    return "\n".join(lines)
+
+
+def _pre_command_text(pre):
+    """Full runnable text of a command <pre>.  BLFS puts only the heredoc opener
+    (cat > f << "EOF") in <kbd class="command"> and the body + closing EOF in
+    sibling nodes of the same <pre>; so we take the whole <pre> text, not just
+    the kbd, or the heredoc would lose its body and delimiter.
+
+    BLFS user-substitution placeholders render as <em class="replaceable"> with
+    literal angle brackets (e.g. <PREFIX>), which bash reads as a redirection and
+    rejects.  Rewrite them to a safe, obvious __PREFIX__ token instead."""
+    if pre.find("kbd", class_="command") is None:
+        return ""
+    if pre.find(class_="replaceable") is None:
+        return pre.get_text().strip()
+    clone = BeautifulSoup(str(pre), "html.parser")
+    for rep in clone.select(".replaceable"):
+        txt = rep.get_text().strip()
+        if txt.startswith("<") and txt.endswith(">"):
+            txt = txt[1:-1]
+        token = "__" + re.sub(r"[^A-Za-z0-9_]", "_", txt).strip("_") + "__"
+        rep.replace_with(token)
+    return clone.get_text().strip()
+
+
+def extract_commands(sec, selector):
+    elements = sec.select(selector + " > *")
+    if not elements:
+        return ""
+    out = []
+    for el in elements:
+        name = getattr(el, "name", None)
+        if name == "h2":
+            out.append("\n\n\n#### " + "".join(l.strip() for l in el.get_text().splitlines()) + "\n")
+        elif name == "h3":
+            out.append("\n\n### " + "".join(l.strip() for l in el.get_text().splitlines()))
+        elif name == "h4":
+            out.append("\n\n## " + "".join(l.strip() for l in el.get_text().splitlines()))
+        elif name == "p":
+            out.append("\n\n# " + " ".join(l.strip() for l in el.get_text().splitlines()).strip() + "\n")
+        elif name == "pre":
+            text = _pre_command_text(el)
+            if text:
+                out.append(text)
+        elif name == "div":
+            classes = list(el.get("class", []))
+            if "admon" in classes:
+                classes.remove("admon")
+                out.append("\n#### " + "".join(c.upper() for c in classes) + " ####")
+                for adm in el:
+                    if getattr(adm, "name", None) == "p":
+                        lines = []
+                        for item in adm.contents:
+                            if isinstance(item, str):
+                                line = re.sub(r"\s+", " ", item.strip())
+                                if line:
+                                    lines.append(line)
+                            elif item.name:
+                                child = re.sub(r"\s+", " ", item.get_text().strip())
+                                if child:
+                                    lines.append(child)
+                        out.append("## " + " ".join(lines).replace(" , ", ", "))
+                        out.append("")
+    return "\n".join(out)
+
+
+def extract_commands_phased(sec):
+    """Split the installation section into (build, install).  BLFS marks the
+    privileged install step as <pre class="root"> (make install, install -v ...);
+    everything else (configure, make, ...) is the build.  In the pkgusr model the
+    'root' step runs as the package user and is where permission problems appear,
+    so isolating it lets you fix perms and re-run just the install phase without
+    recompiling."""
+    inst = sec.find("div", class_="installation")
+    if inst is None:
+        return "", ""
+    build, install = [], []
+    for el in inst.children:
+        name = getattr(el, "name", None)
+        if name is None:
+            continue
+        if name == "pre":
+            text = _pre_command_text(el)
+            if not text:
+                continue
+            (install if "root" in el.get("class", []) else build).append(text)
+        elif name in ("h3", "h4"):
+            build.append("\n### " + " ".join(el.get_text().split()))
+        elif name == "p":
+            build.append("\n# " + " ".join(el.get_text().split()) + "\n")
+        elif name == "div" and "admon" in el.get("class", []):
+            build.append("## NOTE: " + " ".join(el.get_text().split()))
+    return "\n".join(build).strip(), "\n".join(install).strip()
+
+
+def extract_raw_commands(sec):
+    cmds = []
+    for pre in sec.select("pre"):
+        if pre.find_parent("div", class_="configuration"):
+            continue
+        text = _pre_command_text(pre)
+        if text:
+            cmds.append(text)
+    return "\n".join(cmds)
+
+
+def subsection_titled(sec, *prefixes):
+    """Find a sub-section whose title starts with any prefix."""
+    for sub in sec.select("div.sect1, div.sect2, div.sect3"):
+        h = sub.find(lambda t: t.name in H_TAGS
+                     and (_header_classes(t) & set(HEADER_CLASSES)))
+        if h is not None:
+            title = " ".join(h.get_text().split())
+            if any(title.startswith(p) for p in prefixes):
+                return sub
+    return None
+
+
+def extract_between_package_and_installation(sec):
+    pkg = sec.find("div", class_="package")
+    inst = sec.find("div", class_="installation")
+    if not (pkg and inst):
+        return []
+    names = []
+    for sib in pkg.next_siblings:
+        if sib == inst:
+            break
+        if getattr(sib, "name", None):
+            names.extend(sib.get("class", []))
+    return names
+
+
+# --------------------------------------------------------------------------- #
+# dependencies
+# --------------------------------------------------------------------------- #
+
+def anchor_from_href(href):
+    """A cross-ref href -> (anchor, external_url).  In the nochunks book local
+    refs are '#anchor'; https refs are out-of-book."""
+    if not href:
+        return None, None
+    if href.startswith(("http://", "https://")):
+        return None, href
+    if "#" in href:
+        return href.split("#", 1)[1], None
+    if href.endswith(".html"):
+        return os.path.basename(href)[:-5], None
+    return href, None
+
+
+DEP_KINDS = ("required", "recommended", "optional")
+
+
+def section_deps(sec, kinds=("required", "recommended")):
+    """Return list of dicts: {title, anchor, external, kind}."""
+    pd = package_div(sec)
+    if not pd:
+        return []
+    deps = []
+    for kind in kinds:
+        for x in pd.select(f"p.{kind} a.xref"):
+            title = strip_paren(" ".join(x.get("title", "").split()))
+            # xrefs to whole chapters/parts aren't packages -- skip them
+            if not title or re.match(r"(Chapter|Part)\b", title):
+                continue
+            anchor, external = anchor_from_href(x.get("href"))
+            deps.append({"title": title.replace(" ", "-"), "anchor": anchor,
+                         "external": external, "kind": kind})
+    return deps
+
+
+def selected_kinds(args):
+    """Which dependency classes a deps/order run should follow."""
+    kinds = ["required"]
+    if not getattr(args, "no_required", False):
+        pass
+    if not getattr(args, "no_recommended", False):
+        kinds.append("recommended")
+    if getattr(args, "optional", False):
+        kinds.append("optional")
+    return kinds
+
+
+def deps_of(data, kinds):
+    """Dependency dicts of a cached package, filtered to the chosen kinds."""
+    return [d for d in data.get("deps", []) if d["kind"] in kinds]
+
+
+def walk_deps(book, anchor, kinds=("required", "recommended")):
+    """Depth-first walk over cached package data.  Returns (order, edges,
+    missing, via).  `order` is install order (deps first); `edges` maps anchor
+    -> child dep dicts; `via` maps each dependency anchor -> (parent_anchor,
+    kind) recording who first pulled it in and how."""
+    order, edges, missing, via, visited = [], {}, [], {}, set()
+
+    def visit(a):
+        if a in visited:
+            return
+        visited.add(a)
+        data = book.get(a)
+        if data is None:
+            missing.append(a)
+            return
+        deps = deps_of(data, kinds)
+        edges[a] = deps
+        for d in deps:
+            if d["external"]:
+                missing.append(d["external"])
+                via.setdefault(d["external"], (a, d["kind"]))
+            elif d["anchor"]:
+                via.setdefault(d["anchor"], (a, d["kind"]))
+                visit(d["anchor"])
+        order.append(a)
+
+    visit(anchor)
+    return order, edges, missing, via
+
+
+# --------------------------------------------------------------------------- #
+# script generation
+# --------------------------------------------------------------------------- #
+
+def bash_array(items):
+    return "(" + " ".join(f"'{i}'" for i in items) + ")"
+
+
+def extract_info(sec, is_module):
+    pd = package_div(sec)
+    if not pd:
+        return ""
+    start = pd.find(class_="sect3" if is_module else "sect2")
+    if not start:
+        return ""
+    stop = "h4" if is_module else "h3"
+    text = ""
+    for el in start.next_siblings:
+        if getattr(el, "name", None) == stop and "Package Information" in el.get_text():
+            break
+        if getattr(el, "name", None) == "p":
+            text += "\\n\\n" + " ".join(l.strip() for l in el.get_text().strip().splitlines())
+    return text.replace('"', '\\"').lstrip("\\n")
+
+
+def extract_package_data(sec, is_module, group, anchor):
+    """Pull everything a script / dependency walk needs out of the soup, once.
+    The result is plain JSON-serialisable data (the cache stores this)."""
+    title = full_title(sec, is_module)
+
+    install_cmds = extract_commands(sec, "div.installation")
+    if not install_cmds.strip():
+        sub = subsection_titled(sec, "Installation", "Install")
+        if sub is not None:
+            install_cmds = (extract_commands(sub, "div.installation")
+                            or extract_raw_commands(sub))
+    if is_module and not install_cmds.strip():
+        install_cmds = extract_raw_commands(sec)
+    install_cmds = fix_heredocs(install_cmds)
+
+    # split the installation section into build (configure/make) vs install
+    # (the privileged <pre class="root"> step) for the phased script
+    build_cmds, install_root = extract_commands_phased(sec)
+    if not build_cmds.strip() and not install_root.strip():
+        sub = subsection_titled(sec, "Installation", "Install")
+        if sub is not None:
+            build_cmds, install_root = extract_commands_phased(sub)
+    build_cmds = fix_heredocs(build_cmds or "")
+    install_root = fix_heredocs(install_root or "")
+
+    config_cmds = extract_commands(sec, "div.configuration > div.sect3")
+    if not config_cmds.strip():
+        sub = subsection_titled(sec, "Configuring", "Configuration")
+        if sub is not None:
+            config_cmds = (extract_commands(sub, "div.configuration > div.sect3")
+                           or extract_commands(sub, "div.configuration"))
+    config_cmds = fix_heredocs(config_cmds or "")
+
+    between = extract_between_package_and_installation(sec)
+    between_cmds = [extract_commands(sec, "div." + cls) for cls in between]
+
+    link = extract_link(sec)
+    return {
+        "anchor": anchor,
+        "title": title,
+        "name": short_name(anchor),
+        "name_version": sanitize(title),
+        "is_module": is_module,
+        "group": group,
+        "link": link,
+        "pkg": os.path.basename(link),
+        "md5": extract_md5(sec),
+        "additional_links": extract_additional_downloads(sec),
+        "info": extract_info(sec, is_module),
+        "required": _xref_titles(sec, "required"),
+        "recommended": _xref_titles(sec, "recommended"),
+        "optional": _xref_titles(sec, "optional"),
+        "installed_content": extract_installed_content(sec),
+        "install_cmds": install_cmds,
+        "build_cmds": build_cmds,
+        "install_root_cmds": install_root,
+        "config_cmds": config_cmds,
+        "between_cmds": between_cmds,
+        "deps": section_deps(sec, DEP_KINDS),
+    }
+
+
+def render_script(data, source_url):
+    """Turn cached package data into a phased install_<name-version> script:
+    unpack -> build -> install -> configure, each a separate function with a
+    dispatcher, so a failed install (e.g. permissions) can be fixed and re-run
+    WITHOUT recompiling:  bash install_<pkg> install"""
+    name_version = data["name_version"]
+    pkg = data["pkg"]
+    build_cmds = data.get("build_cmds") or data["install_cmds"]
+    install_root = data.get("install_root_cmds") or ""
+    config_cmds = data["config_cmds"]
+    # let packagemanager's --reinstall actually force pip to reinstall: when
+    # PM_REINSTALL=1 is set, pip install picks up --force-reinstall; otherwise the
+    # expansion is empty and nothing changes.
+    def _pip_reinstall(cmds):
+        return re.sub(r'\bpip3?\s+install\b',
+                      lambda m: m.group(0) + ' ${PM_REINSTALL:+--force-reinstall}',
+                      cmds or "")
+    build_cmds = _pip_reinstall(build_cmds)
+    install_root = _pip_reinstall(install_root)
+    installed = data["installed_content"]
+    unpacks = not re.search(rf"^tar .* {re.escape(pkg)} .*", data["install_cmds"])
+
+    L = []
+    w = L.append
+    w("#!/bin/bash")
+    w("############################################")
+    w(f"### {name_version}")
+    w(f"### generated by blfs {BLFS_VERSION} -- script format v{SCRIPT_VERSION}")
+    w("### phased install script -- run a single phase with its name as $1:")
+    w("###   all (default) | unpack | build | install | configure | update")
+    w("###   update = install + reconfigure is SKIPPED (keeps your config)")
+    w("### re-run just 'install' after fixing permissions, without recompiling.\n")
+    w(f'url="{source_url}"')
+    w(f'name="{data["name"]}"')
+    w(f'name_version="{name_version}"')
+    w(f'link="{data["link"]}"')
+    w(f'pkg="{pkg}"')
+    w(f'md5_sum="{data["md5"]}"')
+    w(f"additional_links={bash_array(data['additional_links'])}")
+    w(f'info="{data["info"]}"')
+    w(f"required={bash_array(data['required'])}")
+    w(f"recommended={bash_array(data['recommended'])}")
+    w(f"optional={bash_array(data['optional'])}")
+    w("installed_content=(" + " ".join(f'"{k.rstrip(":")}"' for k in installed) + ")")
+    for k, v in installed.items():
+        w(f'{k}="{v}"')
+    if data["is_module"] and data["group"]:
+        w(f"install_groups={bash_array([data['group']])}")
+
+    # where the source is unpacked/built; kept between phases so 'install' can be
+    # re-run against the already-built tree.
+    w('\nBUILD_ROOT="${BUILD_ROOT:-$PWD}"')
+    w('pkg_dir=""')
+    w("")
+    w("_enter_build() {")
+    w('\t# locate the already-unpacked source directory for build/install phases')
+    w('\tcd "$BUILD_ROOT" || exit 1')
+    if unpacks:
+        w('\tif [ -z "$pkg_dir" ]; then')
+        w('\t\tpkg_dir="$name_version"')
+        w('\t\t[ -d "$pkg_dir" ] || pkg_dir="$(ls -d */ 2>/dev/null | head -n1)"')
+        w('\tfi')
+        w('\tif [ -n "$pkg_dir" ] && [ -d "$pkg_dir" ]; then cd "$pkg_dir" || exit 1')
+        w('\telse echo "no unpacked source in $BUILD_ROOT -- run: $0 unpack" && exit 1; fi')
+    w("}\n")
+
+    # ---- unpack ----
+    w("unpack_pkg() {")
+    w("#### UNPACK ####")
+    w('\tcd "$BUILD_ROOT" || exit 1')
+    if data["between_cmds"] and any(c.strip() for c in data["between_cmds"]):
+        w("\t# before-installation steps")
+        for cmds in data["between_cmds"]:
+            if cmds.strip():
+                w(cmds)
+    w('\t[ -f "$pkg" ] || { [ -n "$link" ] && wget -4 "$link"; }')
+    w('\tif [ -n "$md5_sum" ] && ! grep -wq "$md5_sum" <<< "$(md5sum "$pkg")"; then')
+    w('\t\techo "ERROR: md5sum check failed" && exit 1')
+    w("\tfi")
+    w('\tfor li in "${additional_links[@]}"; do wget -4 "$li"; done')
+    if unpacks:
+        w("\trm -rf tmp && mkdir tmp && cd tmp")
+        if pkg.endswith(".zip"):
+            w('\tunzip ../"$pkg"')
+        else:
+            w('\ttar -xf ../"$pkg"')
+        w('\tif [ "$(ls | wc -w)" = "1" ]; then pkg_dir="$(ls)";')
+        w('\telse pkg_dir="$name_version"; fi')
+        w('\tcd .. && [ -d "$pkg_dir" ] && rm -rf "$pkg_dir"')
+        w('\tif [ "$(ls tmp | wc -w)" = "1" ]; then mv tmp/* . ; else mv tmp "$pkg_dir"; fi')
+        w('\trm -rf tmp')
+        w('\techo "unpacked into $BUILD_ROOT/$pkg_dir"')
+    w("#### UNPACK DONE ####")
+    w("}\n")
+
+    # ---- build ----
+    w("build_pkg() {")
+    w("#### BUILD ####")
+    w("\t_enter_build")
+    w('\t# remove a stale CONFIGURED build dir so re-running "build" works, but')
+    w('\t# never a source dir that merely happens to be named build/ -- only wipe')
+    w('\t# it if it holds build-system artifacts we would have generated.')
+    w('\tfor _d in build builddir _build; do')
+    w('\t\tif [ -d "$_d" ] && { [ -f "$_d/build.ninja" ] || '
+      '[ -f "$_d/CMakeCache.txt" ] || [ -d "$_d/meson-private" ] || '
+      '[ -f "$_d/config.status" ]; }; then rm -rf "$_d"; fi')
+    w('\tdone')
+    w(build_cmds if build_cmds.strip() else '\t: # (no separate build step)')
+    w('\t# remember where the build ended (e.g. a meson "build/" subdir) so the')
+    w('\t# install phase can resume there even when run separately.')
+    w('\tpwd > "$BUILD_ROOT/.pm_build_cwd" 2>/dev/null || true')
+    w("#### BUILD DONE ####")
+    w("}\n")
+
+    # ---- install ----
+    w("install_pkg() {")
+    w("#### INSTALL ####")
+    w("\t_enter_build")
+    w('\t# resume where the build actually happened: prefer the dir the build')
+    w('\t# phase recorded; otherwise auto-detect a meson/cmake build subdir, so')
+    w('\t# "ninja install" / "make install" run in the right place even if the')
+    w('\t# tree was built by an older script.')
+    w('\tif [ -f "$BUILD_ROOT/.pm_build_cwd" ] && '
+      '[ -d "$(cat "$BUILD_ROOT/.pm_build_cwd" 2>/dev/null)" ]; then')
+    w('\t\tcd "$(cat "$BUILD_ROOT/.pm_build_cwd")"')
+    w('\telif [ ! -e build.ninja ] && [ ! -e Makefile ]; then')
+    w('\t\tfor _d in build builddir _build; do')
+    w('\t\t\tif [ -e "$_d/build.ninja" ] || [ -e "$_d/Makefile" ]; then '
+      'cd "$_d"; break; fi')
+    w('\t\tdone')
+    w('\tfi')
+    if install_root.strip():
+        w(install_root)
+    else:
+        w('\t: # (this package installs during the build phase; nothing separate)')
+    w("#### INSTALL DONE ####")
+    w("}\n")
+
+    # ---- configure ----
+    if config_cmds.strip():
+        w("configure_pkg() {")
+        w("#### CONFIGURE ####")
+        w('\techo "## Configuration"')
+        w(config_cmds)
+        w("#### CONFIGURE DONE ####")
+        w("}\n")
+    else:
+        w("configure_pkg() { : ; }\n")
+
+    # ---- test (best-effort; edit for package-specific test commands) ----
+    w("test_pkg() {")
+    w("#### TEST ####")
+    w("\t_enter_build")
+    w('\tif [ -f "$BUILD_ROOT/.pm_build_cwd" ] && '
+      '[ -d "$(cat "$BUILD_ROOT/.pm_build_cwd" 2>/dev/null)" ]; then')
+    w('\t\tcd "$(cat "$BUILD_ROOT/.pm_build_cwd")"')
+    w('\telif [ ! -e build.ninja ] && [ ! -e Makefile ]; then')
+    w('\t\tfor _d in build builddir _build; do [ -e "$_d/build.ninja" ] || '
+      '[ -e "$_d/Makefile" ] && cd "$_d" && break; done')
+    w('\tfi')
+    w('\techo "## Running test suite"')
+    w('\tif [ -f build.ninja ]; then meson test || ninja test')
+    w('\telif [ -f Makefile ]; then make check || make test')
+    w('\telse echo "no recognized test target -- edit test_pkg() for this package"; fi')
+    w("#### TEST DONE ####")
+    w("}\n")
+
+    # ---- dispatcher ----
+    w('# run only when executed directly, not when sourced')
+    w('if [ "${BASH_SOURCE[0]}" = "${0}" ]; then')
+    w('case "${1:-all}" in')
+    w('\tall)')
+    w('\t\tunpack_pkg && build_pkg || exit 1')
+    w('\t\t[ "${PM_TEST:-}" = "1" ] && test_pkg')
+    w('\t\tinstall_pkg && configure_pkg ;;')
+    w('\tunpack)    unpack_pkg ;;')
+    w('\tbuild)     build_pkg ;;')
+    w('\ttest)      test_pkg ;;')
+    w('\tinstall)   install_pkg ;;')
+    w('\tconfigure) configure_pkg ;;')
+    w('\tupdate)')
+    w('\t\tunpack_pkg && build_pkg || exit 1')
+    w('\t\t[ "${PM_TEST:-}" = "1" ] && test_pkg')
+    w('\t\tinstall_pkg ;;')
+    w('\t*) echo -e "usage: $0 {all|unpack|build|test|install|configure|update}\\n'
+      '  all       full run (default; set PM_TEST=1 to also run tests)\\n'
+      '  unpack    fetch + extract only\\n'
+      '  build     configure + compile (needs unpack)\\n'
+      '  test      run the test suite (needs build)\\n'
+      '  install   install step only -- re-run this after fixing permissions\\n'
+      '  configure post-install configuration\\n'
+      '  update    unpack + build + install, no reconfigure (keeps your config)" ;;')
+    w("esac")
+    w("fi")
+
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name_version).strip("-")
+    body = "\n".join(L) + "\n"
+    # embed a checksum of the pristine script so packagemanager can tell later
+    # whether the user edited it (edit-detection for migrate).  The checksum is
+    # computed over the body WITHOUT this line, so verification just strips the
+    # 'pm_md5' line and recomputes.
+    digest = hashlib.md5(body.encode()).hexdigest()
+    stamp = f"### generated by blfs {BLFS_VERSION} -- script format v{SCRIPT_VERSION}"
+    body = body.replace(stamp, stamp + f"\n### pm_md5={digest}", 1)
+    return f"install_{safe}", body
+
+
+def build_script(sec, is_module, group, anchor, source_url):
+    """Convenience: extract + render straight from the soup (used at cache build
+    time and by the whole-book test harness)."""
+    return render_script(
+        extract_package_data(sec, is_module, group, anchor), source_url)
+
+
+# --------------------------------------------------------------------------- #
+# subcommands
+# --------------------------------------------------------------------------- #
+
+def cmd_books(args):
+    if getattr(args, "rebuild_cache", False):
+        book = get_book(args, rebuild=True)
+        print(f"Re-indexed {book.path}: {len(book.packages)} packages cached.")
+        return
+    cfg = load_config()
+    default = cfg.get("default", DEFAULT_SELECTOR)
+    print(f"Store:   {store_dir()}")
+    print(f"Default: {default}\n")
+
+    print("Cached books:")
+    found = False
+    for f in sorted(os.listdir(books_dir())):
+        if f.endswith(".meta") or f.endswith(".part"):
+            continue
+        found = True
+        meta = _load_meta(os.path.join(books_dir(), f))
+        sel = meta.get("selector", "?")
+        ver = meta.get("version", "?")
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(meta.get("fetched", 0)))
+        mark = " (default)" if sel == default else ""
+        print(f"  {sel:<18} version {ver:<8} fetched {when}{mark}  [{f}]")
+    if not found:
+        print("  (none yet)")
+
+    if args.discover:
+        print("\nAvailable books (from the downloads index):")
+        try:
+            books = discover_all()
+        except Exception as e:
+            print(f"  could not read {downloads_index_url()} ({e})")
+            return
+        if not books:
+            print("  (none found)")
+        for sel, rec in sorted(books.items()):
+            mark = " (default)" if sel == default else ""
+            print(f"  {sel:<22} version {rec['version']:<8} [{rec['init']}]{mark}")
+        print(f"\nPick one with:  blfs set-default <selector>")
+    else:
+        avail = load_available()
+        if avail:
+            print("\nAvailable books (cached from last --discover):")
+            for sel, rec in sorted(avail.items()):
+                mark = " (default)" if sel == default else ""
+                print(f"  {sel:<22} version {rec['version']:<8} [{rec['init']}]{mark}")
+            print("\nRe-run with --discover to refresh this list.")
+        else:
+            print("\nRun 'blfs books --discover' to list what the site offers.")
+
+
+def cmd_set_default(args):
+    cfg = load_config()
+    cfg["default"] = args.selector
+    save_config(cfg)
+    print(f"Default book set to: {args.selector}")
+
+
+def cmd_search(args):
+    book = get_book(args)
+    needle = args.name.lower().replace(" ", "-")
+    hits = []
+    for anchor, data in sorted(book.packages.items()):
+        if needle in (anchor + " " + data["title"]).lower():
+            hits.append((anchor, data["title"], data["is_module"]))
+    if not hits:
+        print(f"No package matching '{args.name}'.")
+        return
+    for anchor, title, is_module in hits:
+        kind = "module " if is_module else "package"
+        print(f"  [{kind}] {anchor:<28} {title}")
+    print(f"\n{len(hits)} result(s).")
+
+
+def cmd_script(args):
+    book = get_book(args)
+    anchor = anchor_from_input(args.target)
+    data = book.get(anchor)
+    if data is None:
+        print(f"ERROR: could not find anchor '{anchor}' in the book.")
+        print("       run:  blfs debug " + args.target)
+        sys.exit(1)
+    src = args.target if args.target.startswith("http") else f"#{anchor}"
+    filename, script = render_script(data, src)
+    os.makedirs(args.outdir, exist_ok=True)
+    path = os.path.join(args.outdir, filename)
+    with open(path, "w") as f:
+        f.write(script)
+    print(f"Created {path}")
+    try:
+        subprocess.run(["bash", "-n", path], check=True)
+        print("Bash syntax OK.")
+    except subprocess.CalledProcessError:
+        print("!!! bash syntax error -- review the file")
+    return path
+
+
+def cmd_deps(args):
+    book = get_book(args)
+    anchor = anchor_from_input(args.name)
+    if book.get(anchor) is None:
+        print(f"ERROR: '{anchor}' not found.  try: blfs debug {args.name}")
+        sys.exit(1)
+    kinds = selected_kinds(args)
+
+    if args.tree:
+        printed = set()
+
+        def show(a, prefix="", last=True):
+            data = book.get(a)
+            title = data["title"] if data else a + " (missing)"
+            connector = "└─ " if last else "├─ "
+            print(prefix + (connector if prefix else "") + title)
+            if a in printed or data is None:
+                if a in printed and data is not None:
+                    print(prefix + ("   " if last else "│  ") + "   … (already shown)")
+                return
+            printed.add(a)
+            deps = deps_of(data, kinds)
+            child_prefix = prefix + ("   " if last else "│  ")
+            for i, d in enumerate(deps):
+                is_last = i == len(deps) - 1
+                if d["anchor"]:
+                    show(d["anchor"], child_prefix, is_last)
+                else:
+                    label = d["external"] or d["title"]
+                    conn = "└─ " if is_last else "├─ "
+                    print(child_prefix + conn + label + f"  [{d['kind']}, external]")
+        show(anchor)
+        return
+
+    order, edges, missing, via = walk_deps(book, anchor, kinds)
+    print(f"Install order (dependencies first) [{'+'.join(kinds)}]:")
+    for a in order:
+        print(f"  {book.get(a)['title']}")
+    if missing:
+        print("\nOut-of-book / missing:")
+        for m in sorted(set(missing)):
+            print(f"  {m}")
+
+
+def cmd_versions(args):
+    """Machine-readable: every package as 'anchor<TAB>name_version', in ONE call
+    (so callers don't spawn a process per package)."""
+    book = get_book(args)
+    for anchor in sorted(book.packages):
+        data = book.get(anchor)
+        if data:
+            print(f"{anchor}\t{data['name_version']}")
+
+
+def _reverse_graph(book, kinds):
+    """anchor -> set of anchors that directly depend on it (of the given kinds)."""
+    rev = {}
+    for anchor, data in book.packages.items():
+        for d in deps_of(data, kinds):
+            if d.get("anchor"):
+                rev.setdefault(d["anchor"], set()).add(anchor)
+    return rev
+
+
+def cmd_rdeps(args):
+    """Reverse dependencies: packages that (recursively) depend ON the target --
+    i.e. what may need rebuilding when the target is updated."""
+    book = get_book(args)
+    target = anchor_from_input(args.name)
+    if book.get(target) is None:
+        print(f"ERROR: '{target}' not found.  try: blfs debug {args.name}")
+        sys.exit(1)
+    rev = _reverse_graph(book, selected_kinds(args))
+    order, seen, queue = [], set(), [target]
+    while queue:
+        cur = queue.pop(0)
+        for dependent in sorted(rev.get(cur, ())):
+            if dependent not in seen:
+                seen.add(dependent)
+                order.append(dependent)
+                queue.append(dependent)
+    if getattr(args, "anchors", False):
+        for a in order:
+            data = book.get(a)
+            print(f"{a}\t{data['name_version'] if data else ''}")
+        return
+    print(f"{len(order)} package(s) (recursively) depend on {target}:")
+    for a in order:
+        data = book.get(a)
+        print(f"  {a:<28} {data['name_version'] if data else ''}")
+
+
+def cmd_order(args):
+    book = get_book(args)
+    anchor = anchor_from_input(args.name)
+    if book.get(anchor) is None:
+        print(f"ERROR: '{anchor}' not found.  try: blfs debug {args.name}")
+        sys.exit(1)
+    kinds = selected_kinds(args)
+
+    order, edges, missing, via = walk_deps(book, anchor, kinds)
+
+    # machine-readable mode: one TSV line per package in install order,
+    # "anchor<TAB>name_version<TAB>kind<TAB>parent_anchor" (root has empty
+    # kind/parent), then "#missing<TAB>name<TAB>kind<TAB>parent".
+    if getattr(args, "anchors", False):
+        for a in order:
+            parent, kind = ("", "") if a == anchor else via.get(a, ("", ""))
+            print(f"{a}\t{book.get(a)['name_version']}\t{kind}\t{parent}")
+        for m in sorted(set(missing)):
+            parent, kind = via.get(m, ("", ""))
+            print(f"#missing\t{m}\t{kind}\t{parent}")
+        return
+
+    os.makedirs(args.outdir, exist_ok=True)
+    order_file = os.path.join(args.outdir, "install_order.txt")
+
+    lines = []
+    for a in order:
+        data = book.get(a)
+        lines.append(data["name_version"])
+        if args.scripts:
+            fn, script = render_script(data, f"#{a}")
+            with open(os.path.join(args.outdir, fn), "w") as f:
+                f.write(script)
+
+    with open(order_file, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"Install order ({len(order)} packages) [{'+'.join(kinds)}] "
+          f"written to {order_file}")
+    for ln in lines:
+        print(f"  {ln}")
+    if args.scripts:
+        print(f"\nGenerated {len(order)} install scripts in {args.outdir}")
+    if missing:
+        print("\nOut-of-book / missing (handle manually):")
+        for m in sorted(set(missing)):
+            print(f"  {m}")
+
+
+def cmd_debug(args):
+    book = get_book(args)
+    anchor = anchor_from_input(args.target)
+    print(f"input          : {args.target}")
+    print(f"anchor         : {anchor}")
+
+    data = book.get(anchor)
+    if data is None:
+        # not a package in the cache -- parse the soup to explain why
+        soup = book.soup
+        node = soup.find(attrs={"id": anchor}) or soup.find("a", attrs={"name": anchor})
+        if node is None:
+            print("resolve        : NOT FOUND (no element with this id/name)")
+        else:
+            print(f"resolve        : found <{node.name} id={node.get('id')}> but it is "
+                  f"not an installable package (no package block + download link)")
+        print("hint           : blfs search " + anchor)
+        return
+
+    print(f"title          : {data['title']}")
+    print(f"is_module      : {data['is_module']}  group={data['group']}")
+    print(f"link           : {data['link']}")
+    print(f"md5            : {data['md5']}")
+    print(f"required       : {[d['title'] for d in data['deps'] if d['kind']=='required']}")
+    print(f"recommended    : {[d['title'] for d in data['deps'] if d['kind']=='recommended']}")
+    print(f"optional       : {[d['title'] for d in data['deps'] if d['kind']=='optional']}")
+
+    if args.raw:
+        pkg = resolve_package(book.soup, anchor)
+        if pkg is not None:
+            print("\n--- content section (first ~1600 chars) ---")
+            print(str(pkg["content"])[:1600])
+
+
+# --------------------------------------------------------------------------- #
+# cli
+# --------------------------------------------------------------------------- #
+
+def main():
+    # Pre-parse the book selectors from anywhere in argv (before OR after the
+    # subcommand), so both `blfs --book-file X script vim` and
+    # `blfs script --book-file X vim` work.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--book")
+    pre.add_argument("--book-file")
+    book_args, remaining = pre.parse_known_args()
+
+    ap = argparse.ArgumentParser(prog="blfs", description="BLFS book tool")
+    ap.add_argument("--version", action="version",
+                    version=f"blfs {BLFS_VERSION} (cache v{CACHE_VERSION}, "
+                            f"script v{SCRIPT_VERSION})")
+    ap.add_argument("--book", help="book selector or url for this run (overrides default)")
+    ap.add_argument("--book-file", help="use a local nochunks html file (offline/testing)")
+    sub = ap.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("versions", help="dump every anchor + version (machine-readable)")
+    p.set_defaults(func=cmd_versions)
+
+    p = sub.add_parser("rdeps", help="reverse deps: what depends on a package "
+                       "(needs rebuilding when it changes)")
+    p.add_argument("name")
+    p.add_argument("--anchors", action="store_true", help="machine-readable TSV")
+    p.add_argument("--no-recommended", action="store_true")
+    p.add_argument("--optional", action="store_true")
+    p.set_defaults(func=cmd_rdeps)
+
+    p = sub.add_parser("books", help="list/inspect books")
+    p.add_argument("--discover", action="store_true", help="probe the live site")
+    p.add_argument("--rebuild-cache", action="store_true",
+                   help="re-index the current book (after upgrading blfs)")
+    p.set_defaults(func=cmd_books)
+
+    p = sub.add_parser("set-default", help="set the default book")
+    p.add_argument("selector")
+    p.set_defaults(func=cmd_set_default)
+
+    p = sub.add_parser("search", help="find packages / modules")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("script", help="write an install_<name-version> script")
+    p.add_argument("target", help="package name, or a BLFS url (optionally #fragment)")
+    p.add_argument("-o", "--outdir", default=".")
+    p.set_defaults(func=cmd_script)
+
+    p = sub.add_parser("deps", help="show dependencies")
+    p.add_argument("name")
+    p.add_argument("--tree", action="store_true")
+    p.add_argument("--no-recommended", action="store_true",
+                   help="follow required deps only (skip recommended)")
+    p.add_argument("--optional", action="store_true",
+                   help="also follow optional dependencies")
+    p.set_defaults(func=cmd_deps)
+
+    p = sub.add_parser("order", help="recursive install order (+ optional scripts)")
+    p.add_argument("name")
+    p.add_argument("-o", "--outdir", default=".")
+    p.add_argument("--scripts", action="store_true", help="also emit every install script")
+    p.add_argument("--no-recommended", action="store_true",
+                   help="follow required deps only (skip recommended)")
+    p.add_argument("--optional", action="store_true",
+                   help="also follow optional dependencies")
+    p.add_argument("--anchors", action="store_true",
+                   help="machine-readable: print 'anchor<TAB>name_version' in order")
+    p.set_defaults(func=cmd_order)
+
+    p = sub.add_parser("debug", help="explain how an anchor resolves")
+    p.add_argument("target")
+    p.add_argument("--raw", action="store_true", help="also dump raw HTML around the anchor")
+    p.set_defaults(func=cmd_debug)
+
+    args = ap.parse_args(remaining)
+    # book selectors come from the pre-parser (either position wins over none)
+    args.book = book_args.book
+    args.book_file = book_args.book_file
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except BrokenPipeError:
+        # output was piped into something like `head` that closed early
+        try:
+            sys.stdout.close()
+        except Exception:
+            pass
+        os._exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
