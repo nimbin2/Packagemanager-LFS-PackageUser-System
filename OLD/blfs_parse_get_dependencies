@@ -1,0 +1,115 @@
+#!/bin/python3
+
+
+import re, sys, os
+import argparse
+import requests
+import subprocess
+from bs4 import BeautifulSoup, Tag 
+from urllib.parse import urlparse
+from urllib.parse import urljoin
+
+file_path = '/tmp/packagemanager/install_links.txt'
+
+# Now you have a list of pairs from the file
+#for pkg_name, url in stored_pairs:
+#    print(f'pkg_name: {pkg_name}, url: {url}')
+
+dependencies = {}
+missing = []
+quiet = False
+
+
+def extract_package_required_pks(url):
+    global dependencies
+    global missing
+    global quiet
+    if not quiet:
+        print()
+        print("#################")
+        print("FETCHING: ", os.path.basename(url.replace(".html","")))
+    soup = None
+    pkg_name = None
+    pkg_name_short = None
+    deps = []
+    # Send a GET request to the URL
+    response = requests.get(url)
+
+    # Check if the request was successful (status code 200)
+    if response.status_code == 200:
+        # Parse the HTML content of the webpage
+        soup = BeautifulSoup(response.text, "html.parser")
+    else:
+        print(f"Failed to retrieve the webpage. Status code: {response.status_code}")
+
+    # Extract name
+    div_element = soup.select_one('h1.sect1 > a')
+    pkg_name = div_element['name']
+
+    # Find the div element with class "package"
+    package_div = soup.find(class_="package")
+
+    with open(file_path, 'a') as file:
+        file.write(f'{pkg_name}\t{url}\n')
+
+    dependencies[pkg_name] = deps
+    if package_div:
+        # Find all <a class="xref"> elements within <p class="required"> under the package_div
+
+        # Extract and join the titles of all found xref elements with a comma
+        def get_p(required_xref_elements):
+            for xref in required_xref_elements:
+                title = xref.get("title").split()[0]
+                if title:
+                    href = xref.get("href")
+                    # if not a local page
+                    if href.startswith("https://"):
+                        missing.append([title, href])
+                    else:
+                        url_new = urljoin(url, href)
+                        deps.append([title, url_new])
+                        for subarray in dependencies:
+                            if title in dependencies:
+                                return
+                        extract_package_required_pks(url_new)
+
+        get_p(package_div.select('p.required a.xref'))
+        get_p(package_div.select('p.recommended a.xref'))
+
+    dependencies[pkg_name] = deps
+
+
+if __name__ == "__main__":
+
+    # Check if -q was passed as a parameter
+    if "-q" in sys.argv:
+        quiet = True
+        # Remove the "-q" parameter from sys.argv
+        sys.argv.remove("-q")
+
+    parser = argparse.ArgumentParser(description="Fetch data from a URL")
+    parser.add_argument("url", help="URL of the webpage to fetch")
+
+    args = parser.parse_args()
+
+    url = args.url
+
+    # Check if the URL is not a webpage (doesn't start with "https://" or "http://")
+    if not url.startswith(("https://", "http://")):
+        # Execute the blfs_parse_find_package script with -q and store its output in the 'url' variable
+        try:
+            blfs_output = subprocess.check_output(["blfs_parse_find_package", "-q", url], universal_newlines=True, stderr=subprocess.STDOUT).strip()
+            url = blfs_output
+        except subprocess.CalledProcessError as e:
+            if e.output:
+                url = e.output.strip()
+            else:
+                print(f"Error executing blfs_parse_find_package: {e}")
+                sys.exit(1)
+
+    extract_package_required_pks(url)
+    if not quiet:
+        print("DEPENDENCIES: ", dependencies)
+        print("MISSING: ", missing)
+    else:
+        print(dependencies)

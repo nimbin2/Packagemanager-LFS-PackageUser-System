@@ -1,0 +1,876 @@
+#!/bin/python3
+
+from urllib.parse import urlparse, urlsplit, unquote, urljoin
+from bs4 import BeautifulSoup, Tag
+from collections import defaultdict
+import subprocess
+import os, sys, re, csv
+
+import argparse
+import requests
+
+import pwd
+import grp
+
+users_info = {}
+
+install_package = None
+install_url = None
+install_dependencies = None
+is_module = False
+
+# ANSI escape codes for text colors
+class colors:
+    normal = '\033[0m'
+    black = '\033[30m'
+    red = '\033[31m'
+    green = '\033[32m'
+    yellow = '\033[33m'
+    blue = '\033[34m'
+    purple = '\033[35m'
+    cyan = '\033[36m'
+    white = '\033[37m'
+
+# ANSI escape codes for text styles
+class styles:
+    bold = '\033[1m'
+    underline = '\033[4m'
+
+users = []
+users_broken = []
+class User:
+    def __init__(self):
+        self.search = None
+        self.name = None
+        self.uid = None
+        self.gid = None
+        self.home = None
+        self.pkg_list = None
+
+
+get_dependencies = {}
+get_not_installable = []
+base_dir = "/usr/src"
+install_scripts_main = "/etc/pkgusr/install_scripts"
+install_command = ""
+package_reinstall = False
+
+ignore_list = None
+ignore_deps = False
+ignore_recommended = False
+
+soup_global = None
+
+file_install_links = '/tmp/packagemanager/install_links.txt'
+try: open(file_install_links, 'w').close()
+except Exception as e: print(f"Error: {e}")
+
+if not os.path.exists('/tmp/packagemanager/'):
+    os.makedirs('/tmp/packagemanager/')
+if not os.path.exists(install_scripts_main):
+    os.makedirs(install_scripts_main)
+
+def printHeader(msg):
+    header_width = 40
+    msg_length = len(msg)
+    num_hashes = max(header_width - msg_length - 6, 2)
+    print(f"\n{colors.blue}{'#' * header_width}{colors.normal}")
+    print(f"{colors.blue}### {msg} #{'#' * num_hashes} {colors.normal}")
+
+def printLine():
+    print(f"{colors.blue}{'–' * 40}{colors.normal}")
+    return f"{colors.blue}{'–' * 40}{colors.normal}"
+
+def printSuccess(msg):
+    print(f"{colors.green}{msg}{colors.normal}")
+
+def printInfo(msg):
+    print(f"{colors.blue}{msg}{colors.normal}")
+
+def printWarning(msg):
+    print(f"{colors.yellow}{msg}{colors.normal}")
+
+def printError(msg):
+    print(f"{colors.red}{msg}{colors.normal}")
+
+
+####################################################
+### oter functions
+
+# yes no request
+def askYesNoQuestion(question):
+    while True:
+        response = input(question + " [y|n]: ").strip().lower()
+        if response == 'y':
+            return True
+        elif response == 'n':
+            return False
+        else:
+            print("Please enter 'y' for yes or 'n' for no.")
+
+def strip_package_name_full(name):
+    return re.sub("\(.*","",name).strip()
+
+def extract_package_name(soup):
+    global is_module
+    name_link = None
+    if is_module:
+        name_link = soup.select_one("h2.sect2 > a")
+    else:
+        name_link = soup.select_one("h1.sect1 > a")
+    name = name_link['name']
+    parts = name.split("-")
+    if len(parts) > 1 and parts[-1].replace(".","").isdigit():
+        return "-".join(parts[:-1])
+    else:
+        return name
+
+# return name and version of name-verion
+
+def extract_package_name_full(soup):
+    global is_module
+    # Find the div element with class "sect1" followed by h1 with class "sect1"
+    div_element = None
+    if is_module:
+        div_element = soup.select_one('h2.sect2')
+    else:
+        div_element = soup.select_one('h1.sect1')
+
+    if div_element:
+        # Extract and return the content within the div
+        content = div_element.get_text().strip()
+        return strip_package_name_full(content)
+    else:
+        print(f"extract_package_name_version: nothing found")
+        return ""
+
+def extractPackageNameVersion(package_string):
+    version_pattern = r'-(\d+(\.\d+)+)$'
+    match = re.search(version_pattern, package_string)
+
+    if match:
+        package_name_without_version = package_string[:match.start()]
+        package_version = match.group(1)
+        return package_name_without_version, package_version
+    else:
+        return package_string, None
+
+def sortDependencies(dependencies):
+    global get_not_installable
+    ## SORT
+    # Create a defaultdict to store dependencies as sets
+    dependency_sets = defaultdict(set)
+    # Convert the dependencies dictionary to sets
+    for package, deps in dependencies.items():
+        for dep, _ in deps:
+            dependency_sets[package].add(dep)
+    # Perform topological sorting
+    sorted_packages = []
+    visited = set()
+
+    def topologicalSort(package):
+        visited.add(package)
+        for dep in dependency_sets[package]:
+            if dep not in visited:
+                topologicalSort(dep)
+        sorted_packages.append(package)
+
+    for package in dependencies.keys():
+        if package not in visited:
+            topologicalSort(package)
+
+    # Create a new dictionary with sorted packages
+    sorted_dependencies = {}
+    for pkg in sorted_packages:
+        try:
+            sorted_dependencies[pkg] = dependencies[pkg]
+        except KeyError:
+            # If dependencies[pkg] does not exist, add pkg to get_not_installable
+            get_not_installable.append(pkg)
+    return sorted_dependencies
+
+
+def checkInstalledDependencies(dependencies, ignore_check):
+    global get_not_installable
+    installed = []
+    missing = []
+    version_mismatch = []
+
+    ### CHECK
+    for key in dependencies:
+        package_name = getNameFromDependencyFile(key)
+        name, version = extractPackageNameVersion(key)
+        check = checkPackage(package_name, version)
+        if ignore_check:
+            missing.append(key)
+        elif check == "True":
+            installed.append(key)
+        elif check == "False":
+            missing.append(key)
+        elif check == "Undefined":
+            get_not_installable.append(key)
+        else:
+            version_mismatch.append(f"{key} == {check}")
+
+    return installed, missing, version_mismatch
+
+def getPkgSoup(url):
+    global soup_global
+
+    # Send a GET request to the URL
+    response = requests.get(url)
+    # Check if the request was successful (status code 200)
+    if response.status_code == 200:
+        # Parse the HTML content of the webpage
+        soup_global = BeautifulSoup(response.text, "html.parser")
+    else:
+        print(f"Failed to retrieve the webpage. Status code: {response.status_code}")
+
+####################################################
+### packagemanager functions
+
+def findUserByName(username):
+    res =  next((user for user in users if user.name == username), None)
+    if not res:  
+        res = next((user for user in users if user.search == username), None) 
+    return res 
+
+
+
+def setUserInfo(packages):
+    if len(packages) == 1 and packages[0] == "all":
+        packages = listAllUsers()
+
+    default_infos = ("name", "uid", "gid", "home", "pkg_list")
+    for username in packages:
+        default_info = {}
+        for f in default_infos: default_info[f] = None
+        user = findUserByName(username)
+        if not user:
+            user = User()
+            users.append(user)
+            user.search = username
+
+        commands = {
+            "name": ["id", "-un", username],
+            "uid": ["id", "-u", username],
+            "gid": ["id", "-g", username],
+            "home": ["bash", "-c", f'[ -d "{base_dir}" ] && echo "{base_dir}/{username}"'],
+            "pkg_list": ["bash", "-c", f'[ -f "{base_dir}/{username}/pkg.lst" ] && echo "{base_dir}/{username}/pkg.lst"']
+        }
+
+        check_missing = False
+        for attribute, command in commands.items():
+            try:
+                setattr(user, attribute, subprocess.check_output(command).decode().strip())
+            except subprocess.CalledProcessError:
+                check_missing  = True
+                setattr(user, attribute, None)
+        
+        if check_missing and not user in users_broken:
+            users_broken.append(user)
+
+
+def formatUserTableCell(key, value):
+    if not value:
+        value = "None"
+    if key == "name":
+        return value.ljust(12)
+    if key == "uid":
+        return value.ljust(6)
+    if key == "gid":
+        return value.ljust(6)
+    if key == "home":
+        return value.ljust(25)
+    if key == "pkg_list":
+        return value.ljust(28)
+
+
+
+def printUserInfo(packages):
+    if len(packages) == 1 and packages[0] == "all":
+        packages = listAllUsers()
+
+    # Print the values of user_info
+    printHeader(f"User infos")
+    print()
+    arg_to_attr = {"name": args.name, "uid": args.uid, "gid": args.gid, "home": args.home, "pkg_list": args.pkg_list}
+    
+    values_to_print = []
+    values_all = []
+    # Loop through the dictionary and append values to values_all or values_to_print accordingly
+    for arg_name, arg_value in arg_to_attr.items():
+        if arg_value:
+            values_to_print.append(arg_name)
+        else:
+            values_all.append(arg_name)
+
+    if len(values_to_print) == 0:
+        values_to_print = values_all
+
+    print_header = " ".join(formatUserTableCell(value, value.capitalize()) for value in values_to_print)
+    print(print_header)
+    printLine()
+
+    def printUsers(users):
+        for user_name in users:
+            user = findUserByName(user_name)
+            def printValues(values):
+                print_string = ""
+                for value in values:
+                    #print_value_in = userinfo[value]
+                    print_value_in = getattr(user, value)
+                    print_value = formatUserTableCell(value, print_value_in)
+                    if not print_value_in:
+                        if value == "name":
+                            print_value = formatUserTableCell("name", user.search)
+                        print_value = colors.red + print_value + colors.normal
+                    elif (value == "uid" or value == "gid" ) and not user.gid == user.uid:
+                        print_value = colors.yellow + print_value + colors.normal
+                    print_string = print_string + f"{print_value} "
+                print(print_string)
+
+
+            printValues(values_to_print)
+            #print(f"{userinfo['name']}\t{userinfo['uid']}\t{userinfo['gid']}\t{userinfo['home']}\t{userinfo['pkg_list']}")
+
+    printUsers(packages)
+    print()
+    if len(users_broken) > 0:
+        printHeader("Broken")
+        print()
+        print(print_header)
+        printLine()
+        printUsers([u.search for u in users_broken])
+
+def getUserInfo(packages):
+    setUserInfo(packages)
+    printUserInfo(packages)
+
+def checkPackageVersion(package_name_version):
+    package_name, package_version = extractPackageNameVersion(package_name_version)
+    file_path = f"/usr/src/{package_name}/install_{package_name}"
+    with open(file_path, 'r') as file:
+        for line in file:
+            line = line.strip()
+            if line.startswith("name_version="):
+                name_version = line.split("=")[1].replace('"',"")
+                name, version = extractPackageNameVersion(name_version)
+                return version
+
+
+def checkPackage(package_name, version):
+    if not package_name:
+        return "Undefined"
+
+    installed_version = None
+    printHeader(f"Checking {package_name} {version}")
+
+    print(f"Checking '{package_name}'")
+    package_name = package_name.lower()
+
+    check = "True"
+    try:
+        user_result = os.system(f"id {package_name} >/dev/null 2>&1")
+
+        if user_result == 0:
+            printSuccess("User "+package_name+" exists.")
+        else:
+            printWarning("User "+package_name+" does not exist.")
+            check = False
+    except Exception as e:
+        print(f"Error checking user: {e}")
+        check = "False"
+
+    # Check dir
+    directory = f"/usr/src/{package_name}"
+    if os.path.exists(directory):
+        printSuccess("Directory "+directory+" exists.")
+    else:
+        printWarning("Directory "+directory+" does not exist.")
+        check = "False"
+
+    # Check pkg.list file -> installed...
+    file_path = f"{directory}/pkg.lst"
+    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+        printSuccess("File "+file_path+" exists")
+    else:
+        printWarning("File "+file_path+" does not exist or is empty.")
+        check = "False"
+
+    # Check version
+    file_install = f"{directory}/install_{package_name}"
+    if os.path.exists(file_install) and os.path.getsize(file_install) > 0:
+        printSuccess("File "+file_install+" exists")
+        version_is = checkPackageVersion(package_name)
+        if not version_is == version and version is not None:
+            printWarning(f"Version mismatch: {version}")
+            check = version
+        else:
+            printSuccess(f"Version match: {version}")
+    else:
+        printWarning("File "+file_install+" does not exist or is empty.")
+
+    printLine()
+    if check == "True":
+        printSuccess("All checks passed.")
+    elif check == "False":
+        printError("Some checks failed.")
+    else:
+        printError("Version mismatch.")
+
+    return check
+
+def getPackageUrl(pkg_name, quiet):
+    # Execute the blfs_parse_find_package script with -q and store its output in the 'url' variable
+    url = ""
+    try:
+        if quiet:
+            blfs_output = subprocess.check_output(["blfs_parse_find_package", "-q", pkg_name], universal_newlines=True, stderr=subprocess.STDOUT).strip()
+        else:
+            blfs_output = subprocess.check_output(["blfs_parse_find_package", pkg_name], universal_newlines=True, stderr=subprocess.STDOUT).strip()
+        url = blfs_output
+    except subprocess.CalledProcessError as e:
+        if e.output:
+            url = e.output.strip()
+        else:
+            print(f"Error executing blfs_parse_find_package: {e}")
+            sys.exit(1)
+
+    if "not found" in url or not quiet:
+        printHeader(f"Search {pkg_name}")
+        print(url)
+
+        if "not found" in url:
+            sys.exit(0)
+    return url
+
+def fetchDependencies(url, quiet, once, tab):
+    global is_module
+    if not url:
+        return
+
+    tab_space = " " * tab
+    tab += 1
+    global get_dependencies
+    global get_not_installable
+    global ignore_list
+
+    basename = os.path.basename(url.replace(".html", ""))
+
+    if basename.startswith("xorg7#"):
+        printError("\n#################")
+        printError(f"cannot fetch {basename}")
+        get_not_installable.append(basename)
+        return
+
+    if not quiet:
+        print("\n#################")
+        print(f"{tab_space}FETCHING: ", basename)
+        print()
+    soup = None
+    deps = []
+    # Send a GET request to the URL
+    response = requests.get(url)
+
+    # Check if the request was successful (status code 200)
+    if response.status_code == 200:
+        is_module = False
+
+        # Check if pkg is a module
+        parsed_url = urlsplit(url)
+        fragment = parsed_url.fragment
+
+        # Remove URL encoding from the fragment
+        if fragment:
+            is_module = unquote(fragment)
+
+        # Parse the HTML content of the webpage
+        soup = BeautifulSoup(response.text, "html.parser")
+        if is_module:
+            soup = soup.select_one(f'div.sect2 h2.sect2 a[name="{is_module}"]').find_parent('div', class_='sect2')
+    else:
+        print(f"Failed to retrieve the webpage. Status code: {response.status_code}")
+
+    # Extract name
+    pkg_name_version = extract_package_name_full(soup).replace(" ", "-")
+
+    # Find the div element with class "package"
+
+    pg_name, version = extractPackageNameVersion(pkg_name_version)
+    pkg_name = extract_package_name(soup)
+
+    package_div = soup.find(class_="package")
+    with open(file_install_links, 'a') as file:
+        file.write(f'{pkg_name}\t{pkg_name_version}\t{url}\n')
+
+    #if once:
+    #    sys.exit(0)
+    #    return
+    
+    #get_dependencies[pkg_name_version] = deps
+    get_dependencies[pkg_name_version] = []
+    loop_pkg = pkg_name_version
+
+    if checkPackage(pkg_name, version) == "True":
+        printSuccess(f"{pkg_name} is installed")
+        return
+
+    
+    if package_div:
+        # Find all <a class="xref"> elements within <p class="required"> under the package_div
+
+        # Extract and join the titles of all found xref elements with a comma
+        def getP(required_xref_elements):
+            for xref in required_xref_elements:
+                title_full = strip_package_name_full(xref.get("title"))
+                title_full = title_full.replace(" ", "-")
+                if title_full:
+                    href = xref.get("href")
+                    # if not a local page
+                    if href.startswith("https://"):
+                        missing.append([title_full, href])
+                    else:
+                        url_new = urljoin(url, href)
+                        deps.append([title_full, url_new])
+                        check_title = False
+                        check_ignore = False
+                        for subarray in get_dependencies:
+                            if title_full in get_dependencies and not loop_pkg == subarray:
+                                check_title = True
+                        for ignore in ignore_list:
+                            if ignore.lower() in title_full.lower():
+                                printError(f"\n\n{printHeader('IGNORE')}\n\n{title_full}\n\n")
+                                check_ignore = True
+                        if not once and not check_title and not check_ignore and not ignore_deps:
+                            fetchDependencies(url_new, quiet, False, tab)
+
+        getP(package_div.select('p.required a.xref'))
+        if not ignore_recommended:
+            getP(package_div.select('p.recommended a.xref'))
+
+    get_dependencies[pkg_name_version] = deps
+
+def getDependencies(url, quiet, once):
+    global get_dependencies
+    global get_not_installable
+
+
+    if not url.startswith(("https://", "http://")):
+        url = getPackageUrl(url, True)
+
+    if not quiet:
+        printHeader("Dependencies")
+        print()
+
+    fetchDependencies(url, quiet, False, 0)
+
+    dependencies_sorted = sortDependencies(get_dependencies)
+
+    if not quiet:
+        printHeader(f"{package_name} dependencies")
+        print("DEPENDENCIES: ", dependencies_sorted)
+        print("NOT INSTALLABLE: ", get_not_installable)
+
+    return dependencies_sorted
+
+def getUrlFromDependencyFile(pkg_name):
+    with open(file_install_links, "r", encoding="utf8") as file:
+        reader = csv.reader(file, delimiter="\t")
+        for row in reader:
+            (name, name_version, url) = row
+            if name_version == pkg_name:
+                return url
+
+def getNameFromDependencyFile(pkg_name_version):
+    with open(file_install_links, "r", encoding="utf8") as file:
+        reader = csv.reader(file, delimiter="\t")
+        for row in reader:
+            (name, name_version, url) = row
+            if name_version == pkg_name_version:
+                return name
+
+def getInstallFile(pkg_name):
+    original_dir = os.getcwd()
+    file_dir = f'/tmp/packagemanager/install_files'
+    if not os.path.exists(file_dir):
+        os.makedirs(file_dir)
+    os.chdir(file_dir)
+
+    url = getUrlFromDependencyFile(pkg_name)
+
+    print("URL: ", url)
+    try:
+        subprocess.check_output(['blfs_parse_page', url], universal_newlines=True, stderr=subprocess.STDOUT).strip()
+    except subprocess.CalledProcessError as e:
+        print("Error getInstallFile:", e)
+        sys.exit(0)
+
+    os.chdir(original_dir)
+
+def getInstallPkgCommands(pkg_name):
+    global install_command
+    global soup_global
+
+    name, version = extractPackageNameVersion(pkg_name)
+    name = getNameFromDependencyFile(pkg_name)
+    install_file = f'/tmp/packagemanager/install_files/install_{pkg_name}'
+    printHeader(f"Get Install file {pkg_name}")
+    print()
+    if not os.path.isfile(install_file):
+        print(f"Cannot find install file {install_file}")
+        #sys.exit(0)
+    print(f"{install_file}")
+    #askYesNoQuestion("Do you wish to continue?")
+    try:
+        subprocess.run(["bash", "-n", install_file], check=True)
+        printSuccess(f'\n–––––––––––––––––––––––––––––––––––––')
+        printSuccess("\nBash script syntax is valid.")
+    except subprocess.CalledProcessError as e:
+        printError(f'\n–––––––––––––––––––––––––––––––––––––')
+        printError("\n!!! Error in Bash script syntax !!!")
+        if e.stderr is not None:
+            print(e.stderr)
+        print("Recheck the file!")
+        print(f"{install_file}")
+    install_command = install_command + f"packagemanager_install {name.lower()} {install_file};\n"
+    
+
+install_check_run = 0
+def installCheck(package_name_version, dependencies, ignore_check):
+    global install_check_run
+    install_check_run  = install_check_run + 1
+
+    printHeader("Install")
+    # get dependencies
+    package_name = getNameFromDependencyFile(package_name_version)
+    name, version = extractPackageNameVersion(package_name_version)
+    if not package_name:
+        package_name = name
+    add_missing = None
+    if checkPackage(package_name, version) == "True" and not ignore_check:
+        printLine()
+        printError(f"{package_name} is already installed")
+        if install_check_run == 1:
+            if askYesNoQuestion(f"do you want to go on anyways?"):
+                add_missing = package_name_version
+            else:
+                exit(1)
+    printLine()
+    # check dependencies
+    installed, missing, version_mismatch = checkInstalledDependencies(dependencies, ignore_check)
+    if add_missing:
+        installed.append(add_missing)
+    printHeader("Dependencie summary:")
+    printSuccess(f"Installed: {installed}")
+    printError(f"Missing: {missing}")
+    printWarning(f"Version mismatch: {version_mismatch}")
+
+    return installed, missing, version_mismatch
+
+def installMissing(pkgs):
+    printHeader("Install missing pkgs")
+
+    print(pkgs)
+    for pkg in pkgs:
+        getInstallFile(pkg)
+        getInstallPkgCommands(pkg)
+
+def installCycle(package_name):
+    global package_reinstall
+
+    url = ""
+
+    # Check if the URL is not a webpage (doesn't start with "https://" or "http://")
+    if not package_name.startswith(("https://", "http://")):
+        url = getPackageUrl(package_name, True)
+
+    # get global soup
+    getPkgSoup(url)
+
+    if not package_reinstall:
+        dependencies = getDependencies(url, False, False)
+        installed, missing, version_mismatch = installCheck(package_name, dependencies, False)
+    else:
+        dependencies = getDependencies(url, False, True)
+        installed, missing, version_mismatch = installCheck(package_name, dependencies, True)
+
+    installMissing(missing)
+    print(install_command)
+
+def listPackage(packages):
+    for package_name in packages:
+        if package_name == "all" and len(packages) == 1:
+            listAllUsers()
+            return
+
+        print()
+        printLine()
+        printHeader(f"List {package_name}")
+
+
+def listAllUsers():
+    print()
+    printLine()
+    printHeader(f"List all found in /usr/src")
+    print()
+    directory_names = None
+    directory_names = sorted([d for d in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, d))])
+    directory_names = directory_names[::-1]
+    longest_name = len(max(directory_names, key=len))
+    num_columns = 3
+    c = 0
+    row_str = ""
+    a_break = 0
+    for d_name in directory_names:
+        c = c+1
+        if d_name and d_name[0].lower() == "a":
+            a_break = 1
+
+        if a_break == 1 and d_name[0].lower() != "a":
+            a_break = 2
+            row_str = row_str + f"\n{printLine()}\n"
+            c = 1
+        row_str = row_str + "" + d_name.ljust(longest_name+1)
+        if c % num_columns == 0: 
+            row_str = row_str + "\n"
+
+    print(row_str)
+    printLine()
+    print(f"Total:   {len(directory_names)}")
+    print(f"Strange: {c}")
+    return directory_names
+
+def reloadPkgList(package_name):
+    print()
+    printLine()
+    printHeader(f"Reload pkg list {package_name}")
+    print()
+    #setUserInfo([package_name])
+
+    package_dir = os.path.join(base_dir, package_name)
+    if os.path.exists(package_dir):
+        # Execute the bash command and redirect output to pkg.lst.new file
+        command = f"list_package {package_name} 2>&1 | tee /tmp/pkg.lst.new && cp {package_dir}/pkg.lst.new {package_dir}/pkg.lst"
+        subprocess.run(command, shell=True, check=True)
+        print(f"Command executed successfully for {package_name}.")
+    else:
+        print(f"Directory {package_dir} does not exist.")
+
+
+def findFilesOrFoldersWithBrokenGidOrUid():
+    def print_find(file):
+        print(file)
+
+    def findFilesWithInvalidIds(root_dir, ignored_paths):
+        invalid_files = []
+
+        for foldername, subfolders, filenames in os.walk(root_dir):
+            ignore_flag = False
+            for ignored_path in ignored_paths:
+                if foldername.startswith(ignored_path):
+                    ignore_flag = True
+                    break
+            if ignore_flag:
+                continue
+
+            for filename in filenames:
+                file_path = os.path.join(foldername, filename)
+
+                try:
+                    file_stat = os.lstat(file_path)  # Use os.lstat() instead of os.stat() for symlinks
+                    uid = file_stat.st_uid
+                    gid = file_stat.st_gid
+
+                    try:
+                        pwd.getpwuid(uid)
+                        grp.getgrgid(gid)
+                    except (KeyError, OverflowError):
+                        invalid_files.append(file_path)
+                        print_find(file_path)
+
+                except (FileNotFoundError, PermissionError):
+                    invalid_files.append(file_path)
+                    print_find(file_path)
+
+        return invalid_files
+
+    root_directory = '/'
+    ignored_paths = [ '/mnt', '/proc']
+    invalid_files = findFilesWithInvalidIds(root_directory, ignored_paths)
+
+    print()
+    print(invalid_files)
+
+    # Write invalid files to a file in /tmp directory
+    output_file_path = '/tmp/invalid_files.txt'
+    with open(output_file_path, 'w') as output_file:
+        for file_path in invalid_files:
+            output_file.write(file_path + '\n')
+
+    # Inform user about the output file
+    print(f'\nInvalid files list written to: {output_file_path}\n')
+    return invalid_files
+
+
+if __name__ == "__main__":
+    ignore_list
+
+    parser = argparse.ArgumentParser(description="Package Manager")
+    parser.add_argument("command", choices=["info", "install", "reload-pkg-list", "remove", "check", "search", "dependencies", "list", "files_with_broken_id"], help="Usage: packagemanager check <package_name>")
+    parser.add_argument("packages", nargs='+', default=None, help="Packages to operate on")
+    parser.add_argument("-r", "--reinstall", action="store_true", help="reinstall")
+    parser.add_argument("-i", "--ignore", help="List of items to ignore, separated by commas")
+    parser.add_argument("-e", "--ignore-recommended", action="store_true", help="Ignore recommended packages")
+    parser.add_argument("-f", "--force", action="store_true", help="ignores dependencies")
+    parser.add_argument("-name", action="store_true", help="Specify name parameter for info")
+    parser.add_argument("-uid", action="store_true", help="Specify uid parameter for info")
+    parser.add_argument("-gid", action="store_true", help="Specify home parameter for info")
+    parser.add_argument("-pkg-list", action="store_true", help="Specify pkg-list parameter for info")
+    parser.add_argument("-home", action="store_true", help="Specify home parameter for info")
+
+    # print(args.reinstall)
+    args = parser.parse_args()
+    packages = args.packages
+
+    if args.ignore:
+        ignore_list = args.ignore.split(",")
+    if not ignore_list:
+        ignore_list = ""
+
+    #package_name = args.package.replace(" ","-")
+
+    if args.reinstall:
+        package_reinstall = True
+
+    if args.force:
+        ignore_deps = True
+    if args.ignore_recommended:
+        ignore_recommended = True
+
+    if args.command == "files_with_broken_id":
+        findFilesOrFoldersWithBrokenGidOrUid()
+    elif args.command == "reload-pkg-list":
+        for package_name in packages:
+            reloadPkgList(package_name)
+    elif args.command == "info":
+        getUserInfo(packages)
+    elif args.command == "list":
+        listPackage(packages)
+    elif args.command == "check":
+        checkPackage(package_name, None)
+    elif args.command == "install":
+        for package_name in packages:
+            installCycle(package_name)
+        if len(get_not_installable) > 0:
+            print("NOT INSTALLABLE: ", get_not_installable)
+    elif args.command == "dependencies":
+        for package_name in packages:
+            getDependencies(package_name, False, False)
+    elif args.command == "search":
+        for package_name in packages:
+            getPackageUrl(package_name, False)
+    else:
+        printError("Usage: packagemanager check <package_name>")
+        sys.exit(1)
+

@@ -1,0 +1,97 @@
+#!/bin/python3
+
+import os
+import requests
+from bs4 import BeautifulSoup
+import tempfile
+
+
+base_url = "https://www.linuxfromscratch.org/blfs/view/12.0/"
+main_index_url = f"{base_url}index.html"
+base_dir = tempfile.mkdtemp()
+print(base_dir)
+
+class ChapterInfo:
+    def __init__(self):
+        self.chapter_name = ""
+        self.chapter_link = ""
+        self.chapter_pages = []
+
+# Create the 'downloaded_pages' directory if it doesn't exist
+if not os.path.exists(base_dir):
+    os.makedirs(base_dir)
+
+response = requests.get(main_index_url)
+if response.status_code == 200:
+    # Save the HTML content to a file
+    with open(f"{base_dir}/index.html", "w", encoding="utf-8") as file:
+        file.write(response.text)
+
+    # Create a BeautifulSoup object
+    soup = BeautifulSoup(response.text, 'html.parser')
+
+    chapters = []
+    for part in soup.select('div.book div.toc li.part'):
+        for chapter in part.select('li.chapter'):
+            chapter_info = ChapterInfo()
+            h4 = chapter.find('h4')
+            if h4:
+                chapter_info.chapter_name = ' '.join(h4.a.get_text(strip=True).split())
+                chapter_info.chapter_link = h4.a['href']
+
+            ul = chapter.find('ul')
+            if ul:
+                chapter_info.chapter_pages = [(' '.join(a.get_text(strip=True).split()), a['href']) for a in ul.select('li a')]
+            
+            chapters.append(chapter_info)
+
+
+
+    for chapter in chapters:
+        print("Chapter Name:", chapter.chapter_name)
+        print("Chapter Link:", chapter.chapter_link)
+        print("Chapter Pages:")
+
+        chapter_url = base_url + chapter.chapter_link
+        chapter_response = requests.get(chapter_url)
+
+        if chapter_response.status_code == 200:
+            # Create a directory for the chapter
+            chapter_file = os.path.join(base_dir, chapter.chapter_link)
+            chapter_dir = os.path.dirname(chapter_file)
+            print("1#################")
+            print(chapter_file)
+            print(chapter_dir)
+            print("2#################")
+
+            if not os.path.exists(chapter_dir):
+                os.makedirs(chapter_dir)
+
+            # Save the chapter page content
+            print(f"CH: {chapter_dir}")
+            with open(chapter_file, "wb") as f:
+                f.write(chapter_response.content)
+
+            # Download and save chapter pages
+            for page_name, page_link in chapter.chapter_pages:
+                print(f"{page_name}\t{page_link}")
+                page_url = base_url + page_link
+                page_response = requests.get(page_url)
+
+                if page_response.status_code == 200:
+                    page_file = os.path.join(base_dir, page_link)
+                    page_dir = os.path.dirname(page_file)
+                    os.makedirs(page_dir, exist_ok=True)
+
+                    with open(page_file, "wb") as f:
+                        f.write(page_response.content)
+
+
+else:
+    print(f"Failed to fetch the page. Status code: {response.status_code}")
+
+
+print()
+print(base_dir)
+#shutil.rmtree(base_dir)
+#print("Temporary directory deleted.")

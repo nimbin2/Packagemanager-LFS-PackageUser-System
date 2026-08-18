@@ -1,0 +1,542 @@
+#!/usr/bin/python3
+
+##### just do wget if pkg is not there
+##### remove pkg_dir if it exist before unpacking tar
+
+
+
+import argparse
+import requests
+from bs4 import BeautifulSoup, Tag
+from urllib.parse import urlparse, urlsplit, unquote
+import re
+import os
+import sys
+import subprocess
+
+# Global variable to hold the BeautifulSoup object
+soup = None
+
+
+soup = None
+extract_name = None
+extract_name_version = None
+is_module = False
+
+def fetch_webpage(url):
+    global soup, extract_name, extract_name_version, is_module
+    
+    # If there is a fragment in the URL, use it to find the specific div.sect2
+    if is_module:
+        extract_name = is_module
+
+        # Send a GET request to the URL without the fragment
+        url_without_fragment = url.split("#")[0]
+        response = requests.get(url_without_fragment)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+            
+            # Search for the specific div.sect2 using the criteria you mentioned
+            soup = soup.select_one(f'div.sect2 h2.sect2 a[name="{is_module}"]').find_parent('div', class_='sect2')
+            
+            # Check if there's an h2.sect2 > a#asciidoc within the div.sect2
+        else:
+            print(f"Failed to retrieve the webpage. Status code: {response.status_code}")
+    else:
+        # Handle the case where there's no fragment in the URL (your original logic)
+        response = requests.get(url)
+        
+        if response.status_code == 200:
+            soup = BeautifulSoup(response.text, "html.parser")
+        else:
+            print(f"Failed to retrieve the webpage. Status code: {response.status_code}")
+
+
+def strip_package_name_full(name):
+    return re.sub("\(.*","",name).strip()
+
+def extractPackageNameFull():
+    global soup
+    # Find the div element with class "sect1" followed by h1 with class "sect1"
+    div_element = None
+    if is_module:
+        div_element = soup.select_one('h2.sect2')
+    else:
+        div_element = soup.select_one('h1.sect1')
+
+    if div_element:
+        # Extract and return the content within the div
+        content = div_element.get_text().strip()
+        return strip_package_name_full(content)
+    else:
+        print(f"extractPackageNameFull: nothing found")
+        return ""
+
+
+def extractPackageName():
+    global soup
+    name_link = None
+    if is_module:
+        name_link = soup.select_one("h2.sect2 > a")
+    else:
+        name_link = soup.select_one("h1.sect1 > a")
+    name = name_link['name']
+    parts = name.split("-")
+    if len(parts) > 1 and parts[-1].replace(".","").isdigit():
+        return "-".join(parts[:-1])
+    else:
+        return name
+
+def extractPackageNameVersion(package_string):
+    version_pattern = r'-(\d+(\.\d+)+)$'
+    match = re.search(version_pattern, package_string)
+
+    if match:
+        package_name_without_version = package_string[:match.start()]
+        package_version = match.group(1)
+        return package_name_without_version, package_version
+    else:
+        return package_string, None
+
+def extract_package_link():
+    global soup
+    # Find the div element with class "package"
+    package_div = soup.find(class_="package")
+
+    if package_div:
+        # Find all <a class="ulink"> elements within the div
+        ulink_elements = package_div.select('div.itemizedlist a.ulink')
+
+        if ulink_elements:
+            for ulink_element in ulink_elements:
+                href = ulink_element.get("href")
+                if href and href.startswith("https"):
+                    return href
+
+            # If no HTTPS link is found, return the first one
+            first_href = ulink_elements[0].get("href")
+            return first_href
+
+    print(f"extract_package_link: nothing found")
+    return ""
+
+def extract_package_md5():
+    global soup
+    # Find the div element with class "package"
+    package_div = soup.find(class_="package")
+
+    if package_div:
+        itemizedlists = package_div.find_all("div", class_="itemizedlist")
+        md5_sum = ""
+
+        for itemizedlist in itemizedlists:
+            md5_p = itemizedlist.find("p", string=re.compile(r'\sDownload MD5 sum:\s*', re.IGNORECASE))
+            if md5_p:
+                # Extract the text after "*Download MD5 sum:*" and remove any line breaks or leading/trailing spaces
+                md5_sum = md5_p.get_text()
+                md5_sum = re.sub(r'Download MD5 sum:', '', md5_sum, flags=re.IGNORECASE).strip().replace('\n', ' ')
+
+                # Break after finding the first matching element
+                break
+
+        return md5_sum
+    else:
+        print(f"extract_package_md5: nothing found")
+        return None
+
+def extract_additional_downloads():
+    global soup
+    # Find the div element with class "package"
+    package_div = soup.find(class_="package")
+
+    if package_div:
+        content = []
+        h3_additional_downloads = package_div.find("h3", string=re.compile(r'\s*Additional Downloads\s*'))
+        h3_dependencies = package_div.find("h3", string=re.compile(r'\s* Dependencies\s*'))
+
+
+        #if h3_additional_downloads and h3_dependencies:
+        if h3_additional_downloads:
+            ulink_elements = []
+            content = []
+
+            # Iterate through siblings of h3_additional_downloads until h3_dependencies is found
+            current_element = h3_additional_downloads.find_next_sibling()
+            while current_element and current_element != h3_dependencies:
+                # Find all <a> elements with class "ulink" within current_element
+                ulinks = current_element.find_all("a", class_="ulink")
+                for ulink in ulinks:
+                    link = ulink.get("href")
+                    if link:
+                        content.append(link)
+                current_element = current_element.find_next_sibling()
+
+            return content
+        else:
+            print(f"extract_additional_downloads: nothing found")
+            return []
+    else:
+        print(f"extract_additional_downloads: nothing found")
+        return []
+
+
+
+def extract_package_info():
+    global soup
+    # Find the element with class "package"
+    package_element = soup.find(class_="package")
+
+    if package_element:
+        # Find all p elements between "sect2" and the h3 element with content "Package Information"
+        sect2_element = None
+        if is_module:
+            sect2_element = package_element.find(class_="sect3")
+        else:
+            sect2_element = package_element.find(class_="sect2")
+
+        if sect2_element:
+            package_info = []
+            p_content = ""
+            break_div = "h3"
+            if is_module:
+                break_div = "h4"
+
+            for element in sect2_element.next_siblings:
+                if element.name == break_div and "Package Information" in element.text:
+                    break
+                if element.name == "p":
+                    p_content = p_content + '\\n\\n' + ' '.join(line.strip() for line in element.text.strip().splitlines())
+
+            package_info.append(p_content.replace('"', '\\"'))
+            # Return the extracted package information as a single string
+            extracted_info = '\n'.join(package_info).lstrip("\\n")
+            return extracted_info
+        else:
+            print(f"extract_package_info: nothing found")
+    else:
+        print(f"extract_package_info: nothing found")
+        return ""
+
+def extract_package_required_pks():
+    global soup
+    # Find the div element with class "package"
+    package_div = soup.find(class_="package")
+
+    if package_div:
+        # Find all <a class="xref"> elements within <p class="required"> under the package_div
+        required_xref_elements = package_div.select('p.required a.xref')
+
+        # Extract and join the titles of all found xref elements with a comma
+        titles = [xref.get("title").replace(" ","-") for xref in required_xref_elements if xref.get("title")]
+
+        if titles:
+            return titles
+        else:
+            print(f"extract_package_required_pks: nothing found")
+            return []
+    else:
+        print(f"extract_package_required_pks: nothing found")
+        return []
+
+def extract_package_recommended_pks():
+    global soup
+    # Find the div element with class "package"
+    package_div = soup.find(class_="package")
+
+    if package_div:
+        # Find all <a class="xref"> elements within <p class="required"> under the package_div
+        required_xref_elements = package_div.select('p.recommended a.xref')
+
+        # Extract and join the titles of all found xref elements with a comma
+        titles = [xref.get("title").replace(" ","-") for xref in required_xref_elements if xref.get("title")]
+
+        if titles:
+            return titles
+        else:
+            return []
+            print(f"extract_package_recommended_pks: nothing found")
+    else:
+        print(f"extract_package_recommended_pks: nothing found")
+        return []
+
+def extract_package_optional_pks():
+    global soup
+    # Find the div element with class "package"
+    package_div = soup.find(class_="package")
+
+    if package_div:
+        # Find all <a class="xref"> elements within <p class="required"> under the package_div
+        required_xref_elements = package_div.select('p.optional a.xref')
+
+        # Extract and join the titles of all found xref elements with a comma
+        titles = [xref.get("title").replace(" ","-") for xref in required_xref_elements if xref.get("title")]
+
+        if titles:
+            return titles
+        else:
+            print(f"extract_package_optional_pks: nothing found")
+            return []
+    else:
+        print(f"extract_package_optional_pks: nothing found")
+        return []
+
+def extract_package_installed_content():
+    global soup
+    # Find all div.seg within div.sect1 > div.content > div.seglistitem
+    seglistitems = None
+    if is_module:
+        seglistitems = soup.select('div.content div.seglistitem')
+    else:
+        seglistitems = soup.select('div.sect1 > div.content div.seglistitem')
+
+    content_dict = {}
+
+    for seglistitem in seglistitems:
+        segs = seglistitem.find_all("div", class_="seg")
+
+        for seg in segs:
+            segtitle = seg.find("strong", class_="segtitle")
+            segbody = seg.find("span", class_="segbody")
+
+            if segtitle and segbody:
+                segtitle_text = segtitle.get_text().strip().lower().replace(" ", "_").replace(":","")
+                segbody_text = ' '.join(segbody.get_text().split())  # Remove multiple spaces and newlines
+
+                content_dict[segtitle_text] = segbody_text.replace(" and "," ")
+
+    return content_dict
+
+def extract_package_commands(class_names):
+    global soup
+    # Find the div element with class "installation"
+    #command_div = soup.find(class_=class_names)
+    command_div = soup.select(class_names + " >*")
+
+    if command_div:
+        contents = []
+
+        # Iterate through the elements within div.installation
+        for element in command_div:
+            if element.name == "h2":
+                d_content = "\n\n\n#### " + ''.join(line.strip() for line in element.get_text().splitlines()).replace('\n', '') + "\n"
+                contents.append(d_content)
+            elif element.name == "h3":
+                d_content = "\n\n### " + ''.join(line.strip() for line in element.get_text().splitlines()).replace('\n', '')
+                contents.append(d_content)
+            elif element.name == "h4":
+                d_content = "\n\n## " + ''.join(line.strip() for line in element.get_text().splitlines()).replace('\n', '')
+                contents.append(d_content)
+            elif element.name == "p":
+                # If it's a <p> element, add its text content with "# " prefix
+                p_content = ' '.join(line.strip() for line in element.get_text().splitlines()).replace('\n', ' ')
+                p_content = "\n\n# " + p_content.strip() + "\n"
+                contents.append(p_content)
+            elif element.name == "pre":
+                kbd_command = element.find("kbd", class_="command")
+                if kbd_command:
+                    # If it's a <pre><kbd class="command"> element, add its text content
+                    contents.append(kbd_command.get_text().strip())
+            elif element.name == "div":
+                element_classes = element.get("class", [])
+                if isinstance(element, Tag) and "admon" in element.get("class", []):
+                    element_classes.remove("admon")
+                    contents.append("\n#### " + ''.join([element.upper() for element in element_classes]) + " ####")
+                    for element_admon in element:
+                        if element_admon.name == "p":
+                            lines = []
+                            # Iterate through the contents of the p element
+                            for item in element_admon.contents:
+                                if isinstance(item, str):
+                                    # If it's a text node (not a child element), strip leading and trailing whitespace
+                                    line = re.sub(r'\s+', ' ', item.strip())
+                                    if line:
+                                        lines.append(line)
+                                elif item.name:  # If it's a child element (has a name)
+                                    # Add the content of the child element without leading/trailing whitespace
+                                    child_text = item.get_text().strip()
+                                    child_text  = re.sub(r'\s+', ' ', child_text)
+                                    if child_text:
+                                        lines.append(child_text)
+
+                            # Join the lines into a single string, replacing line breaks with spaces
+                            content_str = ' '.join(lines)
+                            contents.append("## " + content_str.replace(" , ", ", "))
+                            contents.append("")
+                    
+
+
+        if contents:
+            joined_contents = '\n'.join(contents)
+            return joined_contents
+        else:
+            print(f"extract_package_commands({class_names}): nothing found")
+            return ""
+    else:
+        print(f"extract_package_commands({class_names}): nothing found")
+        return ""
+
+def extract_classnames_between_package_and_installation():
+    global soup
+    # Find the div element with class "sect1"
+    sect1_div = soup.find("div", class_="sect1")
+
+    if sect1_div:
+        installation_div = sect1_div.find("div", class_="package")
+        configuration_div = sect1_div.find("div", class_="installation")
+
+        if installation_div and configuration_div:
+            # Find all siblings of div.installation that are on the same level
+            elements_between = []
+
+            for sibling in installation_div.next_siblings:
+                if sibling == configuration_div:
+                    break
+
+                if sibling.name:
+                    elements_between.append(sibling["class"])
+
+            if elements_between:
+                classnames = [classname for element_classes in elements_between for classname in element_classes]
+                return classnames
+
+def format_array_to_bash_array(input_array):
+    formatted_elements = " ".join([f"'{element}'" for element in input_array])
+    return f'({formatted_elements})'
+
+if __name__ == "__main__":
+    install_groups = []
+    # get url from arguments
+    parser = argparse.ArgumentParser(description="Fetch data from a URL")
+    parser.add_argument("url", help="URL of the webpage to fetch")
+
+    args = parser.parse_args()
+    url = args.url
+
+    # Check if pkg is a module
+    parsed_url = urlsplit(url)
+    fragment = parsed_url.fragment
+    
+    # Remove URL encoding from the fragment
+    if fragment:
+        is_module = unquote(fragment)
+        install_groups.append(os.path.basename(parsed_url.path.strip('/')).replace(".html", ""))
+
+    #url = "https://www.linuxfromscratch.org/blfs/view/12.0/x/qt5.html"
+    #url = "https://www.linuxfromscratch.org/blfs/view/12.0/xsoft/libreoffice.html"
+    #url = "https://www.linuxfromscratch.org/blfs/view/12.0/postlfs/mitkrb.html"
+    
+    # Fetch the webpage and parse it
+    fetch_webpage(url)
+
+    print(f'\n\n–––––––––––––––––––––––––––––––––––––\n')
+    print(f'Getting content\n')
+
+    if extract_name_version is None:
+        extract_name_version = extractPackageNameFull()
+
+    # Get the extract_name
+    if extract_name is None:
+        extract_name, extracted_version = extractPackageNameVersion(extract_name_version)
+    extract_name = extractPackageName()
+    # Convert extract_name to lowercase
+    extract_name_lower = extract_name.lower()
+
+    # Define the filename
+    filename = f"install_{extract_name_version}"
+
+    pkg_link = extract_package_link()
+    pkg_name = basename = os.path.basename(pkg_link)
+    
+    installed_content = extract_package_installed_content()
+    # Extract the keys from the dictionary
+    installed_content_formatted_keys = [f'"{key.rstrip(":")}"' for key in installed_content.keys()]
+
+    # Create the first string
+    installed_content_a = f"installed_content=({' '.join(installed_content_formatted_keys)})"
+
+    # Create the second string by joining the values of the dictionary
+    installed_content_b = '\n'.join([f'{key}="{value}"' for key, value in installed_content.items()])
+
+    installation_command = extract_package_commands("div.installation")
+
+    installation_configuration = extract_package_commands("div.configuration >div.sect3")
+
+    classnames_between_package_and_installation = extract_classnames_between_package_and_installation()
+
+    # Open the file for writing
+    with open(filename, "w") as script_file:
+        # Write the script content to the file
+        script_file.write(f'#!/bin/bash\n\n')
+        script_file.write(f'############################################\n### {extract_name_version}\n\n')
+        script_file.write(f'url="{url}"\n')
+        script_file.write(f'name="{extract_name}"\n')
+        script_file.write(f'name_version="{extract_name_version}"\n')
+        script_file.write(f'link="{pkg_link}"\n')
+        script_file.write(f'pkg="{pkg_name}"\n')
+        script_file.write(f'pkg_dir="" # this is getting set within the script\n')
+        script_file.write(f'md5_sum="{extract_package_md5()}"\n')
+        script_file.write(f'additional_links={format_array_to_bash_array(extract_additional_downloads())}\n')
+        script_file.write(f'info="{extract_package_info()}"\n')
+        script_file.write(f'required={format_array_to_bash_array(extract_package_required_pks())}\n')
+        script_file.write(f'recommended={format_array_to_bash_array(extract_package_recommended_pks())}\n')
+        script_file.write(f'optional={format_array_to_bash_array(extract_package_optional_pks())}\n')
+        script_file.write(f'{installed_content_a}\n')
+        script_file.write(f'{installed_content_b}\n')
+        if is_module:
+            script_file.write(f'install_groups={format_array_to_bash_array(install_groups)}\n')
+
+        script_file.write(f'\n\n')
+        script_file.write(f'install_pkg() {{\n')
+        if classnames_between_package_and_installation:
+            script_file.write(f'#### BEFORE INSTALLATION ####\n\n')
+            for b_package in classnames_between_package_and_installation:
+                bc_package = "div." + b_package
+                script_file.write(f'{extract_package_commands(bc_package)}\n')
+            script_file.write(f'#### BEFORE INSTALLATION DONE ####\n\n')
+        script_file.write(f'#### INSTALLATION ####\n\n')
+        script_file.write(f'# Get tar/zip\n')
+        script_file.write(f'[ -f "$pkg" ] || wget -4 $link\n\n')
+        script_file.write(f'# Check md5sum\n')
+        script_file.write(f'if ! grep -wq "$md5_sum" <<< $(md5sum $pkg); then\n\techo "ERROR: md5sum check failed" && exit\nfi\n\n')
+        script_file.write(f'# Get additional links\n')
+        # LAST WORKED HERE:
+        script_file.write('for li in "${additional_links[@]}"; do wget -4 "$li"; done\n\n')
+        if not re.search(fr"^tar .* {re.escape(pkg_name)} .*", installation_command):
+            script_file.write(f'# Unpack tar/zip and get pkg_dir variable\n')
+            script_file.write(f'rm -rf tmp && mkdir tmp && cd tmp\n')
+            if pkg_name.endswith(".zip"):
+                script_file.write(f'unzip ../$pkg &&\nif [ "$(ls | wc -w)" = "1" ]; then\n\tpkg_dir="$(ls)"; [ -d ../$pkg_dir ] && rm -rf ../$pkg_dir; cd .. && mv tmp/* . && rm -r tmp\nelse\n\tcd ..\n\t[ -d $name_version ] && rm -rf $name_version\n\tmv tmp $name_version\n\tpkg_dir=$name_version\nfi\n')
+            elif pkg_name.endswith((".tar", ".tgz", ".tar.gz", ".tar.bz2", ".tar.xz")):
+                script_file.write(f'tar -xvf ../$pkg && if [ "$(ls | wc -w)" = "1" ]; then\n\tpkg_dir="$(ls)";\nelse\n\techo "ERROR: unpacked tar leaves unknown directory: \\"$(ls)\\"" && exit;\nfi &&\ncd ..\n[ -d $pkg_dir ] && rm -rf $pkg_dir\nmv tmp/* . && rm -r tmp\n')
+            script_file.write(f'cd $pkg_dir\n')
+        script_file.write(f'{installation_command}\n')
+        script_file.write(f'\n#### INSTALLATION DONE ####\n\n')
+        script_file.write(f'}}\n\n')
+        if installation_configuration:
+            script_file.write(f'\nconfigure_pkg() {{\n')
+            script_file.write(f'\n#### CONFIGURATION ####\n\n')
+            script_file.write('echo "## Configuration"\n\n')
+            script_file.write(f'{installation_configuration}\n')
+            script_file.write(f'\n#### CONFIGURATION DONE ####\n\n')
+            script_file.write(f'}}\n\n')
+        script_file.write(f'if [[ "$1" == "install" ]]; then install_pkg; else echo -e "you may want to run\\n$0 install"; fi\n')
+        if installation_configuration:
+            script_file.write(f'if [[ "$1" == "install" ]]; then configure_pkg; fi')
+        # script_file.write(f'cd ..; llist_package $(whoami) > pkg.lst 2>&1 & disown')
+
+
+    print(f'\n\n–––––––––––––––––––––––––––––––––––––')
+    print(f'\nSuccessfully created {filename}')
+    # Check the syntax of the script without executing it
+    try:
+        subprocess.run(["bash", "-n", filename], check=True)
+        print(f'\n–––––––––––––––––––––––––––––––––––––')
+        print("\nBash script syntax is valid.")
+    except subprocess.CalledProcessError as e:
+        print(f'\n–––––––––––––––––––––––––––––––––––––')
+        print("\n!!! Error in Bash script syntax !!!")
+        if e.stderr is not None:
+            print(e.stderr)
+    print(f'\n–––––––––––––––––––––––––––––––––––––')
+    print(f'\nFile path: {filename}')

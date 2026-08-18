@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+
+import sys
+import requests
+import re
+from bs4 import BeautifulSoup
+
+blfs_version = "svn"
+
+def extract_package_info(package_string):
+    version_pattern = r'-(\d+(\.\d+)*)$'
+    match = re.search(version_pattern, package_string)
+
+    if match:
+        package_name_without_version = package_string[:match.start()]
+        package_version = match.group(1)
+        return package_name_without_version, package_version
+    else:
+        return package_string, None
+
+def get_package_name(url):
+    response = requests.get(url)
+    
+    if response.status_code != 200:
+        return "Error: Unable to fetch the webpage"
+
+    soup_n = BeautifulSoup(response.content, 'html.parser')
+    name_link = soup_n.select_one("h1.sect1 > a")
+    #name_link = soup_n.select_one("div.sect1 > h1.sect1 > a")
+    return name_link['name']
+
+def find_packages(package_name):
+    url = f"https://www.linuxfromscratch.org/blfs/view/{blfs_version}/"
+    response = requests.get(url)
+    
+    if response.status_code != 200:
+        return "Error: Unable to fetch the webpage"
+
+    soup = BeautifulSoup(response.content, 'html.parser')
+    package_name = package_name.lower()
+    
+    results = []
+    for package_link in soup.select("li.chapter > ul > li > a"):
+        link_text = package_link.text.strip().lower().replace(" ","-")
+        if package_name in link_text:
+            package_title = package_link.find_previous("h4").text
+            package_title = re.sub(r'\s+', ' ', package_title.strip())
+            # package_found_name = package_link['name']
+            package_url = f"https://www.linuxfromscratch.org/blfs/view/{blfs_version}/{package_link['href']}"
+            package_found_name = get_package_name(package_url)
+            results.append((package_title, package_found_name, package_url))
+    
+    if results:
+        return results
+    else:
+        return "Package not found on the page"
+
+if __name__ == "__main__":
+
+    # Initialize the quiet flag to False
+    quiet = False
+
+    if len(sys.argv) == 1:
+        print("Find packages by name")
+        print("       blfs_parse_find_package {package_name}")
+        print("Find exact package name and return url")
+        print("       blfs_parse_find_package -q {package_name}")
+        sys.exit(1)
+
+    # Check if -q was passed as a parameter
+    if "-q" in sys.argv:
+        quiet = True
+        # Remove the "-q" parameter from sys.argv
+        sys.argv.remove("-q")
+
+    if len(sys.argv) != 2:
+        print("Usage: script.py [-q] <package_name>")
+        sys.exit(1)
+
+    package_name = sys.argv[1].replace(" ","-")
+    found_packages = find_packages(package_name)
+
+    if isinstance(found_packages, list):
+        if not quiet:
+            for package in found_packages:
+                print(f"Title: {package[0]}")
+                print(f"Name:  {package[1]}")
+                print(f"Link:  {package[2]}\n")
+        else:
+            for package in found_packages:
+                name, version = extract_package_info(package[1])
+                if name.lower() == package_name.lower():
+                    print(package[2])
+                    sys.exit(1)
+            print(found_packages[0][2])
+            sys.exit(0)
+            
+    else:
+        print(found_packages)
