@@ -1385,10 +1385,15 @@ def render_script(data, source_url):
             w('\tunzip ../"$pkg"')
         else:
             w('\ttar -xf ../"$pkg"')
-        w('\tif [ "$(ls | wc -w)" = "1" ]; then pkg_dir="$(ls)";')
-        w('\telse pkg_dir="$name_version"; fi')
-        w('\tcd .. && [ -d "$pkg_dir" ] && rm -rf "$pkg_dir"')
-        w('\tif [ "$(ls tmp | wc -w)" = "1" ]; then mv tmp/* . ; else mv tmp "$pkg_dir"; fi')
+        # move the extracted tree to a clean $pkg_dir in BUILD_ROOT.  Move the
+        # single top-level dir *explicitly* to $pkg_dir -- never `mv tmp/* .`,
+        # which would nest it inside an existing same-named dir.
+        w('\tif [ "$(ls | wc -w)" = "1" ] && [ -d "$(ls)" ]; then')
+        w('\t\tinner="$(ls)"; pkg_dir="$inner"')
+        w('\t\tcd .. && rm -rf "$pkg_dir" && mv "tmp/$inner" "$pkg_dir"')
+        w('\telse')
+        w('\t\tpkg_dir="$name_version"; cd .. && rm -rf "$pkg_dir" && mv tmp "$pkg_dir"')
+        w('\tfi')
         w('\trm -rf tmp')
         w('\techo "unpacked into $BUILD_ROOT/$pkg_dir"')
     w("#### UNPACK DONE ####")

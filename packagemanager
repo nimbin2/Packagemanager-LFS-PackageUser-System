@@ -1031,7 +1031,7 @@ def cmd_nimgnu_delete(args):
 #                  group-writable so package-users can add files, sticky so they
 #                  can't remove each other's.  Files stay user:user (install is
 #                  a supplementary group), so recursion only regroups DIRS.
-#   nimgnu dir   : chgrp nimgnu_<x> <dir> ; chmod g+w,g+s <dir> (SETGID)
+#   nimgnu dir   : chgrp nimgnu_<x> <dir> ; chmod g+rwx <dir> (group rwx, no setgid)
 #                  new files/dirs inherit group nimgnu_<x> (owner = creator), so
 #                  members of nimgnu_<x> can install here.  Recursion regroups
 #                  files too (they belong to the collector group).
@@ -1051,7 +1051,7 @@ def _perm_kind(group):
     if group == "install":
         return "g+w,o-t", "group-writable"           # no sticky (per your call)
     if group.startswith(collector_prefix()):
-        return "g+w,g+s,o-t", "setgid"               # trusted: no sticky
+        return "g+rwx,o-t", "group-rwx"              # group rwx, NO setgid
     return "g+w", "group-writable"
 
 
@@ -1379,7 +1379,8 @@ def build_install_plan(args):
                          "update" if u.state == "installed" else "new"))
 
     for target in args.packages:
-        if args.force:
+        if not getattr(args, "recursive", False):
+            # DEFAULT: just this package, no dependency walk
             nv = book_version(target)
             if nv is None:
                 printError(f"{target}: not found in book -- skipping")
@@ -1506,7 +1507,7 @@ def install_local(name, path, run, yes, verb="install", test=False, clean=False)
 
 def cmd_install(args):
     # ---- local package: install a custom script directly, no BLFS ----
-    if args.local or (len(args.packages) == 1 and not args.force
+    if args.local or (len(args.packages) == 1
                       and book_version(args.packages[0]) is None
                       and find_local_script(args.packages[0])):
         name = args.packages[0]
@@ -1599,6 +1600,7 @@ def cmd_install(args):
             clear_status()
             printError(f"install failed for {nv} (exit {result.returncode}); "
                        f"stopping ({i - 1}/{total} done).")
+            printInfo(f"  install file: {path}")
             printInfo(f"  logs: {_pkg_log_dir(anchor)}   "
                       f"(see all: packagemanager errors)")
             printInfo(f"  After fixing the problem you can re-run ONLY the "
@@ -1607,6 +1609,7 @@ def cmd_install(args):
             sys.exit(result.returncode)
         if getattr(args, "clean", False):
             _clean_after_install(anchor, old_paths, t0)
+        _maybe_remove_old_sources(anchor, nv, getattr(args, "keep_sources", False))
     clear_status()
     printSuccess(f"Done -- {total} package(s) installed.")
     printInfo(f"  results: packagemanager errors     logs: "
@@ -1737,7 +1740,8 @@ def cmd_update(args):
         return
 
     flag_sig = "".join([
-        "f" if args.force else "", "R" if args.dependents else "",
+        "r" if getattr(args, "recursive", False) else "",
+        "R" if args.dependents else "",
         "e" if args.ignore_recommended else "", "o" if args.optional else "",
         "c" if getattr(args, "clean", False) else "",
         "i" if getattr(args, "reinstall", False) else ""])
@@ -1750,8 +1754,8 @@ def cmd_update(args):
     if cached is not None:
         plan = [tuple(x) for x in cached]
     else:
-        if args.packages and args.force:
-            # -f: just the named packages, no dependency walk
+        if args.packages and not getattr(args, "recursive", False):
+            # DEFAULT: just the named packages, no dependency walk
             vers = book_versions_all()
             vlookup = {t: vers.get(t) for t in args.packages}
             names = list(args.packages)
@@ -1869,17 +1873,24 @@ def cmd_update(args):
                     if _package_script_outdated(name, cur_v)]
         if outdated:
             bar = colors.red + "!" * 58 + colors.normal
+            trunc = len(outdated) > 12
             print(f"\n{bar}")
             printWarning(f"!! {len(outdated)} package(s) still use an OLD-format "
                          f"install script:")
-            printWarning("!!   " + ", ".join(outdated[:12])
-                         + (" ..." if len(outdated) > 12 else ""))
+            printWarning("!!   " + ", ".join(outdated[:12]) + (" ..." if trunc else ""))
+            if trunc:
+                printWarning("!! Full list (space-separated, pipe-ready):")
+                printWarning("!!   packagemanager script-status --fast -q")
             printWarning("!! A reinstall/update may not run your edits correctly "
                          "and could lose them.")
-            printWarning("!! MIGRATE FIRST (merges your edits, backs up .bak):")
-            printWarning("!!   packagemanager migrate-scripts "
-                         + " ".join(outdated[:12])
-                         + (" ..." if len(outdated) > 12 else "") + " --run")
+            printWarning("!! MIGRATE FIRST (merges your edits, backs up .bak) -- "
+                         "these packages, or all at once:")
+            if trunc:
+                printWarning("!!   packagemanager migrate-scripts "
+                             "$(packagemanager script-status --fast -q) --run")
+            else:
+                printWarning("!!   packagemanager migrate-scripts "
+                             + " ".join(outdated) + " --run")
             printWarning("!! or add --regenerate here to rebuild scripts from the "
                          "book (discards edits).")
             print(f"{bar}")
@@ -1945,6 +1956,7 @@ def cmd_update(args):
             clear_status()
             printError(f"update failed for {name} (exit {result.returncode}); "
                        f"stopping ({i - 1}/{total} done, {errors} error(s)).")
+            printInfo(f"  install file: {path}")
             printInfo(f"  logs: {_pkg_log_dir(name)}   "
                       f"(see all: packagemanager errors)")
             base = ("packagemanager update " + " ".join(list(args.packages)))
@@ -1959,7 +1971,7 @@ def cmd_update(args):
             sys.exit(result.returncode)
         if getattr(args, "clean", False):
             _clean_after_install(name, old_paths, t0)
-        _maybe_remove_old_sources(name, bv, args.yes)
+        _maybe_remove_old_sources(name, bv, getattr(args, "keep_sources", False))
         remaining = [p for p in remaining if p[0] != anchor]
         save_plan("update", plan_key, remaining)
     clear_status()
@@ -2117,10 +2129,12 @@ def _pkg_log_dir(user):
     return os.path.join(BASE_DIR, user, "log")
 
 
-def _maybe_remove_old_sources(user, keep_name_version, assume_yes):
-    """After a successful upgrade, offer to delete OLD unpacked source dirs and
+def _maybe_remove_old_sources(user, keep_name_version, keep_sources=False):
+    """After a successful (re)install, remove OLD unpacked source dirs and stale
     downloaded archives in the package user's home, keeping the current version.
-    Auto-removes when --yes."""
+    Removes automatically; pass keep_sources=True to skip."""
+    if keep_sources:
+        return
     home = os.path.join(BASE_DIR, user)
     keep = keep_name_version
     victims = []
@@ -2133,7 +2147,6 @@ def _maybe_remove_old_sources(user, keep_name_version, assume_yes):
                 continue
             if fn == keep:                              # current source dir
                 continue
-            # old source dir or archive (tarball/zip) that isn't the current one
             is_archive = fn.endswith((".tar", ".tgz", ".tar.gz", ".tar.bz2",
                                       ".tar.xz", ".zip"))
             if (os.path.isdir(p) or is_archive) and keep.split("-")[0].lower() \
@@ -2145,12 +2158,6 @@ def _maybe_remove_old_sources(user, keep_name_version, assume_yes):
         return
     if not victims:
         return
-    if not assume_yes:
-        print(f"  Old source/archives for {user} (keeping {keep}):")
-        for p in victims:
-            print(f"    {p}")
-        if not ask_yes_no("  remove these to save space?"):
-            return
     for p in victims:
         try:
             if os.path.isdir(p):
@@ -2159,7 +2166,8 @@ def _maybe_remove_old_sources(user, keep_name_version, assume_yes):
                 os.remove(p)
         except OSError as e:
             printWarning(f"    could not remove {p}: {e}")
-    printInfo(f"  removed {len(victims)} old source item(s) for {user}.")
+    printInfo(f"  removed {len(victims)} old source item(s) for {user} "
+              f"(keeping {keep}).")
 
 
 def _plan_path(kind, key):
@@ -3227,23 +3235,104 @@ def cmd_script_status(args):
     """Report whether each package's install script has been changed from the
     book's version (edited), is behind the book (outdated), or matches it."""
     names = args.packages if args.packages else list_all_users()
+
+    # --fast: format-stamp check only (no book generation) -- quick way to get
+    # the full list of scripts the update warning flags as OLD-format.
+    if getattr(args, "fast", False):
+        cur = _current_script_version()
+        outdated = [n for n in sorted(set(names))
+                    if _package_script_outdated(n, cur)]
+        if getattr(args, "quiet", False):
+            print(" ".join(outdated))
+            return
+        printHeader("Old-format install scripts")
+        for n in outdated:
+            print(f"  {n}")
+        print(f"\n  {len(outdated)} of {len(set(names))} need migration.")
+        if outdated:
+            printInfo("Migrate them (merges your edits):  packagemanager "
+                      "migrate-scripts " + " ".join(outdated) + " --run")
+        return
+
     script_dir = os.path.join(TMP_DIR, "install_files")
     os.makedirs(script_dir, exist_ok=True)
-    printHeader("Install-script status")
-    print(f"\n  {colors.dim}up-to-date=matches book  edited=you changed it  "
-          f"outdated=book newer (no edits)  no-baseline=can't tell{colors.normal}\n")
-    counts = {}
+    quiet = getattr(args, "quiet", False)
+    changed_names, counts = [], {}
+    rows = []
     for name in sorted(set(names)):
         st, cand, _bp, _nv = classify_script(name, script_dir)
         if st == "no-script":
             continue
         counts[st] = counts.get(st, 0) + 1
+        rows.append((name, st, cand))
+        if st in ("edited", "no-baseline", "outdated"):
+            changed_names.append(name)
+
+    if quiet:                                        # names only, for piping
+        print(" ".join(changed_names))
+        return
+
+    printHeader("Install-script status")
+    print(f"\n  {colors.dim}up-to-date=matches book  edited=you changed it  "
+          f"outdated=book newer (no edits)  no-baseline=can't tell{colors.normal}\n")
+    for name, st, cand in rows:
         color = _SCRIPT_STATUS_COLOR.get(st, "")
         print(f"  {name:<24} {color}{st:<12}{colors.normal} {cand or ''}")
     print("\n  " + "   ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
-    if counts.get("edited") or counts.get("no-baseline") or counts.get("outdated"):
-        printInfo("Migrate the changed/outdated ones:  "
-                  "packagemanager migrate-scripts <pkgs> --run")
+    if changed_names:
+        printInfo("Migrate the changed/outdated ones:  packagemanager "
+                  "migrate-scripts " + " ".join(changed_names) + " --run")
+
+
+def cmd_regenerate_script(args):
+    """Generate fresh install script(s) from the book and place them in each
+    package-user's home as the canonical install_<book_nv> (what the next
+    install/update uses).  Existing scripts are kept unless --overwrite."""
+    script_dir = os.path.join(TMP_DIR, "install_files")
+    os.makedirs(script_dir, exist_ok=True)
+    written, skipped, failed = 0, 0, 0
+    for name in sorted(set(args.packages)):
+        home = os.path.join(BASE_DIR, name)
+        if not os.path.isdir(home):
+            printWarning(f"{name}: no package-user home at {home} -- skipping "
+                         f"(create it first with: packagemanager add-user {name}).")
+            failed += 1
+            continue
+        rc, out, err = run_blfs(["script", name, "-o", script_dir])
+        m = re.search(r"^Created (.+)$", out, re.M)
+        if rc != 0 or not m:
+            printWarning(f"{name}: not in the book / can't generate "
+                         f"({(err or out).strip()[:60]}).")
+            failed += 1
+            continue
+        gen = m.group(1).strip()
+        nv = _script_name_version(gen) or name
+        dest = os.path.join(home, f"install_{nv}")
+        if os.path.exists(dest) and not args.overwrite:
+            printWarning(f"{name}: install_{nv} already exists -- pass --overwrite "
+                         f"to replace it (a .bak is kept).")
+            skipped += 1
+            continue
+        backed = False
+        try:
+            if os.path.exists(dest):
+                shutil.copy(dest, dest + ".bak")
+                backed = True
+            shutil.copy(gen, dest)
+        except OSError as e:
+            printError(f"{name}: could not write {dest} -- {e}")
+            failed += 1
+            continue
+        _chown_to(dest, name)
+        printSuccess(f"  {name:<24} wrote install_{nv}"
+                     + (f"  (backup: {dest}.bak)" if backed else ""))
+        written += 1
+
+    printHeader("regenerate-script summary")
+    print(f"\n  {written} written,  {skipped} kept (exists, no --overwrite),  "
+          f"{failed} failed.")
+    if skipped:
+        printInfo("Re-run with --overwrite to replace the existing scripts.")
 
 
 def cmd_migrate_scripts(args):
@@ -3715,8 +3804,15 @@ def main():
                    help="required deps only (skip recommended)")
     p.add_argument("--optional", action="store_true",
                    help="also pull in optional deps")
+    p.add_argument("--recursive", action="store_true",
+                   help="also resolve and build the package's dependencies "
+                        "(default: just the named package(s))")
     p.add_argument("-f", "--force", action="store_true",
-                   help="just the named package(s), skip dependency resolution")
+                   help="(deprecated: non-recursive is now the default; kept for "
+                        "compatibility)")
+    p.add_argument("--keep-sources", action="store_true",
+                   help="keep old unpacked source dirs/archives (default: remove "
+                        "them after a successful install)")
     p.add_argument("--local", metavar="SCRIPT",
                    help="install a custom package from a local install script "
                         "(made with 'template'); skips BLFS")
@@ -3748,8 +3844,12 @@ def main():
                        "skipped; use 'verify' to recheck all.")
     p.add_argument("packages", nargs="*",
                    help="packages to update (with deps); default: all installed")
+    p.add_argument("--recursive", action="store_true",
+                   help="also update the named package(s)' dependencies "
+                        "(default: just the named package(s))")
     p.add_argument("-f", "--force", action="store_true",
-                   help="just the named package(s), skip dependency resolution")
+                   help="(deprecated: non-recursive is now the default; kept for "
+                        "compatibility)")
     p.add_argument("-R", "--dependents", action="store_true",
                    help="also update everything that (recursively) depends on the "
                         "named package(s) -- rebuild reverse deps too")
@@ -3777,6 +3877,9 @@ def main():
     p.add_argument("--no-reinstall", action="store_true",
                    help="with --yes, do NOT re-apply already-up-to-date packages "
                         "(otherwise --yes accepts the re-apply prompt)")
+    p.add_argument("--keep-sources", action="store_true",
+                   help="keep old unpacked source dirs/archives (default: remove "
+                        "them after a successful update)")
     p.add_argument("-e", "--ignore-recommended", action="store_true",
                    help="required deps only (skip recommended)")
     p.add_argument("--optional", action="store_true", help="also follow optional deps")
@@ -3909,10 +4012,25 @@ def main():
                    help="reuse a stored dry-run without asking")
     p.set_defaults(func=cmd_fix_install)
 
+    p = sub.add_parser("regenerate-script", aliases=["regen-script"],
+                       help="write fresh install script(s) from the book into the "
+                       "package home as install_<book_nv> (for the next "
+                       "install/update); keeps existing unless --overwrite")
+    p.add_argument("packages", nargs="+", help="one or more package names")
+    p.add_argument("--overwrite", action="store_true",
+                   help="replace an existing script (a .bak is kept)")
+    p.set_defaults(func=cmd_regenerate_script)
+
     p = sub.add_parser("script-status", help="check whether each package's install "
                        "script is changed from the book (edited), behind the book "
                        "(outdated), or matches it")
     p.add_argument("packages", nargs="*", help="default: all package-users")
+    p.add_argument("--fast", action="store_true",
+                   help="format-stamp check only (no book comparison) -- the quick "
+                        "way to list every OLD-format script")
+    p.add_argument("-q", "--quiet", action="store_true",
+                   help="print only the package names needing migration, space-"
+                        "separated (pipe into migrate-scripts)")
     p.set_defaults(func=cmd_script_status)
 
     p = sub.add_parser("migrate-scripts", help="upgrade older install scripts to "
@@ -3951,7 +4069,7 @@ def main():
                        help="turn a directory into an install/sysgroup group dir")
     p.add_argument("dirs", nargs="+")
     p.add_argument("--group", default="install",
-                   help="'install' (sticky, default) or a nimgnu name (setgid)")
+                   help="'install' (default) or a nimgnu name (group rwx, no setgid)")
     p.add_argument("-R", "--recursive", action="store_true")
     p.set_defaults(func=cmd_make_group_dir)
 

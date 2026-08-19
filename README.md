@@ -1,9 +1,9 @@
 # pkgusr package manager for BLFS / LFS
 
-> **🎲 100% vibecode** — this whole toolchain was built by prompting an AI.
-> It's not a polished distro tool. That said, The Prompter
-> actually runs it on his own BLFS/LFS system.
-> Still, read the code and test on something
+> **🎲 100% vibecode** — this whole toolchain was built by prompting an AI, not
+> hand-written line by line. It's not a polished distro tool. That said, I
+> actually run it on my own BLFS/LFS system, so it's vibecode I trust enough to
+> point at my own machine — still, read the code and test on something
 > disposable before you point it at yours.
 
 A small toolchain for building and maintaining a BLFS/LFS system with the
