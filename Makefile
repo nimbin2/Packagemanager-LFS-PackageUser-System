@@ -1,7 +1,7 @@
 # lfs-pkgusr -- install the package-user toolchain.
 #
-#   make install                 -> /usr/local
-#   make install PREFIX=/usr     -> /usr
+#   make install                    -> /usr
+#   make install PREFIX=/usr/local  -> /usr/local
 #   make uninstall
 #   make check                   -> run the regression tests
 #
@@ -9,7 +9,10 @@
 # into a tree that is not the running system:
 #   make install DESTDIR=/mnt/lfs PREFIX=/usr
 
-PREFIX      ?= /usr/local
+# /usr, not /usr/local: these tools ARE the system's package management -- the
+# chroot invokes them by name, and packagemanager runs packagemanager_install
+# off $PATH, which does not include /usr/local everywhere.
+PREFIX      ?= /usr
 DESTDIR     ?=
 BINDIR      := $(DESTDIR)$(PREFIX)/bin
 SHAREDIR    := $(DESTDIR)$(PREFIX)/share/lfs-pkgusr
@@ -29,8 +32,8 @@ INSTALL     ?= install
 all: help
 
 help:
-	@echo "make install [PREFIX=/usr] [DESTDIR=...]   install the tools"
-	@echo "make uninstall [PREFIX=/usr]               remove them"
+	@echo "make install [PREFIX=...] [DESTDIR=...]   install the tools"
+	@echo "make uninstall [PREFIX=...]               remove them"
 	@echo "make check                                 run the tests"
 	@echo ""
 	@echo "installs into: $(PREFIX)/bin"
@@ -51,6 +54,15 @@ install:
 	@for t in blfs packagemanager lfs-helper; do \
 	    ln -sf lfs "$(COMPDIR)/$$t"; \
 	done
+	@echo "==> XDG profile for shared users -> $(SYSCONFDIR)/pkgusr/skel-u_xdg"
+	$(INSTALL) -d $(SYSCONFDIR)/pkgusr/skel-u_xdg
+	@if [ -f "$(SYSCONFDIR)/pkgusr/skel-u_xdg/.bash_profile" ]; then \
+	    echo "    kept your existing .bash_profile"; \
+	else \
+	    $(INSTALL) -m 644 skel-u_xdg/.bash_profile \
+	        "$(SYSCONFDIR)/pkgusr/skel-u_xdg/.bash_profile"; \
+	    echo "    installed (XDG_RUNTIME_DIR is filled in on first use)"; \
+	fi
 	@echo "==> last build step -> $(SYSCONFDIR)/lfs"
 	$(INSTALL) -d $(SYSCONFDIR)/lfs
 	@if [ -f "$(SYSCONFDIR)/lfs/$(LAST_STEP)" ]; then \
@@ -77,6 +89,7 @@ uninstall:
 	@echo ""
 	@echo "Left alone (they are yours):"
 	@echo "    $(SYSCONFDIR)/lfs/$(LAST_STEP)"
+	@echo "    $(SYSCONFDIR)/pkgusr/skel-u_xdg/.bash_profile"
 	@echo "    /usr/share/lfs        books, settings, snapshots"
 	@echo "    /etc/pkgusr           packagemanager settings"
 

@@ -3574,8 +3574,13 @@ Creating the account is the easy part; what makes it usable is the rest:
   * `su - u_<name>` from your account without a password, where the hint's
     /etc/pam.d/su_u_user is installed (skipped where it is not: su then
     simply asks for a password)
-  * with --shared, a directory both accounts can write, symlinked into your
-    home -- how you get files in and out
+  * with --shared, the account joins the group on your XDG runtime directory
+    -- the display, the session bus and audio live there, so a graphical
+    program cannot draw anything without it.  That group is read from the
+    directory, not assumed: it is set up once for you, and every shared
+    account afterwards joins whatever is there.
+  * with --share-dir, a directory both accounts can write, symlinked into
+    your home -- how you get files in and out
   * with --launcher, a wrapper in ~/bin so running `<name>` starts the
     program as that account
 
@@ -3584,9 +3589,16 @@ grant access to:
 
     packagemanager config --main-user <your-login>
 
-Example:
+Everything here is idempotent, and can be applied to an account that already
+exists -- including one made by hand:
 
-    packagemanager user create firefox --shared --launcher --groups audio,video
+    packagemanager user setup firefox --shared --launcher --desktop
+
+Examples:
+
+    packagemanager user create firefox --shared --share-dir --launcher --desktop
+    packagemanager user setup  firefox --desktop          # just add the menu entry
+    packagemanager user setup  firefox --shared           # just the session group
 """
 
 
@@ -3627,6 +3639,113 @@ def cmd_user_create(args):
     _setup_application_user(u, args)
 
 
+def _xdg_runtime_dir_of(user):
+    """The main user's XDG runtime directory, however this system names it."""
+    try:
+        import pwd
+        uid = pwd.getpwnam(user).pw_uid
+    except (KeyError, ImportError):
+        return None
+    for cand in (os.environ.get("XDG_RUNTIME_DIR") if user == os.environ.get("USER") else None,
+                 "/run/user/%d" % uid,
+                 "/tmp/xdg-%s" % user,
+                 "/tmp/xdg-%d" % uid):
+        if cand and os.path.isdir(cand):
+            return cand
+    return None
+
+
+def _join_xdg_runtime_group(main, u):
+    """Put an application user in the group that owns the session.
+
+    A "shared user" is one that may reach the main user's XDG runtime
+    directory -- that is where the display socket, the session bus and the
+    audio socket live, so without it a graphical program starts and then
+    cannot draw anything.
+
+    The group is read from the directory rather than assumed: it is set up
+    once for the main user, and every shared account afterwards simply joins
+    whatever is there."""
+    rt = _xdg_runtime_dir_of(main)
+    if not rt:
+        printWarning(f"  no XDG runtime directory found for {main} -- "
+                     f"{u} will not reach the session")
+        printInfo("    (looked for /run/user/<uid> and /tmp/xdg-<user>)")
+        return
+    try:
+        import grp
+        grp_name = grp.getgrgid(os.stat(rt).st_gid).gr_name
+    except (KeyError, ImportError, OSError):
+        printWarning(f"  cannot read the group on {rt}")
+        return
+    if grp_name in (main, "root"):
+        printWarning(f"  {rt} is group '{grp_name}', which is not a shared "
+                     f"group -- {u} was not added")
+        printInfo("    Set up a runtime group for the session first, then "
+                  "re-run this.")
+        return
+    _run(["usermod", "-a", "-G", grp_name, u])
+    printInfo(f"  {u} joined '{grp_name}' (the group on {rt})")
+
+
+XDG_SKEL = "/etc/pkgusr/skel-u_xdg/.bash_profile"
+
+
+def _link_xdg_profile(main, u):
+    """Point a shared user's .bash_profile at the XDG skeleton.
+
+    Being in the session group is necessary but not sufficient: the account
+    also has to KNOW where the session is.  XDG_RUNTIME_DIR, WAYLAND_DISPLAY
+    and the package-user PATH come from this one file, so a shared user
+    without it can reach the socket and still not find it.
+
+    It is a symlink, not a copy: change the file once and every shared account
+    picks it up."""
+    if not os.path.isfile(XDG_SKEL):
+        printWarning(f"  {XDG_SKEL} is missing -- {u} will not find the session")
+        printInfo("    It ships with these tools; reinstall them, or write it "
+                  "by hand.")
+        return
+
+    # The skeleton is installed with a placeholder, because the runtime
+    # directory belongs to whoever is logged in.  Fill it in once.
+    try:
+        text = open(XDG_SKEL).read()
+    except OSError as e:
+        printWarning(f"  could not read {XDG_SKEL}: {e}")
+        return
+    if "@XDG_RUNTIME_DIR@" in text:
+        rt = _xdg_runtime_dir_of(main)
+        if not rt:
+            printWarning(f"  {XDG_SKEL} still has a placeholder and no runtime "
+                         f"directory was found for {main}")
+            printInfo(f"    Set it by hand:  XDG_RUNTIME_DIR in {XDG_SKEL}")
+            return
+        try:
+            with open(XDG_SKEL, "w") as f:
+                f.write(text.replace("@XDG_RUNTIME_DIR@", rt))
+            printInfo(f"  {XDG_SKEL}: XDG_RUNTIME_DIR set to {rt}")
+        except OSError as e:
+            printWarning(f"  could not write {XDG_SKEL}: {e}")
+            return
+
+    home = os.path.join(BASE_DIR, u)
+    target = os.path.join(home, ".bash_profile")
+    if os.path.islink(target) and os.path.realpath(target) == \
+            os.path.realpath(XDG_SKEL):
+        printInfo(f"  {target} already points at the XDG profile")
+        return
+    try:
+        if os.path.exists(target) or os.path.islink(target):
+            os.replace(target, target + ".pkgusr")
+            printInfo(f"    kept the old one as {target}.pkgusr")
+        os.symlink(XDG_SKEL, target)
+        _run(["chown", "-h", f"{u}:{u}", target])
+        printInfo(f"  {target} -> {XDG_SKEL}")
+    except OSError as e:
+        printWarning(f"  could not link {target}: {e}")
+
+
 def _setup_application_user(u, args):
     """Make an application user actually usable from your own account.
 
@@ -3659,8 +3778,16 @@ def _setup_application_user(u, args):
     # 3. su without a password, if this system uses the hint's PAM file
     _allow_su_via_pam(u, main)
 
-    # 4. a shared directory, when asked for
+    # 4. the session: a shared user is one that may reach the main user's
+    #    XDG runtime directory (the display, the session bus, the audio
+    #    socket).  The group is whatever that directory carries -- reading it
+    #    rather than assuming a name, since the prefix is configurable.
     if getattr(args, "shared", False):
+        _join_xdg_runtime_group(main, u)
+        _link_xdg_profile(main, u)
+
+    # 5. a shared directory, when asked for
+    if getattr(args, "share_dir", False):
         share = os.path.join(home, "Shared")
         _run(["mkdir", "-p", share])
         _run(["chown", f"{u}:{u}", share])
@@ -3672,14 +3799,25 @@ def _setup_application_user(u, args):
         if link:
             printInfo(f"    reachable from your account as {link}")
 
-    # 5. a launcher, when the program is on PATH
-    app = getattr(args, "app", None) or args.name
+    # 6. a launcher and a menu entry, when the program is really there
+    app = getattr(args, "app", None) or getattr(args, "name", None) \
+        or u[len(user_prefix()):]
     import shutil as _sh
-    if getattr(args, "launcher", False):
+    want_launcher = getattr(args, "launcher", False)
+    want_desktop = getattr(args, "desktop", False)
+    if want_launcher or want_desktop:
+        # Their original checked `which $app` first and skipped both when it
+        # was missing -- a launcher for a program that is not installed is
+        # just a broken command in your PATH.
         if not _sh.which(app):
-            printWarning(f"  no '{app}' on PATH -- not writing a launcher")
+            printWarning(f"  no '{app}' on PATH -- no launcher or menu entry")
+            printInfo(f"    (install it first, then: packagemanager user "
+                      f"setup {app} --launcher --desktop)")
         else:
-            _write_launcher(main, u, app)
+            if want_launcher:
+                _write_launcher(main, u, app)
+            if want_desktop:
+                _write_desktop_entry(main, u, app)
 
 
 def _home_of(user):
@@ -3725,6 +3863,55 @@ def _allow_su_via_pam(u, main):
         printInfo(f"  {main} may now `su - {u}` without a password")
     except OSError as e:
         printWarning(f"  could not write {pam}: {e}")
+
+
+def cmd_user_setup(args):
+    """Apply the application-user setup to an account that already exists.
+
+    Everything `user create` does after making the account, so a user made
+    earlier -- or made by hand -- can be brought up to the same state.  Each
+    step is idempotent, so running it again is safe and only fills in what is
+    missing."""
+    u = _user_prefixed(args.name)
+    if not _user_exists(u):
+        printError(f"{u}: no such user.")
+        printInfo(f"  Create it first:  packagemanager user create {args.name}")
+        sys.exit(1)
+    printHeader(f"Set up {u}")
+    print()
+    if args.groups:
+        _add_groups(u, [g for g in re.split(r"[,\s]+", args.groups) if g])
+    _setup_application_user(u, args)
+
+
+def _write_desktop_entry(main, u, app):
+    """A menu entry that launches the program as the application user.
+
+    Written next to the wrapper, so the program appears in the menu and starts
+    under the right account when clicked -- not just from a terminal."""
+    home = _home_of(main)
+    if not home:
+        return
+    appdir = os.path.join(home, ".local", "share", "applications")
+    os.makedirs(appdir, exist_ok=True)
+    path = os.path.join(appdir, f"{app}.desktop")
+    if os.path.exists(path) and not getattr(_write_desktop_entry, "_force", False):
+        printInfo(f"  {path} already exists -- left alone")
+        return
+    launcher = os.path.join(home, "bin", app)
+    with open(path, "w") as f:
+        f.write(
+            "[Desktop Entry]\n"
+            f"Name={app.capitalize()}\n"
+            f"Comment=Runs as the application user {u}\n"
+            f"Exec={launcher} %U\n"
+            "Terminal=false\n"
+            "Type=Application\n"
+            f"Icon={app}\n"
+            f"StartupWMClass={app.capitalize()}\n")
+    os.chmod(path, 0o644)
+    _run(["chown", f"{main}:{main}", path])
+    printInfo(f"  menu entry: {path}")
 
 
 def _write_launcher(main, u, app):
@@ -5208,12 +5395,35 @@ def main():
     q.add_argument("name")
     q.add_argument("--groups", help="also add these groups, e.g. audio,video")
     q.add_argument("--shared", action="store_true",
-                   help="a directory both accounts can write, linked into "
-                        "your home")
+                   help="a SHARED user: joins the group on your XDG runtime "
+                        "directory, so it can reach the display, the session "
+                        "bus and audio")
+    q.add_argument("--share-dir", action="store_true",
+                   help="also make a directory both accounts can write, "
+                        "linked into your home")
     q.add_argument("--launcher", action="store_true",
                    help="a wrapper in ~/bin that runs the program as this user")
+    q.add_argument("--desktop", action="store_true",
+                   help="also a menu entry, so it launches from the desktop")
     q.add_argument("--app", help="program the launcher runs (default: <name>)")
     q.set_defaults(func=cmd_user_create)
+
+    q = usub.add_parser("setup",
+                        help="apply the same setup to a user that already "
+                             "exists",
+                        description=_APPLICATION_USER_HELP,
+                        formatter_class=argparse.RawDescriptionHelpFormatter)
+    q.add_argument("name")
+    q.add_argument("--groups", help="also add these groups, e.g. audio,video")
+    q.add_argument("--shared", action="store_true",
+                   help="join the group on your XDG runtime directory")
+    q.add_argument("--share-dir", action="store_true",
+                   help="a directory both accounts can write")
+    q.add_argument("--launcher", action="store_true",
+                   help="a wrapper in ~/bin")
+    q.add_argument("--desktop", action="store_true", help="a menu entry")
+    q.add_argument("--app", help="program to launch (default: <name>)")
+    q.set_defaults(func=cmd_user_setup)
     q = usub.add_parser("delete", help="delete an shared user + group + home")
     q.add_argument("name")
     q.add_argument("--run", action="store_true", help="actually delete (default dry-run)")

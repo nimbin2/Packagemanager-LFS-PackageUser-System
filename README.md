@@ -39,10 +39,14 @@ Works **offline** from a downloaded copy of the books.
 ## Install
 
 ```sh
-make install          # to /usr/local
-make install PREFIX=/usr
+make install                        # to /usr
+make install PREFIX=/usr/local
+make install DESTDIR=/mnt/lfs       # into a tree, not the running system
 make uninstall
 ```
+
+`/usr` is the default: the chroot invokes these by name, and
+`packagemanager` runs `packagemanager_install` off `$PATH`.
 
 Installs the four tools, the completion script, and `last_build_step.sh`.
 
@@ -88,8 +92,17 @@ Separate from package users. An account a program **runs as**, so a browser
 cannot read your files:
 
 ```sh
-packagemanager user create firefox --shared --launcher
+packagemanager user create firefox --shared --share-dir --launcher
 ```
+
+| Flag | Does |
+|---|---|
+| `--shared` | Joins the group on your XDG runtime dir, and links `/etc/pkgusr/skel-u_xdg/.bash_profile` — display, session bus, audio |
+| `--share-dir` | A directory both accounts can write, linked into your home |
+| `--launcher` | A wrapper in `~/bin` that runs the program as that account |
+
+The session group is read from the runtime directory, not assumed. Set it up
+once for your own account; every shared user then joins whatever is there.
 
 ---
 
