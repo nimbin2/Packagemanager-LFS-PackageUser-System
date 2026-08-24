@@ -1,0 +1,4250 @@
+#!/bin/bash
+#
+# lfs-helper -- manage the LFS build from INSIDE the chroot.
+#
+# The `lfs` tool is Python, and the chroot has no Python until chapter 8 builds
+# it.  This is the bash stand-in: it tracks session state, sets up the
+# package-user system, creates package users, runs the phased install scripts,
+# and records which files each package installed.
+#
+# State lives in /.lfs-pkgusr (the same dir `lfs` uses from outside, so both
+# tools see one shared session).
+#
+# The install scripts it runs are the SAME phased format `packagemanager` uses
+# (unpack_pkg / build_pkg / install_pkg / configure_pkg / test_pkg + a
+# name_version variable), so once the system is up, `packagemanager` can update
+# these packages with the scripts already in each package user's home.
+#
+# GPLv2-or-later.  Part of the pkgusr toolchain.
+
+set -u
+
+# Bump on every change that alters behaviour.  `lfs-helper --version` makes it
+# possible to tell at a glance whether the copy inside the chroot is the one
+# that was just fixed -- guessing at that has wasted a lot of time.
+LFS_HELPER_VERSION="1.7.0"
+
+# A fingerprint of this file's own contents.  A hand-maintained version number
+# goes stale the moment someone forgets to bump it -- and the reason for
+# printing a version at all is to answer "am I running the code that was just
+# fixed?".  This changes whenever the file does, so it cannot lie.
+_build_id() {
+    local f="${BASH_SOURCE[0]:-$0}"
+    if [ -r "$f" ] && command -v md5sum >/dev/null 2>&1; then
+        md5sum "$f" 2>/dev/null | cut -c1-7
+    else
+        echo unknown
+    fi
+}
+
+STATE="${LFS_PKGUSR_DIR:-/.lfs-pkgusr}"
+SCRIPTS="$STATE/scripts"
+MANIFESTS="$STATE/manifests"
+PROGRESS="$STATE/chroot-progress"
+SNAPSHOT="$STATE/.snapshot"
+SNAPDIRS="$STATE/.snapshot-dirs"
+INSTALLDIRS="$STATE/installdirs.lst"
+SRCROOT="${LFS_SRC_ROOT:-/usr/src}"
+# Root of the filesystem being tracked.  Inside the chroot that is "/"; the
+# test harness points it elsewhere.  Defined here because several paths below
+# are derived from it.
+SNAP_ROOT="${LFS_SNAP_ROOT:-/}"
+ETC="${LFS_ETC:-/etc}"          # overridable so the test suite can exercise
+                                # user creation without touching the real /etc
+
+INSTALL_GID=9999          # 'install' group; package users start at 10000
+PKG_UID_MIN=10000
+
+# Collector groups get their OWN range, well clear of the package users.
+# Sharing one range means a collector group can take the gid that the next
+# package user's group wants, and then user 10042 has group 10043 while some
+# unrelated collector group holds 10042 -- the ids stop lining up and a
+# `chown pkg:pkg` starts meaning something different from what it reads like.
+COLLECTOR_GID_MIN=90000
+
+# The build user from outside the chroot.  Files it created -- /sources, the
+# tree it handed over at 7.2 -- carry its uid, and the chroot has no passwd
+# entry for it, so they show as a bare number and every tool calls them
+# UNKNOWN.  Recreating the account here (just below the install group, clear of
+# the package users at 10000+) makes those files resolve to a name again.
+LFS_BUILD_UID=9998
+
+# The next free gid in the collector range.
+next_collector_gid() {
+    local g="$COLLECTOR_GID_MIN"
+    while getent group "$g" >/dev/null 2>&1 \
+          || { [ -r "$ETC/group" ] && cut -d: -f3 "$ETC/group" | grep -qx "$g"; }; do
+        g=$((g + 1))
+    done
+    printf '%s' "$g"
+}
+
+# Create a collector group in its own id range.
+create_collector_group() {
+    local grp="$1" gid
+    getent group "$grp" >/dev/null 2>&1 && return 0
+    gid="$(next_collector_gid)"
+    if have_shadow_tools; then
+        groupadd -g "$gid" "$grp" 2>/dev/null && return 0
+        # the gid raced or is taken: let groupadd choose rather than fail
+        groupadd "$grp" 2>/dev/null && return 0
+    else
+        # no Shadow yet -- same by hand, the way init-pkgusr does it
+        printf '%s:x:%s:\n' "$grp" "$gid" >> "$ETC/group" && return 0
+    fi
+    getent group "$grp" >/dev/null 2>&1
+}
+
+C_OK=$'\033[0;32m'; C_WARN=$'\033[0;33m'; C_ERR=$'\033[0;31m'
+C_DIM=$'\033[2m';   C_OFF=$'\033[0m'
+[ -t 1 ] || { C_OK=; C_WARN=; C_ERR=; C_DIM=; C_OFF=; }
+
+say()  { echo "$*"; }
+ok()   { echo "${C_OK}$*${C_OFF}"; }
+warn() { echo "${C_WARN}$*${C_OFF}" >&2; }
+die()  { echo "${C_ERR}!! $*${C_OFF}" >&2; exit 1; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "must be run as root (inside the chroot)"; }
+
+# --------------------------------------------------------------------------- #
+# state
+# --------------------------------------------------------------------------- #
+mkstate() { mkdir -p "$STATE" "$SCRIPTS" "$MANIFESTS"; }
+
+is_done()   { [ -f "$PROGRESS" ] && grep -qxF "$1" "$PROGRESS"; }
+mark_done() { mkstate; is_done "$1" || echo "$1" >> "$PROGRESS"; }
+unmark()    { [ -f "$PROGRESS" ] && sed -i "\|^$1\$|d" "$PROGRESS"; }
+
+# The ordered list of steps.  Each is "name" and the script is
+# $SCRIPTS/<name>.sh -- generated by `lfs build-system gen-chroot-scripts`.
+steps() {
+    if [ -f "$STATE/steporder" ]; then
+        grep -v '^[[:space:]]*$' "$STATE/steporder"
+    else
+        ls -1 "$SCRIPTS" 2>/dev/null | sed -n 's/\.sh$//p'
+    fi
+}
+
+# --------------------------------------------------------------------------- #
+# package-user system
+# --------------------------------------------------------------------------- #
+# getent comes from glibc (present), but useradd/groupadd come from Shadow,
+# which is chapter 8 package #26 -- so for most of the build there is no user
+# management at all.  /etc/passwd and /etc/group are plain text though, so we
+# create accounts by appending to them directly when the tools are missing.
+have_shadow_tools() { command -v useradd >/dev/null 2>&1 \
+                   && command -v groupadd >/dev/null 2>&1; }
+
+# The passwd/group FILES are authoritative: inside the chroot they ARE the user
+# database, and getent can otherwise answer from another NSS source and mask
+# what's really in /etc.  Only fall back to getent if the file is unreadable.
+group_exists() {
+    if [ -r "$ETC/group" ];  then grep -q "^$1:" "$ETC/group";
+    else getent group "$1" >/dev/null 2>&1; fi
+}
+user_exists() {
+    if [ -r "$ETC/passwd" ]; then grep -q "^$1:" "$ETC/passwd";
+    else getent passwd "$1" >/dev/null 2>&1; fi
+}
+
+id_taken() {
+    # Ask the real database as well as the files.  A uid can be in use without
+    # matching the ":x:<id>:" pattern (a different password field, an entry from
+    # another source), and picking it anyway ends in
+    #     useradd: UID 10067 is not unique
+    getent passwd "$1" >/dev/null 2>&1 && return 0
+    getent group  "$1" >/dev/null 2>&1 && return 0
+    grep -q ":x:$1:" "$ETC/passwd" 2>/dev/null && return 0
+    grep -q ":x:$1:" "$ETC/group"  2>/dev/null && return 0
+    return 1
+}
+
+# append a group / user by hand (no Shadow needed)
+# remove a user from the install group's member list (handles the member being
+# first, last, only, or in the middle -- chained seds get this wrong)
+drop_from_install_group() {
+    local u="$1" line members out=""
+    line="$(grep "^install:" "$ETC/group" 2>/dev/null)" || return 0
+    members="${line##*:}"
+    local IFS=','
+    for m in $members; do
+        [ "$m" = "$u" ] && continue
+        [ -n "$m" ] || continue
+        out="${out:+$out,}$m"
+    done
+    unset IFS
+    sed -i "s|^install:.*|install:x:$INSTALL_GID:$out|" "$ETC/group"
+}
+
+raw_groupadd() { echo "$1:x:$2:" >> "$ETC/group"; }
+raw_useradd() {
+    local name="$1" id="$2" home="$3"
+    echo "$name:x:$id:$id:package $name:$home:/bin/bash" >> "$ETC/passwd"
+    # supplementary membership in the install group
+    if grep -q "^install:" "$ETC/group"; then
+        local line members
+        line="$(grep "^install:" "$ETC/group")"
+        members="${line##*:}"
+        if [ -n "$members" ]; then members="$members,$name"; else members="$name"; fi
+        sed -i "s|^install:.*|install:x:$INSTALL_GID:$members|" "$ETC/group"
+    fi
+}
+
+# The shared "install directories" -- the dirs packages install INTO.  These
+# belong to root:install and are group-writable so any package user can add
+# files; they are NOT owned by individual packages.  (Modelled on
+# more_control_helpers/installdirs.lst from the package-users hint.)
+install_dirs_list() {
+    if [ -f "$INSTALLDIRS" ]; then
+        grep -v '^[[:space:]]*\(#\|$\)' "$INSTALLDIRS"
+        return
+    fi
+    cat <<'IDLIST'
+/bin
+/sbin
+/lib
+/lib64
+/opt
+/boot
+/boot/efi
+/efi
+/sources
+/usr/src
+/tmp
+/var/tmp
+/root
+/home
+/etc
+/etc/opt
+/etc/sysconfig
+/usr
+/usr/bin
+/usr/sbin
+/usr/lib
+/usr/lib64
+/usr/lib/pkgconfig
+/usr/libexec
+/usr/include
+/usr/src
+/usr/share
+/usr/share/aclocal
+/usr/share/color
+/usr/share/dict
+/usr/share/doc
+/usr/share/info
+/usr/share/locale
+/usr/share/man
+/usr/share/man/man1
+/usr/share/man/man2
+/usr/share/man/man3
+/usr/share/man/man4
+/usr/share/man/man5
+/usr/share/man/man6
+/usr/share/man/man7
+/usr/share/man/man8
+/usr/share/misc
+/usr/share/pkgconfig
+/usr/share/terminfo
+/usr/share/zoneinfo
+/usr/local
+/usr/local/bin
+/usr/local/sbin
+/usr/local/lib
+/usr/local/include
+/usr/local/share
+/usr/local/share/man
+/usr/local/src
+/var
+/var/cache
+/var/lib
+/var/local
+/var/log
+/var/mail
+/var/opt
+/var/spool
+IDLIST
+}
+
+# /usr/include itself is shared -- every package drops headers in it.  Its
+# SUBTREES are not: /usr/include/c++/<version> belongs to gcc.  Listing those
+# here made them "shared install directories", so a package that could not
+# write there got the `install` group applied automatically instead of being
+# asked which collector group should own it -- silently handing gcc's headers
+# to everyone.  Adoption of that tree is prevented by the contents check in
+# cmd_adopt_dirs, which is the right mechanism for it.
+#
+# /tmp and /var/tmp are world-writable scratch space with the sticky bit
+# already set -- a package that happens to write there must not come to OWN
+# them (man-pages ended up owning /tmp, which would break every other user of
+# it).  /root and /home belong to people, not packages.
+#
+# Note the shape of these: /usr/libexec is shared (every package drops a
+# subdirectory in it) but /usr/libexec/p11-kit is NOT -- that belongs to
+# p11-kit.  The same goes for /usr/share/zsh/site-functions, which IS shared:
+# every package drops a completion file straight into it.
+#
+# Directories that are shared by their very nature, matched as PATTERNS rather
+# than listed one by one.  Translated man pages and message catalogues create a
+# directory per language (/usr/share/man/de/man1, /usr/share/locale/pl/
+# LC_MESSAGES, ...) and practically every package writes into them, so listing
+# them individually is hopeless -- there are hundreds, and they appear as
+# packages are installed.
+install_dir_patterns() {
+    cat <<'IPAT'
+*/usr/share/man/man[1-9]
+*/usr/share/man/*/man[1-9]
+*/usr/share/man/*
+*/usr/share/locale/*/LC_MESSAGES
+*/usr/share/locale/*
+*/usr/share/info
+*/usr/share/doc
+*/usr/lib/pkgconfig
+*/usr/share/pkgconfig
+*/usr/share/terminfo/*
+*/usr/include
+*/usr/share/bash-completion/completions
+*/usr/share/zsh/site-functions
+*/usr/share/zsh/vendor-completions
+*/usr/share/fish/completions
+*/usr/share/fish/vendor_completions.d
+*/usr/share/applications
+*/usr/share/mime/packages
+*/usr/share/dbus-1/services
+*/usr/share/dbus-1/system-services
+*/usr/share/metainfo
+*/usr/share/appdata
+*/usr/share/icons/hicolor/*
+*/usr/share/pixmaps
+*/usr/share/glib-2.0/schemas
+*/usr/share/vala/vapi
+*/usr/share/gir-1.0
+*/usr/lib/girepository-1.0
+*/usr/share/aclocal
+*/usr/share/gtk-doc/html
+*/usr/lib/systemd/system
+*/usr/lib/udev/rules.d
+*/etc/xdg/autostart
+*/usr/libexec
+IPAT
+}
+
+matches_install_pattern() {
+    local p="${1%/}" pat
+    while IFS= read -r pat; do
+        # shellcheck disable=SC2254
+        case "$p" in $pat) return 0 ;; esac
+    done < <(install_dir_patterns)
+    return 1
+}
+
+# is this path one of the shared install dirs (root:install), rather than
+# something the package created for itself?
+is_install_dir() {
+    local raw="${1%/}" p d
+    p="${raw#${SNAP_ROOT%/}}"        # make it absolute-in-target
+    [ -n "$p" ] || return 0
+    while IFS= read -r d; do
+        [ "$p" = "$d" ] && return 0
+    done < <(install_dirs_list)
+    matches_install_pattern "$raw" && return 0
+    return 1
+}
+
+pkgusr_ready() { group_exists install; }
+
+cmd_init_pkgusr() {
+    need_root; mkstate
+    local run=0; [ "${1:-}" = "--run" ] && run=1
+
+    say "Package-user system setup:"
+    say "  1. create the 'install' group (gid $INSTALL_GID)"
+    say "  2. give install directories to group 'install', group-writable"
+    say "     NOT sticky yet: an install directory is finally group-writable"
+    say "     AND sticky, but during the build the sticky bit would stop package"
+    say "     users replacing the temporary-system files still owned by root."
+    say "     Add it at the very end with:  lfs-helper seal-install-dirs --run"
+    if [ "$run" = 0 ]; then
+        warn "(dry run -- re-run with --run to apply)"
+        return 0
+    fi
+
+    if group_exists install; then
+        say "# 'install' group already exists"
+    elif have_shadow_tools; then
+        # Tolerate "already exists": init-pkgusr is run automatically now, and
+        # a step that cannot be repeated safely would break every later run.
+        if groupadd -g "$INSTALL_GID" install 2>/dev/null; then
+            ok "# created group install ($INSTALL_GID)"
+        elif getent group install >/dev/null 2>&1; then
+            say "# 'install' group already exists"
+        else
+            die "groupadd install failed"
+        fi
+    else
+        raw_groupadd install "$INSTALL_GID"
+        ok "# created group install ($INSTALL_GID) by editing /etc/group"
+        say "  (Shadow isn't built yet -- no groupadd, so this was done by hand)"
+    fi
+
+    # Directories packages install into.  Anything missing is skipped quietly.
+    local d n=0 failed=""
+    while IFS= read -r d; do
+        d="${SNAP_ROOT%/}$d"
+        [ -d "$d" ] || continue
+        if ! chgrp install "$d" 2>/dev/null; then
+            # `|| continue` here reported "0 install directories" with no hint
+            # that anything went wrong -- and the build then failed much later
+            # with permission errors nobody could trace back to this.
+            failed="$failed $d"
+            continue
+        fi
+        # the hint's definition: chgrp install <dir> && chmod g+w,o+t <dir>.
+        # o+t (sticky) is deliberately deferred to seal-install-dirs, because
+        # it would stop package users replacing files the temporary system
+        # installed as root.
+        chmod g+w "$d" 2>/dev/null || true
+        n=$((n+1))
+    done < <(install_dirs_list)
+    ok "# $n install directories now belong to group 'install' (group-writable)"
+    if [ -n "$failed" ]; then
+        warn "# could not set the group on:"
+        local f
+        for f in $failed; do warn "#     $f"; done
+        warn "# The build will hit permission errors in these later."
+    fi
+    mark_done "pkgusr-init"
+    say ""
+    say "Next:  lfs-helper next"
+}
+
+# add-user <name> -- create a package user the packagemanager way:
+#   own group, home /usr/src/<name>, member of the supplementary 'install' group
+# The shared package-user environment (the hint's /etc/pkgusr).  A user without
+# it exists but cannot build: no .bash_profile, no .bashrc, no build helper, and
+# the wrong umask.
+PKGUSR_ETC="${LFS_PKGUSR_ETC:-${SNAP_ROOT%/}/etc/pkgusr}"
+
+ensure_pkgusr_etc() {
+    mkdir -p "$PKGUSR_ETC" 2>/dev/null || return 1
+    if [ ! -f "$PKGUSR_ETC/bash_profile" ]; then
+        cat > "$PKGUSR_ETC/bash_profile" <<'EOF'
+# /etc/pkgusr/bash_profile -- shared by every package user (symlinked as
+# ~/.bash_profile), so every build sees the same environment.
+umask 022
+export LC_ALL=POSIX
+# /usr/local/bin comes FIRST after the wrappers: locally installed
+# overrides belong ahead of /usr/bin, and a temporary wrapper there
+# (the no-verify wget, say) is useless if nothing ever finds it.
+PATH=/usr/lib/pkgusr:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+export PS1='\u:\w\$ '
+export PKG_HOME="$HOME"
+cd "$HOME" 2>/dev/null || true
+[ -f "$HOME/build.conf" ] && . "$HOME/build.conf"
+EOF
+    fi
+    if [ ! -f "$PKGUSR_ETC/bashrc" ]; then
+        cat > "$PKGUSR_ETC/bashrc" <<'EOF'
+# /etc/pkgusr/bashrc -- symlinked as ~/.bashrc.  Package users never log in, so
+# login and non-login shells should behave identically: just source the profile.
+[ -f "$HOME/.bash_profile" ] && . "$HOME/.bash_profile"
+EOF
+    fi
+    if [ ! -f "$PKGUSR_ETC/build" ]; then
+        cat > "$PKGUSR_ETC/build" <<'EOF'
+#!/bin/bash
+# /etc/pkgusr/build -- symlinked as ~/build.  Runs the usual sequence using the
+# package user's build.conf.
+set -e
+conf="${1:-$HOME/build.conf}"
+[ -f "$conf" ] || { echo "no build.conf at $conf" >&2; exit 1; }
+. "$conf"
+: "${SRC_DIR:=$HOME}"
+: "${CONFIGURE_OPTS:=--prefix=/usr}"
+: "${MAKE_OPTS:=}"
+cd "$SRC_DIR"
+[ -x ./configure ] && ./configure $CONFIGURE_OPTS
+make $MAKE_OPTS
+make install
+EOF
+        chmod 755 "$PKGUSR_ETC/build"
+    fi
+    return 0
+}
+
+init_package_user_home() {
+    local name="$1" home="${2:-$SRCROOT/$1}"
+    ensure_pkgusr_etc || return 1
+    mkdir -p "$home"
+    local link target
+    for link in .bash_profile:bash_profile .bashrc:bashrc build:build; do
+        target="${link#*:}"; link="${link%%:*}"
+        ln -sfn "$PKGUSR_ETC/$target" "$home/$link"
+    done
+    if [ ! -f "$home/build.conf" ]; then
+        cat > "$home/build.conf" <<EOF
+# build.conf for package user '$name' -- read by ~/build.
+#SRC_DIR="\$HOME/$name-1.0"
+CONFIGURE_OPTS="--prefix=/usr"
+MAKE_OPTS=""
+EOF
+    fi
+    [ -f "$home/.project" ] || printf '%s\n\nPackage user for %s.\n' "$name" "$name" > "$home/.project"
+    chown -R -h "$name:$name" "$home" 2>/dev/null || true
+    return 0
+}
+
+# Steps that are not packages, and must never get a package user.
+#
+# last-step, init-dirs, cfg-* and refind are actions, not software: they own no
+# files of their own and installing "as" them makes no sense.  A `last-step`
+# user appeared because a manifest existed under that name, and everything the
+# step touched -- including wget's binary, installed as the wget user -- was
+# then handed to it.
+_is_not_a_package() {
+    case "$1" in
+        last-step|init-*|cfg-*|refind) return 0 ;;
+    esac
+    return 1
+}
+
+# Keep /etc/passwd and /etc/group in id order as users are created.
+#
+# They are appended to, so without this the files drift into build order and
+# have to be tidied up afterwards -- which only happens if someone remembers.
+# The files are a few kilobytes; sorting them on each creation costs nothing.
+_sort_users_quietly() {
+    cmd_sort_users --run >/dev/null 2>&1 || true
+}
+
+cmd_add_user() {
+    need_root
+    local name="${1:-}"; [ -n "$name" ] || die "usage: lfs-helper add-user <name>"
+    if _is_not_a_package "$name"; then
+        warn "'$name' is a build step, not a package -- no user created."
+        return 0
+    fi
+    pkgusr_ready || die "run 'lfs-helper init-pkgusr --run' first"
+
+    if user_exists "$name"; then
+        say "# user '$name' already exists"
+    else
+        if have_shadow_tools; then
+            # Let Shadow allocate the ids.  Choosing them by hand means racing
+            # its own idea of what is free -- and losing:
+            #     useradd: UID 10067 is not unique
+            # -K UID_MIN/GID_MIN keeps package users in their own range without
+            # us having to track which numbers are already used.
+            if group_exists "$name"; then
+                useradd -c "package $name" -d "$SRCROOT/$name" -g "$name" \
+                        -G install -s /bin/bash -K "UID_MIN=$PKG_UID_MIN" "$name" \
+                    || die "useradd $name failed"
+            else
+                # -U creates the private group together with the user, so the
+                # uid and gid match -- creating the group separately lets the
+                # two counters drift apart (uid 10000 / gid 10001).
+                useradd -c "package $name" -d "$SRCROOT/$name" -U \
+                        -G install -s /bin/bash \
+                        -K "UID_MIN=$PKG_UID_MIN" -K "GID_MIN=$PKG_UID_MIN" \
+                        "$name" \
+                    || die "useradd $name failed"
+            fi
+            ok "# created package user $name (uid/gid $(id -u "$name")/$(id -g "$name"), +install)"
+            _sort_users_quietly
+        else
+            # No Shadow yet: we write the files ourselves, so we do have to pick
+            # a free id -- one that is free as BOTH a uid and a gid, so the
+            # package user gets a matching private group.
+            local uid=$PKG_UID_MIN
+            while id_taken "$uid"; do uid=$((uid+1)); done
+            group_exists "$name" || raw_groupadd "$name" "$uid"
+            raw_useradd "$name" "$uid" "$SRCROOT/$name"
+            ok "# created package user $name (uid/gid $uid, +install) via /etc/passwd"
+            _sort_users_quietly
+        fi
+    fi
+    init_package_user_home "$name" "$SRCROOT/$name"
+    chmod 755 "$SRCROOT/$name"
+}
+
+# --------------------------------------------------------------------------- #
+# file tracking (same manifest layout the `lfs` tool writes)
+# --------------------------------------------------------------------------- #
+# Build variables (LFS_TGT, MAKEFLAGS) as configured by `lfs config`.  The
+# chroot resets the environment, so they're read from a file inside the tree
+# rather than inherited -- otherwise a custom LFS_TGT silently reverts.
+load_env() { [ -f "$STATE/env" ] && . "$STATE/env"; return 0; }
+load_env
+
+# Read a stored snapshot, translating paths recorded OUTSIDE the chroot.
+# Chapters 5-6 ran on the host, where this tree was $LFS/usr/bin/...; in here
+# the same files are /usr/bin/....  Without translating, the "before" set shares
+# no paths with the "after" set and the very first in-chroot build looks like it
+# installed the entire system.
+load_snapshot() {
+    local f="$1" m="${LFS_HOST_MOUNT:-}" r="${SNAP_ROOT%/}"
+    if [ -n "$m" ] && grep -q "^$m/" "$f" 2>/dev/null; then
+        sed "s|^$m/|$r/|" "$f"
+    else
+        cat "$f"
+    fi
+}
+
+have_su() { command -v su >/dev/null 2>&1; }
+
+snapshot_dirs() {
+    local r="${SNAP_ROOT%/}"
+    find "${SNAP_ROOT:-/}" -xdev -type d \
+        -not -path "$r/.lfs-pkgusr/*" -not -path "$SRCROOT/*" \
+        -not -path "$r/dev/*"  -not -path "$r/proc/*" \
+        -not -path "$r/sys/*"  -not -path "$r/run/*" \
+        -not -path "$r/tmp/*"  -not -path "$r/sources/*" \
+        2>/dev/null | sort
+}
+
+snapshot() {
+    # Exclusions are anchored to the tracked root -- a bare "*/tmp/*" would also
+    # throw away legitimate files like /usr/share/foo/tmp/bar.
+    local r="${SNAP_ROOT%/}"
+    find "${SNAP_ROOT:-/}" -xdev \( -type f -o -type l \) \
+        -not -path "$r/.lfs-pkgusr/*" -not -path "$SRCROOT/*" \
+        -not -path "$r/dev/*"  -not -path "$r/proc/*" \
+        -not -path "$r/sys/*"  -not -path "$r/run/*" \
+        -not -path "$r/tmp/*"  -not -path "$r/sources/*" \
+        2>/dev/null | sort
+}
+
+# --------------------------------------------------------------------------- #
+# building
+# --------------------------------------------------------------------------- #
+script_for() { echo "$SCRIPTS/$1.sh"; }
+
+# Chapter 7's temporary tools are built as root (the book does it that way);
+# the package-user system takes over for the real chapter 8 packages.
+# The package USER a step's files belong to.  Several steps are really the same
+# package built more than once -- gcc-pass1, gcc-pass2 and libstdcpp are all
+# GCC; binutils-pass1/-pass2 are both Binutils -- and chapter 8 rebuilds each of
+# them under the plain name.  Giving each pass its own user would leave the
+# system with gcc-pass1-owned files that the real `gcc` user can never manage,
+# so every pass maps to the base package name.
+pkg_owner_name() {
+    # Lower-case first.  User names are case-sensitive on Unix, and the book's
+    # anchors are not consistent: chapter 7 gives "python-tmp" but chapter 8
+    # gives "Python", which would become two different accounts -- and then the
+    # chapter-8 package cannot overwrite its own chapter-7 files:
+    #     install: cannot remove '/usr/lib/python3.13/.../__init__.py':
+    #              Permission denied      (owned by python, installing as Python)
+    local n; n="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    # Perl module names ("XML::Parser") are not valid user names
+    n="${n//:://}"; n="${n//\//-}"
+    case "$n" in
+        libstdcpp|libstdc++) echo gcc; return ;;
+    esac
+    # strip a trailing -pass<N> or -tmp
+    n="${n%-tmp}"
+    case "$n" in
+        *-pass[0-9]) n="${n%-pass[0-9]}" ;;
+    esac
+    echo "$n"
+}
+
+# Per-phase progress.  A step is only "built" after a full run, but people
+# legitimately run one phase at a time (retrying just `install` after a failed
+# test suite, say), so remember which phases finished and let `next` pick up
+# from there instead of suggesting the whole package again.
+PHASES="$STATE/phases"
+LOGS="$STATE/logs"
+
+# Pull the actual error out of a build log.  With a parallel make the failing
+# job's message can be thousands of lines above the end, so showing the tail
+# (what you see on screen) is usually useless.
+show_build_errors() {
+    local log="$1" n=0
+    [ -f "$log" ] || return 0
+    say ""
+    say "${C_ERR}--- first errors in the log ---${C_OFF}"
+    grep -nE "(^|[^-])\\berror\\b:|\\*\\*\\* \\[|Error [0-9]+|No such file or directory|command not found|undefined reference" \
+        "$log" 2>/dev/null | grep -vE "Error 1$|Error 2$" | head -12 | while IFS= read -r l; do
+        say "  $l"
+    done
+    n=$(grep -cE "\\berror\\b:|\\*\\*\\* \\[" "$log" 2>/dev/null || echo 0)
+    say "${C_ERR}-------------------------------${C_OFF}"
+    say "  full log: $log"
+}
+
+phase_file()   { echo "$PHASES/$1"; }
+record_phase() { mkdir -p "$PHASES"; grep -qxF "$2" "$(phase_file "$1")" 2>/dev/null \
+                 || echo "$2" >> "$(phase_file "$1")"; }
+phase_done()   { grep -qxF "$2" "$(phase_file "$1")" 2>/dev/null; }
+clear_phases() { rm -f "$(phase_file "$1")"; }
+
+# which phases does this package's script actually define?
+script_phases() {
+    local f; f="$(script_for "$1")"
+    [ -f "$f" ] || return 0
+    echo unpack
+    echo build
+    echo install
+    grep -q '^#### CONFIGURE ####' "$f" && echo configure
+    return 0
+}
+
+# The phase to run next: the one AFTER the furthest phase already finished.
+# (Not simply the first unfinished one -- after running only `install`, the
+# earlier unpack/build had clearly happened too, and suggesting "unpack" would
+# send you backwards.)
+next_phase_for() {
+    local name="$1" p last="" seen=0
+    while read -r p; do
+        phase_done "$name" "$p" && { last="$p"; seen=1; }
+    done < <(script_phases "$name")
+    [ "$seen" = 1 ] || { script_phases "$name" | head -n1; return 0; }
+    local after=0
+    while read -r p; do
+        [ "$after" = 1 ] && { echo "$p"; return 0; }
+        [ "$p" = "$last" ] && after=1
+    done < <(script_phases "$name")
+    return 1
+}
+
+# =========================================================================== #
+# SHARED WITH packagemanager (kept in sync by hand for now)
+#
+# These functions exist in both tools -- lfs-helper (bash, drives the chroot
+# build) and packagemanager/packagemanager_install (drives everything after).
+# They must behave identically; when one changes, change the other:
+#
+#   here                          there
+#   ----------------------------  -------------------------------------------
+#   unwritable_dirs_from_log      packagemanager_install: same name
+#   grant_dir_access              packagemanager_install: grant_dir_to_user
+#   is_install_dir + patterns     packagemanager: config install_dirs
+#   init_package_user_home        packagemanager: init_package_user_home
+#   ensure_pkgusr_etc             packagemanager: ensure_pkgusr_etc
+#   count_lines                   (bash-only)
+#
+# The rules they implement, in one place:
+#   * a package's files belong to its package user -- always
+#   * shared install dirs are root:install, group-writable, later sticky
+#   * a directory another package owns is shared via a collector group;
+#     if it already HAS one, join it -- never make a second
+#   * NEVER a collector group for root; root-owned trees are adopted or left
+#   * paths to fix come only from genuine permission-error lines, never from
+#     tracebacks or incidental log text
+# =========================================================================== #
+
+# Count non-empty lines safely.
+#
+# `grep -c .` prints 0 AND exits non-zero when there is no match, so the common
+# `grep -c . file || echo 0` produces "0\n0" and every later numeric test fails
+# with "integer expression expected".
+count_lines() {
+    local n
+    if [ -f "$1" ]; then
+        n=$(grep -c . "$1" 2>/dev/null) || n=0
+    else
+        n=0
+    fi
+    printf '%s' "${n:-0}"
+}
+
+count_stdin_lines() {
+    local n
+    n=$(grep -c . 2>/dev/null) || n=0
+    printf '%s' "${n:-0}"
+}
+
+is_root_step() { [ -f "$STATE/rootsteps" ] && grep -qxF "$1" "$STATE/rootsteps"; }
+
+# Remove a stale unpacked source tree BEFORE the build, as root.
+#
+# /sources is sticky (1777), so only the owner may delete a directory in it.
+# Chapters 5-6 unpacked their sources as the `lfs` user, and chapter 8 builds
+# the same packages as their own package user -- which therefore cannot remove
+# the leftover tree.  The script's own `rm -rf` fails, tar extracts on top of
+# it, and the build dies with a wall of
+#     tar: gcc-15.2.0/README: Cannot open: File exists
+#     tar: gcc-15.2.0: Cannot utime: Operation not permitted
+# Doing it here, as root, keeps the package user out of the problem entirely.
+clean_stale_source() {
+    local name="$1" script="$2" srcdir="${SNAP_ROOT%/}/sources"
+    [ -d "$srcdir" ] || return 0
+    local glob; glob="$(sed -n 's/^pkg_glob="\(.*\)"$/\1/p' "$script" | head -n1)"
+    [ -n "$glob" ] || return 0
+
+    local pkg="" _c
+    ( cd "$srcdir" || exit 0
+      for _c in $glob; do
+          [ -e "$_c" ] || continue
+          case "$_c" in *-src.*|*-source.*) echo "$_c"; exit 0 ;; esac
+      done
+      for _c in $glob; do
+          [ -e "$_c" ] || continue
+          case "$_c" in *-html.*|*-doc.*|*-docs.*|*-man.*|*-manual.*|*-tests.*) continue ;; esac
+          echo "$_c"; exit 0
+      done ) > /tmp/.lfs-pkg.$$ 2>/dev/null
+    pkg="$(cat /tmp/.lfs-pkg.$$ 2>/dev/null)"; rm -f /tmp/.lfs-pkg.$$
+    [ -n "$pkg" ] || return 0
+
+    # The build markers are written by whoever built last.  /sources is sticky,
+    # so a marker left by the `lfs` user (chapters 5-6) cannot be replaced by a
+    # chapter-8 package user, and the build dies with
+    #     /sources/.cc-build-ncurses: Permission denied
+    # Clear them here, as root; the build recreates them.
+    rm -f "$srcdir/.cc-build-$name" "$srcdir/.cc-dir-$name" 2>/dev/null
+
+    local dir
+    dir="$(tar tf "$srcdir/$pkg" 2>/dev/null | head -n1 | cut -d/ -f1)"
+    [ -n "$dir" ] || return 0
+    [ -d "$srcdir/$dir" ] || return 0
+    say "${C_DIM}# [root] removing stale source tree $srcdir/$dir${C_OFF}"
+    rm -rf "${srcdir:?}/${dir:?}" || warn "could not remove $srcdir/$dir"
+}
+
+# ---------------------------------------------------------------------------
+# collector groups
+#
+# The package-user scheme gives every package its own user, but packages do
+# install into directories another package created -- gcc drops gcc.mo into
+# /usr/share/locale/<lang>/LC_MESSAGES, which belongs to whichever package made
+# those directories.  Without help the installing user simply cannot write
+# there:
+#     install: cannot create regular file '.../gcc.mo': Permission denied
+#
+# The fix (same as the packagemanager script uses) is a COLLECTOR GROUP: the
+# owning package's directory is handed to a group named <prefix>_<owner>, made
+# group-writable, and every package that needs to install there joins it.
+# Ownership stays with the owner; the others get exactly the access they need.
+# One source of truth, in this order:
+#   1. LFS_COLLECTOR_PREFIX      -- set by the generated build env
+#   2. the lfs config            -- what the system was actually built with
+#   3. packagemanager's own conf -- for a booted system with no lfs config
+# Disagreeing prefixes mean two parallel sets of groups over the same
+# directories, with nothing to say so, which is why this is resolved once here
+# rather than defaulted separately in each tool.
+_read_shared_prefix() {
+    local v=""
+    for f in /usr/share/lfs/config.json "$HOME/.local/share/lfs/config.json"; do
+        [ -r "$f" ] || continue
+        v="$(sed -n 's/.*"collector_prefix"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' \
+             "$f" | head -n1)"
+        [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    done
+    for f in /etc/pkgusr/packagemanager.conf; do
+        [ -r "$f" ] || continue
+        v="$(sed -n 's/^collector_prefix=\(.*\)$/\1/p' "$f" | head -n1)"
+        [ -n "$v" ] && { printf '%s' "$v"; return 0; }
+    done
+    return 1
+}
+
+COLLECTOR_PREFIX="${LFS_COLLECTOR_PREFIX:-$(_read_shared_prefix || true)}"
+GRANTED="$STATE/granted-groups"
+# dir|group, one per line: the decisions made so far.  Exported so a rebuild
+# can reuse them instead of asking the same questions again.
+COLLECTOR_MAP="$STATE/collector-map"
+
+require_collector_prefix() {
+    [ -n "$COLLECTOR_PREFIX" ] && return 0
+    die "no collector-group prefix configured.
+
+  Packages sometimes install into a directory another package owns -- gcc
+  writes gcc.mo into glibc's /usr/share/locale/*/LC_MESSAGES.  Such a
+  directory keeps its owner but is handed to a group named <prefix>_<owner>
+  and made group-writable, and both packages join it.
+
+  Set the prefix OUTSIDE the chroot, then regenerate:
+      lfs config collector_prefix sysgroup
+      lfs build-system gen-chroot-scripts --run --overwrite"
+}
+
+collector_group_for() { echo "${COLLECTOR_PREFIX}_$1"; }
+
+ensure_group() {
+    local grp="$1"
+    group_exists "$grp" && return 0
+    if have_shadow_tools; then
+        # groupadd fails if it already exists in the real database (which
+        # group_exists may not see when $ETC is redirected) -- treat that as fine
+        create_collector_group "$grp" || return 1
+    else
+        local gid=$(( INSTALL_GID - 1 ))
+        while getent group "$gid" >/dev/null 2>&1 \
+              || grep -q ":x:$gid:" "$ETC/group" 2>/dev/null; do
+            gid=$(( gid - 1 ))
+        done
+        echo "$grp:x:$gid:" >> "$ETC/group"
+    fi
+}
+
+add_to_group() {
+    local user="$1" grp="$2"
+    if have_shadow_tools && command -v usermod >/dev/null 2>&1; then
+        usermod -a -G "$grp" "$user" 2>/dev/null && return 0
+    fi
+    local line members
+    line="$(grep "^$grp:" "$ETC/group" 2>/dev/null)" || return 1
+    members="${line##*:}"
+    case ",$members," in *",$user,"*) return 0 ;; esac
+    [ -n "$members" ] && members="$members,$user" || members="$user"
+    local gid; gid="$(echo "$line" | cut -d: -f3)"
+    sed -i "s|^$grp:.*|$grp:x:$gid:$members|" "$ETC/group"
+}
+
+# Group names may only sensibly contain [a-z0-9_-]; keep them short too, since
+# many tools cap group names at 32 characters.
+sanitise_group_name() {
+    # `tr -c` turns EVERY other character into a dash, including spaces -- so
+    # an answer typed with a leading space became "-name", and one with two
+    # became "--name", which groupadd rejects as an option:
+    #     could not create group --nimgnu_gcc
+    # Trim first, then collapse runs of dashes, then strip them from the ends:
+    # a group name may not start with a dash, and a trailing one is just noise.
+    local n="$1"
+    n="${n#"${n%%[![:space:]]*}"}"          # leading whitespace
+    n="${n%"${n##*[![:space:]]}"}"          # trailing whitespace
+    printf '%s' "$n" \
+        | tr 'A-Z' 'a-z' \
+        | tr -c 'a-z0-9_-' '-' \
+        | sed -E 's/-+/-/g; s/^-+//; s/-+$//' \
+        | cut -c1-32
+}
+
+# Which collector group should own this directory?
+#
+# The default names it after the OWNING package (<prefix>_binutils), which
+# groups every directory that package owns under one group.  Naming it after
+# the DIRECTORY instead (<prefix>_bfd-plugins) is often clearer when the point
+# is "anyone who installs a linker plugin", so offer both and let the user
+# decide -- with enough context to choose sensibly.
+# Is <user> already a member of <group>?
+user_in_group() {
+    local u="$1" g="$2" line
+    if [ -r "$ETC/group" ]; then
+        line="$(grep "^$g:" "$ETC/group" 2>/dev/null | head -n1)"
+    else
+        line="$(getent group "$g" 2>/dev/null)"
+    fi
+    [ -n "$line" ] || return 1
+    case ",${line##*:}," in
+        *",$u,"*) return 0 ;;
+    esac
+    return 1
+}
+
+choose_collector_group() {
+    local dir="$1" owner="$2" user="$3"
+    local by_owner by_dir
+    by_owner="$(sanitise_group_name "$(collector_group_for "$owner")")"
+    by_dir="$(sanitise_group_name "${COLLECTOR_PREFIX}_$(basename "$dir")")"
+
+    # already handled? reuse whatever group the directory has
+    local cur; cur="$(stat -c %G "$dir" 2>/dev/null)"
+    case "$cur" in
+        "${COLLECTOR_PREFIX}_"*) echo "$cur"; return 0 ;;
+    esac
+
+    # Already a member of the owner's collector group?  Then the decision was
+    # made when that group was created: this package may install into the
+    # owner's directories.  Asking again for every directory is just noise --
+    # a package in <prefix>_python installing into a python-owned directory is
+    # precisely what that group is for.  The directory still changes one at a
+    # time; membership does not hand over python's whole tree.
+    if group_exists "$by_owner" && user_in_group "$user" "$by_owner"; then
+        echo "$by_owner"
+        return 0
+    fi
+
+    # decided before (this run or an imported list)?  don't ask again
+    # An export copied into the tree is a decision already made, even if
+    # `import-groups` has not been run.  Consulting it here means the build
+    # never stops to ask a question whose answer is sitting in the tree.
+    if [ -f "$STATE/collector-groups.import" ]; then
+        local _pre
+        _pre="$(awk -F'|' -v d="$dir" \
+                    '$1 == "dir" && $2 == d { print $3; exit }' \
+                    "$STATE/collector-groups.import" 2>/dev/null)"
+        if [ -n "$_pre" ]; then
+            echo "$_pre"
+            return 0
+        fi
+    fi
+
+    if [ -f "$COLLECTOR_MAP" ]; then
+        local mapped
+        mapped="$(awk -F'|' -v d="${dir#${SNAP_ROOT%/}}" \
+                      '$1 == d { print $2; exit }' "$COLLECTOR_MAP" 2>/dev/null)"
+        if [ -n "$mapped" ]; then
+            echo "$mapped"; return 0
+        fi
+    fi
+
+    # Ask on /dev/tty, not stdin: this runs inside a `while ... done <<< list`
+    # loop, so stdin is the directory list and a plain `read` would silently
+    # consume that instead of waiting for an answer.
+    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ] || [ "${LFS_ASSUME_YES:-0}" = 1 ]; then
+        echo "$by_owner"; return 0
+    fi
+
+    {
+    say ""
+    say "  '$user' needs to install into:  $dir"
+    say "     that directory belongs to package '$owner'"
+    say "     contents: $(ls -A "$dir" 2>/dev/null | wc -l) entry(ies)"
+    say "  Which group should share it?"
+    say "     1) $by_owner   (everything owned by '$owner' -- fewer groups)"
+    say "     2) $by_dir   (just this directory -- more precise)"
+    say "     or type another name"
+    } > /dev/tty
+    # Ask until the answer is usable.  Quietly substituting a different group
+    # than the one asked for is worse than asking again -- the whole point of
+    # this prompt is that the choice is the user's.
+    local ans picked attempts=0
+    while :; do
+        attempts=$((attempts + 1))
+        printf '  [1/2/name] (default 1): ' > /dev/tty
+        # -e: readline editing, so arrow keys and backspace work while
+        # typing an answer instead of inserting escape codes
+        if ! read -e -r ans < /dev/tty; then
+            # no terminal (a script, a pipe): take the default rather than
+            # looping forever on input that will never come
+            echo "$by_owner"
+            return 0
+        fi
+        case "$ans" in
+            ""|1) echo "$by_owner"; return 0 ;;
+            2)    echo "$by_dir";   return 0 ;;
+        esac
+        picked="$(sanitise_group_name "$ans")"
+        if [ -n "$picked" ]; then
+            # say so when the name had to be adjusted, so it is never a
+            # surprise which group ends up owning the directory
+            [ "$picked" = "$ans" ] \
+                || echo "    using '$picked' (adjusted from '$ans')" > /dev/tty
+            echo "$picked"
+            return 0
+        fi
+        echo "    '$ans' has nothing usable in it -- a group name needs" > /dev/tty
+        echo "    letters, digits, '_' or '-'.  Try again, or 1 / 2." > /dev/tty
+        if [ "$attempts" -ge 5 ]; then
+            echo "    giving up after $attempts tries -- using $by_owner" > /dev/tty
+            echo "$by_owner"
+            return 0
+        fi
+    done
+}
+
+# The top of the tree a directory belongs to: walk up while the parent has the
+# same owner and is not one of the shared install directories.  Python's
+# standard library is ~200 directories under /usr/lib/python3.13, so granting
+# one failure at a time never finishes -- share from the top instead.
+collector_tree_top() {
+    local top="$1" parent owner
+    owner="$(stat -c %U "$top" 2>/dev/null)" || { echo "$top"; return 0; }
+    while :; do
+        parent="${top%/*}"
+        [ -n "$parent" ] || break
+        [ "$parent" = "${SNAP_ROOT%/}" ] && break
+        [ -d "$parent" ] || break
+        is_install_dir "$parent" && break
+        [ "$(stat -c %U "$parent" 2>/dev/null)" = "$owner" ] || break
+        top="$parent"
+    done
+    echo "$top"
+}
+
+# give <user> the right to install into <dir>
+grant_dir_access() {
+    local dir="$1" user="$2" owner grp
+    [ -d "$dir" ] || return 0
+    owner="$(stat -c %U "$dir" 2>/dev/null)" || return 0
+
+    # Grant exactly what was asked for.  Promoting the request to "the top of
+    # the owner's tree" turned one directory into a whole hierarchy -- and for
+    # a root-owned tree that meant offering to share /sources.  The package
+    # asks again for the next directory it needs, which is cheap now that an
+    # existing membership grants immediately (below).
+
+    # Fast path: the directory already carries a collector group this user
+    # belongs to.  The decision was made when the group was created, so making
+    # it again is just noise -- open the directory to the group and move on.
+    local curgrp
+    curgrp="$(stat -c %G "$dir" 2>/dev/null)"
+    if [ -n "$curgrp" ] && [ "$curgrp" != root ] \
+       && case "$curgrp" in "$COLLECTOR_PREFIX"*) true ;; *) false ;; esac \
+       && id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$curgrp"; then
+        chmod g+rwx "$dir" 2>/dev/null || true
+        say "    $dir -> already group $curgrp, and '$user' is a member"
+        return 0
+    fi
+
+    # A directory that really is shared infrastructure -- /usr/lib,
+    # /usr/share/man/de/man1 and the rest of installdirs.lst -- gets the install
+    # group and stays root-owned.  Nothing else changes here.
+    if is_install_dir "$dir"; then
+        # ...but never on a directory a PACKAGE USER owns.  The install group
+        # means "anyone may install here", and applying it to a package's own
+        # directory hands that package's tree to everyone without asking.
+        # If a package owns it, the answer is a collector group, and that is a
+        # decision to put to the user -- fall through.
+        local _cur_owner
+        _cur_owner="$(stat -c %U "$dir" 2>/dev/null)"
+        if [ -n "$_cur_owner" ] && [ "$_cur_owner" != root ] \
+           && [ "$_cur_owner" != "$user" ] && user_exists "$_cur_owner"; then
+            say "    $dir is owned by '$_cur_owner' -- asking rather than"
+            say "    opening it to every package."
+        else
+            chgrp install "$dir" 2>/dev/null
+            chmod g+w "$dir" 2>/dev/null
+            say "    $dir -> group install (shared install directory)"
+            return 0
+        fi
+        # owned by another package: fall through to the collector-group path,
+        # which asks rather than deciding on the user's behalf
+    fi
+
+    # A ROOT-OWNED tree that is not an install directory is a leftover: chapter
+    # 7 built the -tmp package as root, so /usr/lib/python3.13 and its ~190
+    # subdirectories all belong to root.  That is a package's private tree, not
+    # shared infrastructure -- it should simply belong to the package.  Hand the
+    # whole leftover subtree to the package installing into it; if some OTHER
+    # package needs to add files there later, it gets a collector group then,
+    # which is the normal mechanism.
+    if [ "$owner" = "root" ]; then
+        # ONLY this directory -- not the tree under it.
+        #
+        # This used to chown the whole subtree, so a package installing one
+        # file into /usr/lib/python3.13/site-packages took all ~190 python
+        # directories with it.  Needing to write into a directory says nothing
+        # about the directories below it, and now that packages record the
+        # directories they create, those already have the right owner.
+        chown "$user:$user" "$dir" 2>/dev/null
+        say "    $dir -> owned by '$user' (was root, from the temporary system)"
+        return 0
+    fi
+    if [ "$owner" = "$user" ]; then
+        return 0                       # already ours
+    fi
+
+
+    # Never invent a collector group for root.  "<prefix>_root" would mean "may
+    # write anywhere root owns", which undoes the whole scheme -- and there is
+    # no user 'root' to put in a collector group anyway.  A root-owned
+    # directory is either shared infrastructure or a leftover to adopt, both
+    # handled above; it is never a package's to share.
+    if [ "$owner" = "root" ]; then
+        warn "    $dir is owned by root -- not creating a collector group for it"
+        return 1
+    fi
+
+    grp="$(choose_collector_group "$dir" "$owner" "$user")"
+    [ -n "$grp" ] || grp="$(collector_group_for "$owner")"
+    if ! ensure_group "$grp"; then
+        # A bad name should not end the build: say what was wrong with it and
+        # fall back to the default, which is always valid.
+        warn "    '$grp' is not a usable group name"
+        grp="$(collector_group_for "$owner")"
+        warn "    using '$grp' instead"
+        ensure_group "$grp" || {
+            warn "    could not create group $grp"
+            return 1
+        }
+    fi
+    add_to_group "$owner" "$grp"
+    add_to_group "$user"  "$grp"
+    chgrp "$grp" "$dir" 2>/dev/null
+    chmod g+rwx "$dir" 2>/dev/null
+
+    # Share exactly the directory that was asked for -- nothing below it.
+    #
+    # A collector group named after a package does NOT mean "may write anywhere
+    # that package owns".  It means: when some package needs to install into a
+    # directory this one owns, that directory can be shared.  Walking the
+    # owner's whole subtree turned one legitimate request into blanket access
+    # over hundreds of directories, so `nimgnu_python` ended up meaning "full
+    # run of every Python directory".
+    #
+    # Installing into a second directory asks again -- and because the package
+    # is already a member of the group by then, that grant is automatic (see
+    # the fast path at the top of this function).
+    chgrp "$grp" "$dir" 2>/dev/null || return 1
+    chmod g+rwx "$dir" 2>/dev/null || true
+    say "    $dir -> group $grp (owner $owner, + $user)"
+    mkdir -p "$(dirname "$GRANTED")"
+    grep -qxF "$grp|$user|$owner" "$GRANTED" 2>/dev/null \
+        || echo "$grp|$user|$owner" >> "$GRANTED"
+    local rel="${dir#${SNAP_ROOT%/}}"
+    grep -qxF "$rel|$grp" "$COLLECTOR_MAP" 2>/dev/null \
+        || echo "$rel|$grp" >> "$COLLECTOR_MAP"
+}
+
+# Read a failed build's log, find every directory the package could not write
+# to, and grant access via collector groups.  Then the same phase can simply be
+# re-run -- no editing, no manual chgrp.
+# Directories mentioned in a log that <user> genuinely cannot write into.
+unwritable_dirs_from_log() {
+    local log="$1" user="$2" p d
+    [ -f "$log" ] || return 0
+    # Take paths both quoted ('...' / "...") and bare -- bash and perl report
+    # them unquoted ("...core_perl/perllocal.pod: Permission denied"), and only
+    # matching quoted ones made the recovery silently find nothing to do.
+    # Read only the TAIL of the log, and only lines that mention a permission
+    # problem.  A build log is tens of megabytes; extracting every path from all
+    # of it and then running `su ... test -w` on each is minutes of CPU for an
+    # answer that is always in the last few lines.
+    local _tail
+    _tail="$(tail -c 524288 "$log" 2>/dev/null \
+             | grep -aE "Permission denied|Operation not permitted|cannot (create|remove|touch|open)|couldn't copy|No such file or directory" \
+             | grep -avE "^[[:space:]]*(File \"|Traceback|at .* line )" \
+             | head -n 100)"
+    { printf '%s\n' "$_tail" | grep -aoE "'[^']+'|\"[^\"]+\"" | tr -d "'\""
+      printf '%s\n' "$_tail" | grep -aoE "/[A-Za-z0-9._/+-]{6,}"; } \
+      | while IFS= read -r p; do
+            case "$p" in /*) ;; *) continue ;; esac
+            case "$p" in
+                "${SNAP_ROOT%/}"/*) ;;
+                /usr/*|/etc/*|/var/*|/opt/*|/lib/*|/lib64/*|/bin/*|/sbin/*|\
+                /home/*|/root/*|/srv/*|/boot/*|/tools/*|/sources/*) ;;
+                *) continue ;;
+            esac
+            if [ -d "$p" ]; then echo "$p"; else echo "${p%/*}"; fi
+        done | sort -u \
+      | while IFS= read -r d; do
+            [ -n "$d" ] && [ -d "$d" ] || continue
+            su -s /bin/bash "$user" -c "test -w '$d'" 2>/dev/null && continue
+            echo "$d"
+        done
+}
+
+# Grant <user> access to everything in the log it could not write, and say
+# which groups that took.  Returns 0 if anything was granted.
+auto_grant_from_log() {
+    local log="$1" user="$2" need d granted=0
+    need="$(unwritable_dirs_from_log "$log" "$user")"
+    [ -n "$need" ] || return 1
+    require_collector_prefix
+    say ""
+    say "${C_WARN}# '$user' could not write into some directories -- granting"
+    say "# access via collector groups and retrying:${C_OFF}"
+    # Many failing paths walk up to the SAME tree top, so without this the same
+    # directory is granted once per path -- nine identical grants in one round.
+    local seen=""
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        local top; top="$(collector_tree_top "$d")"
+        case "$seen" in *"|$top|"*) continue ;; esac
+        seen="$seen|$top|"
+        grant_dir_access "$d" "$user" && granted=1
+    done <<< "$need"
+    [ "$granted" = 1 ]
+}
+
+# Repair /sources after the fact.
+#
+# Two kinds of debris accumulate there:
+#   * tarballs and trees owned by UIDs that only exist on the HOST (tar run as
+#     root restores the ownership recorded in the archive -- 8282, 15399, ...);
+#   * build markers left by a previous package user which, under the sticky
+#     /sources, nobody else can replace.
+# Keep only the languages you actually want.
+#
+# Packages install translated man pages and message catalogues for every
+# language they ship -- often 30+ directories each, none of which you will read.
+# LFS itself suggests trimming them.  The set is configurable; the default keeps
+# English (always) plus German.
+LOCALES_KEEP="${LFS_LOCALES:-en de}"
+
+cmd_prune_locales() {
+    need_root
+    local run=0; [ "${1:-}" = "--run" ] && run=1
+    local r="${SNAP_ROOT%/}"
+
+    say "Keep only these languages: $LOCALES_KEEP  (plus English, always)"
+    say "  configure with:  lfs config locales \"en de fr\"   (outside the chroot)"
+    say ""
+
+    local keep_re="^(en|C|POSIX)"
+    local l
+    for l in $LOCALES_KEEP; do keep_re="$keep_re|^${l}\$|^${l}[._@]"; done
+
+    local d base victims=""
+    for d in "$r"/usr/share/locale/*/ "$r"/usr/share/man/*/; do
+        [ -d "$d" ] || continue
+        base="$(basename "${d%/}")"
+        # man/man1..man9 are the untranslated pages -- never touch them
+        case "$base" in man[1-9]|man[1-9]x) continue ;; esac
+        printf '%s\n' "$base" | grep -qE "$keep_re" && continue
+        victims="$victims${d%/}
+"
+    done
+    victims="$(printf '%s' "$victims" | grep -v '^$' || true)"
+
+    local n; n=$(printf '%s\n' "$victims" | count_stdin_lines)
+    if [ "$n" = 0 ]; then
+        ok "  nothing to remove -- only the wanted languages are installed"
+        return 0
+    fi
+    say "  $n language director(ies) would be removed, e.g.:"
+    printf '%s\n' "$victims" | head -6 | sed 's/^/      /'
+    say ""
+    if [ "$run" = 0 ]; then
+        warn "(dry run -- nothing was changed.  Add --run to remove them.)"
+        return 0
+    fi
+    printf '%s\n' "$victims" | while IFS= read -r d; do
+        [ -n "$d" ] && rm -rf "$d"
+    done
+    ok "  removed $n language director(ies)"
+    say "  (packages will recreate them on reinstall; re-run this when you like)"
+}
+
+# Find (and optionally remove) per-user Python installs.
+#
+# pip falls back to ~/.local when the system site-packages is not writable.  The
+# package that installed it can still import it, so its build looks successful,
+# but nothing else on the system can -- which surfaces much later as
+#     BackendUnavailable: Cannot import 'flit_core.buildapi'
+# Export / import the collector-group decisions.
+#
+# Building a second system means answering the same "which group should share
+# this directory?" questions again.  Exporting the map makes the next build
+# reuse the names you already chose -- no prompts, same layout.
+# Remove duplicate entries from an export.
+#
+# Two sources feed it: a filesystem scan (what really carries a group now) and
+# the recorded map (what was decided, possibly not yet applied).  A directory
+# that is in both appeared twice, because each source was only deduplicated
+# against itself.  `sort -u` across everything would also reorder the file;
+# keeping first occurrences preserves the scan-then-map order, which reads
+# more naturally and keeps a re-export stable.
+_dedupe_collector_export() {
+    awk '!seen[$0]++'
+}
+
+cmd_export_groups() {
+    local out="${1:-$STATE/collector-groups.export}"
+    : > "$out"
+    {
+        echo "# lfs collector groups -- import with: lfs-helper import-groups <file>"
+        echo "# prefix|$COLLECTOR_PREFIX"
+        # The directories that actually carry a collector group right now.
+        # The recorded map only holds the tree TOPS we were asked about; the
+        # filesystem is the authority on what really ended up in each group.
+        local r="${SNAP_ROOT%/}"
+        find "${r:-/}" -xdev -type d \
+             -not -path "${r}/proc/*" -not -path "${r}/sys/*" \
+             -not -path "${r}/dev/*"  -not -path "${r}/run/*" \
+             -not -path "${r}/tmp/*"  -not -path "${r}/sources/*" \
+             -printf '%g|%p\n' 2>/dev/null \
+          | awk -F'|' -v p="${COLLECTOR_PREFIX}_" -v r="$r" '
+                index($1, p) == 1 {
+                    d = $2
+                    if (r != "" && index(d, r) == 1) d = substr(d, length(r) + 1)
+                    print "dir|" d "|" $1
+                }'
+        # plus anything decided but not yet applied
+        if [ -f "$COLLECTOR_MAP" ]; then
+            sed 's/^/dir|/' "$COLLECTOR_MAP"
+        fi
+        # group membership, so the same packages end up in the same groups
+        local line grp members
+        while IFS=: read -r grp _x _gid members; do
+            case "$grp" in
+                "${COLLECTOR_PREFIX}_"*) echo "group|$grp|$members" ;;
+            esac
+        done < "$ETC/group"
+    } | _dedupe_collector_export >> "$out"
+    ok "exported $(grep -c '^dir|' "$out" 2>/dev/null || echo 0) directory mapping(s)"
+    say "  and $(grep -c '^group|' "$out" 2>/dev/null || echo 0) group(s) to $out"
+    say ""
+    say "  Copy that file to the next system and run:"
+    say "      lfs-helper import-groups $out"
+}
+
+cmd_import_groups() {
+    need_root
+    # Parse the arguments ONCE, in one place.  This used to set run=1, then
+    # declare `local run=0` below it (wiping the flag), then reassign $in to
+    # the export path -- so `import-groups --run` read the wrong file and
+    # reported "imported 0 directory mapping(s)" while the decisions sat
+    # unapplied in collector-groups.import.
+    local in="" run=0 a
+    for a in "$@"; do
+        case "$a" in
+            --run) run=1 ;;
+            -*)    die "usage: lfs-helper import-groups [<file>] [--run]" ;;
+            *)     in="$a" ;;
+        esac
+    done
+    if [ -z "$in" ]; then
+        # prefer a file placed here by `lfs build-system gen-chroot-scripts`
+        if [ -f "$STATE/collector-groups.import" ]; then
+            in="$STATE/collector-groups.import"
+        else
+            in="$STATE/collector-groups.export"
+        fi
+    fi
+    [ -f "$in" ] || die "no such file: $in"
+    say "reading $in"
+
+    local ndir=0 ngrp=0 kind a b
+    while IFS='|' read -r kind a b; do
+        case "$kind" in
+            dir)   ndir=$((ndir+1))
+                   [ "$run" = 1 ] && { mkdir -p "$(dirname "$COLLECTOR_MAP")"
+                                       grep -qxF "$a|$b" "$COLLECTOR_MAP" 2>/dev/null \
+                                           || echo "$a|$b" >> "$COLLECTOR_MAP"; } ;;
+            group) ngrp=$((ngrp+1))
+                   if [ "$run" = 1 ]; then
+                       ensure_group "$a" || continue
+                       local m
+                       for m in ${b//,/ }; do
+                           user_exists "$m" && add_to_group "$m" "$a"
+                       done
+                   fi ;;
+        esac
+    # Dedupe on read as well as on write: an export made before the writer
+    # was fixed can contain the same mapping twice, and importing it would
+    # report and apply it twice.
+    done < <(grep -vE '^\s*(#|$)' "$in" | _dedupe_collector_export)
+
+    if [ "$run" = 1 ]; then
+        ok "imported $ndir directory mapping(s) and $ngrp group(s)"
+        say "  Those directories will not be asked about again."
+    else
+        say "  would import $ndir directory mapping(s) and $ngrp group(s)"
+        warn "(dry run -- nothing was changed.  Add --run to apply.)"
+    fi
+}
+
+# Repair package-user homes and VERSION files after the fact.
+#
+# Users created before the skeleton existed have no .bash_profile/.bashrc/build
+# links, or links copied from the wrong place; and packages built before
+# VERSION was recorded have no record of what is installed.  This rebuilds both
+# from what is already on disk.
+cmd_fix_users() {
+    need_root
+    local run=0 skel="${LFS_PKGUSR_SKEL:-${SNAP_ROOT%/}/etc/pkgusr/skel-package}"
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --run)  run=1; shift ;;
+            --skel) skel="${2:?--skel needs a directory}"; shift 2 ;;
+            *) die "usage: lfs-helper fix-users [--run] [--skel <dir>]" ;;
+        esac
+    done
+
+    say "Repair every package user's home:"
+    say "  * .bash_profile, .bashrc and build -> $PKGUSR_ETC"
+    say "  * VERSION, from the install script's name_version"
+    [ -d "$skel" ] && say "  * other files from $skel"
+    say ""
+
+    local n_link=0 n_ver=0 name home nv script
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
+        home="$SRCROOT/$name"
+        [ -d "$home" ] || continue
+
+        # links
+        local need_links=0 l t
+        for l in .bash_profile:bash_profile .bashrc:bashrc build:build; do
+            t="${l#*:}"; l="${l%%:*}"
+            [ "$(readlink "$home/$l" 2>/dev/null)" = "$PKGUSR_ETC/$t" ] || need_links=1
+        done
+        if [ "$need_links" = 1 ]; then
+            n_link=$((n_link+1))
+            printf '    %-24s links\n' "$name"
+            if [ "$run" = 1 ]; then
+                init_package_user_home "$name" "$home"
+                if [ -d "$skel" ]; then
+                    # skeleton files the host uses, without clobbering the links
+                    cp -a "$skel"/. "$home"/ 2>/dev/null || true
+                    init_package_user_home "$name" "$home"
+                fi
+            fi
+        fi
+
+        # VERSION
+        if [ ! -f "$home/VERSION" ]; then
+            script="$SCRIPTS/$name.sh"
+            nv=""
+            [ -f "$script" ] && \
+                nv="$(sed -n 's/^name_version="\(.*\)"$/\1/p' "$script" | head -n1)"
+            if [ -n "$nv" ]; then
+                n_ver=$((n_ver+1))
+                printf '    %-24s VERSION -> %s\n' "$name" "$nv"
+                if [ "$run" = 1 ]; then
+                    {
+                        echo "$nv"
+                        echo "# recorded $(date '+%Y-%m-%d %H:%M:%S') by fix-users"
+                    } > "$home/VERSION"
+                    chown "$name:$name" "$home/VERSION" 2>/dev/null || true
+                fi
+            fi
+        fi
+    done < <(pkg_users_list)
+
+    say ""
+    if [ "$run" = 1 ]; then
+        ok "  fixed $n_link home(s) and wrote $n_ver VERSION file(s)"
+    else
+        say "  $n_link home(s) need links, $n_ver VERSION file(s) missing"
+        warn "(dry run -- nothing was changed.  Add --run to apply.)"
+    fi
+}
+
+# every package user we know about
+pkg_users_list() {
+    local d name
+    for d in "$SRCROOT"/*; do
+        [ -d "$d" ] || continue
+        name="$(basename "$d")"
+        user_exists "$name" && echo "$name"
+    done
+}
+
+cmd_find_user_site() {
+    need_root
+    local run=0; [ "${1:-}" = "--run" ] && run=1
+    local d n=0
+    say "Per-user Python installs under $SRCROOT:"
+    say "  (pip put these in a package user's home because the system"
+    say "   site-packages was not writable; only that user can import them)"
+    say ""
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        printf "    %s\n" "$d"
+        n=$((n+1))
+        [ "$run" = 1 ] && rm -rf "$d"
+    done < <(find "$SRCROOT" -maxdepth 4 -type d -path '*/.local/lib' 2>/dev/null | sort)
+    say ""
+    if [ "$n" = 0 ]; then
+        ok "  none -- every package installed system-wide"
+    elif [ "$run" = 1 ]; then
+        ok "  removed $n per-user install(s)"
+        say "  Rebuild the affected packages so they install system-wide:"
+        say "      lfs-helper build <package> --force"
+    else
+        say "  $n found"
+        warn "(dry run -- nothing was changed.  Add --run to remove them.)"
+    fi
+}
+
+cmd_clean_sources() {
+    need_root
+    local run=0; [ "${1:-}" = "--run" ] && run=1
+    local srcdir="${SNAP_ROOT%/}/sources"
+    [ -d "$srcdir" ] || die "no $srcdir"
+
+    say "Tidy $srcdir:"
+    say "  * files owned by a UID that does not exist here -> root"
+    say "  * leftover build markers (.cc-build-*, .cc-dir-*) -> removed"
+    say ""
+
+    local orphans markers
+    orphans="$(find "$srcdir" -maxdepth 1 \( -nouser -o -nogroup \) 2>/dev/null | sort)"
+    markers="$(find "$srcdir" -maxdepth 1 -name '.cc-*' 2>/dev/null | sort)"
+
+    local n_o n_m
+    n_o=$(printf '%s\n' "$orphans" | count_stdin_lines)
+    n_m=$(printf '%s\n' "$markers" | count_stdin_lines)
+    say "  $n_o path(s) with an unknown owner"
+    say "  $n_m build marker(s)"
+    if [ "$run" = 0 ]; then
+        [ "$n_o" -gt 0 ] && printf '%s\n' "$orphans" | head -6 | sed 's/^/      /'
+        say ""
+        warn "(dry run -- nothing was changed.  Add --run to apply.)"
+        return 0
+    fi
+    [ "$n_o" -gt 0 ] && chown -R root:root $orphans 2>/dev/null
+    [ "$n_m" -gt 0 ] && rm -f $markers
+    say ""
+    ok "  tidied: $n_o ownership(s) reset, $n_m marker(s) removed"
+    say "  (markers are recreated by the next build; nothing else is lost)"
+}
+
+cmd_fix_perms() {
+    need_root
+    local name="" phase="all" run=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --run) run=1; shift ;;
+            --phase) phase="$2"; shift 2 ;;
+            -*) die "usage: lfs-helper fix-perms <package> [--phase P] [--run]" ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "usage: lfs-helper fix-perms <package> [--run]"
+    local owner; owner="$(pkg_owner_name "$name")"
+    local log="$LOGS/$name-$phase.log"
+    [ -f "$log" ] || die "no log for $name (phase $phase) at $log"
+
+    # "install: cannot create regular file '/a/b/c': Permission denied"
+    # "mkdir: cannot create directory '/a/b': Permission denied"
+    # "/a/b/c: Permission denied"
+    local dirs
+    dirs="$(grep -oE "'[^']+'|\"[^\"]+\"" "$log" 2>/dev/null \
+            | tr -d "'\"" \
+            | while IFS= read -r p; do
+                  case "$p" in /*) ;; *) continue ;; esac
+                  if [ -d "$p" ]; then echo "$p"; else echo "${p%/*}"; fi
+              done | sort -u)"
+    # only keep ones that really are unwritable for the package user
+    local need="" d
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        [ -d "$d" ] || continue
+        su -s /bin/bash "$owner" -c "test -w '$d'" 2>/dev/null && continue
+        need="$need$d
+"
+    done <<< "$dirs"
+    need="$(printf '%s' "$need" | grep -v '^$' || true)"
+
+    if [ -z "$need" ]; then
+        say "Nothing to fix: '$owner' can already write every directory"
+        say "mentioned in $log."
+        return 0
+    fi
+
+    say "Directories '$owner' cannot write into (from $log):"
+    printf '    %s\n' $need
+    say ""
+    if [ "$run" = 0 ]; then
+        warn "(dry run -- add --run to grant access via collector groups)"
+        return 0
+    fi
+    while IFS= read -r d; do
+        [ -n "$d" ] && grant_dir_access "$d" "$owner"
+    done <<< "$need"
+    say ""
+    ok "Access granted.  Re-run the build:"
+    say "    lfs-helper build $name --phase $phase --force"
+}
+
+# ---------------------------------------------------------------------------
+# command wrappers (the package-users hint's /usr/lib/pkgusr)
+#
+# Packages routinely try to set ownership or permissions a package user simply
+# cannot: the LFS book's GCC section runs
+#     chown -v -R root:root /usr/lib/gcc/<triplet>/<ver>/include{,-fixed}
+# and as the `gcc` user that fails with "Operation not permitted", killing the
+# install for no good reason -- the files are already owned correctly for this
+# scheme.  The hint's answer is to put wrappers for the five troublesome
+# commands (mkdir, chgrp, chown, chmod, install) first in the package user's
+# PATH.  They neutralise the impossible parts, report what they skipped, and
+# otherwise behave normally.
+WRAPPERS="$STATE/wrappers"
+
+make_wrappers() {
+    mkdir -p "$WRAPPERS"
+
+    cat > "$WRAPPERS/chown" <<'EOF'
+#!/bin/bash
+# Ownership is decided by the package-user scheme, not by the package.
+echo "*** chown $* (skipped: package users cannot change ownership)" >&2
+exit 0
+EOF
+
+    cat > "$WRAPPERS/chgrp" <<'EOF'
+#!/bin/bash
+# Group changes (e.g. setgid tty) need root; do them yourself afterwards.
+echo "*** chgrp $* (skipped: package users cannot change group)" >&2
+exit 0
+EOF
+
+    cat > "$WRAPPERS/install" <<'EOF'
+#!/bin/bash
+# Drop -o/-g (ownership), refuse setuid/setgid modes, and never re-create or
+# re-mode a directory that already exists.  Packages routinely do
+#     install -m 0755 -d /usr/sbin
+# for no good reason; as a package user that fails with
+#     install: cannot change permissions of '/usr/sbin': Operation not permitted
+# The directory is already there and correctly set up, so there is nothing to do.
+real=/usr/bin/install
+args=(); skipped=""
+
+# -d mode: create directories.  Skip the ones that already exist.
+want_dirs=0
+for a in "$@"; do case "$a" in -d|--directory) want_dirs=1 ;; esac; done
+if [ "$want_dirs" = 1 ]; then
+    dirs=(); opts=(); skip_next=0
+    for a in "$@"; do
+        if [ "$skip_next" = 1 ]; then skip_next=0; continue; fi
+        case "$a" in
+            -d|--directory) ;;
+            -m|--mode|-o|--owner|-g|--group) skip_next=1 ;;
+            -*) ;;
+            *) dirs+=("$a") ;;
+        esac
+    done
+    rc=0
+    for d in "${dirs[@]}"; do
+        if [ -d "$d" ]; then
+            echo "*** install -d $d (already exists -- not re-created or re-moded)" >&2
+            continue
+        fi
+        /usr/bin/mkdir -p "$d" || rc=$?
+    done
+    exit $rc
+fi
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o|--owner|-g|--group) skipped="$skipped $1 $2"; shift 2 ;;
+        -o*|-g*)               skipped="$skipped $1";    shift ;;
+        -m|--mode)
+            case "$2" in
+                [2467][0-7][0-7][0-7])   # setuid/setgid/sticky requested
+                    echo "*** install -m $2 (using 755 instead; set the bit as root if you want it)" >&2
+                    args+=(-m 755); shift 2 ;;
+                *) args+=("$1" "$2"); shift 2 ;;
+            esac ;;
+        *) args+=("$1"); shift ;;
+    esac
+done
+[ -n "$skipped" ] && echo "*** install:$skipped (skipped: ownership is the package user's)" >&2
+exec "$real" "${args[@]}"
+EOF
+
+    cat > "$WRAPPERS/chmod" <<'EOF'
+#!/bin/bash
+# Allow everything except setuid/setgid, which a package user must not set.
+real=/usr/bin/chmod
+me="$(id -un)"
+for a in "$@"; do
+    case "$a" in
+        [2467][0-7][0-7][0-7]|*[ug]+s*|*+s*)
+            echo "*** chmod $* (skipped: refuses to set setuid/setgid; do it as root if needed)" >&2
+            exit 0 ;;
+    esac
+done
+# Never change the mode of something owned by someone else.  Packages try to
+# re-mode shared directories they merely install into; the package-user scheme
+# says those belong to their owner and stay as they are.
+# The first non-option argument is the MODE; everything after it is a target.
+args=(); skipped=""; targets=0; seen_mode=0
+for a in "$@"; do
+    case "$a" in
+        -[!0-9]*|--*) args+=("$a"); continue ;;
+    esac
+    if [ "$seen_mode" = 0 ]; then
+        seen_mode=1; args+=("$a"); continue      # the mode itself
+    fi
+    if [ -e "$a" ] && [ "$(stat -c %U "$a" 2>/dev/null)" != "$me" ]; then
+        skipped="$skipped $a"
+        continue
+    fi
+    args+=("$a"); targets=$((targets+1))
+done
+[ -n "$skipped" ] && \
+    echo "*** chmod:$skipped (skipped: not owned by '$me' -- left as it is)" >&2
+# every target was skipped?  then there is nothing to do, and that is fine
+[ "$targets" -eq 0 ] && exit 0
+exec "$real" "${args[@]}"
+EOF
+
+    cat > "$WRAPPERS/cp" <<'EOF'
+#!/bin/bash
+# `cp -a dest/* /` is how several packages install a staged tree.  As a package
+# user, copying the FILES works, but cp then tries to stamp the destination
+# DIRECTORIES (/usr, /usr/bin -- owned by root) with the source's timestamps
+# and permissions, and fails:
+#     cp: preserving times for '/usr/bin': Operation not permitted
+# The copy itself succeeded, so treat that specific complaint as harmless and
+# fail only on real errors.
+real=/usr/bin/cp
+err="$(mktemp)"
+# capture stderr to a file first: with process substitution the check below can
+# run before tee has flushed, and the result becomes a coin toss
+"$real" "$@" 2>"$err"
+rc=$?
+cat "$err" >&2
+if [ $rc -ne 0 ] && [ -s "$err" ]; then
+    if ! grep -qvE "preserving (times|permissions|ownership) for" "$err"; then
+        echo "*** cp: could not stamp existing directories (harmless: the files copied)" >&2
+        rc=0
+    fi
+fi
+rm -f "$err"
+exit $rc
+EOF
+
+    cat > "$WRAPPERS/mkdir" <<'EOF'
+#!/bin/bash
+# A package recreating an existing system directory must not fail the build.
+real=/usr/bin/mkdir
+"$real" "$@" && exit 0
+rc=$?
+for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    [ -d "$a" ] || exit $rc
+done
+echo "*** mkdir $* (directory already exists -- continuing)" >&2
+exit 0
+EOF
+
+    chmod 755 "$WRAPPERS"/*
+    chmod a+rx "$WRAPPERS" 2>/dev/null || true
+}
+
+# Re-apply the install-directory permissions.
+#
+# Packages reset modes on directories they touch -- /usr/share/man/man1 ends up
+# root:install but drwxr-xr-x, and the next package then cannot write its man
+# page:
+#   ln: failed to create symbolic link '/usr/share/man/man1/cc.1': Permission denied
+# Re-asserting group-writability before each build costs nothing and stops that
+# drift from becoming a failed install.
+ensure_install_dirs_writable() {
+    pkgusr_ready || return 0
+    local d fixed=0
+    while IFS= read -r d; do
+        d="${SNAP_ROOT%/}$d"
+        [ -d "$d" ] || continue
+        # Check the GROUP write bit numerically.  Matching "w" in the symbolic
+        # mode is wrong: drwxr-xr-x contains a "w" -- the owner's.
+        local _grp _mode
+        _grp="$(stat -c '%G' "$d" 2>/dev/null)" || continue
+        _mode="$(stat -c '%a' "$d" 2>/dev/null)" || continue
+        if [ "$_grp" = "install" ] && [ $(( (10#$_mode / 10) % 10 & 2 )) -ne 0 ]
+        then
+            continue                             # already install + group-writable
+        fi
+        chgrp install "$d" 2>/dev/null || continue
+        chmod g+w "$d" 2>/dev/null || continue
+        fixed=$((fixed+1))
+    done < <(install_dirs_list)
+
+    # ...and the per-language man/locale directories, which come and go as
+    # packages are installed.  Without this every translated man page turns
+    # into another "grant access?" prompt.
+    local r="${SNAP_ROOT%/}"
+    while IFS= read -r d; do
+        [ -d "$d" ] || continue
+        local _g _m
+        _g="$(stat -c '%G' "$d" 2>/dev/null)" || continue
+        _m="$(stat -c '%a' "$d" 2>/dev/null)" || continue
+        [ "$_g" = "install" ] && [ $(( (10#$_m / 10) % 10 & 2 )) -ne 0 ] && continue
+        chgrp install "$d" 2>/dev/null || continue
+        chmod g+w "$d" 2>/dev/null || continue
+        fixed=$((fixed+1))
+    done < <(
+        find "$r/usr/share/man" "$r/usr/share/locale" "$r/usr/share/terminfo" \
+             -mindepth 1 -maxdepth 2 -type d 2>/dev/null
+    )
+
+    [ "$fixed" -gt 0 ] && \
+        say "${C_DIM}# re-applied group-writability to $fixed install dir(s)${C_OFF}"
+    return 0
+}
+
+# When an install fails, inspect the paths the errors mention and report what
+# is actually there.  "No such file or directory" on a destination can mean the
+# parent directory is missing, or that the target is a dangling symlink -- and
+# "Permission denied" can mean the file exists but belongs to another package.
+# Guessing from the message alone wastes a lot of time; this shows the facts.
+diagnose_paths_from_log() {
+    local log="$1" user="$2" p shown=0
+    [ -f "$log" ] || return 0
+    local paths
+    # tail only, and cap the results: see unwritable_dirs_from_log for why
+    paths="$(tail -c 524288 "$log" 2>/dev/null | grep -aoE "/[A-Za-z0-9._/+-]{6,}" \
+             | grep -vE "^/(proc|sys|dev|tmp)/" | sort -u \
+             | while IFS= read -r p; do
+                   case "$p" in
+                       */lib/perl5/*|*/usr/*) echo "$p" ;;
+                   esac
+               done)"
+    # only the ones named on an error line
+    local errpaths
+    # Require at least two slashes: a bare "/GDBM_File.pm" is the tail of a
+    # RELATIVE path in the message (lib/GDBM_File.pm), not a real target.
+    errpaths="$(grep -iE "couldn't|cannot|no such file|permission denied|failed" "$log" 2>/dev/null \
+                | grep -oE "/[A-Za-z0-9._/+-]{6,}" \
+                | sort -u \
+                | while IFS= read -r p; do
+                      # keep real targets: either inside the tree we track, or
+                      # under a known top-level dir.  This drops the tails of
+                      # RELATIVE paths in messages ("lib/GDBM_File.pm" ->
+                      # "/GDBM_File.pm", "auto/B/B.so" -> "/auto/B/B.so").
+                      case "$p" in
+                          "${SNAP_ROOT%/}"/*) echo "$p" ;;
+                          /usr/*|/etc/*|/var/*|/opt/*|/lib/*|/lib64/*|/bin/*|\
+                          /sbin/*|/home/*|/root/*|/srv/*|/boot/*|/tools/*|/sources/*)
+                              echo "$p" ;;
+                      esac
+                  done | head -8)"
+    [ -n "$errpaths" ] || return 0
+
+    say ""
+    say "${C_WARN}--- what those paths actually are ---${C_OFF}"
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        if [ -L "$p" ] && [ ! -e "$p" ]; then
+            printf "  %-52s DANGLING SYMLINK -> %s\n" "$p" "$(readlink "$p")"
+        elif [ -e "$p" ]; then
+            printf "  %-52s %s %s:%s\n" "$p" \
+                   "$(stat -c %A "$p" 2>/dev/null)" \
+                   "$(stat -c %U "$p" 2>/dev/null)" "$(stat -c %G "$p" 2>/dev/null)"
+            # "cannot remove"/"cannot create" is really about the DIRECTORY the
+            # file sits in -- replacing a file needs write permission there, not
+            # on the file itself.  Show it, or the report is misleading.
+            local pd="${p%/*}"
+            [ -d "$pd" ] && printf "  %-52s %s %s:%s  (parent -- this is what matters)\n" \
+                   "  in $pd" "$(stat -c %A "$pd" 2>/dev/null)" \
+                   "$(stat -c %U "$pd" 2>/dev/null)" "$(stat -c %G "$pd" 2>/dev/null)"
+        else
+            local d="${p%/*}"
+            if [ -d "$d" ]; then
+                printf "  %-52s missing; parent %s is %s %s:%s\n" "$p" "$d" \
+                       "$(stat -c %A "$d" 2>/dev/null)" \
+                       "$(stat -c %U "$d" 2>/dev/null)" "$(stat -c %G "$d" 2>/dev/null)"
+            else
+                printf "  %-52s missing, and so is its parent %s\n" "$p" "$d"
+            fi
+        fi
+        shown=$((shown+1))
+    done <<< "$errpaths"
+    [ "$shown" -gt 0 ] && say "${C_WARN}-------------------------------------${C_OFF}"
+    return 0
+}
+
+# Give a pip-based package write access to Python's site-packages BEFORE it
+# runs.
+#
+# `pip3 install` writes into /usr/lib/pythonX.Y/site-packages, which belongs to
+# the python package.  If that isn't writable, pip does not always fail loudly:
+# depending on the build it can fall back to a per-user location under the
+# package user's home, where nothing else can import it.  The next package that
+# needs it then fails with a baffling
+#     BackendUnavailable: Cannot import 'flit_core.buildapi'
+# even though the earlier install "succeeded".  Granting up front avoids the
+# whole class of problem.
+# does this package install with pip?
+uses_pip() {
+    grep -qE '\bpip[0-9]*\s+install|\bpip[0-9]*\s+wheel' "$1" 2>/dev/null
+}
+
+pregrant_python_sitedirs() {
+    local user="$1" script="$2" r="${SNAP_ROOT%/}" d
+    uses_pip "$script" || return 0
+
+    # Remove a stale per-user install.
+    #
+    # When the system site-packages is not writable, pip installs into the
+    # package user's ~/.local instead -- and then reports
+    #     Requirement already satisfied: flit_core in
+    #         /usr/src/flit-core/.local/lib/python3.13/site-packages
+    # on every later run, so it never installs system-wide.  Only that one user
+    # can import it; every other package fails with
+    #     BackendUnavailable: Cannot import 'flit_core.buildapi'
+    local ulocal="$SRCROOT/$user/.local"
+    if [ -d "$ulocal/lib" ]; then
+        say "${C_WARN}# removing a stale per-user install in $ulocal${C_OFF}"
+        say "${C_DIM}#   (pip put it there because site-packages was not writable;"
+        say "#    nothing outside '$user' can import from it)${C_OFF}"
+        rm -rf "$ulocal/lib"
+    fi
+    for d in "$r"/usr/lib/python*/site-packages "$r"/usr/lib/python*; do
+        [ -d "$d" ] || continue
+        su -s /bin/bash "$user" -c "test -w '$d'" 2>/dev/null && continue
+        say "${C_DIM}# pip package: making sure '$user' can write $d${C_OFF}"
+        grant_dir_access "$d" "$user"
+        break
+    done
+    return 0
+}
+
+# A build that was interrupted part-way leaves the package half-installed.
+_note_interrupted() {
+    warn ""
+    warn "!! interrupted while building '$1'."
+    warn "   The package may be HALF-INSTALLED: some files on disk, some not."
+    warn "   Finish or undo it before building anything else --"
+    warn "   a half-installed toolchain package breaks every build after it:"
+    warn "       lfs-helper build $1 --phase install --force   # finish it"
+    warn "       lfs-helper check-toolchain                    # is cc/c++ ok?"
+}
+
+# Packages recorded as mid-install and never finished.
+_interrupted_packages() {
+    [ -f "$STATE/interrupted" ] || return 1
+    sort -u "$STATE/interrupted" 2>/dev/null | grep -v '^$'
+}
+
+_clear_interrupted() {
+    local name="$1" f tmp
+    f="$STATE/interrupted"
+    [ -f "$f" ] || return 0
+    tmp="$f.$$"
+    grep -vx "$name" "$f" > "$tmp" 2>/dev/null
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+    [ -s "$f" ] || rm -f "$f"
+}
+
+# Keep out of a step's manifest anything that belongs to a DIFFERENT package.
+#
+# A step can install packages under other users: last-step builds wget as the
+# package user 'wget'.  Everything written during the step was recorded as
+# last-step's, so /usr/bin/wget landed in last-step's manifest -- and the next
+# thing to act on that manifest (adoption, fix-ownership) took the file from
+# wget and gave it to last-step.  wget could then not reinstall itself.
+#
+# A manifest should list what this step owns, not everything that happened
+# while it ran.
+_drop_other_packages_files() {
+    local owner="$1" p cur
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        cur="$(stat -c %U "$p" 2>/dev/null)"
+        if [ -n "$cur" ] && [ "$cur" != "$owner" ] && [ "$cur" != root ] \
+           && [ "$cur" != UNKNOWN ] && user_exists "$cur"; then
+            continue                      # another package installed this
+        fi
+        printf '%s\n' "$p"
+    done
+}
+
+cmd_build() {
+    need_root
+    local name="" phase="all" force=0 run_tests=0 jobs="" auto_fix=1
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --phase) phase="$2"; shift 2 ;;
+            --force) force=1; shift ;;
+            --tests) run_tests=1; shift ;;
+            --jobs|-j) jobs="${2:?--jobs needs a number}"; shift 2 ;;
+            --no-auto-fix) auto_fix=0; shift ;;
+            -*) die "unknown option: $1" ;;
+            *) name="$1"; shift ;;
+        esac
+    done
+    [ -n "$name" ] || die "usage: lfs-helper build <package> [--phase P] [--force]"
+    local s; s="$(script_for "$name")"
+    [ -f "$s" ] || die "no script for '$name' at $s
+  Generate them from outside the chroot:
+      lfs build-system gen-chroot-scripts --run"
+
+    # Clear a stale source tree first, as root -- independent of everything
+    # below, and it must happen even if staging later has trouble.
+    case "$phase" in
+        all|unpack) clean_stale_source "$name" "$s" ;;
+    esac
+
+    if is_done "$name" && [ "$force" = 0 ]; then
+        if [ -t 0 ]; then
+            printf "'%s' is already built. Rebuild it? [y/N]: " "$name"
+            local ans; read -e -r ans
+            case "$ans" in [Yy]*) ;; *) say "# leaving '$name' as it is"; return 0 ;; esac
+        else
+            say "# '$name' is already built (skipping; --force to rebuild)"
+            return 0
+        fi
+    fi
+
+    local chown_after=0
+    local as_root=0 staged owner="$name"
+    if is_root_step "$name"; then
+        as_root=1
+        staged="$SRCROOT/$name/install_$name"
+        mkdir -p "$SRCROOT/$name"
+        install -m 0755 "$s" "$staged" || die "could not stage the install script"
+        # A *-tmp temporary tool is the SAME package chapter 8 rebuilds, so its
+        # files should belong to that package user from the outset -- otherwise
+        # chapter 8 inherits a root-owned tree it cannot write into.  The user
+        # may not exist this early (init-pkgusr runs later), in which case
+        # adopt-existing assigns them afterwards.
+        case "$name" in
+            *-tmp)
+                owner="$(pkg_owner_name "$name")"
+                # subshell: a `die` inside would kill the build, not just
+                # fall back to building this step as root
+                if pkgusr_ready && ( cmd_add_user "$owner" ) >/dev/null 2>&1; then
+                    chown_after=1
+                else
+                    owner="$name"        # no package users yet; adopt later
+                fi ;;
+        esac
+    else
+        pkgusr_ready || die "run 'lfs-helper init-pkgusr --run' first"
+        owner="$(pkg_owner_name "$name")"
+        cmd_add_user "$owner"
+        staged="$SRCROOT/$owner/install_$name"
+        install -m 0755 -o "$owner" -g "$owner" "$s" "$staged" \
+            || die "could not stage the install script"
+    fi
+
+    mkstate
+    local before after before_dirs
+    if [ -f "$SNAPSHOT" ]; then before="$(load_snapshot "$SNAPSHOT")"
+    else before="$(snapshot)"; fi
+    if [ -f "$SNAPDIRS" ]; then before_dirs="$(load_snapshot "$SNAPDIRS")"
+    else before_dirs="$(snapshot_dirs)"; fi
+
+    local _book_of_script
+    _book_of_script="$(sed -n 's/^### book *: *//p' "$s" 2>/dev/null | head -n1)"
+    say "${C_DIM}# script : $s${C_OFF}"
+    [ -n "$_book_of_script" ] && \
+        say "${C_DIM}# book   : $_book_of_script${C_OFF}"
+    if [ "$as_root" = 1 ]; then
+        say "${C_DIM}# user   : root (temporary chapter-7 tool)   phase: $phase${C_OFF}"
+    else
+        say "${C_DIM}# user   : $owner (package user)   phase: $phase${C_OFF}"
+    fi
+    [ "$phase" = "all" ] && clear_phases "$name"
+    # Record that this package is MID-INSTALL.  Cancelling here (Ctrl-C during
+    # `make install`) leaves the package half on disk: gcc, interrupted during
+    # its install, replaces /usr/bin/gcc with a native compiler but has not yet
+    # installed the C++ headers -- so the whole toolchain stops working and
+    # nothing on disk says why.  The marker is removed when the build finishes,
+    # whether it succeeded or failed cleanly.
+    local _interrupted="$STATE/interrupted"
+    mkdir -p "$STATE" 2>/dev/null || true
+    echo "$name" >> "$_interrupted" 2>/dev/null || true
+    # Interrupting during an install leaves the package half on disk, and for
+    # a toolchain package that breaks every later build.  We cannot stop you
+    # pressing Ctrl-C, so record it plainly and make the next run fix it --
+    # see the auto-finish in cmd_build_all.
+    trap '_note_interrupted "$name"; exit 130' INT TERM
+
+    say "# building $name ..."
+    local rc=0
+    make_wrappers
+    ensure_install_dirs_writable
+    [ "$as_root" = 1 ] || pregrant_python_sitedirs "$owner" "$s"
+    local envpass="LFS_CC_PHASE='$phase'"
+    # The wrappers exist to stop a PACKAGE USER doing things it may not: chown,
+    # setuid modes, re-moding shared directories.  A ROOT step must not get
+    # them.  Root legitimately runs `chown -R wget:wget /sources/wget-1.25.0`
+    # to hand a source tree to a package user, and the wrapper silently skipped
+    # it -- leaving the tree root-owned, so the build then failed with
+    #     ./configure: line 4389: config.log: Permission denied
+    if [ "$as_root" = 1 ]; then
+        envpass="$envpass PATH='/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin'"
+    else
+        # wrappers first in PATH -- see make_wrappers() for why
+        envpass="$envpass PATH='$WRAPPERS:/usr/local/bin:/usr/local/sbin:/usr/bin:/usr/sbin:/bin:/sbin'"
+    fi
+    # the books expect some test failures, so suites only run when asked
+    [ "$run_tests" = 1 ] && envpass="$envpass LFS_RUN_TESTS=1"
+    [ -n "${LFS_TGT:-}" ] && envpass="$envpass LFS_TGT='$LFS_TGT'"
+    # MAKEFLAGS: --jobs wins over the configured value (it must be appended
+    # LAST -- `env A=1 A=2` keeps the last one, so ordering decides).  A package
+    # that races under -j12 usually builds fine with --jobs 1.
+    if [ -n "$jobs" ]; then
+        envpass="$envpass MAKEFLAGS='-j$jobs'"
+    elif [ -n "${MAKEFLAGS:-}" ]; then
+        envpass="$envpass MAKEFLAGS='$MAKEFLAGS'"
+    fi
+    # Keep pip out of the package user's ~/.local.  PIP_USER=0 stops it
+    # installing there, and PYTHONNOUSERSITE=1 stops it *seeing* an existing
+    # per-user copy and concluding the requirement is "already satisfied" --
+    # which is how flit_core ended up importable by nobody but flit-core.
+    if uses_pip "$s"; then
+        envpass="$envpass PIP_USER=0 PYTHONNOUSERSITE=1"
+    fi
+
+    # How the build runs:
+    #   * chapter-7 temp tools      -> as root, no package user at all
+    #   * package user + su present -> as that user (the real package-user way)
+    #   * package user, NO su yet   -> as root, then hand the freshly installed
+    #     files to the package user.  `su` comes from Shadow (chapter 8 #26),
+    #     so for the first 25 packages there is no way to drop privileges --
+    #     but we know exactly which files appeared, so ownership still ends up
+    #     correct.
+    mkdir -p "$LOGS"
+    local log="$LOGS/$name-$phase.log"
+    # Mark the start of the build.  The snapshot diff finds files that are NEW,
+    # but a package very often OVERWRITES files an earlier one installed (the
+    # chapter-8 bison replaces the chapter-7 bison-tmp binaries).  Those aren't
+    # new, so without a timestamp to compare against they'd keep the previous
+    # owner -- which is how bison's files stayed owned by root.
+    # The stamp is the reference for "what did this build touch".  It must NOT
+    # live in /tmp: init-dirs is the step that CREATES /tmp (book 7.5), so
+    # mktemp fails there with
+    #     mktemp: failed to create file via template '/tmp/tmp.XXXXXXXXXX'
+    # and the empty path that follows silently disables file tracking for the
+    # whole step.  $STATE always exists -- it is where the scripts came from.
+    local stamp
+    mkdir -p "$STATE/tmp" 2>/dev/null || true
+    stamp="$STATE/tmp/stamp.$$"
+    : > "$stamp" 2>/dev/null || stamp="$(mktemp 2>/dev/null || echo "")"
+    [ -n "$stamp" ] && touch "$stamp" 2>/dev/null || true
+    if [ -z "$stamp" ] || [ ! -e "$stamp" ]; then
+        warn "# cannot create a build stamp -- file tracking is off for this step"
+    fi
+    if [ "$as_root" = 1 ]; then
+        ( cd "$SRCROOT/$name" && eval "env $envpass bash '$staged' '$phase'" ) \
+            2>&1 | tee "$log"; rc=${PIPESTATUS[0]}
+    elif have_su; then
+        # `su -` resets the environment, so the vars go on the command line
+        su - "$owner" -c "env $envpass bash '$staged' '$phase'" \
+            2>&1 | tee "$log"; rc=${PIPESTATUS[0]}
+    else
+        say "${C_DIM}# no 'su' yet (Shadow not built) -- building as root, then"
+        say "# giving the installed files to '$owner'${C_OFF}"
+        chown_after=1
+        ( cd "$SRCROOT/$name" && eval "env $envpass bash '$staged' '$phase'" ) \
+            2>&1 | tee "$log"; rc=${PIPESTATUS[0]}
+    fi
+
+    after="$(snapshot)"
+    local newfiles newdirs
+    newfiles="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))"
+    newdirs="$(comm -13 <(printf '%s\n' "$before_dirs") <(snapshot_dirs))"
+    printf '%s\n' "$after" > "$SNAPSHOT"
+    printf '%s\n' "$(snapshot_dirs)" > "$SNAPDIRS"
+
+    # Everything this build wrote: created OR modified since the stamp.
+    # Always work out what the build TOUCHED, even when we are not going to
+    # change ownership.  A config step rewrites files that already exist
+    # (/etc/hosts was created back in 7.6), so the snapshot diff sees nothing
+    # new and the step looks like it did nothing at all.
+    local touched="" touched_dirs=""
+    if true; then
+        local r="${SNAP_ROOT%/}"
+        # "${r:-/}": SNAP_ROOT is "/" inside the chroot, and "${SNAP_ROOT%/}"
+        # trims that to the empty string -- `find ""` then fails silently and
+        # NOTHING is ever seen as touched, so every config step looks like it
+        # did nothing at all.
+        # a missing stamp would make `find -newer` fail and silently report
+        # that the build touched nothing at all
+        [ -n "$stamp" ] && [ -e "$stamp" ] && \
+        # DIRECTORIES this build wrote into, not just the ones it created.
+        # A directory that already existed -- made by root in chapter 7, or by
+        # an earlier run -- kept root ownership while every file inside it
+        # became the package's, so a package owned its files but not the
+        # directory holding them.  Shared install dirs and directories another
+        # package owns are filtered out below, exactly as for files.
+        touched_dirs="$(find "${r:-/}" -xdev -type d -newer "$stamp" \
+                     -not -path "$r/.lfs-pkgusr*" -not -path "$SRCROOT/*" \
+                     -not -path "$r/sources/*" -not -path "$r/dev/*" \
+                     -not -path "$r/proc/*"  -not -path "$r/sys/*" \
+                     -not -path "$r/run/*"   -not -path "$r/tmp/*" \
+                     2>/dev/null | sort -u)"
+        touched="$(find "${r:-/}" -xdev \( -type f -o -type l \) -newer "$stamp" \
+                     -not -path "$r/.lfs-pkgusr/*" -not -path "$SRCROOT/*" \
+                     -not -path "$r/sources/*" -not -path "$r/dev/*" \
+                     -not -path "$r/proc/*"  -not -path "$r/sys/*" \
+                     -not -path "$r/run/*"   -not -path "$r/tmp/*" \
+                     2>/dev/null | sort -u)"
+    fi
+    rm -f "$stamp"
+
+    local man="$MANIFESTS/$name.files" mand="$MANIFESTS/$name.dirs"
+    # Record what was touched regardless of whether ownership changed -- a
+    # config step that rewrites /etc/hosts installs no NEW file but has very
+    # much done its job.
+    { [ -f "$man" ] && cat "$man"; printf '%s\n' "$newfiles"
+      printf '%s\n' "$touched"; } \
+        | grep -v '^$' | sort -u \
+        | _drop_other_packages_files "$owner" > "$man.tmp" \
+        && mv "$man.tmp" "$man"
+    { [ -f "$mand" ] && cat "$mand"; printf '%s\n' "$newdirs"; } \
+        | grep -v '^$' | sort -u > "$mand.tmp" && mv "$mand.tmp" "$mand"
+    say "# tracked $(wc -l < "$man") file(s) for '$name'"
+
+
+    # A FAILED build must not take ownership of anything.
+    #
+    # gcc failing half-way still "tracked 828 file(s)" and chowned them -- so a
+    # broken, partial install claimed files from the working temporary system,
+    # and the next attempt inherited the damage.  Ownership is a statement that
+    # this package installed these files successfully; if it did not, say
+    # nothing.  The manifest is still written (it is the record of what the
+    # attempt touched, needed for cleanup) but nothing changes hands.
+    if [ "${rc:-0}" != "0" ] && [ "$chown_after" = 1 ]; then
+        warn "# build failed -- not changing ownership of the $(printf '%s\n%s\n' "$newfiles" "$touched" | grep -cv '^$') path(s) it touched"
+        chown_after=0
+    fi
+
+    if [ "$chown_after" = 1 ] && [ -n "$newfiles$newdirs$touched" ]; then
+        # hand everything this package just installed to its package user.
+        # Directories that belong to the install group are shared infrastructure
+        # (root:install) and must stay that way -- only take the ones this
+        # package created itself.
+        local n=0 p cur skipped_foreign=0
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            # NEVER take a file that already belongs to another package user.
+            #
+            # "touched" is every file with a newer mtime than the build stamp,
+            # which is wider than "files this package installed": a build that
+            # rewrites, re-links or merely re-times something belonging to
+            # another package would claim it.  That is how zstd came to own
+            #     /usr/include/c++/15.2.0/bits/memoryfwd.h
+            # -- gcc's own C++ headers -- after which gcc could not build.
+            # Files owned by root are fair game (the temporary system's), files
+            # owned by another package are not.
+            cur="$(stat -c %U "$p" 2>/dev/null)"
+            if [ -n "$cur" ] && [ "$cur" != "$owner" ] && [ "$cur" != "root" ] \
+               && [ "$cur" != "UNKNOWN" ] && user_exists "$cur"; then
+                skipped_foreign=$((skipped_foreign+1))
+                continue
+            fi
+            chown -h "$owner:$owner" "$p" 2>/dev/null && n=$((n+1))
+        done <<< "$(printf '%s\n%s\n' "$newfiles" "$touched" | grep -v '^$' | sort -u)"
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            # shared by nature (/usr/bin, /usr/include, ...): stays root:install
+            is_install_dir "$p" && continue
+            cur="$(stat -c %U "$p" 2>/dev/null)"
+            [ "$cur" = "$owner" ] && continue
+            # another package's directory: leave it, and let the collector-group
+            # machinery decide -- never take it silently
+            if [ -n "$cur" ] && [ "$cur" != root ] && user_exists "$cur"; then
+                skipped_foreign=$((skipped_foreign+1))
+                continue
+            fi
+            chown "$owner:$owner" "$p" 2>/dev/null && n=$((n+1))
+        done <<< "$(printf '%s\n%s\n' "$newdirs" "$touched_dirs" \
+                    | grep -v '^$' | sort -u)"
+        say "# gave $n newly installed path(s) to '$owner'"
+        [ "$skipped_foreign" -gt 0 ] && say "#   ($skipped_foreign path(s) left with the package that owns them)"
+    fi
+
+    # Automatic recovery: a "Permission denied" here almost always means the
+    # package needs to install into a directory another package owns.  Grant it
+    # (collector groups) and retry the phase once, rather than making you run
+    # fix-perms by hand.
+    # Do not key this on "Permission denied": perl's installperl reports an
+    # unwritable destination directory as "No such file or directory", so the
+    # message is unreliable.  auto_grant_from_log TESTS writability as the
+    # package user and does nothing when there is nothing to grant.
+    # An install reveals only the FIRST directory it cannot write; granting that
+    # one and retrying then reveals the next (perl modules span core_perl/,
+    # site_perl/ and more).  So keep granting and retrying while each round
+    # actually grants something -- bounded, so a genuine build error can't loop.
+    # Only attempt a permission fix when the failure LOOKS like one.  A script
+    # that stops because the USER must do something -- "mount your EFI System
+    # Partition first" -- must never be answered by handing directories away.
+    local _perm_ish=0
+    grep -qiE "permission denied|operation not permitted|cannot (create|remove|change|touch)|couldn't copy|read-only file system" \
+         "$log" 2>/dev/null && _perm_ish=1
+
+    # Grants are per-directory now (a collector group is permission to install
+    # into a directory, not ownership of a tree), so a package installing into
+    # several directories needs several rounds.  The loop still stops as soon
+    # as a round grants nothing new, so a higher cap costs nothing when things
+    # are going well and only helps a package with a deep install layout.
+    local _round=0 _max_rounds=20 _last_need="" _need_now
+    while [ "$rc" != 0 ] && [ "$auto_fix" = 1 ] && [ "$_perm_ish" = 1 ] \
+          && [ "$_round" -lt "$_max_rounds" ]; do
+        # If this round would grant exactly what the last one did, granting is
+        # not the answer -- stop rather than burn the whole retry budget.
+        _need_now="$(unwritable_dirs_from_log "$log" "$owner" | sort -u)"
+        if [ -n "$_last_need" ] && [ "$_need_now" = "$_last_need" ]; then
+            warn "the same directories keep coming up -- permissions are not the problem"
+            break
+        fi
+        _last_need="$_need_now"
+        auto_grant_from_log "$log" "$owner" || break     # nothing left to grant
+        _round=$((_round + 1))
+        say ""
+        say "# retrying $name (phase $phase), round $_round ..."
+        if [ "$as_root" = 1 ]; then
+            ( cd "$SRCROOT/$name" && eval "env $envpass bash '$staged' '$phase'" ) \
+                2>&1 | tee "$log"; rc=${PIPESTATUS[0]}
+        elif have_su; then
+            su - "$owner" -c "env $envpass bash '$staged' '$phase'" \
+                2>&1 | tee "$log"; rc=${PIPESTATUS[0]}
+        else
+            ( cd "$SRCROOT/$name" && eval "env $envpass bash '$staged' '$phase'" ) \
+                2>&1 | tee "$log"; rc=${PIPESTATUS[0]}
+        fi
+        after="$(snapshot)"
+    done
+    if [ "$_round" -ge "$_max_rounds" ] && [ "$rc" != 0 ]; then
+        warn "gave up after $_max_rounds permission grants -- something else is wrong"
+    fi
+
+    # An 'all' run executes the phases in order and stops at the first failure,
+    # so everything before the failing phase did succeed.  Record that, or the
+    # next run wrongly reports unpack/build as "never completed".
+    if [ "$phase" = "all" ]; then
+        local _failed _p
+        _failed="$(grep -oE "phase '[a-z]+' FAILED" "$log" 2>/dev/null \
+                   | head -n1 | cut -d"'" -f2)"
+        if [ -n "$_failed" ]; then
+            for _p in unpack build install configure; do
+                [ "$_p" = "$_failed" ] && break
+                record_phase "$name" "$_p"
+            done
+        fi
+    fi
+
+    # Exit 4 means "there was deliberately nothing to do" -- e.g. rEFInd is
+    # already installed and already has an LFS entry.  That is a success, and
+    # the "installed no files" check below must not treat it as suspicious.
+    local _nothing_to_do=0
+    if [ "$rc" = 4 ]; then _nothing_to_do=1; rc=0; fi
+
+    # Exit 3 means "this needs the user to do something", not a build error.
+    # Report it plainly: no failure banner, no permission fixing, no retrying.
+    if [ "$rc" = 3 ]; then
+        say ""
+        say "${C_WARN}$name is waiting on you -- see the message above.${C_OFF}"
+        say "  When it's ready:  lfs-helper build $name --force"
+        trap - INT TERM
+        _clear_interrupted "$name"
+        # Pass 3 up unchanged.  Flattening it to 1 made "needs a decision"
+        # indistinguishable from "failed", so build-all could not tell the two
+        # apart -- refind slipped past and the build claimed to be complete
+        # with that step still pending.
+        return 3
+    fi
+
+    if [ "$rc" != 0 ]; then
+        echo "${C_ERR}"
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "! $name FAILED (phase '$phase', exit $rc)"
+        echo "!   script: $s"
+        echo "!   staged: $SRCROOT/$name/install_$name"
+        if grep -qiE "permission denied|couldn't copy|cannot create|cannot remove" \
+                "$log" 2>/dev/null; then
+        echo "! The package could not write into a directory owned by another"
+        echo "! package.  Grant access (collector groups) and retry:"
+        echo "!   lfs-helper fix-perms $name --phase $phase --run"
+        echo "!   lfs-helper build $name --phase $phase --force"
+        fi
+        # A later phase often fails because an EARLIER one never finished --
+        # gcc's `mv /usr/lib/*gdb.py` finds nothing when `make install` aborted
+        # partway (e.g. on a permission error) and never installed them.
+        if [ "$phase" != "all" ] && [ "$phase" != "unpack" ]; then
+            local _prev _missing=""
+            for _prev in unpack build install; do
+                [ "$_prev" = "$phase" ] && break
+                phase_done "$name" "$_prev" || _missing="$_missing $_prev"
+            done
+            if [ -n "$_missing" ]; then
+        echo "! NOTE: these earlier phases have not completed successfully for"
+        echo "!       this package:$_missing"
+        echo "!       A later phase can fail simply because an earlier one"
+        echo "!       stopped partway and never installed everything.  Run:"
+        for _prev in $_missing; do
+        echo "!         lfs-helper build $name --phase $_prev --force"
+        done
+            fi
+        fi
+        echo "! Edit the script, then retry just this phase:"
+        echo "!   lfs-helper build $name --phase $phase --force"
+        if [ -z "$jobs" ] && [ "$phase" != "install" ]; then
+        echo "! If the output ends with no obvious error, a parallel build may"
+        echo "! have raced -- the real message is far above the tail.  Retry"
+        echo "! serially (slower, but the error appears where it happens):"
+        echo "!   lfs-helper build $name --phase $phase --force --jobs 1"
+        fi
+        echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+        echo "${C_OFF}"
+        show_build_errors "$log"
+        diagnose_paths_from_log "$log" "$owner"
+        exit "$rc"
+    fi
+    # A build that installs NOTHING has almost certainly failed quietly.  pip
+    # in particular can report success while writing nowhere useful -- flit-core
+    # "succeeded" without ever putting flit_core into site-packages, and the
+    # next package then failed with a baffling
+    #     BackendUnavailable: Cannot import 'flit_core.buildapi'
+    # Say so loudly rather than marking the step done and moving on.
+    # grep -c prints 0 AND exits non-zero on no match, so a `|| echo 0` fallback
+    # produces "0\n0" and breaks the numeric test.  Count with wc instead.
+    local _tracked; _tracked=$(count_lines "$man")
+    if [ "$_tracked" -eq 0 ] && [ "$_nothing_to_do" = 0 ] \
+       && [ "$phase" != "unpack" ] && [ "$phase" != "test" ]; then
+        warn ""
+        warn "!! $name reported success but installed NO files."
+        warn "   That normally means the install silently did nothing."
+        warn "   Check the log before trusting this step:"
+        warn "     $log"
+        warn "   The step is NOT marked as built."
+        warn ""
+        return 1
+    fi
+
+    # Record what is installed, in the package user's own home.
+    #
+    # The scripts are regenerated from the book whenever it moves on, so their
+    # name_version tells you what the BOOK has, not what is on disk.  Without a
+    # record of the latter, "is this up to date?" is unanswerable.
+    local _nv _home
+    _nv="$(sed -n 's/^name_version="\(.*\)"$/\1/p' "$s" 2>/dev/null | head -n1)"
+    _home="$SRCROOT/$owner"
+    if [ -n "$_nv" ] && [ -d "$_home" ]; then
+        {
+            echo "$_nv"
+            echo "# installed $(date '+%Y-%m-%d %H:%M:%S') by lfs-helper"
+            [ -n "${_book_of_script:-}" ] && echo "# from: $_book_of_script"
+        } > "$_home/VERSION"
+        chown "$owner:$owner" "$_home/VERSION" 2>/dev/null || true
+    fi
+
+    if [ "$phase" = "all" ]; then
+        mark_done "$name"
+        ok "# $name: done"
+        report_granted_groups
+        trap - INT TERM
+        _clear_interrupted "$name"
+    else
+        record_phase "$name" "$phase"
+        local nxt; nxt="$(next_phase_for "$name" || true)"
+        if [ -n "$nxt" ]; then
+            ok "# $name: phase '$phase' finished"
+            say "  still to do: $nxt   ->  lfs-helper build $name --phase $nxt"
+        else
+            # every phase the script defines has now run
+            mark_done "$name"
+            # This build already gave its files to the package user, so there
+            # is nothing for the adoption pass to do.  Recording it here is
+            # what stops "Give the already-built packages their own users"
+            # running again on every build-all.
+            [ -f "$MANIFESTS/$name.files" ] && \
+                _mark_adopted "$name" "$(_manifest_size "$MANIFESTS/$name.files")"
+            ok "# $name: done (all phases complete)"
+            report_granted_groups
+        fi
+    fi
+    # finished one way or another: no longer mid-install
+    trap - INT TERM
+    _clear_interrupted "$name"
+}
+
+# Tell the user which collector groups this run had to create.  These are real
+# changes to the system's group database, so they should never be silent.
+report_granted_groups() {
+    [ -f "$GRANTED" ] || return 0
+    local n; n=$(count_lines "$GRANTED")
+    [ "$n" -gt 0 ] || return 0
+    say ""
+    say "${C_WARN}Collector groups used during this run:${C_OFF}"
+    local grp user owner
+    while IFS='|' read -r grp user owner; do
+        [ -n "$grp" ] || continue
+        printf "    %-24s lets '%s' install into '%s' directories\n" \
+               "$grp" "$user" "$owner"
+    done < "$GRANTED"
+    say ""
+    say "  These are permanent: the directory keeps its owner, but the group"
+    say "  owns it group-writable so both packages can install there."
+    say "  Review with:  getent group | grep '^${COLLECTOR_PREFIX}_'"
+    : > "$GRANTED"
+}
+
+# Is there a recorded package that has no package user yet?  Cheap enough to
+# check on every build-all, and it keeps the adoption pass quiet once done.
+_has_unadopted_packages() {
+    local man
+    for man in "$MANIFESTS"/*.files; do
+        [ -e "$man" ] || continue
+        _needs_adoption "$man" && return 0
+    done
+    return 1
+}
+
+# Which packages have already been adopted, and at what manifest size.
+#
+# A whole-manifest signature was useless: every build writes a manifest, so it
+# changed constantly and adoption ran every time.  Recording "name size" per
+# package means a package is re-adopted only when ITS OWN manifest grows --
+# which is exactly when it has new files to hand over.
+_ADOPTED_LIST() { echo "$STATE/adopted.list"; }
+
+_manifest_size() {
+    wc -c < "$1" 2>/dev/null | tr -d ' ' || echo 0
+}
+
+_adopted_size() {
+    local name="$1" f
+    f="$(_ADOPTED_LIST)"
+    [ -f "$f" ] || { echo ""; return; }
+    awk -v n="$name" '$1 == n { print $2; found=1 } END { if (!found) print "" }' \
+        "$f" | head -n1
+}
+
+_mark_adopted() {
+    local name="$1" size="$2" f tmp
+    f="$(_ADOPTED_LIST)"
+    tmp="$f.$$"
+    { [ -f "$f" ] && grep -v "^$name " "$f"; echo "$name $size"; } > "$tmp" 2>/dev/null
+    mv -f "$tmp" "$f" 2>/dev/null || rm -f "$tmp"
+}
+
+# A package needs adopting if it has no user yet, or its manifest has grown
+# since the last time it was adopted.
+_needs_adoption() {
+    local man="$1" name size
+    [ -s "$man" ] || return 1
+    name="$(basename "${man%.files}")"
+    _is_not_a_package "$name" && return 1
+
+    # Adoption exists for ONE thing: packages built before the chroot, whose
+    # files were recorded but whose ownership could not be assigned at the time
+    # because no package users existed yet.
+    #
+    # Anything in this chroot's step list is built by lfs-helper, which gives
+    # each file to its package user as part of the build -- there is nothing
+    # left to adopt, and walking its manifest is pure waste.  Checking that
+    # first is also much cheaper than statting thousands of files.
+    if steps | grep -qxF "$name"; then
+        return 1
+    fi
+
+    user_exists "$(pkg_owner_name "$name")" || return 0
+    size="$(_manifest_size "$man")"
+    [ "$(_adopted_size "$name")" = "$size" ] && return 1
+    return 0
+}
+
+# Is the compiler in this chroot actually usable?
+#
+# The book runs a sanity check after gcc-pass2 and again after entering the
+# chroot, and it is worth doing before every chapter-8 build: a toolchain that
+# cannot link a trivial program produces failures that look like anything but
+# a broken compiler --
+#     configure: error: cannot compute sizeof (long long)
+#     fatal error: bits/c++config.h: No such file or directory
+# Repair a C++ header tree installed under a different target triplet.
+#
+# The chroot compiler reports one triplet (say x86_64-pc-linux-gnu) while
+# chapter 6 installed its headers under another (x86_64-lfs-linux-gnu), so
+# g++ never looks where c++config.h actually is:
+#     fatal error: bits/c++config.h: No such file or directory
+#
+# The two trees are the same gcc version on the same machine, so the headers
+# are interchangeable -- a symlink from the triplet the compiler expects to
+# the one that exists is enough to build the real chapter-8 gcc, which then
+# installs a matching set and makes the link redundant.
+# Which package installed this path?
+#
+# The manifests are the record of who installed what, so a file that should
+# not exist can be traced to the step that created it.  Answers questions like
+# "where did this native x86_64-pc-linux-gnu compiler come from?" without
+# guessing.
+# Sort /etc/passwd and /etc/group by id.
+#
+# Package users are appended as they are created, so the files end up in build
+# order rather than id order -- awkward to read when you are trying to see
+# which package owns which id.  Sorting is cosmetic and safe: nothing depends
+# on the order of these files.  System entries (id < 1000) are kept at the top
+# in their existing order, because the first few lines of /etc/passwd are
+# conventional (root first) and worth not disturbing.
+# Files whose owner has no passwd entry in this chroot.
+#
+# The lfs user exists on the HOST, not in here, so anything it created shows
+# as a raw uid.  Recreate the account and hand those files to it, rather than
+# leaving them owned by nobody in particular.
+# Give one user access to one directory, using the normal rules.
+#
+#   lfs-helper grant-dir <dir> <user> [--run]
+#
+# Exactly what a failed install triggers automatically: if the directory
+# already carries a collector group, join it; if not, ask which group should
+# own it.  Exposed as a command so a script can ask for access BEFORE trying,
+# instead of failing first and repairing afterwards.
+cmd_grant_dir() {
+    need_root
+    local dir="${1:?usage: lfs-helper grant-dir <dir> <user> [--run]}"
+    local user="${2:?usage: lfs-helper grant-dir <dir> <user> [--run]}"
+    shift 2
+    local run=0
+    [ "${1:-}" = "--run" ] && run=1
+
+    [ -d "$dir" ] || die "no such directory: $dir"
+    user_exists "$user" || die "no such user: $user"
+
+    if su -s /bin/bash "$user" -c "test -w '$dir'" 2>/dev/null; then
+        say "'$user' can already write into $dir"
+        return 0
+    fi
+    if [ "$run" != 1 ]; then
+        say "'$user' cannot write into $dir"
+        say "  owner: $(stat -c '%U:%G %A' "$dir" 2>/dev/null)"
+        warn "(dry run -- nothing was changed.  Add --run to grant access.)"
+        return 0
+    fi
+    grant_dir_access "$dir" "$user"
+}
+
+# Is there anything with no passwd entry?  Stops at the first hit, so it costs
+# nothing on a tree that is already in order.
+_has_orphaned_files() {
+    local r="${SNAP_ROOT%/}" hit
+    hit="$(find "${r:-/}" -xdev -nouser \
+                -not -path "$r/dev/*"  -not -path "$r/proc/*" \
+                -not -path "$r/sys/*"  -not -path "$r/run/*" \
+                -print -quit 2>/dev/null)"
+    [ -n "$hit" ]
+}
+
+cmd_fix_orphans() {
+    need_root
+    local run=0
+    [ "${1:-}" = "--run" ] && run=1
+
+    # 1. make sure there IS an lfs user to own them
+    if ! user_exists lfs; then
+        say "No 'lfs' user in this chroot -- the build user from outside."
+        say "Creating it with uid $LFS_BUILD_UID so its files resolve to a name:"
+        if [ "$run" = 1 ]; then
+            if have_shadow_tools; then
+                groupadd -g "$LFS_BUILD_UID" lfs 2>/dev/null || true
+                useradd -M -u "$LFS_BUILD_UID" -g lfs -s /bin/bash \
+                        -c "build user from outside the chroot" lfs 2>/dev/null \
+                    || warn "  could not create the lfs user"
+            else
+                printf 'lfs:x:%s:\n' "$LFS_BUILD_UID" >> "$ETC/group"
+                printf 'lfs:x:%s:%s:build user from outside the chroot:/:/bin/bash\n' \
+                       "$LFS_BUILD_UID" "$LFS_BUILD_UID" >> "$ETC/passwd"
+            fi
+            user_exists lfs && ok "  created lfs ($LFS_BUILD_UID)"
+        else
+            say "  would create lfs ($LFS_BUILD_UID)"
+        fi
+        say ""
+    fi
+
+    # 2. hand the orphaned files over
+    local r="${SNAP_ROOT%/}"
+    say "Files owned by a uid with no passwd entry:"
+    # Write the full list to a file rather than capping it.  An earlier
+    # version kept only the first 2000 paths and fixed just those, so /lib and
+    # /.lfs-pkgusr were still owned by a uid with no name afterwards -- and it
+    # reported success.
+    local list="$STATE/tmp/orphans.$$"
+    mkdir -p "$STATE/tmp" 2>/dev/null || true
+    find "${r:-/}" -xdev -nouser \
+         -not -path "$r/dev/*"  -not -path "$r/proc/*" \
+         -not -path "$r/sys/*"  -not -path "$r/run/*" \
+         2>/dev/null > "$list"
+    local n
+    n="$(count_lines "$list")"
+    if [ "${n:-0}" = 0 ]; then
+        rm -f "$list"
+        ok "  none -- every file has a real owner"
+        return 0
+    fi
+    head -n 8 "$list" | sed 's/^/    /'
+    [ "$n" -gt 8 ] && say "    ... and $((n - 8)) more"
+    say ""
+    if [ "$run" != 1 ]; then
+        say "  they would be given to 'lfs'"
+        rm -f "$list"
+        warn "(dry run -- nothing was changed.  Add --run to apply.)"
+        return 0
+    fi
+    local fixed=0
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        chown -h lfs:lfs "$p" 2>/dev/null && fixed=$((fixed+1))
+        # a few hundred thousand chowns with no output looks like a hang, and
+        # people cancel things that look hung
+        [ $((fixed % 5000)) = 0 ] && printf '\r  %d of %d ...' "$fixed" "$n" >&2
+    done < "$list"
+    printf '\r%*s\r' 40 '' >&2
+    rm -f "$list"
+    ok "  gave $fixed of $n path(s) to 'lfs'"
+    [ "$fixed" = "$n" ] || warn "  ($((n - fixed)) could not be changed)"
+}
+
+cmd_sort_users() {
+    need_root
+    local run=0
+    [ "${1:-}" = "--run" ] && run=1
+
+    local f
+    for f in "$ETC/passwd" "$ETC/group"; do
+        [ -f "$f" ] || continue
+        local tmp="$f.sorted.$$"
+        # field 3 is the uid/gid in both files
+        {
+            awk -F: '$3 < 1000' "$f"
+            awk -F: '$3 >= 1000' "$f" | sort -t: -k3,3n
+        } > "$tmp" 2>/dev/null || { rm -f "$tmp"; continue; }
+
+        # never write a file with fewer lines than we started with
+        local a b
+        a="$(wc -l < "$f")"; b="$(wc -l < "$tmp")"
+        if [ "$a" != "$b" ]; then
+            warn "  $f: refusing to sort ($a lines in, $b out)"
+            rm -f "$tmp"
+            continue
+        fi
+        if cmp -s "$f" "$tmp"; then
+            say "  $f is already in id order"
+            rm -f "$tmp"
+            continue
+        fi
+        if [ "$run" = 1 ]; then
+            cp -p "$f" "$f.bak" 2>/dev/null || true
+            cat "$tmp" > "$f"          # preserve the inode, mode and owner
+            rm -f "$tmp"
+            ok "  $f sorted by id (previous kept as $f.bak)"
+        else
+            say "  $f would be sorted by id"
+            rm -f "$tmp"
+        fi
+    done
+    [ "$run" = 1 ] || warn "(dry run -- nothing was changed.  Add --run to apply.)"
+}
+
+cmd_which_package() {
+    local target="${1:?usage: lfs-helper which-package <path>}"
+    local man name hits=0
+
+    # match the path as recorded (manifests store chroot-absolute paths)
+    # Manifests store chroot-absolute paths.  strip_host_prefix maps a real
+    # path INTO that form; a path the user typed is usually already in it, so
+    # try both rather than silently finding nothing.
+    local needle needle2
+    needle="$target"
+    needle2="$(strip_host_prefix "$target")"
+
+    say "Searching the manifests for: $needle"
+    say ""
+    for man in "$MANIFESTS"/*.files "$MANIFESTS"/*.dirs; do
+        [ -e "$man" ] || continue
+        if grep -qxF "$needle" "$man" 2>/dev/null \
+           || grep -qxF "$needle2" "$man" 2>/dev/null; then
+            name="$(basename "$man")"; name="${name%.files}"; name="${name%.dirs}"
+            printf '    %-28s (%s)\n' "$name" "$(basename "$man")"
+            hits=$((hits+1))
+        fi
+    done
+
+    if [ "$hits" = 0 ]; then
+        # not an exact entry -- show packages that installed anything beneath it
+        say "  No package recorded that exact path."
+        say ""
+        say "  Packages that installed something under it:"
+        local found=0
+        for man in "$MANIFESTS"/*.files; do
+            [ -e "$man" ] || continue
+            local n
+            n="$(grep -c -e "^${needle%/}/" -e "^${needle2%/}/" "$man" 2>/dev/null)"
+            if [ "${n:-0}" -gt 0 ]; then
+                name="$(basename "${man%.files}")"
+                printf '    %-28s %s file(s)\n' "$name" "$n"
+                found=1
+            fi
+        done
+        if [ "$found" = 0 ]; then
+            say "    (none -- nothing recorded installing it)"
+            say ""
+            say "  Nothing recorded means it was installed before file tracking"
+            say "  existed, or outside these tools entirely."
+        fi
+    fi
+
+    # who owns it now, which may differ from who installed it
+    if [ -e "$target" ]; then
+        say ""
+        say "  On disk now: $(stat -c '%A %U:%G' "$target" 2>/dev/null)"
+    fi
+}
+
+cmd_fix_toolchain() {
+    need_root
+    local run=0
+    [ "${1:-}" = "--run" ] && run=1
+
+    local mine have hdr base
+    mine="$(c++ -dumpmachine 2>/dev/null)" \
+        || die "no working c++ -- this cannot be repaired automatically"
+    [ -n "$mine" ] || die "c++ -dumpmachine said nothing"
+
+    hdr=""
+    for h in /usr/include/c++/*/*/bits/c++config.h; do
+        [ -e "$h" ] || continue
+        hdr="$h"; break
+    done
+    [ -n "$hdr" ] || die "no c++config.h anywhere under /usr/include/c++ --
+  chapter 6's gcc-pass2 did not install the C++ headers.
+  Finish it outside the chroot:  lfs build-system crosschain --run"
+
+    have="$(basename "$(dirname "$(dirname "$hdr")")")"   # the triplet dir
+    base="$(dirname "$(dirname "$(dirname "$hdr")")")"    # .../c++/<version>
+
+    if [ "$have" = "$mine" ]; then
+        ok "Nothing to repair: the headers are already under '$mine'."
+        say "  If C++ still fails, it is not a triplet mismatch --"
+        say "  run: lfs-helper check-toolchain"
+        return 0
+    fi
+
+    say "The compiler and its headers disagree about the target triplet:"
+    say ""
+    say "    compiler reports : $mine"
+    say "    headers are under: $have"
+    say "    in               : $base"
+    say ""
+    say "Same gcc version, same machine, so the headers are interchangeable."
+    say "Link the name the compiler expects to the one that exists:"
+    say ""
+    say "    $base/$mine -> $have"
+    say ""
+    say "That is enough to build chapter 8's gcc, which installs a matching"
+    say "set of its own and makes this link unnecessary."
+
+    if [ -e "$base/$mine" ]; then
+        warn ""
+        warn "$base/$mine already exists -- not touching it."
+        return 1
+    fi
+    if [ "$run" != 1 ]; then
+        say ""
+        warn "(dry run -- nothing was changed.  Add --run to apply.)"
+        return 0
+    fi
+
+    ln -sv "$have" "$base/$mine" || die "could not create the link"
+    say ""
+    if cmd_check_toolchain >/dev/null 2>&1; then
+        ok "C++ works now."
+        say ""
+        say "Next:  lfs-helper build-all"
+    else
+        warn "The link is in place but C++ still fails."
+        say "Run 'lfs-helper check-toolchain' to see what else is wrong."
+        return 1
+    fi
+}
+
+cmd_check_toolchain() {
+    local rc=0 t
+    # not /tmp: it may not exist yet this early in the chroot
+    mkdir -p "$STATE/tmp" 2>/dev/null || true
+    t="$(mktemp -d -p "$STATE/tmp" 2>/dev/null || mktemp -d 2>/dev/null)" \
+        || die "cannot create a temp dir"
+    say "Toolchain check:"
+    say ""
+
+    # Identify the compiler FIRST.  Everything else is downstream of which
+    # binary this is and how it was configured -- and "how it was configured"
+    # is the only thing that explains a triplet mismatch, since a compiler
+    # searches for headers under the target it was BUILT for, not the one the
+    # headers happen to be installed under.
+    say "  The compiler:"
+    say "      c++        : $(command -v c++ 2>/dev/null || echo '(not found)')"
+    say "      gcc        : $(command -v gcc 2>/dev/null || echo '(not found)')"
+    say "      dumpmachine: $(c++ -dumpmachine 2>/dev/null || echo '(failed)')"
+    say "      version    : $(c++ --version 2>/dev/null | head -n1)"
+    local cfg
+    cfg="$(c++ -v 2>&1 | grep -m1 '^Configured with:')"
+    if [ -n "$cfg" ]; then
+        # the --host/--target it was built with is the whole story
+        say "      built with :"
+        printf '%s\n' "$cfg" | tr ' ' '\n' \
+            | grep -E '^--(host|target|build|prefix|with-gxx-include-dir)=' \
+            | sed 's/^/          /'
+    fi
+    say ""
+
+    # 1. C: compile and link
+    printf 'int main(void){return 0;}\n' > "$t/t.c"
+    if cc "$t/t.c" -o "$t/t" 2>"$t/cc.err"; then
+        ok "  C   compiles and links"
+    else
+        warn "  C   CANNOT compile a trivial program"
+        sed 's/^/        /' "$t/cc.err" | head -n 5
+        rc=1
+    fi
+
+    # 2. the interpreter the book checks for
+    if [ -f "$t/t" ]; then
+        local interp
+        interp="$(readelf -l "$t/t" 2>/dev/null | grep -o '/lib64/ld-linux[^]]*' | head -n1)"
+        if [ -n "$interp" ]; then
+            say "      interpreter: $interp"
+        fi
+    fi
+
+    # 3. C++: this is what chapter 8's gcc needs and what fails first
+    printf '#include <memory>\nint main(void){return 0;}\n' > "$t/t.cc"
+    if c++ "$t/t.cc" -o "$t/tpp" 2>"$t/cxx.err"; then
+        ok "  C++ compiles and links (headers are complete)"
+    else
+        warn "  C++ CANNOT compile -- the C++ headers are incomplete"
+        sed 's/^/        /' "$t/cxx.err" | head -n 5
+        rc=1
+        say ""
+        say "  Where the C++ headers actually are:"
+        local d found=0
+        for d in /usr/include/c++/*/*/bits/c++config.h \
+                 /tools/*/include/c++/*/*/bits/c++config.h; do
+            [ -e "$d" ] || continue
+            say "      $d"
+            found=1
+        done
+        [ "$found" = 0 ] && say "      (none found -- gcc-pass2 did not install them)"
+        say ""
+        # A header that exists and is world-readable can still be invisible:
+        # if any directory on the way to it lacks o+x, the compiler gets
+        # ENOENT -- "No such file or directory" -- not a permission error.
+        # That is indistinguishable from a missing file in the message, and it
+        # is exactly what a mis-assigned package-user directory causes.
+        local h
+        for h in /usr/include/c++/*/*/bits/c++config.h; do
+            [ -e "$h" ] || continue
+            local part="" comp bad=""
+            local IFS_SAVE="$IFS"; IFS=/
+            for comp in $h; do
+                [ -n "$comp" ] || continue
+                part="$part/$comp"
+                if [ ! -r "$part" ] || { [ -d "$part" ] && [ ! -x "$part" ]; }; then
+                    bad="$part"
+                    break
+                fi
+            done
+            IFS="$IFS_SAVE"
+            if [ -n "$bad" ]; then
+                say ""
+                warn "  This header EXISTS but cannot be reached:"
+                say "      $h"
+                say "  blocked at: $bad"
+                say "      $(stat -c '%A %U:%G' "$bad" 2>/dev/null)"
+                say "  Every directory on the way needs o+x, or the compiler"
+                say "  gets 'No such file or directory' even though it is there."
+                say ""
+                say "  Fix it with:"
+                say "      lfs-helper fix-perms --run"
+            fi
+        done
+
+        # The decisive fact: which directories the compiler actually searches.
+        # A header can exist, be world-readable, and sit on a fully traversable
+        # path, and still not be found -- because that directory is not in the
+        # search list at all.  Permissions and existence cannot tell you that;
+        # only the compiler can.
+        say ""
+        say "  Where this compiler actually looks for C++ headers:"
+        printf '' | c++ -x c++ -E -v - 2>&1 \
+            | sed -n '/#include <...> search starts here/,/End of search list/p' \
+            | grep -v 'search starts here\|End of search list' \
+            | sed 's/^/      /'
+        say ""
+        say "  If the directory holding c++config.h is not in that list, the"
+        say "  compiler was built for a different target than the headers were"
+        say "  installed for -- that is a mismatch, not a missing file."
+        say ""
+
+        say "  The compiler looks for them under its OWN target triplet:"
+        say "      $(cc -dumpmachine 2>/dev/null || echo '(cc not working)')"
+        say "  If the headers above are under a different triplet, chapter 6's"
+        say "  gcc-pass2 was built for a different target than this compiler"
+        say "  reports -- rebuild it with the LFS_TGT this tree was made with."
+    fi
+
+    rm -rf "$t"
+    say ""
+    if [ "$rc" = 0 ]; then
+        ok "Toolchain is usable."
+    else
+        warn "Do not start chapter 8 until this is fixed."
+    fi
+    return $rc
+}
+
+# Has the copied-in export already been applied?
+_groups_already_imported() {
+    local f="$STATE/collector-groups.import" first
+    [ -f "$f" ] || return 0
+    [ -f "$COLLECTOR_MAP" ] || return 1
+    # every dir decision in the file must be in the map
+    while IFS='|' read -r kind a b; do
+        [ "$kind" = dir ] || continue
+        grep -qxF "$a|$b" "$COLLECTOR_MAP" 2>/dev/null || return 1
+    done < <(grep -vE '^\s*(#|$)' "$f")
+    return 0
+}
+
+cmd_build_all() {
+    need_root
+    local force=0 from=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force) force=1; shift ;;
+            --from)  from="${2:?--from needs a step name}"; shift 2 ;;
+            *) die "usage: lfs-helper build-all [--from <step>] [--force]" ;;
+        esac
+    done
+    if [ -n "$from" ]; then
+        steps | grep -qxF "$from" \
+            || die "no such step: $from  (see: lfs-helper list)"
+    fi
+
+    # Set the package-user system up NOW, before the first package is built,
+    # not when we first trip over a package that needs it.  The earlier it
+    # exists, the fewer files are installed as root and have to be given back
+    # afterwards -- and it is what this whole toolchain is for.
+    if ! pkgusr_ready; then
+        say "Setting up the package-user system first (it must exist before"
+        say "any package is built):"
+        cmd_init_pkgusr --run || true
+        say ""
+    fi
+
+    # A groups export copied into the tree is a set of decisions already made
+    # -- apply them before anything can ask the same questions again.  Leaving
+    # this to be run by hand meant the file sat in the tree while the build
+    # stopped to ask about directories it already had an answer for.
+    if [ -f "$STATE/collector-groups.import" ] && ! _groups_already_imported; then
+        say "Applying the collector-group decisions copied into this tree:"
+        cmd_import_groups --run || true
+        say ""
+    fi
+
+    # Files carrying the outside build user's uid have no name in here, and
+    # every ownership check calls them UNKNOWN.  Fix that once, up front.
+    # Gate on the WORK, not on a side effect of starting it.
+    #
+    # This used to run only when the lfs user was missing -- but the user is
+    # created first, so cancelling part-way through the chown left the user in
+    # place and every later run skipped the repair entirely, with half a
+    # million files still owned by nobody.
+    if _has_orphaned_files; then
+        say "Some files have no owner in this chroot (created outside it)."
+        cmd_fix_orphans --run || true
+        say ""
+    fi
+
+    # Then hand the ALREADY-built packages to their own users, before building
+    # anything new.  Chapters 5-7 ran before package users existed, so their
+    # files are root-owned and their manifests are the only record of who
+    # installed what.  Doing this now means:
+    #   * the first package users are the packages actually installed first,
+    #     not whichever chapter-8 package happened to come along;
+    #   * bash, coreutils, glibc and the rest own their files from here on;
+    #   * a chapter-8 package that replaces a chapter-7 file writes into a
+    #     directory its own user already owns, instead of hitting root.
+    # It is idempotent -- a package that already has its user is skipped.
+    if pkgusr_ready && [ -d "$MANIFESTS" ] && _has_unadopted_packages; then
+        say "Giving the already-built packages their own users first:"
+        cmd_adopt_existing --run || true
+        say ""
+    fi
+
+    local total done_n=0 s _needs_you=""
+    total=$(steps | wc -l)
+    [ "$total" -gt 0 ] || die "no scripts found in $SCRIPTS
+  Generate them from outside the chroot:
+      lfs build-system gen-chroot-scripts --run"
+    # Work out which steps are in range, and whether any are already built.
+    # Rather than making you remember --force, just ask.
+    local in_range=() built=() started=1
+    [ -n "$from" ] && started=0
+    while read -r s; do
+        if [ "$started" = 0 ]; then
+            [ "$s" = "$from" ] && started=1 || continue
+        fi
+        in_range+=("$s")
+        is_done "$s" && built+=("$s")
+    done < <(steps)
+
+    if [ "${#built[@]}" -gt 0 ] && [ "$force" = 0 ]; then
+        say "${#built[@]} of the ${#in_range[@]} step(s) in range are already built:"
+        # When the list is long, collapse the OLD ones into a numbered range and
+        # spell out only the most recent -- those are the ones you care about.
+        local _show=6 _n="${#built[@]}"
+        if [ "$_n" -gt "$_show" ]; then
+            say "    steps 1-$(( _n - _show )) (built earlier)"
+            say "    ... most recently:"
+            printf '    %s\n' "${built[@]:$(( _n - _show ))}"
+        else
+            printf '    %s\n' "${built[@]}"
+        fi
+        # Spell out what each answer does -- "Rebuild those too? [y/N]" on its
+        # own doesn't say what happens when you decline.
+        local _todo=$(( ${#in_range[@]} - ${#built[@]} ))
+        say ""
+        say "  y = rebuild all ${#in_range[@]} step(s) from the start of the range"
+        if [ "$_todo" -gt 0 ]; then
+            local _first=""
+            local _s
+            for _s in "${in_range[@]}"; do
+                is_done "$_s" && continue
+                _first="$_s"; break
+            done
+            say "  N = keep them, build only the $_todo remaining step(s)," \
+                "starting with '$_first'"
+        else
+            say "  N = keep them; nothing would be built (everything is done)"
+        fi
+        if [ -t 0 ]; then
+            printf 'Rebuild those too? [y/N]: '
+            local ans; read -e -r ans
+            case "$ans" in [Yy]*) force=1; say "# rebuilding everything in range" ;;
+                           *) say "# keeping them; building the $_todo remaining step(s)" ;;
+            esac
+        else
+            say "# not a terminal -- keeping them, building the $_todo remaining step(s)"
+        fi
+        say ""
+    fi
+
+    local i=0
+    started=1; [ -n "$from" ] && started=0
+    while read -r s; do
+        i=$((i+1))
+        # --from: skip everything before the named step, then build onward
+        if [ "$started" = 0 ]; then
+            if [ "$s" = "$from" ]; then started=1; else
+                say "${C_DIM}[$i/$total] $s -- before --from $from, skipping${C_OFF}"
+                continue
+            fi
+        fi
+        if is_done "$s" && [ "$force" = 0 ]; then
+            say "${C_DIM}[$i/$total] $s -- already built, skipping${C_OFF}"
+            done_n=$((done_n+1))
+            continue
+        fi
+        # A package left half-installed by an interrupted build breaks
+        # everything after it, and the failure never points back here.
+        if _interrupted_packages >/dev/null 2>&1; then
+            warn ""
+            warn "These packages were interrupted mid-install and may be"
+            warn "half on disk:"
+            _interrupted_packages | sed 's/^/    /' >&2
+            warn ""
+            warn "Finish one before building anything else:"
+            warn "    lfs-helper build <name> --phase install --force"
+            warn "Or check what state the toolchain is in:"
+            warn "    lfs-helper check-toolchain"
+            warn ""
+        fi
+
+        # The toolchain check belongs HERE, not at the top: chapter 7 builds
+        # the temporary tools and needs no C++ compiler at all, so checking up
+        # front blocked the very steps that would fix a broken toolchain --
+        # build-all simply did nothing, with nothing to say why.  Check once,
+        # before the first package that actually needs a compiler.
+        if ! is_root_step "$s" && [ "${_tc_checked:-0}" = 0 ]; then
+            _tc_checked=1
+            if ! cmd_check_toolchain >/dev/null 2>&1; then
+                # A toolchain package interrupted mid-install is the usual
+                # cause: `make install` replaced /usr/bin/gcc with the new
+                # compiler but had not yet installed its headers, so the new
+                # one shadows the working one and nothing can build.  The fix
+                # is to finish the install that was interrupted -- the tool
+                # knows which package that was, so do it rather than printing
+                # a diagnosis and stopping.
+                local _pkg _fixed=0 _candidates
+                # The marker only exists if the interruption happened while a
+                # version of this tool that writes one was running.  A package
+                # that has already installed files but is not marked built is
+                # in exactly the same state, so treat it the same way -- that
+                # is precisely what a half-installed gcc looks like.
+                _candidates="$(_interrupted_packages 2>/dev/null)"
+                if [ -z "$_candidates" ] && [ -s "$MANIFESTS/$s.files" ] \
+                   && ! is_done "$s"; then
+                    _candidates="$s"
+                    say ""
+                    say "'$s' has already installed files but is not marked"
+                    say "built -- an earlier attempt stopped part-way."
+                fi
+                for _pkg in $_candidates; do
+                    warn ""
+                    warn "The compiler is broken, and '$_pkg' was interrupted"
+                    warn "mid-install -- that is almost certainly why."
+                    say "Finishing its install before going on:"
+                    say ""
+                    if ( cmd_build "$_pkg" --phase install --force ); then
+                        _fixed=1
+                    fi
+                    if cmd_check_toolchain >/dev/null 2>&1; then
+                        ok ""
+                        ok "# the compiler works again -- continuing"
+                        say ""
+                        _fixed=1
+                        break
+                    fi
+                done
+                if ! cmd_check_toolchain >/dev/null 2>&1; then
+                    warn ""
+                    warn "Stopping before '$s': this is the first package that"
+                    warn "needs a working C++ compiler, and there is not one."
+                    if [ "$_fixed" = 1 ]; then
+                        warn "Finishing the interrupted install did not repair it."
+                    fi
+                    say ""
+                    cmd_check_toolchain || true
+                    return 1
+                fi
+            fi
+        fi
+
+        if ! is_root_step "$s" && ! pkgusr_ready; then
+            # Set it up rather than stopping.  The package-user system is not
+            # an optional extra here -- it is the whole point of this toolchain,
+            # and every chapter-8 package needs it.  Asking the user to run one
+            # obvious command and then re-issue build-all is just a detour.
+            say ""
+            say "'$s' is the first package that needs the package-user system."
+            say "Setting it up now (lfs-helper init-pkgusr):"
+            if cmd_init_pkgusr --run; then
+                say ""
+                ok "  package-user system ready -- continuing with $s"
+                say ""
+            fi
+        fi
+        if ! is_root_step "$s" && ! pkgusr_ready; then
+            warn ""
+            warn "Stopping: '$s' is a chapter-8 package and needs the"
+            warn "package-user system. Set it up, then re-run build-all:"
+            warn "    lfs-helper init-pkgusr --run"
+            warn "    lfs-helper build-all"
+            return 0
+        fi
+        # Seal immediately BEFORE the final step.  By now every package is
+        # built, so the install directories no longer need to be writable by
+        # everyone -- and last-step runs after the seal, which is the correct
+        # order: it installs new files (allowed under the sticky bit) rather
+        # than replacing other packages' (which is what the seal prevents).
+        if [ "$s" = "last-step" ] && ! _install_dirs_are_sealed; then
+            say ""
+            say "Everything before the final step is built -- sealing the"
+            say "install directories now, so packages can no longer overwrite"
+            say "each other's files:"
+            say ""
+            cmd_seal_install_dirs --run
+        fi
+
+        say ""
+        say "===== [$i/$total] $s ====="
+        # pass the rebuild decision down -- otherwise the per-package check
+        # prompts (or skips) again for something we already agreed to rebuild
+        # The result matters.  It used to be discarded, so a step that exits 3
+        # ("this one needs you") -- refind, which cannot guess your ESP --
+        # slipped past silently and the build reported everything complete
+        # with that step still pending.
+        local _rc=0
+        if [ "$force" = 1 ]; then cmd_build "$s" --force || _rc=$?
+        else cmd_build "$s" || _rc=$?; fi
+        case "$_rc" in
+            0|4) ;;                       # done, or deliberately nothing to do
+            3)  _needs_you="$_needs_you $s" ;;
+            *)  warn ""
+                warn "'$s' failed (exit $_rc) -- stopping here."
+                warn "Fix it, then run build-all again; it continues from '$s'."
+                return "$_rc" ;;
+        esac
+    done < <(steps)
+    report_granted_groups
+
+    if [ -n "${_needs_you# }" ]; then
+        say ""
+        warn "These steps need a decision from you and were not built:"
+        local _p
+        for _p in $_needs_you; do
+            say "    lfs-helper build $_p"
+        done
+        say ""
+        say "Everything else is built.  Deal with them, then run build-all"
+        say "again -- or skip one deliberately with: lfs-helper done <name>"
+        return 0
+    fi
+
+    ok ""
+    ok "all steps complete ($total total)."
+
+    # The genuinely last step of the chroot stage.  Until now the install
+    # directories were group-writable but NOT sticky, so package users could
+    # replace the temporary system's root-owned files and each other's -- which
+    # the build needs.  Now that everything is built, seal them: a package user
+    # can still create files there but no longer modify or delete another
+    # package's.  Only the install directories; collector-group directories are
+    # shared on purpose and are left alone.
+    if ! _install_dirs_are_sealed; then
+        say ""
+        say "Last step: making the install directories sticky, so packages can"
+        say "no longer overwrite each other's files.  (Collector-group"
+        say "directories are shared deliberately and are left alone.)"
+        say ""
+        cmd_seal_install_dirs --run
+    fi
+
+    # Package users are appended as they are created, so by now /etc/passwd is
+    # in build order.  Sorting by id makes it readable -- and it is purely
+    # cosmetic, so it is safe to do without asking.
+    say ""
+    cmd_sort_users --run || true
+}
+
+# Are the install directories already sticky?  Checking a handful of the ones
+# that certainly exist is enough to tell whether sealing has been done.
+_install_dirs_are_sealed() {
+    local d probe=0 sealed=0
+    while IFS= read -r d; do
+        d="${SNAP_ROOT%/}$d"
+        [ -d "$d" ] || continue
+        probe=$((probe + 1))
+        [ -k "$d" ] && sealed=$((sealed + 1))
+        [ "$probe" -ge 5 ] && break
+    done < <(install_dirs_list)
+    [ "$probe" -gt 0 ] && [ "$sealed" = "$probe" ]
+}
+
+# --------------------------------------------------------------------------- #
+# reporting
+# --------------------------------------------------------------------------- #
+cmd_status() {
+    local total done_n
+    total=$(steps | wc -l)
+    done_n=$(count_lines "$PROGRESS")
+    say "LFS chroot session"
+    say "  state dir   : $STATE"
+    say "  scripts     : $SCRIPTS ($(ls -1 "$SCRIPTS" 2>/dev/null | wc -l) available)"
+    say "  package-user: $(pkgusr_ready && echo 'ready' || echo 'NOT set up')"
+    if pkgusr_ready; then
+        local probe="${SNAP_ROOT%/}/usr/bin" sticky="no"
+        [ -k "$probe" ] && sticky="yes"
+        say "  install dirs : group-writable, sticky=$sticky"
+        if [ "$sticky" = "no" ]; then
+            say "                 (correct while building -- sticky would stop one"
+            say "                  package replacing another's files.  Add it once"
+            say "                  every package is built, to complete the chroot"
+            say "                  stage:  lfs-helper seal-install-dirs --run)"
+        fi
+    fi
+    say "  progress    : $done_n / $total step(s) built"
+    if [ -f "$PROGRESS" ] && [ "$done_n" -gt 0 ]; then
+        say "  last built  : $(tail -n1 "$PROGRESS")"
+    fi
+}
+
+cmd_list() {
+    local total; total=$(steps | wc -l)
+    [ "$total" -gt 0 ] || { warn "no scripts in $SCRIPTS"; return 0; }
+    local i=0 s
+    while read -r s; do
+        i=$((i+1))
+        if is_done "$s"; then
+            printf "  %3d. %-22s ${C_OK}built${C_OFF}\n" "$i" "$s"
+        elif [ -f "$(phase_file "$s")" ]; then
+            printf "  %3d. %-22s ${C_WARN}partial${C_OFF} (%s)\n" "$i" "$s" \
+                   "$(tr '\n' ' ' < "$(phase_file "$s")" | sed 's/ $//')"
+        else
+            printf "  %3d. %-22s ${C_DIM}pending${C_OFF}\n" "$i" "$s"
+        fi
+    done < <(steps)
+}
+
+# Are there manifests from the pre-chroot build that nobody owns yet?
+needs_adoption() {
+    is_done "adopt-existing" && return 1
+    local man name
+    for man in "$MANIFESTS"/*.files; do
+        [ -e "$man" ] || continue
+        [ -s "$man" ] || continue
+        name="$(basename "${man%.files}")"
+        case "$name" in init-*) continue ;; esac
+        user_exists "$(pkg_owner_name "$name")" && continue
+        return 0
+    done
+    return 1
+}
+
+cmd_next() {
+    local s
+    # walk the list in order; the first unfinished step IS the next step
+    while read -r s; do
+        is_done "$s" && continue
+        case "$s" in
+            init-dirs)
+                say "Next step: create the directory tree (book 7.5)"
+                say "    lfs-helper build init-dirs" ;;
+            init-files)
+                say "Next step: create /etc/passwd, /etc/group etc. (book 7.6)"
+                say "    lfs-helper build init-files"
+                say ""
+                say "  (this is why the prompt says \"I have no name!\" -- after"
+                say "   it runs, type:  exec /usr/bin/bash --login)" ;;
+            *)
+                # a partially-built step: continue where it left off
+                local _nxt
+                if [ -f "$(phase_file "$s")" ]; then
+                    _nxt="$(next_phase_for "$s" || true)"
+                    if [ -n "$_nxt" ]; then
+                        say "Next step: continue '$s' -- already done: $(tr '\n' ' ' < "$(phase_file "$s")" | sed 's/ $//')"
+                        say "    lfs-helper build $s --phase $_nxt"
+                        say ""
+                        say "  (or redo the whole package:  lfs-helper build $s --force)"
+                        return 0
+                    fi
+                fi
+                # step 3: hand the already-built packages to package users,
+                # before anything new is compiled
+                if needs_adoption; then
+                    if ! pkgusr_ready; then
+                        say "Next step: set up the package-user system"
+                        say "    lfs-helper init-pkgusr --run"
+                    else
+                        say "Next step: give the already-built packages their"
+                        say "package users (chapters 5-6, from their manifests)"
+                        say "    lfs-helper adopt-existing --run"
+                    fi
+                    return 0
+                fi
+                if is_root_step "$s"; then
+                    say "Next step: build '$s'  (temporary chapter-7 tool, as root)"
+                    say "    lfs-helper build $s"
+                elif ! pkgusr_ready; then
+                    say "Next step: set up the package-user system"
+                    say "    lfs-helper init-pkgusr --run"
+                    say ""
+                    say "  (chapter 8 starts here -- from now on each package is"
+                    say "   built by its own package user)"
+                    return 0
+                else
+                    local nxt; nxt="$(next_phase_for "$s" || true)"
+                    if [ -f "$(phase_file "$s")" ] && [ -n "$nxt" ]; then
+                        say "Next step: continue '$s' -- $(tr '\n' ' ' < "$(phase_file "$s")")already done"
+                        say "    lfs-helper build $s --phase $nxt"
+                    else
+                        say "Next step: build '$s'  (as its own package user)"
+                        say "    lfs-helper build $s"
+                    fi
+                fi ;;
+        esac
+        say ""
+        say "  (or build everything remaining:  lfs-helper build-all)"
+        return 0
+    done < <(steps)
+    ok "Everything in the step list is built."
+    say "  review:  lfs-helper list"
+
+    # Finishing steps, in order.  Skipping these is how a system ends up with
+    # thousands of root-owned files inside package trees: builds that OVERWROTE
+    # a chapter-7 file left it owned by root, and only the manifests know who
+    # it really belongs to.
+    local _leftover
+    _leftover="$(find "${SNAP_ROOT%/}/usr/lib" "${SNAP_ROOT%/}/usr/share" \
+                      -maxdepth 2 -type d -user root 2>/dev/null \
+                 | while IFS= read -r d; do is_install_dir "$d" || echo "$d"; done \
+                 | head -n 1)"
+    if [ -n "$_leftover" ]; then
+        say ""
+        say "Next: give every package its files (some are still owned by root,"
+        say "e.g. $_leftover)"
+        say "    lfs-helper fix-ownership --run"
+        say "    lfs-helper adopt-dirs --run"
+        return 0
+    fi
+    local probe="${SNAP_ROOT%/}/usr/bin"
+    if pkgusr_ready && [ -d "$probe" ] && [ ! -k "$probe" ]; then
+        say ""
+        say "Final step: make the install directories sticky, so a package user"
+        say "can no longer modify another package's files:"
+        say "    lfs-helper seal-install-dirs --run"
+    fi
+}
+
+cmd_manifests() {
+    local name="${1:-}"
+    if [ -n "$name" ]; then
+        local shown=0
+        if [ -s "$MANIFESTS/$name.files" ]; then
+            say "# files"; cat "$MANIFESTS/$name.files"; shown=1
+        fi
+        if [ -s "$MANIFESTS/$name.dirs" ]; then
+            say "# directories"; cat "$MANIFESTS/$name.dirs"; shown=1
+        fi
+        [ "$shown" = 1 ] || die "no manifest for $name"
+        return 0
+    fi
+    local total=0 total_d=0 f n
+    for f in "$MANIFESTS"/*.files; do
+        [ -e "$f" ] || continue
+        n=$(wc -l < "$f"); total=$((total+n))
+        # directories too: a package owns the dirs it creates, and one with
+        # files but no dirs is a tracking bug worth seeing
+        local nm nd flag
+        nm="$(basename "${f%.files}")"
+        nd=0
+        [ -f "$MANIFESTS/$nm.dirs" ] && nd="$(count_lines "$MANIFESTS/$nm.dirs")"
+        flag=""
+        [ "$n" -gt 0 ] && [ "$nd" = 0 ] && flag="   <- no directories recorded"
+        printf "  %-22s %6d files %5d dirs%s\n" "$nm" "$n" "$nd" "$flag"
+        total_d=$((total_d + nd))
+    done
+    say ""
+    say "  $total file(s) and ${total_d:-0} directory(ies) tracked"
+}
+
+# The hint's final chroot-stage step: once everything is built, install
+# directories become sticky, so from then on a package user can add files but
+# cannot modify or delete files belonging to OTHER packages.  Doing this any
+# earlier would block package users from overwriting the temporary system.
+# Chapters 5-6 were built OUTSIDE the chroot, as the lfs user, and their file
+# lists were recorded with host paths ($LFS/usr/bin/...).  In here those same
+# files are /usr/bin/..., so translate before touching anything.
+strip_host_prefix() {
+    local p="$1" m="${LFS_HOST_MOUNT:-}" r="${SNAP_ROOT%/}"
+    [ -n "$m" ] && [ "${p#$m/}" != "$p" ] && p="/${p#$m/}"
+    # anchor to the tracked root: "/" in the real chroot (so unchanged), but the
+    # test root elsewhere -- without this a stray manifest entry could point at
+    # the HOST's /usr/bin instead of the tree we're working on
+    printf '%s\n' "$r$p"
+}
+
+# Hand the already-built packages (chapters 5-6) to package users, using the
+# manifests recorded during those builds.  Run this once, right after 7.6, so
+# every package on the system already belongs to its own user before the first
+# chapter-8 package is compiled.
+# Undo a bad adoption round.  Two things went wrong before the fixes above:
+#   * the first in-chroot build compared against a snapshot recorded OUTSIDE
+#     the chroot, so it claimed every pre-existing file as its own (init-dirs
+#     ended up "owning" ~11000 files that belong to gzip, bash, ...);
+#   * root-only steps (init-dirs/init-files, the *-tmp tools) were given
+#     package users they should never have had.
+# This removes those users, discards the bogus manifests, and puts the affected
+# files back to root so a corrected adopt-existing can assign them properly.
+# Chapters 5-6 were tracked before directory recording existed, so those
+# packages have file lists but no .dirs list -- which is why they all report
+# "0 dirs" even though gcc plainly creates /usr/lib/gcc/<triplet>/<version>/.
+# Reconstruct the directories from the file lists: take every parent directory
+# of every tracked file, drop the shared install directories, and assign a
+# directory only when ALL the tracked files under it come from ONE package.
+# A directory shared by two packages stays root-owned, which is the safe answer.
+# Does <dir> hold files owned by a package user other than <owner>?
+# Only the immediate contents are checked: cheap, and enough to catch a
+# package reaching into a tree that is not its own.
+_dir_contents_foreign() {
+    local d="$1" owner="$2" e u
+    [ -d "$d" ] || return 1
+    for e in "$d"/*; do
+        [ -e "$e" ] || continue
+        u="$(stat -c %U "$e" 2>/dev/null)" || continue
+        case "$u" in
+            "$owner"|root|UNKNOWN|"") continue ;;
+        esac
+        # another PACKAGE user owns something in here -- leave the dir alone
+        user_exists "$u" && return 0
+    done
+    return 1
+}
+
+infer_dirs() {
+    local tmp="$STATE/.dirinfer.$$"
+    : > "$tmp"
+    local man name owner p d r="${SNAP_ROOT%/}"
+    for man in "$MANIFESTS"/*.files; do
+        [ -e "$man" ] || continue
+        [ -s "$man" ] || continue
+        name="$(basename "${man%.files}")"
+        is_root_step "$name" && continue
+        owner="$(pkg_owner_name "$name")"
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            d="$(strip_host_prefix "$p")"
+            d="${d%/*}"
+            # walk up to the tracked root
+            while [ -n "$d" ] && [ "$d" != "$r" ] && [ "$d" != "/" ]; do
+                printf '%s\t%s\n' "$d" "$owner" >> "$tmp"
+                d="${d%/*}"
+            done
+        done < "$man"
+    done
+    # keep only dirs with exactly one owner
+    sort -u "$tmp" | awk -F'\t' '
+        { if ($1 == last) { multi=1 } else { if (last != "" && !multi) print last "\t" lastowner
+                                             last=$1; lastowner=$2; multi=0 } }
+        END { if (last != "" && !multi) print last "\t" lastowner }'
+    rm -f "$tmp"
+}
+
+cmd_adopt_dirs() {
+    need_root
+    local run=0; [ "${1:-}" = "--run" ] && run=1
+    pkgusr_ready || die "run 'lfs-helper init-pkgusr --run' first"
+
+    say "Assign directories that packages created for themselves."
+    say "Derived from the file lists: a directory goes to a package only when"
+    say "every tracked file under it belongs to that one package.  Shared"
+    say "directories stay root:install."
+    say ""
+    [ "$run" = 1 ] || warn "(dry run -- nothing was changed.  Add --run to apply.)"
+    say ""
+
+    local d owner n=0 skipped=0
+    while IFS="$(printf '\t')" read -r d owner; do
+        [ -n "$d" ] && [ -n "$owner" ] || continue
+        # Never take a directory whose contents belong to someone else.
+        #
+        # infer_dirs walks UP from every installed file, so a package that
+        # drops one file deep inside another package's tree claims every
+        # parent on the way -- which is how zstd came to own
+        # /usr/include/c++/15.2.0/bits, gcc's own C++ headers, and gcc could
+        # then no longer build.  Being the only package with a manifest entry
+        # under a directory does not make it yours.
+        _dir_contents_foreign "$d" "$owner" && { skipped=$((skipped+1)); continue; }
+        [ -d "$d" ] || continue
+        is_install_dir "$d" && { skipped=$((skipped+1)); continue; }
+        user_exists "$owner" || continue
+        if [ "$run" = 1 ]; then
+            chown "$owner:$owner" "$d" 2>/dev/null && n=$((n+1))
+        else
+            n=$((n+1))
+            [ "$n" -le 15 ] && say "    $d -> $owner"
+        fi
+    done < <(infer_dirs)
+
+    say ""
+    if [ "$run" = 1 ]; then
+        ok "  $n directory(ies) assigned to their package"
+    else
+        say "  would assign $n directory(ies) ($skipped shared install dirs left alone)"
+    fi
+    return 0
+}
+
+cmd_repair_adoption() {
+    need_root
+    local run=0; [ "${1:-}" = "--run" ] && run=1
+
+    say "Repair a bad adoption round."
+    say ""
+    [ "$run" = 1 ] || warn "(dry run -- nothing was changed.  Add --run to apply.)"
+    say ""
+
+    local man name n p tgt users=0 files=0 owner
+    for man in "$MANIFESTS"/*.files; do
+        [ -e "$man" ] || continue
+        name="$(basename "${man%.files}")"
+        owner="$(pkg_owner_name "$name")"
+        # Two kinds of bad user to undo:
+        #   * root-only steps that should own nothing at all
+        #   * per-pass users (gcc-pass1, binutils-pass2, libstdcpp) whose files
+        #     belong to the base package instead
+        if ! is_root_step "$name" && [ "$owner" = "$name" ]; then
+            continue
+        fi
+
+        # 1. hand the files back to root (their real owners get them from their
+        #    own manifests when adopt-existing runs again)
+        n=0
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            tgt="$(strip_host_prefix "$p")"
+            [ -e "$tgt" ] || [ -L "$tgt" ] || continue
+            if [ "$run" = 1 ]; then
+                chown -h root:root "$tgt" 2>/dev/null && n=$((n+1))
+            else
+                n=$((n+1))
+            fi
+        done < "$man"
+
+        # 2. init-dirs/init-files create directories and /etc files; they never
+        #    "install" a package, so their manifests are meaningless -- drop
+        #    them.  The *-tmp manifests are real and are kept.
+        case "$name" in
+            init-*) [ "$run" = 1 ] && : > "$man"
+                    say "  $name: cleared bogus manifest ($n file(s) returned to root)" ;;
+            *)      if [ "$owner" != "$name" ]; then
+                        say "  $name: $n file(s) will be re-assigned to '$owner' (manifest kept)"
+                    else
+                        say "  $name: $n file(s) returned to root (manifest kept)"
+                    fi ;;
+        esac
+        files=$((files+n))
+
+        # 3. remove the package user/group it should never have had
+        if user_exists "$name"; then
+            if [ "$run" = 1 ]; then
+                if have_shadow_tools && command -v userdel >/dev/null 2>&1; then
+                    userdel "$name" 2>/dev/null
+                    groupdel "$name" 2>/dev/null
+                else
+                    sed -i "/^$name:/d" "$ETC/passwd"
+                    sed -i "/^$name:/d" "$ETC/group"
+                    drop_from_install_group "$name"
+                fi
+            fi
+            say "      removed package user '$name'"
+            users=$((users+1))
+        fi
+    done
+
+    # A user can exist without a manifest (e.g. a step that failed part-way),
+    # so also sweep the passwd file for package users whose name should never
+    # have been a user in the first place.
+    local u
+    while IFS=: read -r u _x uid _rest; do
+        [ -n "$u" ] || continue
+        [ "$uid" -ge "$PKG_UID_MIN" ] 2>/dev/null || continue
+        if is_root_step "$u" || [ "$(pkg_owner_name "$u")" != "$u" ]; then
+            if [ "$run" = 1 ]; then
+                if have_shadow_tools && command -v userdel >/dev/null 2>&1; then
+                    userdel "$u" 2>/dev/null; groupdel "$u" 2>/dev/null
+                else
+                    sed -i "/^$u:/d" "$ETC/passwd"
+                    sed -i "/^$u:/d" "$ETC/group"
+                    drop_from_install_group "$u"
+                fi
+            fi
+            say "      removed stray package user '$u'"
+            users=$((users+1))
+        fi
+    done < "$ETC/passwd"
+
+    say ""
+    if [ "$run" = 1 ]; then
+        ok "  $users bogus user(s) removed, $files file(s) returned to root"
+        unmark "adopt-existing"
+        say ""
+        say "Now assign ownership correctly:"
+        say "    lfs-helper adopt-existing --run"
+    else
+        say "  would remove $users user(s) and return $files file(s) to root"
+    fi
+    return 0
+}
+
+# Manifests oldest-first: the order the packages were built in.
+_manifests_in_build_order() {
+    local f
+    for f in "$MANIFESTS"/*.files; do
+        [ -e "$f" ] || continue
+        # %.Y is nanosecond precision: whole seconds tie for packages built
+        # in the same second, and the order then falls back to alphabetical
+        printf '%s\t%s\n' "$(stat -c %.Y "$f" 2>/dev/null || echo 0)" "$f"
+    done | sort -n -k1,1 | cut -f2-
+}
+
+cmd_adopt_existing() {
+    need_root
+    local run=0 verbose=0
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --run) run=1; shift ;;
+            -v|--verbose) verbose=1; shift ;;
+            *) die "usage: lfs-helper adopt-existing [--run]" ;;
+        esac
+    done
+    pkgusr_ready || die "run 'lfs-helper init-pkgusr --run' first"
+
+    say "Give the CHAPTER 5-6 packages their own package users."
+    say ""
+    say "Those were built outside the chroot, before any package user existed,"
+    say "so their files are still root-owned -- only their recorded file lists"
+    say "say who installed what.  Packages built in here already got their"
+    say "owner as part of the build and are not touched."
+    say ""
+    [ "$run" = 1 ] || warn "(dry run -- nothing was changed.  Add --run to apply.)"
+    say ""
+
+    local man name n nd p tgt total_f=0 total_p=0 skipped=0
+    # In BUILD order, not alphabetical.
+    #
+    # The uid a package gets is the order its user is created in, so walking
+    # the manifests alphabetically gave gcc (built 2nd of 22) a higher uid than
+    # man-pages (the first chapter-8 package).  Sorting by manifest mtime --
+    # written when the package was built -- makes the uids a record of the
+    # order the system was actually built in.
+    for man in $(_manifests_in_build_order); do
+        [ -e "$man" ] || continue
+        name="$(basename "${man%.files}")"
+        # init-dirs/init-files are book housekeeping -- they create the
+        # directory tree and /etc files and own nothing, so they get no user.
+        #
+        # The *-tmp temporary tools DO get adopted, to the base package user
+        # (perl-tmp -> perl).  Leaving them root-owned was a mistake: chapter 8
+        # rebuilds exactly these packages, and its package user then cannot
+        # write into the root-owned tree chapter 7 left behind -- which is what
+        # made perl fail in /usr/lib/perl5/5.42/core_perl.  Since it is the same
+        # package either way, the same user should own it throughout.
+        case "$name" in
+            init-*) skipped=$((skipped+1)); continue ;;
+        esac
+        [ -s "$man" ] || { skipped=$((skipped+1)); continue; }
+        # already done, and its manifest has not grown since: nothing to do.
+        # Without this the whole pass ran again on every build-all, re-checking
+        # tens of thousands of paths that were already correct.
+        if ! _needs_adoption "$man"; then
+            skipped=$((skipped+1)); continue
+        fi
+
+        # gcc-pass1/-pass2/libstdcpp all belong to 'gcc', etc.
+        # show which package is being worked on WHILE it is worked on: a big
+        # manifest takes a few seconds and silence looks like a hang
+        printf '\r  checking %-40s' "$name" >&2
+        local owner; owner="$(pkg_owner_name "$name")"
+        if ! user_exists "$owner"; then
+            if [ "$run" = 1 ]; then
+                # In a SUBSHELL: cmd_add_user dies on failure, and `die`
+                # exits the whole script -- so `|| continue` never ran and one
+                # unlucky package aborted the entire adoption pass.
+                ( cmd_add_user "$owner" ) >/dev/null 2>&1 \
+                    || { warn "  $name: could not create package user '$owner' -- skipping"; \
+                         skipped=$((skipped+1)); continue; }
+            fi
+        fi
+
+        n=0; nd=0
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            tgt="$(strip_host_prefix "$p")"
+            [ -e "$tgt" ] || [ -L "$tgt" ] || continue
+            if [ "$run" = 1 ]; then
+                # already correct: don't re-chown tens of thousands of paths
+                [ "$(stat -c %U "$tgt" 2>/dev/null)" = "$owner" ] && continue
+                chown -h "$owner:$owner" "$tgt" 2>/dev/null && n=$((n+1))
+            else
+                n=$((n+1))
+                [ "$verbose" = 1 ] && say "      $tgt"
+            fi
+        done < "$man"
+
+        if [ -f "$MANIFESTS/$name.dirs" ]; then
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                tgt="$(strip_host_prefix "$p")"
+                [ -d "$tgt" ] || continue
+                is_install_dir "$tgt" && continue
+                if [ "$run" = 1 ]; then
+                    [ "$(stat -c %U "$tgt" 2>/dev/null)" = "$owner" ] && continue
+                    chown "$owner:$owner" "$tgt" 2>/dev/null && nd=$((nd+1))
+                else
+                    nd=$((nd+1))
+                fi
+            done < "$MANIFESTS/$name.dirs"
+        fi
+
+        [ "$run" = 1 ] && _mark_adopted "$name" "$(_manifest_size "$man")"
+        printf '\r%*s\r' 60 '' >&2
+        if [ "$owner" != "$name" ]; then
+            printf "  %-22s %6d file(s) %4d dir(s)  -> user '%s'\n" \
+                   "$name" "$n" "$nd" "$owner"
+        else
+            printf "  %-22s %6d file(s) %4d dir(s)\n" "$name" "$n" "$nd"
+        fi
+        total_f=$((total_f+n)); total_p=$((total_p+1))
+    done
+
+    say ""
+    if [ "$run" = 1 ]; then
+        ok "  $total_f path(s) across $total_p package(s) now owned by package users"
+        mark_done "adopt-existing"
+        say ""
+        say "Every package on the system now belongs to its own user."
+        say "Next:  lfs-helper next"
+    else
+        say "  would assign $total_f path(s) across $total_p package(s)"
+    fi
+    [ "$skipped" -gt 0 ] && say "  ($skipped manifest(s) skipped -- not built yet, or empty)"
+    return 0
+}
+
+cmd_seal_install_dirs() {
+    need_root
+    local run=0; [ "${1:-}" = "--run" ] && run=1
+    local d n=0 missing=0
+    say "Add the sticky bit to the install directories -- the last step of the"
+    say "chroot stage.  Until now they were group-writable but NOT sticky, so"
+    say "package users could replace the temporary system's root-owned files and"
+    say "each other's.  Once sticky, a package user can still create files here"
+    say "but can no longer modify or delete another package's."
+    say ""
+    say "Run this when every package is built (end of chapter 8) -- doing it"
+    say "earlier will break installs that legitimately overwrite older files."
+    say ""
+    # Two sources: the known install directories, and ANY directory that
+    # actually carries the install group -- packages create install dirs the
+    # static list does not know about (/usr/lib/<pkg>, /usr/share/<pkg>), and
+    # those need sealing just as much.  Collector-group directories are shared
+    # deliberately and are never touched.
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        [ -d "$d" ] || { missing=$((missing+1)); continue; }
+        [ -k "$d" ] && continue                  # already sticky
+        if [ "$run" = 1 ]; then
+            chmod o+t "$d" 2>/dev/null && n=$((n+1))
+        else
+            n=$((n+1))
+        fi
+    done < <(
+        { while IFS= read -r d; do
+              printf '%s\n' "${SNAP_ROOT%/}$d"
+          done < <(install_dirs_list)
+          find "${SNAP_ROOT:-/}" -xdev -type d -group install \
+               -not -path "${SNAP_ROOT%/}/.lfs-pkgusr/*" \
+               -not -path "$SRCROOT/*" \
+               -not -path "${SNAP_ROOT%/}/sources/*" \
+               -not -path "${SNAP_ROOT%/}/dev/*" \
+               -not -path "${SNAP_ROOT%/}/proc/*" \
+               -not -path "${SNAP_ROOT%/}/sys/*" \
+               -not -path "${SNAP_ROOT%/}/run/*" 2>/dev/null
+        } | sort -u
+    )
+    if [ "$run" = 1 ]; then
+        ok "  sticky bit set on $n install directory(ies)"
+    else
+        say "  would set the sticky bit on $n directory(ies)"
+        warn "(dry run -- nothing was changed.  Add --run to apply.)"
+    fi
+    [ "$missing" -gt 0 ] && say "  ($missing listed dirs don't exist here -- skipped)"
+    return 0
+}
+
+cmd_fix_ownership() {
+    need_root
+    local run=0 only=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --run) run=1; shift ;;
+            -*) die "usage: lfs-helper fix-ownership [<package>] [--run]" ;;
+            *) only="$1"; shift ;;
+        esac
+    done
+
+    say "Give each package's tracked files to its package user."
+    say "Use this once if packages were installed as root before the"
+    say "package-user system was in place."
+    say ""
+    [ "$run" = 1 ] || warn "(dry run -- nothing was changed.  Add --run to apply.)"
+    say ""
+
+    local total_f=0 total_p=0 man name n
+    for man in "$MANIFESTS"/*.files; do
+        [ -e "$man" ] || continue
+        name="$(basename "${man%.files}")"
+        [ -n "$only" ] && [ "$name" != "$only" ] && continue
+        # chapter-7 temporaries are root-owned on purpose
+        if is_root_step "$name"; then
+            say "  ${C_DIM}$name -- temporary chapter-7 tool, leaving as root${C_OFF}"
+            continue
+        fi
+        if ! user_exists "$name"; then
+            if [ "$run" = 1 ]; then
+                # subshell: cmd_add_user dies on failure, which would exit
+                # the whole script instead of skipping this one package
+                ( cmd_add_user "$name" ) >/dev/null \
+                    || { warn "  $name: cannot create user -- skipping"; continue; }
+            else
+                say "  $name -- would create the package user first"
+            fi
+        fi
+        n=0
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            [ -e "$p" ] || [ -L "$p" ] || continue
+            # Only count files that actually need a change: root-owned or
+            # mis-owned.  And chown to $name -- an earlier version used a
+            # variable that was never set here, so this command reported
+            # success while changing nothing, which is exactly how a system
+            # ends up with thousands of root-owned package files.
+            local cur
+            cur="$(stat -c %U "$p" 2>/dev/null)"
+            [ "$cur" = "$name" ] && continue
+            if [ "$run" = 1 ]; then
+                chown -h "$name:$name" "$p" 2>/dev/null && n=$((n+1))
+            else
+                n=$((n+1))
+            fi
+        done < "$man"
+        # dirs the package created itself (never the shared install dirs)
+        local nd=0 mand="$MANIFESTS/$name.dirs"
+        if [ -f "$mand" ]; then
+            while IFS= read -r p; do
+                [ -n "$p" ] || continue
+                [ -d "$p" ] || continue
+                is_install_dir "$p" && continue
+                if [ "$run" = 1 ]; then
+                    chown "$name:$name" "$p" 2>/dev/null && nd=$((nd+1))
+                else
+                    nd=$((nd+1))
+                fi
+            done < "$mand"
+        fi
+        printf "  %-22s %6d file(s) %4d dir(s)\n" "$name" "$n" "$nd"
+        total_f=$((total_f+n)); total_p=$((total_p+1))
+    done
+    say ""
+    if [ "$run" = 1 ]; then
+        ok "  $total_f path(s) across $total_p package(s) now owned by their package user"
+        say ""
+        say "  Re-apply the shared install directories too (root:install):"
+        say "      lfs-helper init-pkgusr --run"
+    else
+        say "  would touch $total_f path(s) across $total_p package(s)"
+    fi
+}
+
+# Per-command help.  `lfs-helper fix-users -h` should say what the command
+# does, not print the whole usage page again.
+cmd_help_for() {
+    case "$1" in
+      fix-users)
+        cat <<'EOF'
+lfs-helper fix-users [--run] [--skel <dir>]
+
+Repairs package users that were created before the environment existed, or
+whose files came from the wrong place.  For every package user it:
+
+  * points .bash_profile, .bashrc and build at the shared files in
+    /etc/pkgusr, replacing any wrong or missing link;
+  * copies the skeleton files (build.conf, .project) from
+    /etc/pkgusr/skel-package when that exists;
+  * writes VERSION from the install script's name_version, so `lfs update`
+    can tell what is actually installed.
+
+Nothing is deleted and no package files are touched -- only the user's home.
+Without --run it reports what it would change.
+EOF
+        ;;
+      export-groups)
+        cat <<'EOF'
+lfs-helper export-groups [<file>]
+
+Saves the collector-group decisions -- which directory is shared under which
+group, and who is in each -- so the next build reuses them instead of asking
+again.  Writes the directories that really carry a group right now, read from
+the filesystem, not just the ones you were asked about.
+EOF
+        ;;
+      import-groups)
+        cat <<'EOF'
+lfs-helper import-groups [<file>] [--run]
+
+Loads a file written by export-groups: recreates the groups with their
+members, and records the directory-to-group decisions so those directories are
+never asked about again.  With no file it looks for one placed in the tree by
+`lfs build-system gen-chroot-scripts`.
+EOF
+        ;;
+      seal-install-dirs)
+        cat <<'EOF'
+lfs-helper seal-install-dirs [--run]
+
+The LAST step of the chroot stage.  Adds the sticky bit to every shared install
+directory, so a package user can still create files there but can no longer
+modify or delete another package's.
+
+Run it only when every package is built: doing it earlier breaks installs that
+legitimately overwrite an older version's files.
+EOF
+        ;;
+      build)
+        cat <<'EOF'
+lfs-helper build <name> [--phase all|unpack|build|install|configure|test]
+                        [--force] [--tests] [--jobs N] [--no-auto-fix]
+
+Builds one package as its own package user, tracking every file it installs.
+
+  --phase       run a single phase instead of all of them
+  --force       rebuild even if the step is already marked built
+  --tests       run the package's test suite (off by default: the books
+                expect some failures)
+  --jobs N      override MAKEFLAGS for this build
+  --no-auto-fix do not grant collector-group access on a permission failure
+EOF
+        ;;
+      *) return 1 ;;
+    esac
+    return 0
+}
+
+# Colour the group headings, matching `lfs --help` and `blfs --help`: the
+# command list is what people scan, and an unbroken wall of text is hard to
+# search.  Dropped when stdout is not a terminal.
+_colour_usage() {
+    if [ ! -t 1 ] || [ -n "${NO_COLOR:-}" ]; then cat; return; fi
+    sed -E \
+        -e "s/^([A-Za-z][^:]*:)\$/$(printf '\033[1m')\1$(printf '\033[0m')/" \
+        -e "s/^(    )([a-z-]+([ ][a-z<>|-]+)*)/\1$(printf '\033[0;32m')\2$(printf '\033[0m')/"
+}
+
+usage() {
+    _usage_text | _colour_usage
+}
+
+_usage_text() {
+    cat <<EOF
+lfs-helper $LFS_HELPER_VERSION (build $(_build_id)) -- builds the LFS system
+one package user each.
+
+Follow the build:
+    lfs-helper next                   the one command to keep running
+    lfs-helper status                 where the session stands
+    lfs-helper list                   every step and its state
+                                      ('next --all' does the same)
+    lfs-helper check-toolchain        can this compiler build anything?
+    lfs-helper fix-toolchain --run    repair a triplet mismatch in the headers
+
+Build:
+    lfs-helper build <name>           build one step as its package user
+    lfs-helper build-all              build everything remaining, in order
+    lfs-helper done|undone <name>     mark a step built / clear that mark
+        build options: --phase <p>  --force  --tests  --jobs N  --no-auto-fix
+
+Ownership and permissions (the package-user model):
+    lfs-helper init-pkgusr --run      FIRST: install group + install dirs
+    lfs-helper add-user <name>        create one package user (with its links)
+    lfs-helper fix-ownership --run    give every tracked file to its package
+    lfs-helper adopt-dirs --run       same for the directories packages made
+    lfs-helper fix-users --run        repair homes: bash links, VERSION files
+    lfs-helper fix-perms <name> --run grant one package the access it needs
+    lfs-helper grant-dir <dir> <user> --run
+                                      give one user access to one directory
+    lfs-helper seal-install-dirs --run
+                                      LAST: sticky bits on shared dirs
+
+Collector groups (shared directories):
+    lfs-helper export-groups [<file>] save the decisions for the next build
+    lfs-helper import-groups --run    load them again
+
+Look around / tidy up:
+    lfs-helper manifests [<name>]     what each package installed
+    lfs-helper which-package <path>   which package installed this file
+    lfs-helper clean-sources --run    tidy /sources
+    lfs-helper prune-locales --run    drop unwanted translations
+    lfs-helper find-user-site --run   find pip installs hidden in ~/.local
+
+Any command: -h explains it.  Dry run is the default; --run applies.
+State: $STATE
+EOF
+}
+
+# `lfs-helper <cmd> -h|--help` -> what that command does
+if [ $# -ge 2 ]; then
+    case "$2" in
+        -h|--help) cmd_help_for "$1" && exit 0 ;;
+    esac
+fi
+
+case "${1:-}" in
+    status)        shift; cmd_status "$@" ;;
+    --version|-V) echo "lfs-helper $LFS_HELPER_VERSION (build $(_build_id))"; exit 0 ;;
+    next)
+        shift
+        # `next --all` is how the outside tool spells `list`.  Accepting both
+        # in both tools means never having to remember which one you are in.
+        if [ "${1:-}" = "--all" ]; then shift; cmd_list "$@"; else cmd_next "$@"; fi
+        ;;
+    list)          shift; cmd_list "$@" ;;
+    init-pkgusr)   shift; cmd_init_pkgusr "$@" ;;
+    add-user)      shift; cmd_add_user "$@" ;;
+    build)         shift; cmd_build "$@" ;;
+    build-all)     shift; cmd_build_all "$@" ;;
+    manifests)     shift; cmd_manifests "$@" ;;
+    fix-ownership) shift; cmd_fix_ownership "$@" ;;
+    fix-perms)     shift; cmd_fix_perms "$@" ;;
+    clean-sources) shift; cmd_clean_sources "$@" ;;
+    find-user-site) shift; cmd_find_user_site "$@" ;;
+    check-toolchain) shift; cmd_check_toolchain "$@" ;;
+    fix-toolchain)   shift; cmd_fix_toolchain "$@" ;;
+    which-package)   shift; cmd_which_package "$@" ;;
+    sort-users)      shift; cmd_sort_users "$@" ;;
+    fix-orphans)     shift; cmd_fix_orphans "$@" ;;
+    grant-dir)       shift; cmd_grant_dir "$@" ;;
+    fix-users)     shift; cmd_fix_users "$@" ;;
+    export-groups) shift; cmd_export_groups "$@" ;;
+    import-groups) shift; cmd_import_groups "$@" ;;
+    prune-locales) shift; cmd_prune_locales "$@" ;;
+    adopt-existing) shift; cmd_adopt_existing "$@" ;;
+    adopt-dirs)    shift; cmd_adopt_dirs "$@" ;;
+    repair-adoption) shift; cmd_repair_adoption "$@" ;;
+    seal-install-dirs) shift; cmd_seal_install_dirs "$@" ;;
+    done)          shift; mark_done "${1:?usage: lfs-helper done <name>}"; ok "marked '$1' built" ;;
+    undone)        shift; unmark "${1:?usage: lfs-helper undone <name>}"; ok "cleared '$1'" ;;
+    -h|--help|help|"") usage ;;
+    *)             die "unknown command '$1' (try: lfs-helper --help)" ;;
+esac

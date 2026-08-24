@@ -45,6 +45,13 @@ import hashlib
 import json
 import os
 import re
+try:
+    # arrow keys, backspace and history inside input() prompts.  Importing it
+    # is enough -- Python wires it into input() automatically.  Optional: a
+    # Python built without readline still runs, just without line editing.
+    import readline  # noqa: F401
+except ImportError:
+    pass
 import shutil
 import subprocess
 import sys
@@ -53,8 +60,41 @@ import time
 import warnings
 from urllib.parse import urlsplit, unquote
 
-import requests
-from bs4 import BeautifulSoup
+# Both of these are optional at IMPORT time.  Base LFS ships neither, and a
+# cached book can be parsed and turned into install scripts without ever
+# touching the network -- so failing at startup would make the tool useless in
+# exactly the situation it is most needed:
+#     ModuleNotFoundError: No module named 'requests'
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+
+def _need_requests():
+    if requests is None:
+        sys.stderr.write(
+            "this command needs the 'requests' module, which base LFS does not\n"
+            "ship.  Install it as a package user:\n"
+            "    packagemanager pip install requests\n"
+            "Commands that only read an already-downloaded book work without it.\n")
+        sys.exit(2)
+    return requests
+
+
+def _need_bs4():
+    if BeautifulSoup is None:
+        sys.stderr.write(
+            "this command needs 'beautifulsoup4' to parse the book.  Install it\n"
+            "as a package user:\n"
+            "    packagemanager pip install beautifulsoup4\n")
+        sys.exit(2)
+    return BeautifulSoup
 
 # The nochunks book is XHTML; silence the (correct but noisy) heads-up.
 try:
@@ -74,12 +114,61 @@ VALID_INITS = ("systemd", "sysv")
 
 # Bump whenever the extracted-data shape or extraction logic changes, so stale
 # on-disk caches are rebuilt automatically.
-CACHE_VERSION = 3
+CACHE_VERSION = 4
 # tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
 # of generated install scripts changes (phases, dispatcher, ...), and
 # CACHE_VERSION when the parsed/cached data structure changes.
-BLFS_VERSION = "1.0.0"
+BLFS_VERSION = "1.7.0"
+
+
+def _build_id():
+    """A short fingerprint of this file's own contents.
+
+    A hand-maintained version number goes stale the moment someone forgets to
+    bump it -- and the whole reason for printing a version is to answer "am I
+    running the code that was just fixed?".  This cannot go stale: it changes
+    whenever the file does.
+    """
+    import hashlib
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()[:7]
+    except OSError:
+        return "unknown"
+
 SCRIPT_VERSION = 4
+
+
+def _tty_out():
+    return sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+
+
+_C_OFF = "\033[0m"
+_C_HEAD = "\033[1m"
+_C_GROUP = "\033[1;36m"
+_C_CMD = "\033[0;32m"
+
+
+def _colour_epilog(text):
+    """Colour the group headings in the help -- same scheme as `lfs`."""
+    if not _tty_out():
+        return text
+    out = []
+    for line in text.split("\n"):
+        if line and not line.startswith(" ") and line.endswith(":"):
+            out.append("%s%s%s" % (_C_HEAD, line, _C_OFF))
+        elif line.startswith("  ") and not line.startswith("    ") and line.strip():
+            out.append("%s%s%s" % (_C_GROUP, line, _C_OFF))
+        elif line.startswith("    ") and line.strip():
+            m = re.match(r"^(\s+)(\S+(?: \S+)*?)(\s{2,}.*)$", line.rstrip())
+            if m:
+                out.append("%s%s%s%s%s" % (m.group(1), _C_CMD, m.group(2),
+                                           _C_OFF, m.group(3)))
+            else:
+                out.append(line)
+        else:
+            out.append(line)
+    return "\n".join(out)
 
 
 def store_dir():
@@ -183,7 +272,7 @@ KNOWN_NAMED_BOOKS = ["svn", "systemd"]
 def _find_nochunks_at(base):
     """Return (filename, url) for a nochunks book under `base`, or None."""
     try:
-        resp = requests.get(base, timeout=60)
+        resp = _need_requests().get(base, timeout=60)
         resp.raise_for_status()
     except Exception:
         return None
@@ -199,7 +288,7 @@ def _find_svn_archive(base):
     (blfs-book-svn-html-YYYY-MM-DD.tar.xz); the date changes over time, so read
     the directory live and pick the newest.  Returns (filename, url) or None."""
     try:
-        resp = requests.get(base, timeout=60)
+        resp = _need_requests().get(base, timeout=60)
         resp.raise_for_status()
     except Exception:
         return None
@@ -239,7 +328,7 @@ def discover_dir(selector):
                      f"{SITE}/blfs/view/{selector}/"):
             url = base + fn
             try:
-                if requests.head(url, timeout=30,
+                if _need_requests().head(url, timeout=30,
                                  allow_redirects=True).status_code == 200:
                     version, init2 = parse_book_filename(fn)
                     return {"selector": selector, "url": url, "filename": fn,
@@ -247,7 +336,54 @@ def discover_dir(selector):
                             "init": init2, "archive": False}
             except Exception:
                 continue
-    raise RuntimeError(f"no book for '{selector}'")
+    # Nothing on the site matched -- but a book may already be cached here.
+    # A book imported by hand (or copied in by `lfs build-system install-tools`)
+    # has no metadata recording which selector it is, so the lookup failed and
+    # every package came back "not in the BLFS book" while the book sat right
+    # there.  Fall back to what is actually on disk.
+    cached = _cached_book_files()
+    if cached:
+        pick = _best_cached_for(selector, cached)
+        sys.stderr.write(
+            "note: no book matched '%s'; using the cached %s\n"
+            % (selector, os.path.basename(pick)))
+        fn = os.path.basename(pick)
+        version, init2 = parse_book_filename(fn)
+        return {"selector": selector, "url": None, "filename": fn,
+                "version": version if version != "unknown" else selector,
+                "init": init2, "archive": False}
+    raise RuntimeError(
+        "no book for '%s', and none is cached.\n"
+        "  Download one:            blfs fetch\n"
+        "  or import a local copy:  blfs import <file>" % selector)
+
+
+def _cached_book_files():
+    d = os.path.join(store_dir(), "books")
+    try:
+        return sorted(os.path.join(d, f) for f in os.listdir(d)
+                      if f.endswith((".html", ".html.gz")))
+    except OSError:
+        return []
+
+
+def _best_cached_for(selector, cached):
+    """Pick the cached book that best matches what was asked for.
+
+    'stable-systemd' should prefer a systemd book over a SysV one, and a
+    numbered release over the development snapshot."""
+    want_systemd = "systemd" in selector
+    def score(p):
+        n = os.path.basename(p).lower()
+        s = 0
+        if ("systemd" in n) == want_systemd:
+            s += 4
+        if "svn" not in n:
+            s += 2                      # a release beats the dev snapshot
+        if selector.lower() in n:
+            s += 8                      # an exact selector match wins
+        return s
+    return sorted(cached, key=lambda p: (-score(p), p))[0]
 
 
 def book_record_from_selector(selector):
@@ -278,7 +414,7 @@ def discover_all():
     dirs = set(KNOWN_NAMED_BOOKS)
     for index in (downloads_index_url(), view_index_url()):
         try:
-            resp = requests.get(index, timeout=60)
+            resp = _need_requests().get(index, timeout=60)
             resp.raise_for_status()
             dirs.update(_extract_subdirs(resp.text))
         except Exception:
@@ -369,7 +505,15 @@ def resolve_book(selector):
         save_available(avail)
 
     is_svn = "svn" in selector.lower() or "svn" in str(version).lower()
-    filename = os.path.basename(urlsplit(url).path)
+    # A book that is already cached has no URL -- it was imported, or copied in
+    # with the tools.  urlsplit(None) yields bytes, which then fails deep in
+    # os.path.join with "Can't mix strings and bytes"; take the filename the
+    # record carries instead.
+    if url is None:
+        filename = rec["filename"] if isinstance(rec, dict) and rec.get("filename") \
+            else os.path.basename(_best_cached_for(selector, _cached_book_files()))
+    else:
+        filename = os.path.basename(urlsplit(url).path)
     return url, os.path.join(books_dir(), filename), is_svn, version
 
 
@@ -506,7 +650,7 @@ def ensure_book(selector, quiet=False):
         if not have_tar:
             if not quiet:
                 print(f"Fetching dev book ({selector}) archive: {url}")
-            resp = requests.get(url, timeout=300, stream=True)
+            resp = _need_requests().get(url, timeout=300, stream=True)
             resp.raise_for_status()
             tmp = local + ".part"
             with open(tmp, "wb") as f:
@@ -542,7 +686,7 @@ def ensure_book(selector, quiet=False):
 
     if not quiet:
         print(f"Fetching book ({selector}): {url}")
-    resp = requests.get(url, headers=headers, timeout=180, stream=True)
+    resp = _need_requests().get(url, headers=headers, timeout=180, stream=True)
     if resp.status_code == 304:
         meta = _load_meta(local)
         meta["fetched"] = time.time()
@@ -572,10 +716,10 @@ def load_soup(book_path):
         html = f.read()
     for parser in ("lxml", "html.parser"):
         try:
-            return BeautifulSoup(html, parser)
+            return _need_bs4()(html, parser)
         except Exception:
             continue
-    return BeautifulSoup(html, "html.parser")
+    return _need_bs4()(html, "html.parser")
 
 
 def get_book_soup(args):
@@ -1009,7 +1153,7 @@ def _pre_command_text(pre):
         return ""
     if pre.find(class_="replaceable") is None:
         return pre.get_text().strip()
-    clone = BeautifulSoup(str(pre), "html.parser")
+    clone = _need_bs4()(str(pre), "html.parser")
     for rep in clone.select(".replaceable"):
         txt = rep.get_text().strip()
         if txt.startswith("<") and txt.endswith(">"):
@@ -1071,21 +1215,42 @@ def extract_commands_phased(sec):
     if inst is None:
         return "", ""
     build, install = [], []
-    for el in inst.children:
-        name = getattr(el, "name", None)
-        if name is None:
+
+    # Walk the whole subtree in document order, not just the direct children.
+    # Packages that build several components -- gst-plugins-rs builds
+    # libgstdav1d and libgstgtk4 -- put each one in its own sub-section, so
+    # every command block sits one level down.  Looking only at direct
+    # children found nothing at all and produced an empty, silently useless
+    # script.
+    seen = set()
+    for el in inst.find_all(["pre", "h3", "h4", "div"]):
+        if id(el) in seen:
             continue
+        classes = el.get("class", []) or []
+        name = el.name
+
+        if name == "div":
+            # a note or warning: keep it as a comment, and don't descend into
+            # it again through its own children
+            if "admon" in classes or {"note", "warning", "important"} & set(classes):
+                for d in el.find_all(True):
+                    seen.add(id(d))
+                build.append("## NOTE: " + " ".join(el.get_text().split()))
+            continue
+
         if name == "pre":
+            # configuration blocks are a separate phase, handled elsewhere
+            if el.find_parent("div", class_="configuration"):
+                continue
             text = _pre_command_text(el)
             if not text:
                 continue
-            (install if "root" in el.get("class", []) else build).append(text)
-        elif name in ("h3", "h4"):
-            build.append("\n### " + " ".join(el.get_text().split()))
-        elif name == "p":
-            build.append("\n# " + " ".join(el.get_text().split()) + "\n")
-        elif name == "div" and "admon" in el.get("class", []):
-            build.append("## NOTE: " + " ".join(el.get_text().split()))
+            (install if "root" in classes else build).append(text)
+        else:                                            # h3 / h4
+            title = " ".join(el.get_text().split())
+            if title:
+                build.append("\n### " + title)
+
     return "\n".join(build).strip(), "\n".join(install).strip()
 
 
@@ -1522,6 +1687,75 @@ def build_script(sec, is_module, group, anchor, source_url):
 # subcommands
 # --------------------------------------------------------------------------- #
 
+def _find_packagemanager():
+    here = os.path.dirname(os.path.abspath(__file__))
+    local = os.path.join(here, "packagemanager")
+    if os.path.isfile(local):
+        ex = bool(os.stat(local).st_mode & 0o111)
+        return [local] if ex else [sys.executable or "python3", local]
+    import shutil as _sh
+    return ["packagemanager"] if _sh.which("packagemanager") else None
+
+
+def cmd_install(args):
+    """Delegate to packagemanager, which owns the package users.
+
+    Kept here so `blfs install <pkg>` works the way `lfs install <pkg>` does --
+    one obvious verb per tool -- but there is exactly ONE install path: the one
+    that creates the package user, resolves dependencies and tracks files."""
+    pm = _find_packagemanager()
+    if not pm:
+        sys.stderr.write("packagemanager is not installed next to blfs; "
+                         "install the tools first:\n"
+                         "    lfs build-system install-tools --run\n")
+        sys.exit(2)
+    verb = "update" if args.update else "install"
+    argv = pm + [verb] + list(args.packages) + list(args.rest or [])
+    os.execvp(argv[0], argv)
+
+
+def cmd_fetch(args):
+    """Download (or refresh) a book into the cache."""
+    sel = args.selector or DEFAULT_SELECTOR
+    ensure_book(sel)
+    print("cached.")
+
+
+def cmd_import(args):
+    """Add a local book file to the cache -- no network involved."""
+    src = os.path.expanduser(args.file)
+    if not os.path.isfile(src):
+        sys.stderr.write("no such file: %s\n" % src)
+        sys.exit(1)
+    dst = os.path.join(store_dir(), "books")
+    os.makedirs(dst, exist_ok=True)
+    import shutil as _sh
+    out = os.path.join(dst, os.path.basename(src))
+    _sh.copy(src, out)
+    print("imported: %s" % out)
+    print("use it with:  blfs --book-file %s <command>" % out)
+
+
+def cmd_sources(args):
+    """The download URLs for a package, exactly as the book gives them."""
+    book = get_book(args)
+    anchor = anchor_from_input(args.package)
+    data = book.get(anchor)
+    if data is None:
+        sys.stderr.write("no package '%s' in the book (try: blfs search %s)\n"
+                         % (args.package, args.package))
+        sys.exit(1)
+    urls = []
+    if data.get("link"):
+        urls.append(data["link"])
+    urls += data.get("additional_links", []) or []
+    if not urls:
+        print("(the book lists no downloads for %s)" % args.package)
+        return
+    for u in urls:
+        print(u)
+
+
 def cmd_books(args):
     if getattr(args, "rebuild_cache", False):
         book = get_book(args, rebuild=True)
@@ -1797,6 +2031,32 @@ def cmd_debug(args):
 # cli
 # --------------------------------------------------------------------------- #
 
+BLFS_HELP_EPILOG = """\
+commands, by what you are doing:
+
+  find packages
+    search <text>              find a package in the book
+    versions [<pkg>]           every package and its version
+    deps / rdeps <pkg>         what it needs / what needs it
+    order <pkg>                the full build order, dependencies first
+    sources <pkg>              its download URLs, as the book gives them
+
+  build and install (packagemanager owns the package users)
+    install <pkg> [...]        build as its package user; hands over
+    update <pkg> [...]         rebuild from the current book; hands over
+    script <pkg>               just write the install script
+
+  books
+    books                      list the books available
+    fetch [<selector>]         download one into the cache
+    import <file>              add a local book file (no network)
+    set-default <selector>     the book used when none is named
+    debug <pkg>                why a package resolves the way it does
+
+Dry run is the default everywhere; --run applies.
+"""
+
+
 def main():
     # Pre-parse the book selectors from anywhere in argv (before OR after the
     # subcommand), so both `blfs --book-file X script vim` and
@@ -1808,11 +2068,14 @@ def main():
 
     ap = argparse.ArgumentParser(prog="blfs", description="BLFS book tool")
     ap.add_argument("--version", action="version",
-                    version=f"blfs {BLFS_VERSION} (cache v{CACHE_VERSION}, "
+                    version=f"blfs {BLFS_VERSION} (build {_build_id()}, "
+                            f"cache v{CACHE_VERSION}, "
                             f"script v{SCRIPT_VERSION})")
     ap.add_argument("--book", help="book selector or url for this run (overrides default)")
     ap.add_argument("--book-file", help="use a local nochunks html file (offline/testing)")
-    sub = ap.add_subparsers(dest="command", required=True)
+    ap.epilog = _colour_epilog(BLFS_HELP_EPILOG)
+    ap.formatter_class = argparse.RawDescriptionHelpFormatter
+    sub = ap.add_subparsers(dest="command", required=True, metavar="<command>")
 
     p = sub.add_parser("versions", help="dump every anchor + version (machine-readable)")
     p.set_defaults(func=cmd_versions)
@@ -1824,6 +2087,32 @@ def main():
     p.add_argument("--no-recommended", action="store_true")
     p.add_argument("--optional", action="store_true")
     p.set_defaults(func=cmd_rdeps)
+
+    p = sub.add_parser("install", help="build and install (hands over to "
+                       "packagemanager, which owns the package users)")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("rest", nargs=argparse.REMAINDER,
+                   help="passed through, e.g. --recursive --run --yes")
+    p.set_defaults(func=cmd_install, update=False)
+
+    p = sub.add_parser("update", help="rebuild from the current book "
+                       "(hands over to packagemanager)")
+    p.add_argument("packages", nargs="+")
+    p.add_argument("rest", nargs=argparse.REMAINDER)
+    p.set_defaults(func=cmd_install, update=True)
+
+    p = sub.add_parser("fetch", help="download a book into the cache")
+    p.add_argument("selector", nargs="?", help="e.g. stable-systemd, 12.4, svn")
+    p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("import", help="add a local book file (no network)")
+    p.add_argument("file")
+    p.add_argument("--selector", help="name to file it under")
+    p.set_defaults(func=cmd_import)
+
+    p = sub.add_parser("sources", help="a package's download URLs")
+    p.add_argument("package")
+    p.set_defaults(func=cmd_sources)
 
     p = sub.add_parser("books", help="list/inspect books")
     p.add_argument("--discover", action="store_true", help="probe the live site")
@@ -1889,3 +2178,8 @@ if __name__ == "__main__":
         os._exit(0)
     except KeyboardInterrupt:
         sys.exit(130)
+    except RuntimeError as e:
+        # An expected problem (no book cached, no network, a bad selector) is
+        # not a bug -- print it plainly instead of a stack trace.
+        sys.stderr.write("error: %s\n" % e)
+        sys.exit(1)

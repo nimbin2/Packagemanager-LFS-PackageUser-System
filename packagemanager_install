@@ -26,6 +26,80 @@ date_log="$(date +%Y-%m-%d_%H-%m-%S)"
 home_user="n76310"
 home_user_dir="/home/${home_user}"
 
+# --------------------------------------------------------------------------- #
+# Command wrappers for the build
+# --------------------------------------------------------------------------- #
+# Packages routinely try to (re)create and re-mode directories that already
+# exist and belong to someone else:
+#     install -vdm755 /usr/sbin
+#     install: cannot change permissions of '/usr/sbin': Operation not permitted
+# The directory is already there with the right mode; the package just insists
+# on saying so.  Under the package-user model that is a hard error, and it
+# stops installs that would otherwise be completely fine.
+#
+# So put small wrappers ahead of the real tools for the duration of the build:
+#   install -d  on an existing directory  -> succeed, change nothing
+#   chmod       on a directory we do not own -> skip, keep going
+#   chown/chgrp on anything                  -> skip (a package user may not)
+# Anything else is passed straight through.  This is the same approach
+# lfs-helper uses during the chroot build.
+_make_build_wrappers() {
+    local d="$1"
+    mkdir -p "$d" || return 1
+
+    cat > "$d/install" <<'WRAP'
+#!/bin/bash
+# only -d (create directories) is special; everything else is the real thing
+_dirmode=0
+for a in "$@"; do
+    case "$a" in
+        -d|--directory) _dirmode=1 ;;
+        -*d*) case "$a" in -*[!-]*) _dirmode=1 ;; esac ;;
+    esac
+done
+if [ "$_dirmode" = 1 ]; then
+    _rc=0
+    for a in "$@"; do
+        case "$a" in -*) continue ;; esac
+        if [ -d "$a" ]; then
+            continue                 # already there: nothing to do
+        fi
+        /usr/bin/install -d "$a" || _rc=$?
+    done
+    exit $_rc
+fi
+exec /usr/bin/install "$@"
+WRAP
+
+    cat > "$d/chmod" <<'WRAP'
+#!/bin/bash
+# a package user may only re-mode what it owns
+_me="$(id -un)"
+_rc=0
+for a in "$@"; do
+    case "$a" in -*) continue ;; esac
+    [ -e "$a" ] || continue
+    if [ "$(stat -c %U "$a" 2>/dev/null)" != "$_me" ]; then
+        echo "*** chmod $a (skipped: owned by $(stat -c %U "$a" 2>/dev/null))" >&2
+        continue
+    fi
+    /usr/bin/chmod "$@" || _rc=$?
+    exit $_rc
+done
+exit 0
+WRAP
+
+    for t in chown chgrp; do
+        cat > "$d/$t" <<WRAP
+#!/bin/bash
+echo "*** $t \$* (skipped: package users cannot change ownership)" >&2
+exit 0
+WRAP
+    done
+
+    chmod 755 "$d"/install "$d"/chmod "$d"/chown "$d"/chgrp
+}
+
 echoRed() {
     echo -e "\033[0;31m$1\033[0m"
 }
@@ -48,6 +122,12 @@ addUser() {
     fi
     if [ $UID -ne 0 ]; then echo Please run this script as root. ; exit 1; fi
     add_package_user "${1}" $2 10000 20000 $3 10000 20000 || exit  1
+    # Keep /etc/passwd and /etc/group in id order.  They are appended to, so
+    # without this they drift into install order and someone has to tidy them
+    # up later -- which only happens if they remember.  lfs-helper owns the
+    # sorting so both halves of the toolchain do it the same way.
+    command -v lfs-helper >/dev/null 2>&1 \
+        && lfs-helper sort-users --run >/dev/null 2>&1 || true
 }
 
 addCollectorGroup() {
@@ -71,7 +151,7 @@ addCollectorGroup() {
 
     echo "addUser "$group_name""
     echo -n "[y/N]: "
-    read check
+    read -e -r check
     [ "$check" != "y" ] && exit
     addUser "$group_name"
     echo "Created whyle installing $user_name" > info.txt
@@ -140,7 +220,7 @@ checkGroups() {
             echoOrange "By adding to a group the user gets access to all files of the group"
             echo -e " usermod -a -G $group $user_name"
             echo -n "[y/N]: "
-            read check
+            read -e -r check
             [ "$check" == "y" ] && [ "$group $user_name" != " " ] &&
                 addUerToCollectorGroup "$group"
         fi
@@ -176,7 +256,7 @@ addUserToGroup() {
         check="y"
     else
         echo -n "[y/N]: "
-        read check
+        read -e -r check
     fi
 
     [ "$check" == "y" ] && (
@@ -223,7 +303,7 @@ installNimgnuGroup() {
                 echo "change permission recrusive for $user_name on;"
                 echo "$dir"
                 echo -n "[y/N]: "
-                read check
+                read -e -r check
 
                 [ "$check" == "y" ] && 
                     parameter="-R"
@@ -433,15 +513,235 @@ installPkg() {
     chown $user_name: $install_user_dir/install_*
     chown -R $user_name: $install_user_dir/log/
     # pipefail so tee doesn't hide a failing build/install; capture the real code
-    su - -c "set -o pipefail; bash ~/install_$user_name $parameter 2>&1 | tee ~/log/packagemanager_install-$date_log.log" $user_name
+    _wrapdir="/tmp/pkgusr-wrappers.$$"
+    _make_build_wrappers "$_wrapdir" || _wrapdir=""
+    chmod 755 "$_wrapdir" 2>/dev/null || true
+    su - -c "set -o pipefail; \
+             ${_wrapdir:+PATH='$_wrapdir':\$PATH; export PATH; } \
+             bash ~/install_$user_name $parameter 2>&1 | tee ~/log/packagemanager_install-$date_log.log" $user_name
     install_rc=${PIPESTATUS[0]}
+    [ -n "${_wrapdir:-}" ] && rm -rf "$_wrapdir"
 
     if echo "$user_name" | grep "^u_"; then
         gpasswd -d $user_name install # remove install group if nimgnu_group
     fi
 
+# --------------------------------------------------------------------------- #
+# Automatic permission repair, the same way lfs-helper does it during the build.
+#
+# A package that installs into a directory another package owns fails with a
+# permission error.  That is not a mistake to report -- it is the normal state
+# of affairs under the package-user model, and the answer is always the same:
+# put both packages in a collector group that owns the directory.  So do it,
+# and retry, instead of stopping and asking the user to type it out.
+# --------------------------------------------------------------------------- #
+
+collector_prefix_of() {
+    local conf="${PKGUSR_CONFIG:-/etc/pkgusr/packagemanager.conf}" p=""
+    [ -f "$conf" ] && p="$(sed -n 's/.*"collector_prefix"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$conf" | head -n1)"
+    [ -n "$p" ] || p="sysgroup_"
+    case "$p" in *_) ;; *) p="${p}_" ;; esac      # always ends in one underscore
+    printf '%s' "$p"
+}
+
+# Directories the log says the package could not write into.
+#
+# Take paths ONLY from lines that actually report a permission error.  A Python
+# traceback is full of paths -- meson's own source files, the interpreter's
+# stdlib -- and treating those as install targets meant granting a package
+# write access to /usr/lib/python3.13.  The failing path is on the error line,
+# never in the frames above it.
+unwritable_dirs_from_log() {
+    local log="$1" user="$2" p d
+    [ -f "$log" ] || return 0
+    grep -hE "Permission denied|Operation not permitted|Read-only file system" "$log" 2>/dev/null \
+    | grep -vE "^[[:space:]]*(File|Traceback|[[:space:]]*[~^]+$)" \
+    | { grep -hoE "'[^']+'|\"[^\"]+\"" || true; } | tr -d "'\"" \
+    | while IFS= read -r p; do
+          case "$p" in /*) ;; *) continue ;; esac
+          if [ -d "$p" ]; then echo "$p"; else echo "${p%/*}"; fi
+      done | sort -u \
+    | while IFS= read -r d; do
+          [ -n "$d" ] && [ -d "$d" ] || continue
+          su -s /bin/bash "$user" -c "test -w '$d'" 2>/dev/null && continue
+          echo "$d"
+      done
+}
+
+# give <user> the right to install into <dir>
+grant_dir_to_user() {
+    local dir="$1" user="$2" prefix owner grp cur
+
+    # ONE implementation of the collector-group rules, not two.
+    #
+    # lfs-helper owns this logic: join the group the directory already carries,
+    # ask which group should own it when there is none, never create one for
+    # root, never hand a package's tree to the install group.  When it is on
+    # the system -- which it is, on anything these tools built -- use it, so a
+    # package installed after boot behaves exactly like one built during the
+    # chroot stage.  The code below is the fallback for a system without it.
+    if command -v lfs-helper >/dev/null 2>&1; then
+        lfs-helper grant-dir "$dir" "$user" --run
+        return $?
+    fi
+
+    prefix="$(collector_prefix_of)"
+    owner="$(stat -c %U "$dir" 2>/dev/null)" || return 1
+    [ "$owner" = "$user" ] && return 1
+    cur="$(stat -c %G "$dir" 2>/dev/null)"
+
+    case "$cur" in
+        "${prefix}"*)
+            # the directory is ALREADY shared -- just join the existing group,
+            # which is the whole point of having one
+            grp="$cur"
+            ;;
+        install)
+            grp="install"
+            ;;
+        *)
+            # A ROOT-owned directory is never a package's: it is either shared
+            # system infrastructure or something the distribution installed.
+            # "<prefix>_root" would be a group meaning "may write anywhere root
+            # owns", which is the whole scheme undone -- and there is no user
+            # 'root' to add to a collector group in any case.
+            if [ "$owner" = "root" ]; then
+                echo "    $dir  (owned by root -- NOT shared;" >&2
+                echo "      a collector group for root would defeat the scheme." >&2
+                echo "      If this really is a shared install directory:" >&2
+                echo "        chgrp install '$dir' && chmod g+w '$dir'" >&2
+                return 1
+            fi
+            grp="${prefix}${owner}"
+            # Collector groups live in their own id range (90000+), clear of
+            # the package users at 10000+ -- otherwise a collector group takes
+            # the gid the next package user's group wants and the uid/gid
+            # pairing stops lining up.
+            if ! getent group "$grp" >/dev/null 2>&1; then
+                _cgid=90000
+                while getent group "$_cgid" >/dev/null 2>&1; do
+                    _cgid=$((_cgid + 1))
+                done
+                groupadd -g "$_cgid" "$grp" >/dev/null 2>&1 \
+                    || groupadd "$grp" >/dev/null 2>&1
+            fi
+            getent group "$grp" >/dev/null 2>&1 || return 1
+            usermod -a -G "$grp" "$owner" 2>/dev/null
+            chgrp "$grp" "$dir" 2>/dev/null || return 1
+            ;;
+    esac
+
+    usermod -a -G "$grp" "$user" 2>/dev/null
+    chmod g+w "$dir" 2>/dev/null
+    echo "    $dir -> group $grp (owner $owner, + $user)"
+    return 0
+}
+
+# returns 0 if anything was granted
+auto_grant_from_log() {
+    local log="$1" user="$2" need d granted=1
+    need="$(unwritable_dirs_from_log "$log" "$user")"
+    [ -n "$need" ] || return 1
+    echo -e "\033[0;33m"
+    echo "# '$user' could not write into some directories -- granting access"
+    echo "# via collector groups and retrying:"
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        grant_dir_to_user "$d" "$user" && granted=0
+    done <<< "$need"
+    echo -e "\033[0m"
+    return $granted
+}
+
+# Say what actually went wrong.
+#
+# Build systems bury the real error.  Meson reports a permission problem as
+# thirty lines of Python traceback ending in
+#     PermissionError: [Errno 13] Permission denied: '/usr/share/zsh/site-functions/_p11-kit'
+# and the useful part -- one path this package may not write to -- is easy to
+# miss entirely.  Pull it out and say what to do about it.
+diagnose_install_failure() {
+    local user="$1" log="$2"
+    [ -f "$log" ] || return 0
+
+    # the paths a permission error named, however the tool phrased it
+    # Only the TAIL of the log: a build log runs to tens of megabytes and the
+    # error is always at the end.  Scanning all of it, then running stat on
+    # every path it mentions, is what made this take minutes of CPU.
+    local paths tail_log
+    tail_log="$(tail -c 524288 "$log" 2>/dev/null)"
+    paths="$(printf '%s\n' "$tail_log" \
+             | grep -aE "Permission denied|Operation not permitted|PermissionError" \
+             | grep -aoE "/[A-Za-z0-9._/+-]+" | sort -u | head -n 20)"
+
+    if [ -n "$paths" ]; then
+        echo -e "\033[0;33m"
+        echo "--- what went wrong -------------------------------------------"
+        echo "'$user' could not write to:"
+        local p d
+        while IFS= read -r p; do
+            [ -n "$p" ] || continue
+            d="$p"; [ -d "$d" ] || d="${p%/*}"
+            if [ -d "$d" ]; then
+                printf "    %-46s %s %s:%s\n" "$p" \
+                    "$(stat -c %A "$d" 2>/dev/null)" \
+                    "$(stat -c %U "$d" 2>/dev/null)" "$(stat -c %G "$d" 2>/dev/null)"
+            else
+                printf "    %-46s (and its parent does not exist)\n" "$p"
+            fi
+        done <<< "$paths"
+        echo
+        echo "That directory belongs to another package.  Share it, then retry"
+        echo "just the install (no recompile):"
+        echo
+        local first; first="$(printf '%s\n' "$paths" | head -n1)"
+        d="$first"; [ -d "$d" ] || d="${first%/*}"
+        echo "    packagemanager add-dir-to-sysgroup $d $user"
+        echo "    packagemanager script install $user"
+        echo "---------------------------------------------------------------"
+        echo -e "\033[0m"
+        return 0
+    fi
+
+    # otherwise: the last few lines that look like an error, not the whole log
+    local tail_err
+    tail_err="$(grep -hiE "^(error|fatal|.*: error:|make.*\*\*\*|.*Error [0-9]+)" "$log" 2>/dev/null \
+                | grep -viE "error [0-9]+ \(ignored\)" | tail -n 5)"
+    if [ -n "$tail_err" ]; then
+        echo -e "\033[0;33m"
+        echo "--- what went wrong -------------------------------------------"
+        printf '%s\n' "$tail_err" | sed 's/^/    /'
+        echo "---------------------------------------------------------------"
+        echo -e "\033[0m"
+    fi
+    echo "  full log: $log"
+}
+
+    # A permission failure is repairable and common: grant the access and try
+    # again, up to a few rounds (each attempt reveals only the FIRST directory
+    # it could not write, so one round is rarely enough).
+    _log="$(eval echo ~$user_name)/log/packagemanager_install-$date_log.log"
+    _round=0
+    while [ "$install_rc" != "0" ] && [ "${PM_NO_AUTO_FIX:-0}" != "1" ] \
+          && [ "$_round" -lt 20 ]; do
+        grep -qiE "permission denied|operation not permitted|cannot (create|remove|touch)" \
+             "$_log" 2>/dev/null || break
+        auto_grant_from_log "$_log" "$user_name" || break
+        _round=$((_round + 1))
+        echo -e "\033[0;33m# retrying $user_name ($parameter), round $_round ...\033[0m"
+        _wrapdir="/tmp/pkgusr-wrappers.$$"
+    _make_build_wrappers "$_wrapdir" || _wrapdir=""
+    chmod 755 "$_wrapdir" 2>/dev/null || true
+    su - -c "set -o pipefail; \
+             ${_wrapdir:+PATH='$_wrapdir':\$PATH; export PATH; } \
+             bash ~/install_$user_name $parameter 2>&1 | tee ~/log/packagemanager_install-$date_log.log" $user_name
+        install_rc=${PIPESTATUS[0]}
+    [ -n "${_wrapdir:-}" ] && rm -rf "$_wrapdir"
+    done
+
     if [ "$install_rc" != "0" ]; then
-        echo -e "\033[0;31m!! FAILED: $user_name ($parameter) exited $install_rc. See the log above / ~$user_name/log/.\033[0m"
+        echo -e "\033[0;31m!! FAILED: $user_name ($parameter) exited $install_rc\033[0m"
+        diagnose_install_failure "$user_name" "$_log"
         exit $install_rc
     fi
     ###################

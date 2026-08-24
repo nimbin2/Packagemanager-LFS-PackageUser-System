@@ -85,7 +85,24 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.7.0"
+
+
+def _build_id():
+    """A short fingerprint of this file's own contents.
+
+    A hand-maintained version number goes stale the moment someone forgets to
+    bump it -- and the whole reason for printing a version is to answer "am I
+    running the code that was just fixed?".  This cannot go stale: it changes
+    whenever the file does.
+    """
+    import hashlib
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()[:7]
+    except OSError:
+        return "unknown"
+
 PLAN_VERSION = 1
 _DEFAULT_CONFIG = {"collector_prefix": "sysgroup", "user_prefix": "u",
                    "main_user": ""}
@@ -106,7 +123,46 @@ def load_config():
                     _config[k.strip()] = v.strip()
     except OSError:
         pass
+
+    # Settings that MUST match across the tools come from one place.
+    #
+    # collector_prefix decides which groups shared directories carry.  The
+    # system was built with the prefix in the lfs config; if packagemanager
+    # used its own default instead, every package installed afterwards would
+    # join `sysgroup_*` groups while the built system uses `nimgnu_*` -- two
+    # parallel sets of groups over the same directories, and no error to say
+    # so.  The lfs config is authoritative for these.
+    shared = _shared_lfs_config()
+    for key in _SHARED_WITH_LFS:
+        val = shared.get(key)
+        if not val:
+            continue
+        if _config.get(key) and _config[key] != val:
+            printWarning(
+                f"note: {key} is '{_config[key]}' here but '{val}' in the lfs "
+                f"config -- using '{val}', which is what the system was built "
+                f"with.")
+        _config[key] = val
     return _config
+
+
+# Keys owned by the lfs config, not by packagemanager's own file.
+_SHARED_WITH_LFS = ("collector_prefix",)
+
+
+def _shared_lfs_config():
+    """The lfs tool's settings, if it has any on this system."""
+    for cand in (os.environ.get("LFS_STORE"), "/usr/share/lfs",
+                 os.path.expanduser("~/.local/share/lfs")):
+        if not cand:
+            continue
+        p = os.path.join(cand, "config.json")
+        try:
+            with open(p) as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            continue
+    return {}
 
 
 def save_config(cfg):
@@ -225,7 +281,11 @@ def find_blfs():
     here = os.path.dirname(os.path.abspath(__file__))
     local = os.path.join(here, "blfs")
     if os.path.isfile(local):
-        return [local] if os.access(local, os.X_OK) else ["python3", local]
+        # os.access(X_OK) answers "yes" for root even without any execute bit,
+        # so check the mode bits themselves -- exactly the situation in a
+        # fresh copy of the tools, and the exec then dies with EACCES.
+        ex = bool(os.stat(local).st_mode & 0o111)
+        return [local] if ex else [sys.executable or "python3", local]
     return ["blfs"]                                   # rely on $PATH
 
 
@@ -237,9 +297,32 @@ def _blfs_book_flags():
     return []
 
 
+# what each blfs subcommand is actually doing, for the status line
+_BLFS_ACTIVITY = {
+    "order":    "working out the build order for %s",
+    "debug":    "looking up %s in the book",
+    "deps":     "reading %s's dependencies",
+    "script":   "writing the install script for %s",
+    "versions": "reading versions from the book",
+    "search":   "searching the book for %s",
+}
+
+
 def run_blfs(args):
-    """Run blfs; return (returncode, stdout, stderr).  rc 127 => blfs missing."""
+    """Run blfs; return (returncode, stdout, stderr).  rc 127 => blfs missing.
+
+    Each call is a subprocess, and the first one for a given book INDEXES it,
+    which takes many seconds.  Announce what is happening: an install that sits
+    silent for half a minute before its first output looks frozen."""
     cmd = find_blfs() + _blfs_book_flags() + list(args)
+    verb = args[0] if args else ""
+    if verb in _BLFS_ACTIVITY:
+        arg = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
+        try:
+            set_status(_BLFS_ACTIVITY[verb] % arg if "%s" in _BLFS_ACTIVITY[verb]
+                       else _BLFS_ACTIVITY[verb])
+        except Exception:
+            pass
     try:
         r = subprocess.run(cmd, capture_output=True, text=True)
         return r.returncode, r.stdout, r.stderr
@@ -575,6 +658,32 @@ def _script_name_version(path):
     return None
 
 
+def _warn_if_wrong_file_edited(user, chosen):
+    """Point out an edit made to the wrong file.
+
+    A package user's home holds two files with nearly identical names:
+        install_<name>-<version>   the source -- edit THIS one
+        install_<name>             the engine's runtime copy, overwritten each run
+    Editing the second is an easy mistake, and the symptom is silent: the
+    install runs the unedited script and fails in exactly the same way as
+    before, so it looks as though the edit was thrown away."""
+    runtime = os.path.join(BASE_DIR, user, f"install_{user}")
+    if not os.path.isfile(runtime):
+        return
+    try:
+        if os.path.samefile(runtime, chosen):
+            return
+        if os.path.getmtime(runtime) <= os.path.getmtime(chosen):
+            return                      # not edited more recently: nothing odd
+    except OSError:
+        return
+    printWarning(f"  note: {runtime} was changed more recently than the script "
+                 f"in use.")
+    printWarning(f"        That file is a runtime copy and is overwritten every "
+                 f"run -- edits to it are lost.")
+    printWarning(f"        Edit this instead:  {chosen}")
+
+
 def resolve_script(user, name_version, script_dir, assume_yes=False,
                    force_regen=False):
     """Path to the install script to use for `user`.
@@ -588,6 +697,7 @@ def resolve_script(user, name_version, script_dir, assume_yes=False,
     if (not force_regen and os.path.isfile(local)
             and _script_name_version(local) == name_version):
         printInfo(f"  using LOCAL script (your edits, not the book): {local}")
+        _warn_if_wrong_file_edited(user, local)
         try:
             body = open(local).read()
         except OSError:
@@ -875,6 +985,218 @@ def find_add_package_user():
     return os.environ.get("ADD_PACKAGE_USER_BIN", "add_package_user").split()
 
 
+# useradd/groupadd live in /usr/sbin, which is often absent from a non-login
+# PATH -- look there explicitly rather than concluding they do not exist.
+_SBIN_PATH = os.environ.get("PATH", "") + ":/usr/sbin:/sbin:/usr/local/sbin"
+
+
+def _have_cmd(name):
+    return shutil.which(name, path=_SBIN_PATH) is not None
+
+
+def _cmd_path(name):
+    return shutil.which(name, path=_SBIN_PATH) or name
+
+
+PKGUSR_ETC = os.environ.get("PKGUSR_ETC", "/etc/pkgusr")
+
+# The shared environment every package user gets, as the package-users hint
+# describes it: .bash_profile and .bashrc are SYMLINKS into a central directory
+# so all package users share one environment, and `build` is the helper each
+# package's build.conf is fed to.  Creating a user without these leaves an
+# account that cannot build anything.
+_PKGUSR_BASH_PROFILE = """\
+# /etc/pkgusr/bash_profile -- shared by every package user.
+# Symlinked as ~/.bash_profile.  Keep the environment identical for all of
+# them, so a build behaves the same whichever package user runs it.
+
+umask 022
+export LC_ALL=POSIX
+
+# /usr/local/bin comes FIRST after the wrappers: locally installed
+# overrides belong ahead of /usr/bin, and a temporary wrapper there
+# (the no-verify wget, say) is useless if nothing ever finds it.
+PATH=/usr/lib/pkgusr:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+# a short prompt that makes it obvious which package user you are
+export PS1='\\u:\\w\\$ '
+
+# where this package's sources live
+export PKG_HOME="$HOME"
+cd "$HOME" 2>/dev/null || true
+
+[ -f "$HOME/build.conf" ] && . "$HOME/build.conf"
+"""
+
+_PKGUSR_BASHRC = """\
+# /etc/pkgusr/bashrc -- shared by every package user.
+# Symlinked as ~/.bashrc.  Package users are not used for logging in, so there
+# is no reason for login and non-login shells to differ: just source the
+# profile, and `su pkg` and `su - pkg` then behave identically.
+
+[ -f "$HOME/.bash_profile" ] && . "$HOME/.bash_profile"
+"""
+
+_PKGUSR_BUILD = """\
+#!/bin/bash
+# /etc/pkgusr/build -- shared by every package user, symlinked as ~/build.
+#
+# Reads build.conf from the package user's home and runs the usual
+# unpack/configure/make/install sequence with it.  It is deliberately small:
+# anything unusual belongs in the package's own install script.
+set -e
+
+conf="${1:-$HOME/build.conf}"
+[ -f "$conf" ] || { echo "no build.conf at $conf" >&2; exit 1; }
+. "$conf"
+
+: "${SRC_DIR:=$HOME}"
+: "${CONFIGURE_OPTS:=--prefix=/usr}"
+: "${MAKE_OPTS:=}"
+
+cd "$SRC_DIR"
+[ -x ./configure ] && ./configure $CONFIGURE_OPTS
+make $MAKE_OPTS
+make install
+"""
+
+_PKGUSR_BUILD_CONF = """\
+# build.conf for package user '%(name)s'
+#
+# Read by ~/build (a symlink to /etc/pkgusr/build).  Override anything you need
+# and leave the rest alone.
+
+# where the unpacked source is
+#SRC_DIR="$HOME/%(name)s-1.0"
+
+CONFIGURE_OPTS="--prefix=/usr"
+MAKE_OPTS=""
+"""
+
+_PKGUSR_PROJECT = """\
+%(name)s
+
+Package user for '%(name)s'.  Everything this package installed is owned by
+this account; `packagemanager info %(name)s` lists it.
+"""
+
+
+def ensure_pkgusr_etc(verbose=True):
+    """Make sure the shared package-user environment exists in /etc/pkgusr.
+
+    Copied from the host when this runs there; written from scratch otherwise
+    (a fresh LFS system has no /etc/pkgusr at all)."""
+    made = []
+    try:
+        os.makedirs(PKGUSR_ETC, exist_ok=True)
+    except OSError as e:
+        printError(f"cannot create {PKGUSR_ETC}: {e}")
+        return False
+    for fname, content, mode in (
+            ("bash_profile", _PKGUSR_BASH_PROFILE, 0o644),
+            ("bashrc",       _PKGUSR_BASHRC,       0o644),
+            ("build",        _PKGUSR_BUILD,        0o755)):
+        path = os.path.join(PKGUSR_ETC, fname)
+        if os.path.exists(path):
+            continue
+        with open(path, "w") as f:
+            f.write(content)
+        os.chmod(path, mode)
+        made.append(fname)
+    if made and verbose:
+        printInfo(f"created the shared package-user environment in "
+                  f"{PKGUSR_ETC}: {', '.join(made)}")
+    return True
+
+
+def init_package_user_home(name, home=None, verbose=True):
+    """Give a package user the environment the scheme expects.
+
+    Without this the account exists but has no .bash_profile, no .bashrc and no
+    build helper -- `su - <pkg>` lands in a bare shell with the wrong umask and
+    no PATH to the wrapper commands."""
+    home = home or os.path.join(BASE_DIR, name)
+    if not ensure_pkgusr_etc(verbose=verbose):
+        return False
+    try:
+        os.makedirs(home, exist_ok=True)
+    except OSError as e:
+        printError(f"cannot create {home}: {e}")
+        return False
+
+    # symlinks to the shared files, so changing one changes them all
+    for link, target in ((".bash_profile", "bash_profile"),
+                         (".bashrc",       "bashrc"),
+                         ("build",         "build")):
+        dst = os.path.join(home, link)
+        src = os.path.join(PKGUSR_ETC, target)
+        try:
+            if os.path.islink(dst) or os.path.exists(dst):
+                if os.path.islink(dst) and os.readlink(dst) == src:
+                    continue
+                os.remove(dst)
+            os.symlink(src, dst)
+        except OSError as e:
+            printWarning(f"  {dst}: {e}")
+
+    # per-package files
+    for fname, content in (("build.conf", _PKGUSR_BUILD_CONF % {"name": name}),
+                           (".project",   _PKGUSR_PROJECT % {"name": name})):
+        path = os.path.join(home, fname)
+        if not os.path.exists(path):
+            with open(path, "w") as f:
+                f.write(content)
+
+    _run(["chown", "-R", "-h", f"{name}:{name}", home])
+    _run([_cmd_path("chmod"), "0750", home]) if _have_cmd("chmod") else None
+    if verbose:
+        printInfo(f"  initialised {home} "
+                  f"(.bash_profile, .bashrc, build -> {PKGUSR_ETC}; build.conf)")
+    return True
+
+
+def create_package_user(name, home=None):
+    """Create a package user, with or without the hint's add_package_user.
+
+    add_package_user comes from the package-users hint's helper tarball, which
+    a fresh LFS system does not have -- and without a fallback nothing can be
+    installed as a package user at all.  Shadow's own tools do the same job:
+    one user, a private group of the same name, plus the supplementary
+    'install' group."""
+    if _user_exists(name):
+        return True
+    home = home or os.path.join(BASE_DIR, name)
+
+    if _have_cmd(find_add_package_user()[0]):
+        cmd = find_add_package_user() + [name, name, "10000", "20000",
+                                         name, "10000", "20000"]
+        printInfo(f"creating package-user {name}")
+        if _run(cmd):
+            init_package_user_home(name, home)
+            return True
+        printWarning("add_package_user failed -- falling back to useradd")
+
+    if not _have_cmd("useradd"):
+        printError("neither add_package_user nor useradd is available; "
+                   "cannot create package users on this system")
+        return False
+
+    if not _group_exists("install"):
+        printInfo("creating the 'install' group")
+        _run([_cmd_path("groupadd"), "-g", "9999", "install"])
+
+    printInfo(f"creating package-user {name} (useradd)")
+    # -U makes the private group alongside the user so uid and gid match;
+    # -K keeps package users in their own id range
+    ok = _run([_cmd_path("useradd"), "-c", f"package {name}", "-d", home, "-U",
+               "-G", "install", "-s", "/bin/bash",
+               "-K", "UID_MIN=10000", "-K", "GID_MIN=10000", name])
+    if ok:
+        init_package_user_home(name, home)
+    return ok
+
+
 def _group_exists(name):
     try:
         grp.getgrnam(name)
@@ -1093,6 +1415,253 @@ def write_group_manifest(group, background=True):
                          stderr=subprocess.DEVNULL, start_new_session=True)
         return True
     return subprocess.run(cmd).returncode == 0
+
+
+# Directories that are shared by nature, matched as patterns.
+#
+# Kept in step with lfs-helper's list: many packages drop a single file into
+# /usr/share/zsh/site-functions or /usr/share/applications, so treating those
+# as belonging to whichever package created them first makes every later
+# package fail there.  /usr/libexec is shared; /usr/libexec/p11-kit is not.
+SHARED_DIR_PATTERNS = [
+    "/usr/share/man/man[1-9]", "/usr/share/man/*/man[1-9]", "/usr/share/man/*",
+    "/usr/share/locale/*/LC_MESSAGES", "/usr/share/locale/*",
+    "/usr/share/info", "/usr/share/doc",
+    "/usr/lib/pkgconfig", "/usr/share/pkgconfig",
+    "/usr/share/bash-completion/completions",
+    "/usr/share/zsh/site-functions", "/usr/share/zsh/vendor-completions",
+    "/usr/share/fish/completions", "/usr/share/fish/vendor_completions.d",
+    "/usr/share/applications", "/usr/share/mime/packages",
+    "/usr/share/dbus-1/services", "/usr/share/dbus-1/system-services",
+    "/usr/share/metainfo", "/usr/share/appdata",
+    "/usr/share/icons/hicolor/*", "/usr/share/pixmaps",
+    "/usr/share/glib-2.0/schemas", "/usr/share/vala/vapi",
+    "/usr/share/gir-1.0", "/usr/lib/girepository-1.0",
+    "/usr/share/aclocal", "/usr/share/gtk-doc/html",
+    "/usr/lib/systemd/system", "/usr/lib/udev/rules.d",
+    "/etc/xdg/autostart", "/usr/libexec",
+    "/usr/share/terminfo/*",
+]
+
+
+def is_shared_dir(path):
+    import fnmatch
+    p = path.rstrip("/")
+    return any(fnmatch.fnmatch(p, pat) for pat in SHARED_DIR_PATTERNS)
+
+
+# One cheap pre-filter, then the precise patterns.
+#
+# These run over a whole build log, which for something like p11-kit is tens of
+# megabytes.  Running five regexes across all of it -- once per retry round --
+# burned ~90 seconds of CPU and made the machine crawl.  So: only read the tail
+# (errors are at the end), skip any line without the words we care about, and
+# anchor the patterns per line so there is nothing to backtrack over.
+_PERM_HINT = ("Permission denied", "Operation not permitted", "PermissionError")
+
+_PERM_PATTERNS = [
+    re.compile(r"PermissionError[^']*'([^']+)'"),
+    re.compile(r"(?:Permission denied|Operation not permitted)[:,]?\s*'([^']+)'"),
+    re.compile(r"cannot (?:create|remove|touch|open)[^']*'([^']+)'"),
+    re.compile(r"^\s*(/[^\s:]+):\s*Permission denied"),
+]
+
+_LOG_TAIL_BYTES = 512 * 1024        # the error is never at the start
+
+
+def _paths_from_permission_errors(log_path, max_paths=20):
+    if not log_path or not os.path.isfile(log_path):
+        return []
+    try:
+        size = os.path.getsize(log_path)
+        with open(log_path, errors="replace") as f:
+            if size > _LOG_TAIL_BYTES:
+                f.seek(size - _LOG_TAIL_BYTES)
+                f.readline()                    # drop the partial first line
+            lines = f.readlines()
+    except OSError:
+        return []
+
+    seen, out = set(), []
+    for line in lines:
+        # the pre-filter: a plain substring test skips ~all of a build log
+        if not any(h in line for h in _PERM_HINT):
+            continue
+        for pat in _PERM_PATTERNS:
+            m = pat.search(line)
+            if m:
+                path = m.group(1)
+                if path.startswith("/") and path not in seen:
+                    seen.add(path)
+                    out.append(path)
+                break
+        if len(out) >= max_paths:
+            break
+    return out
+
+
+def _dir_of(path):
+    return path if os.path.isdir(path) else os.path.dirname(path)
+
+
+def _user_can_write(user, path):
+    try:
+        r = subprocess.run(["su", "-s", "/bin/bash", user, "-c",
+                            "test -w %s" % shlex.quote(path)],
+                           capture_output=True)
+        return r.returncode == 0
+    except OSError:
+        return False
+
+
+def auto_grant_from_log(user, log_path, verbose=True):
+    """Give `user` the access a failed install needed, and say what changed.
+
+    This is what lfs-helper does during the base build, and there is no reason
+    for packagemanager to behave differently afterwards: a package that has to
+    write into a directory another package owns joins that directory's
+    collector group.
+
+    Returns the list of directories granted (empty if there was nothing to do).
+    """
+    granted = []
+    dirs = []
+    for p in _paths_from_permission_errors(log_path):
+        d = _dir_of(p)
+        if d and os.path.isdir(d) and d not in dirs:
+            dirs.append(d)
+    if not dirs:
+        return granted
+
+    for d in dirs:
+        if _user_can_write(user, d):
+            continue                       # already fine; something else failed
+        cur = None
+        try:
+            cur = grp.getgrgid(os.stat(d).st_gid).gr_name
+        except (KeyError, OSError):
+            pass
+
+        if is_shared_dir(d) and cur != "install":
+            # shared by nature: it belongs to the install group, and every
+            # package user is already in that -- no collector group needed
+            if verbose:
+                printInfo(f"  {d} is a shared directory -> group install")
+            _assign_group_dir(d, "install", recursive=False)
+            granted.append((d, "install"))
+            continue
+
+        if cur == "install" or (cur and cur.startswith(collector_prefix())):
+            # The directory is ALREADY shared -- the package just isn't in the
+            # group yet.  Adding it is the whole fix; don't touch the directory.
+            group = cur
+            if verbose:
+                printInfo(f"  {d} is already group {group} -- adding '{user}' to it")
+        else:
+            owner = "root"
+            try:
+                owner = pwd.getpwuid(os.stat(d).st_uid).pw_name
+            except (KeyError, OSError):
+                pass
+            group = nimgnu_name(owner if owner != "root" else os.path.basename(d))
+            if not _group_exists(group):
+                if verbose:
+                    printInfo(f"  creating collector group {group}")
+                if not _run([_cmd_path("groupadd"), group]):
+                    continue
+            if owner not in ("root", "") and _user_exists(owner):
+                _run([_cmd_path("usermod"), "-a", "-G", group, owner])
+            _assign_group_dir(d, group, recursive=False)
+            if verbose:
+                printInfo(f"  {d} -> group {group} (owner {owner})")
+
+        if not _run([_cmd_path("usermod"), "-a", "-G", group, user]):
+            continue
+        granted.append((d, group))
+
+    if granted and verbose:
+        printWarning("\nCollector groups changed so '%s' can install:" % user)
+        for d, g in granted:
+            print(f"    {d:<44} -> {g}")
+        print("  These are permanent; review with: "
+              f"getent group | grep '^{collector_prefix()}'")
+    return granted
+
+
+def _latest_log(name):
+    """The log the most recent install run wrote."""
+    d = _pkg_log_dir(name)
+    try:
+        logs = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".log")]
+    except OSError:
+        return None
+    return max(logs, key=os.path.getmtime) if logs else None
+
+
+def _run_pm_install_once(name, path, env):
+    """Run the install engine exactly once, with no recovery."""
+    cmd = find_pm_install() + [name, path]
+    printInfo("  $ " + " ".join(shlex.quote(c) for c in cmd))
+    try:
+        return subprocess.run(cmd, env=env)
+    except FileNotFoundError:
+        printError(f"  {cmd[0]}: command not found")
+        return subprocess.CompletedProcess(cmd, 127)
+
+
+def run_pm_install(name, path, env, auto_fix=True, max_rounds=4):
+    """Run the install engine, granting access and retrying on a permission
+    failure -- the same recovery lfs-helper does during the base build.
+
+    An install reveals only the FIRST directory it cannot write, so one grant
+    is rarely enough: a package that drops files into several shared places
+    fails again on the next one.  Keep going while each round actually grants
+    something, bounded so a real build error cannot loop.
+
+    Note the two functions: the retry wrapper must call the RAW runner, never
+    itself.  Calling itself is an infinite recursion that ends in
+        RecursionError: maximum recursion depth exceeded
+    before the install is even attempted."""
+    result = _run_pm_install_once(name, path, env)
+    rounds = 0
+    while result.returncode != 0 and auto_fix and rounds < max_rounds:
+        log = _latest_log(name)
+        granted = auto_grant_from_log(name, log)
+        if not granted:
+            break                       # nothing to grant: a real build error
+        rounds += 1
+        printInfo(f"\nretrying {name} (round {rounds}) ...")
+        result = _run_pm_install_once(name, path, env)
+    if result.returncode != 0 and rounds >= max_rounds:
+        printWarning(f"gave up after {max_rounds} permission grants -- "
+                     f"something else is wrong")
+    if result.returncode == 0:
+        warn_if_nothing_installed(name)
+    return result
+
+
+def warn_if_nothing_installed(name):
+    """A package that installs nothing has usually failed quietly.
+
+    pip is the worst offender -- it can report success while writing nowhere
+    useful -- but any build whose install step is a no-op leaves a package user
+    owning nothing, and the problem only surfaces later when something tries to
+    use it."""
+    pkglist = os.path.join(BASE_DIR, name, "pkg.lst")
+    n = 0
+    if os.path.isfile(pkglist):
+        try:
+            with open(pkglist) as f:
+                n = sum(1 for line in f if line.strip())
+        except OSError:
+            return
+    else:
+        return                      # manifest not written yet: nothing to judge
+    if n == 0:
+        printWarning(
+            f"\n!! {name} reported success but owns no files.\n"
+            f"   That normally means the install silently did nothing.\n"
+            f"   Check before trusting it:  packagemanager info {name}\n")
 
 
 def cmd_make_group_dir(args):
@@ -1355,12 +1924,64 @@ def cmd_dependencies(args):
 #      --yes              don't ask for confirmation before --run
 #   -o/--outdir DIR       where to write the generated scripts
 
+def _blfs_book_available():
+    """Is there a BLFS book on disk to look packages up in?
+
+    Asking `blfs books` is no good: it also lists every version available on
+    the site, so the output is never empty and the answer was always yes."""
+    if os.environ.get("BLFS_BOOK_FILE"):
+        return os.path.isfile(os.environ["BLFS_BOOK_FILE"])
+    for cand in (os.environ.get("BLFS_STORE"), "/usr/share/blfs",
+                 os.path.expanduser("~/.cache/blfs")):
+        if not cand:
+            continue
+        d = os.path.join(cand, "books")
+        try:
+            if any(f.endswith((".html", ".html.gz")) for f in os.listdir(d)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _explain_not_in_book(target):
+    """Say why a package could not be found, and what to do about it.
+
+    "not found in book" is unhelpful when the real problem is that there IS no
+    book -- a fresh chroot has the LFS book but not the BLFS one, and every
+    lookup fails the same way."""
+    if not _blfs_book_available():
+        printError(f"{target}: there is no BLFS book on this system to look "
+                   f"it up in.")
+        printInfo("")
+        printInfo("  Download it (needs working networking):")
+        printInfo("      blfs fetch")
+        printInfo("  or copy one in from the host and import it:")
+        printInfo("      blfs import /path/to/BLFS-BOOK-...-nochunks.html")
+        printInfo("")
+        return
+    printError(f"{target}: not in the BLFS book.")
+    rc, out, _e = run_blfs(["search", target])
+    hits = [ln for ln in out.splitlines() if ln.strip().startswith("[")][:5]
+    if hits:
+        printInfo("  Did you mean:")
+        for h in hits:
+            printInfo("    " + h.strip())
+    else:
+        printInfo(f"  Nothing similar found either.  Try: blfs search {target}")
+
+
 def build_install_plan(args):
     """Return (plan, missing, why).  plan = [(anchor, name_version, reason)] in
     install order (deps first); reason in {new, update, reinstall}.  why maps
     anchor -> (kind, parent) so we can show 'required by <parent>'."""
     ignore = {x for x in (args.ignore or "").split(",") if x}
     plan, seen, missing_all, why = [], set(), [], {}
+    _not_found = []
+    # Reading the book can take many seconds the first time (it is indexed
+    # once per version).  Without a word on screen that looks like a hang, so
+    # say what is happening as it happens.
+    set_status("reading the book ...")
 
     def consider(anchor, nv, kind="", parent=""):
         if anchor not in why:
@@ -1379,11 +2000,14 @@ def build_install_plan(args):
                          "update" if u.state == "installed" else "new"))
 
     for target in args.packages:
+        set_status(f"working out what {target} needs ...")
         if not getattr(args, "recursive", False):
             # DEFAULT: just this package, no dependency walk
             nv = book_version(target)
             if nv is None:
-                printError(f"{target}: not found in book -- skipping")
+                clear_status()
+                _explain_not_in_book(target)
+                _not_found.append(target)
                 continue
             consider(target, nv, "requested", "")
         else:
@@ -1398,7 +2022,7 @@ def build_install_plan(args):
                 for danchor, dnv in book_rdeps(
                         target, args.ignore_recommended, args.optional).items():
                     consider(danchor, dnv, "dependent-of", target)
-    return plan, missing_all, why
+    return plan, missing_all, why, _not_found
 
 
 def _select_plan_rows(rows, render):
@@ -1495,7 +2119,7 @@ def install_local(name, path, run, yes, verb="install", test=False, clean=False)
     t0 = time.time()
     if clean:
         env = {**env, "PM_NO_REFRESH": "1"}
-    result = subprocess.run(find_pm_install() + [name, path], env=env)
+    result = run_pm_install(name, path, env)
     if result.returncode != 0:
         printError(f"{verb} failed for {name} (exit {result.returncode}).")
         printInfo(f"  logs: {_pkg_log_dir(name)}")
@@ -1517,11 +2141,17 @@ def cmd_install(args):
                       clean=getattr(args, "clean", False))
         return
 
-    plan, missing, why = build_install_plan(args)
+    plan, missing, why, not_found = build_install_plan(args)
     if missing:
         printWarning("Out-of-book / missing (install these manually): "
                      + ", ".join(sorted(set(missing))))
     if not plan:
+        if not_found:
+            # NOT success: the package could not be looked up at all.  Saying
+            # "everything is installed and up to date" here told the user the
+            # opposite of the truth.
+            printError("Could not install: " + ", ".join(not_found))
+            sys.exit(1)
         printSuccess("Nothing to do -- everything is installed and up to date.")
         return
 
@@ -1592,7 +2222,7 @@ def cmd_install(args):
         old_paths = _pkglist_paths(anchor) if cleaning else None
         t0 = time.time()
         penv = {**env, "PM_NO_REFRESH": "1"} if cleaning else env
-        result = subprocess.run(pm + [anchor, path], env=penv)
+        result = run_pm_install(anchor, path, penv)
         add_run_entry(run_log, anchor, "install", result.returncode == 0,
                       result.returncode, _pkg_log_dir(anchor))
         if result.returncode != 0:
@@ -1603,8 +2233,13 @@ def cmd_install(args):
             printInfo(f"  install file: {path}")
             printInfo(f"  logs: {_pkg_log_dir(anchor)}   "
                       f"(see all: packagemanager errors)")
-            printInfo(f"  After fixing the problem you can re-run ONLY the "
-                      f"install step (no recompile):\n"
+            # Name the file to EDIT, not just the command to re-run.  A
+            # package user's home holds install_<name>-<version> (the source)
+            # and install_<user> (a runtime copy overwritten every run), and
+            # editing the wrong one fails silently -- the install repeats
+            # unchanged and the edit looks lost.
+            printInfo(f"  To change what it does, edit:\n    {path}")
+            printInfo(f"  Then re-run ONLY the install step (no recompile):\n"
                       f"    packagemanager script install {anchor}")
             sys.exit(result.returncode)
         if getattr(args, "clean", False):
@@ -1947,7 +2582,7 @@ def cmd_update(args):
         old_paths = _pkglist_paths(name) if cleaning else None
         t0 = time.time()
         penv = {**env, "PM_NO_REFRESH": "1"} if cleaning else env
-        result = subprocess.run(pm + [name, path], env=penv)
+        result = run_pm_install(name, path, penv)
         add_run_entry(run_log, name, "update", result.returncode == 0,
                       result.returncode, _pkg_log_dir(name))
         if result.returncode != 0:
@@ -2334,12 +2969,20 @@ def _run(cmd, show_output=False):
     own output is shown too; otherwise it's captured and surfaced only on error."""
     print(f"  {colors.blue}$ "
           f"{' '.join(shlex.quote(c) for c in cmd)}{colors.normal}")
-    if _STATE["verbose"] or show_output:
-        r = subprocess.run(cmd)
-    else:
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
-            printError(f"  {' '.join(cmd)} -> {r.stderr.strip() or r.returncode}")
+    try:
+        if _STATE["verbose"] or show_output:
+            r = subprocess.run(cmd)
+        else:
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            if r.returncode != 0:
+                printError(f"  {' '.join(cmd)} -> {r.stderr.strip() or r.returncode}")
+    except FileNotFoundError:
+        # a missing helper is an ordinary problem to report, not a stack trace
+        printError(f"  {cmd[0]}: command not found")
+        return False
+    except PermissionError as e:
+        printError(f"  {cmd[0]}: {e}")
+        return False
     return r.returncode == 0
 
 
@@ -2524,15 +3167,108 @@ def report_created_user(name, kind="package-user"):
         printInfo(f"    supplementary groups: {', '.join(groups)}")
 
 
+def _sanitise_user_name(mod):
+    """A Python distribution name is not necessarily a valid user name.
+
+    "beautifulsoup4" is fine; "ruamel.yaml", "Jinja2" and "typing_extensions"
+    are not what we want as accounts.  Lower-case and reduce to [a-z0-9_-]."""
+    n = re.sub(r"[^a-z0-9_-]+", "-", mod.lower()).strip("-")
+    return n[:32] or "pymodule"
+
+
+def _pip_site_dir():
+    """The system site-packages directory pip installs into."""
+    import glob as _glob
+    for pat in ("/usr/lib/python3*/site-packages",
+                "/usr/lib/python3*/dist-packages"):
+        hits = sorted(_glob.glob(pat))
+        if hits:
+            return hits[-1]
+    return None
+
+
+def _pip_owner_of_python():
+    """Which package owns Python's tree -- the collector group is named after it."""
+    site = _pip_site_dir()
+    if not site:
+        return "python"
+    d = site
+    while d not in ("/", ""):
+        try:
+            import pwd as _pwd
+            return _pwd.getpwuid(os.stat(d).st_uid).pw_name
+        except (KeyError, OSError):
+            d = os.path.dirname(d)
+    return "python"
+
+
+def cmd_pip(args):
+    """Install or update a Python module AS A PACKAGE USER.
+
+    A bare `pip3 install beautifulsoup4` installs as whoever ran it -- usually
+    root -- so the files belong to nobody in particular and no package user can
+    ever update or remove them.  This does it the package-user way: one user per
+    module, joined to the collector group that owns Python's tree, with pip kept
+    out of ~/.local so the module lands where every other package can import it.
+    """
+    site = _pip_site_dir()
+    if not site:
+        printError("no system site-packages directory found -- is Python installed?")
+        return 1
+    owner = _pip_owner_of_python()
+    grp = collector_prefix() + owner
+
+    modules = args.modules
+    if not modules:
+        printError("usage: packagemanager pip install <module> [<module> ...]")
+        return 1
+
+    for mod in modules:
+        user = _sanitise_user_name(mod)
+        printHeader(f"{mod}  ->  package user '{user}'")
+
+        if not _user_exists(user):
+            if not create_package_user(user):
+                printError(f"could not create {user}")
+                continue
+            report_created_user(user)
+
+        # the collector group is what lets this user write into Python's tree
+        if not _group_exists(grp):
+            printInfo(f"creating collector group {grp}")
+            _run([_cmd_path("groupadd"), grp])
+        _run(["usermod", "-a", "-G", grp, user])
+        if _group_exists(grp):
+            _run(["chgrp", "-R", grp, site])
+            _run(["chmod", "-R", "g+w", site])
+
+        # PIP_USER=0 / PYTHONNOUSERSITE=1: without these pip quietly falls back
+        # to ~/.local when site-packages is not writable, and then reports
+        # "Requirement already satisfied" from there ever after -- so the module
+        # is installed for exactly one user and importable by nobody else.
+        env = ["env", "PIP_USER=0", "PYTHONNOUSERSITE=1"]
+        pip_args = ["pip3", "install"]
+        if args.upgrade:
+            pip_args.append("--upgrade")
+        if args.find_links:
+            pip_args += ["--no-index", "--find-links", args.find_links]
+        pip_args.append(mod)
+
+        cmd = ["su", "-s", "/bin/bash", user, "-c",
+               " ".join(shlex.quote(x) for x in env + pip_args)]
+        printInfo(" ".join(pip_args) + f"   (as {user})")
+        if _run(cmd, show_output=True):
+            printSuccess(f"{mod} installed as package-user {user}")
+        else:
+            printError(f"{mod} failed -- see the output above")
+    return 0
+
 def cmd_add_user(args):
     for name in args.packages:
         if _user_exists(name):
             printInfo(f"{name}: already exists.")
             continue
-        cmd = find_add_package_user() + [name, name, "10000", "20000",
-                                         name, "10000", "20000"]
-        printInfo(f"Creating package-user {name}: {' '.join(cmd)}")
-        if _run(cmd):
+        if create_package_user(name):
             printSuccess(f"Created package-user {name}.")
             report_created_user(name)
 
@@ -2696,6 +3432,46 @@ def cmd_paths(args):
     print(f"  main user             : {main_user() or '(unset)'}")
 
 
+# Settings worth asking for when they are missing.  Only ones that change
+# behaviour: a blank main_user means "no human account", which is a decision,
+# not an oversight, so it is asked once and then left alone.
+_CONFIG_PROMPTS = [
+    ("collector_prefix",
+     "prefix for collector groups (shared install-dir groups)",
+     "sysgroup"),
+    ("user_prefix", "prefix for shared application users", "u"),
+    ("main_user", "your human login account (blank if none)",
+     lambda: _guess_main_user() or ""),
+]
+
+
+def _book_in_use(tool):
+    """Which book each tool would use -- the thing you actually want to know
+    when a package cannot be found."""
+    if tool == "blfs":
+        rc, out, _e = run_blfs(["books"])
+        if rc != 0:
+            return "(blfs not available)"
+        for ln in out.splitlines():
+            if "[" in ln and "]" in ln:
+                return ln.split("[", 1)[1].split("]", 1)[0]
+        return "(none cached -- blfs fetch, or blfs import <file>)"
+    # Read the config directly.  Parsing `lfs config` needed a mounted LFS
+    # tree, which does not exist inside the chroot -- so the book the system
+    # was built from showed as "(unknown)" on the very system it built.
+    cfg = _shared_lfs_config()
+    ver = cfg.get("build_book") or cfg.get("default")
+    if not ver:
+        return "(no book configured)"
+    for cand in (os.environ.get("LFS_STORE"), "/usr/share/lfs"):
+        if not cand:
+            continue
+        p = os.path.join(cand, "books", f"LFS-BOOK-{ver}-NOCHUNKS.html")
+        if os.path.isfile(p):
+            return os.path.basename(p)
+    return f"{ver}  (not cached here)"
+
+
 def cmd_config(args):
     cfg = load_config()
     changed = False
@@ -2714,6 +3490,22 @@ def cmd_config(args):
     if args.main_user:
         cfg["main_user"] = args.main_user
         changed = True
+    # Nothing given on the command line and something is unset?  Ask.  Leaving
+    # a setting blank and carrying on means it surfaces much later as a failed
+    # install with no obvious cause.
+    if not changed and not getattr(args, "show", False):
+        for key, prompt, default in _CONFIG_PROMPTS:
+            if cfg.get(key):
+                continue
+            d = default() if callable(default) else default
+            try:
+                ans = input(f"  {prompt} [{d}]: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            cfg[key] = ans if ans else d
+            changed = True
+
     if changed:
         if save_config(cfg):
             printSuccess(f"Saved {CONFIG_PATH}")
@@ -2725,6 +3517,9 @@ def cmd_config(args):
     print(f"  config file      : {where}")
     print(f"  collector prefix : {cfg['collector_prefix']}_   "
           f"(shared install-dir groups)")
+    for label, tool, args_ in (("LFS book", "lfs", ["config"]),
+                               ("BLFS book", "blfs", ["books"])):
+        print(f"  {label:<16} : {_book_in_use(tool)}")
     print(f"  user prefix      : {cfg['user_prefix']}_   (shared users)")
     print(f"  main user        : {cfg.get('main_user') or '(not set)'}   "
           f"(your human login account)")
@@ -2764,6 +3559,37 @@ def _add_groups(user, groups):
             printSuccess(f"Added {user} to {g}.")
 
 
+_APPLICATION_USER_HELP = """\
+Create an application user and make it usable from your own account.
+
+A package user owns the FILES a package installs.  An application user is a
+separate idea: an account a program RUNS as, so that a browser or a media
+player cannot read your documents, your keys, or another application's data.
+
+Creating the account is the easy part; what makes it usable is the rest:
+
+  * your home directory stays yours -- the account's home is 0750, so the
+    application cannot read it
+  * your login joins the account's group, so a shared directory works
+  * `su - u_<name>` from your account without a password, where the hint's
+    /etc/pam.d/su_u_user is installed (skipped where it is not: su then
+    simply asks for a password)
+  * with --shared, a directory both accounts can write, symlinked into your
+    home -- how you get files in and out
+  * with --launcher, a wrapper in ~/bin so running `<name>` starts the
+    program as that account
+
+Your own login is the "main user" setting; without it there is nothing to
+grant access to:
+
+    packagemanager config --main-user <your-login>
+
+Example:
+
+    packagemanager user create firefox --shared --launcher --groups audio,video
+"""
+
+
 def cmd_user_list(args):
     up = user_prefix()
     if pwd is None:
@@ -2792,9 +3618,133 @@ def cmd_user_create(args):
         if not _run(cmd):
             return
         printSuccess(f"{u} created.")
-        report_created_user(u, kind="shared user")
+        report_created_user(u, kind="application user")
     if args.groups:
         _add_groups(u, [g for g in re.split(r"[,\s]+", args.groups) if g])
+
+    # An account on its own is not usable: you cannot become it, its home is
+    # world-readable, and nothing launches the program.  Do the rest.
+    _setup_application_user(u, args)
+
+
+def _setup_application_user(u, args):
+    """Make an application user actually usable from your own account.
+
+    Creating the account is the easy part.  What makes it useful:
+      * your account may `su - <user>` without a password (via PAM)
+      * the home is 0750, so other users cannot read it
+      * your account joins the user's group, for the shared directory
+      * an optional shared directory both accounts can write
+      * an optional launcher in ~/bin so the program runs as that user
+    """
+    home = os.path.join(BASE_DIR, u)
+    main = main_user()
+    if not main:
+        printWarning("\nNo main user is set, so this account cannot be reached "
+                     "from your own.")
+        printWarning("Set it, then run this again:")
+        printWarning("    packagemanager config --main-user <your-login>")
+        return
+
+    # 1. the home is private
+    if os.path.isdir(home):
+        _run(["chmod", "0750", home])
+        printInfo(f"  home {home} is 0750 (private to {u} and its group)")
+
+    # 2. your account joins the user's group -- this is what makes a shared
+    #    directory work, and what lets PAM identify you as entitled
+    _run(["usermod", "-a", "-G", u, main])
+    printInfo(f"  {main} joined group '{u}'")
+
+    # 3. su without a password, if this system uses the hint's PAM file
+    _allow_su_via_pam(u, main)
+
+    # 4. a shared directory, when asked for
+    if getattr(args, "shared", False):
+        share = os.path.join(home, "Shared")
+        _run(["mkdir", "-p", share])
+        _run(["chown", f"{u}:{u}", share])
+        _run(["chmod", "2770", share])   # setgid: new files keep the group
+        link = os.path.join(_home_of(main) or "", f"{args.name}-shared")
+        if link and not os.path.exists(link):
+            _run(["ln", "-s", share, link])
+        printInfo(f"  shared directory: {share}")
+        if link:
+            printInfo(f"    reachable from your account as {link}")
+
+    # 5. a launcher, when the program is on PATH
+    app = getattr(args, "app", None) or args.name
+    import shutil as _sh
+    if getattr(args, "launcher", False):
+        if not _sh.which(app):
+            printWarning(f"  no '{app}' on PATH -- not writing a launcher")
+        else:
+            _write_launcher(main, u, app)
+
+
+def _home_of(user):
+    try:
+        import pwd
+        return pwd.getpwnam(user).pw_dir
+    except (KeyError, ImportError):
+        return None
+
+
+def _allow_su_via_pam(u, main):
+    """Let <main> su to <u> without a password, if the PAM file is present.
+
+    The hint ships /etc/pam.d/su_u_user with a case statement listing which
+    accounts each user may become.  It is not part of stock LFS, so this is a
+    no-op when the file does not exist -- `su` then simply asks for a
+    password, which still works."""
+    pam = "/etc/pam.d/su_u_user"
+    if not os.path.isfile(pam):
+        printInfo(f"  ({pam} not present -- `su - {u}` will ask for a password)")
+        return
+    try:
+        text = open(pam).read()
+    except OSError as e:
+        printWarning(f"  could not read {pam}: {e}")
+        return
+    if re.search(r"^\s*%s\)" % re.escape(u), text, re.M):
+        printInfo(f"  {pam} already allows it")
+        return
+    marker = 'case "$PAM_USER" in'
+    if marker not in text:
+        printWarning(f"  {pam} has no '{marker}' block -- not editing it")
+        return
+    lines = text.splitlines(True)
+    out = []
+    for line in lines:
+        out.append(line)
+        if marker in line:
+            out.append('  %s) USERS="%s %s"; ;;\n' % (u, u, main))
+    try:
+        with open(pam, "w") as f:
+            f.writelines(out)
+        printInfo(f"  {main} may now `su - {u}` without a password")
+    except OSError as e:
+        printWarning(f"  could not write {pam}: {e}")
+
+
+def _write_launcher(main, u, app):
+    """A wrapper in ~/bin that runs <app> as the application user."""
+    home = _home_of(main)
+    if not home:
+        return
+    bindir = os.path.join(home, "bin")
+    os.makedirs(bindir, exist_ok=True)
+    path = os.path.join(bindir, app)
+    if os.path.exists(path):
+        printInfo(f"  {path} already exists -- left alone")
+        return
+    with open(path, "w") as f:
+        f.write('#!/bin/bash\n'
+                '# Runs %s as the application user %s.\n'
+                'exec su - %s -c "%s $(printf \'%%q \' "$@")"\n' % (app, u, u, app))
+    os.chmod(path, 0o755)
+    _run(["chown", f"{main}:{main}", path])
+    printInfo(f"  launcher: {path}")
 
 
 def cmd_user_allow(args):
@@ -3742,14 +4692,279 @@ def cmd_fix_install(args):
 # cli
 # --------------------------------------------------------------------------- #
 
+PM_HELP_EPILOG = """\
+commands, by what you are doing:
+
+  finding out what is installed
+    list                       every package user on the system
+    info <pkg>                 what a package installed, and where it came from
+    search <pkg>               find a package in the book
+    check <pkg>                is it installed, and does it look right
+    verify [--fix]             check every package, optionally repairing
+    files_with_broken_id       files owned by a user that no longer exists
+
+  installing and updating
+    install <pkg>              build and install as a package user
+    update [<pkg>]             rebuild what the book has a newer version of
+    remove <pkg>               uninstall and delete the package user
+    pip install <module>       install a Python module as a package user
+    dependencies <pkg>         what it needs, in build order
+
+  install scripts
+    script <phase> <pkg>       run one phase of a package's script
+    regenerate-script <pkg>    rewrite it from the book
+    script-status              which scripts are edited, current, or outdated
+    migrate-scripts            move scripts to a newer book, keeping edits
+    template <pkg>             skeleton for a package not in the book
+
+  users, groups and permissions
+    add-user <pkg>             create a package user
+    user / shared-user         application users
+    sysgroup                   collector groups
+    make-group-dir <dir>       hand a directory to a collector group
+    add-dir-to-sysgroup <dir>  share an existing directory
+    fix-group-dir / fix-install
+                               repair permissions
+
+  settings and housekeeping
+    config                     show or change settings
+    paths                      where everything lives
+    init                       first-run setup
+    errors                     what went wrong in the last run
+    plan                       what a run would do, before doing it
+    reload-pkg-list            refresh the cached package list
+    blfs ...                   pass a command straight to blfs
+
+LFS base packages are the `lfs` tool's job; BLFS packages are handled here.
+"""
+
+
+# --------------------------------------------------------------------------- #
+# housekeeping run on every invocation: cheap checks that stop a temporary
+# workaround from quietly becoming permanent
+# --------------------------------------------------------------------------- #
+
+_CA_BUNDLES = ["/etc/ssl/certs/ca-bundle.crt", "/etc/ssl/ca-bundle.crt",
+               "/etc/pki/tls/certs/ca-bundle.crt",
+               "/etc/ssl/certs/ca-certificates.crt"]
+_WGETRC_MARK = "lfs-temporary-no-verify"
+
+
+def restore_wget_verification():
+    """Re-enable certificate checking once CA certificates exist.
+
+    The build disables it in /etc/wgetrc so a certificate-less system can fetch
+    make-ca at all.  Leaving that in place afterwards would mean every download
+    on this system stays unverified forever, so undo it the moment it is no
+    longer needed."""
+    rc = "/etc/wgetrc"
+    if not os.path.isfile(rc):
+        return
+    try:
+        text = open(rc).read()
+    except OSError:
+        return
+    if _WGETRC_MARK not in text:
+        return
+    have_ca = next((c for c in _CA_BUNDLES if os.path.isfile(c)
+                    and os.path.getsize(c) > 0), None)
+    if not have_ca:
+        return
+    # keep everything outside the marked block, drop the block itself
+    out, inside = [], False
+    for line in text.splitlines(True):
+        if _WGETRC_MARK in line:
+            inside = "end " not in line
+            continue
+        if not inside:
+            out.append(line)
+    try:
+        with open(rc, "w") as f:
+            f.writelines(out)
+    except OSError as e:
+        printWarning(f"could not restore certificate checking in {rc}: {e}")
+        return
+    printInfo(f"CA certificates found ({have_ca}) -- certificate checking "
+              f"re-enabled in {rc}")
+
+
+def check_make_ca_generated():
+    """make-ca installed but no certificate bundle?  Say what finishes the job.
+
+    `make-ca -g` reports "No update required!" and generates nothing when it
+    thinks its copy of certdata.txt is current -- which it is, straight after
+    install, even though no bundle has ever been written.  The install then
+    looks successful while the system still has no certificates, and every
+    HTTPS fetch keeps warning."""
+    import shutil as _sh
+    if not _sh.which("make-ca") and not os.path.isfile("/usr/sbin/make-ca"):
+        return
+    if any(os.path.isfile(c) and os.path.getsize(c) > 0 for c in _CA_BUNDLES):
+        return
+    printWarning("\nmake-ca is installed but this system still has no CA "
+                 "certificate bundle.")
+    printWarning("`make-ca -g` skips generating when it considers its copy of")
+    printWarning("certdata.txt current, which it is right after installing.")
+    printWarning("Force it once:")
+    printWarning("    /usr/sbin/make-ca -g --force")
+    printWarning("Then HTTPS verification works and the tools re-enable it "
+                 "automatically.\n")
+
+
+def ensure_wget_workaround():
+    """Let wget fetch anything at all on a system with no CA certificates.
+
+    This is the other half of restore_wget_verification().  Without it the
+    first thing anyone tries -- installing make-ca, so that certificates exist
+    -- fails, because fetching make-ca itself needs a verified connection:
+
+        ERROR: cannot verify ftpmirror.gnu.org's certificate ...
+        ERROR: md5sum check failed
+
+    /etc/wgetrc is used rather than a $PATH wrapper because builds run through
+    `su -` with the package user's own environment, where a wrapper directory
+    on PATH is never seen.
+    """
+    if any(os.path.isfile(c) and os.path.getsize(c) > 0 for c in _CA_BUNDLES):
+        return                                   # certificates exist: nothing to do
+    if not shutil.which("wget"):
+        return                                   # no wget yet, nothing to configure
+    rc = "/etc/wgetrc"
+    try:
+        text = open(rc).read() if os.path.isfile(rc) else ""
+    except OSError:
+        return
+    if _WGETRC_MARK in text:
+        return                                   # already done
+    try:
+        with open(rc, "a") as f:
+            f.write(
+                "\n# --- %s ----------------------------------------\n"
+                "# This system has no CA certificates yet, so wget cannot\n"
+                "# verify anything.  Downloads are UNVERIFIED until make-ca\n"
+                "# is installed; this block is removed automatically then.\n"
+                "check_certificate = off\n"
+                "# --- end %s ------------------------------------\n"
+                % (_WGETRC_MARK, _WGETRC_MARK))
+    except OSError as e:
+        printWarning(f"could not write {rc}: {e}")
+        return
+    printWarning(
+        "No CA certificates on this system yet, so wget could not verify\n"
+        "anything and every download would fail.  Certificate checking has\n"
+        "been turned OFF in /etc/wgetrc so that make-ca can be fetched.\n"
+        "\n"
+        "  Downloads are UNVERIFIED until make-ca is installed.\n"
+        "  This is undone automatically as soon as certificates exist.\n")
+
+
+def _warn_init_mismatch():
+    """The BLFS book's init flavour should match the system's.
+
+    A systemd book emits `systemctl` calls in its install scripts; on a SysV
+    system those fail with "command not found" in the middle of an otherwise
+    successful install, and every affected package has to be edited by hand.
+    The two books differ in more than that, so it is worth saying once."""
+    have_systemd = (os.path.isdir("/usr/lib/systemd/system")
+                    or bool(shutil.which("systemctl")))
+    rc, out, _e = run_blfs(["books"])
+    if rc != 0:
+        return
+    book = ""
+    for ln in out.splitlines():
+        if "[" in ln and "]" in ln:
+            book = ln.split("[", 1)[1].split("]", 1)[0]
+            break
+    if not book:
+        return
+    book_systemd = "systemd" in book.lower()
+    if book_systemd == have_systemd:
+        return
+    printWarning("\nThe BLFS book in use does not match this system's init:")
+    printInfo(f"    book   : {book}  ({'systemd' if book_systemd else 'SysV'})")
+    printInfo(f"    system : {'systemd' if have_systemd else 'SysV'}")
+    printInfo("")
+    printInfo("Install scripts from the wrong book carry commands this system")
+    printInfo("does not have -- `systemctl: command not found` mid-install is")
+    printInfo("the usual symptom.  Switch with:")
+    printInfo("")
+    printInfo("    blfs fetch %s" % ("stable" if have_systemd is False
+                                     else "stable-systemd"))
+    printInfo("")
+
+
+def _hint_generate_ca_bundle():
+    """make-ca is installed but the certificate store is empty.
+
+    Installing make-ca does not create any certificates -- it installs the
+    tool that generates them.  Until it is run there is still no CA bundle,
+    wget still cannot verify anything, and the /etc/wgetrc workaround stays in
+    place.  The step is easy to miss because the install reports success."""
+    if any(os.path.isfile(c) and os.path.getsize(c) > 0 for c in _CA_BUNDLES):
+        return                                   # certificates exist already
+    if not (os.path.isfile("/usr/sbin/make-ca")
+            or shutil.which("make-ca")):
+        return                                   # make-ca not installed yet
+    printWarning("\nmake-ca is installed but no CA certificates exist yet.")
+    printInfo("Installing it does not create them -- it installs the tool.")
+    printInfo("Generate the certificate store now:")
+    printInfo("")
+    printInfo("    make-ca -g")
+    printInfo("")
+    printInfo("Then HTTPS verification works, and the temporary")
+    printInfo("'check_certificate = off' in /etc/wgetrc is removed "
+              "automatically.\n")
+
+
+def _file_md5(path):
+    try:
+        with open(path, "rb") as f:
+            return hashlib.md5(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def warn_if_tools_are_stale():
+    """Tell the user when the chroot is running older tools than the host.
+
+    The tools are copied into the tree; edit them outside and the chroot keeps
+    running the old copy until they are copied again.  That is a genuinely
+    confusing failure mode -- behaviour that was fixed "yesterday" reappears --
+    so say so plainly."""
+    stamp = "/usr/share/lfs/tool-stamps.json"
+    if not os.path.isfile(stamp):
+        return
+    try:
+        stamps = json.load(open(stamp))
+    except (OSError, ValueError):
+        return
+    stale = []
+    for name, want in stamps.items():
+        path = shutil.which(name) or os.path.join("/usr/bin", name)
+        have = _file_md5(path)
+        if have and want and have != want:
+            stale.append(name)
+    if stale:
+        printWarning(
+            "\nThese tools differ from the copies on the host: "
+            + ", ".join(sorted(stale)))
+        printWarning("  You are probably running an older version in here.  "
+                     "On the HOST, run:")
+        printWarning("      lfs build-system sync-tools --run")
+        printWarning("      lfs build-system install-tools --run --force\n")
+
+
 def main():
     ap = argparse.ArgumentParser(prog="packagemanager",
                                  description="pkgusr-model package manager")
     ap.add_argument("-V", "--version", action="version",
-                    version=f"packagemanager {TOOL_VERSION} (plan cache v{PLAN_VERSION})")
+                    version=f"packagemanager {TOOL_VERSION} (build {_build_id()}, "
+                            f"plan cache v{PLAN_VERSION})")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="show the system commands being run and their output")
-    sub = ap.add_subparsers(dest="command", required=True)
+    ap.epilog = PM_HELP_EPILOG
+    ap.formatter_class = argparse.RawDescriptionHelpFormatter
+    sub = ap.add_subparsers(dest="command", required=True, metavar="<command>")
 
     # ---- info (implemented) ----
     p = sub.add_parser("verify", help="recheck install state of all/named "
@@ -3911,6 +5126,19 @@ def main():
                    help="wait for it instead of running as a disowned task")
     p.set_defaults(func=cmd_reload_pkg_list)
 
+    p = sub.add_parser("pip", help="install or update a Python module as a "
+                       "package user (not as root)")
+    p.add_argument("action", choices=["install", "update", "upgrade"],
+                   help="install or update")
+    p.add_argument("modules", nargs="*", help="module names, e.g. beautifulsoup4")
+    p.add_argument("--find-links", metavar="DIR",
+                   help="install from local wheels in DIR instead of the network "
+                        "(there is no network inside the chroot)")
+    p.set_defaults(func=lambda a: cmd_pip(
+        argparse.Namespace(modules=a.modules,
+                           upgrade=(a.action in ("update", "upgrade")),
+                           find_links=a.find_links)))
+
     p = sub.add_parser("add-user",
                        help="create a PACKAGE user (installs files; home /usr/src/<n>)")
     p.add_argument("packages", nargs="+")
@@ -3955,6 +5183,8 @@ def main():
                    "(default: $EDITOR or vim)")
     p.add_argument("--difftool", help="diff tool for 'migrate-scripts --vimdiff' "
                    "(default: vimdiff)")
+    p.add_argument("--show", action="store_true",
+                   help="just print the settings; do not ask for missing ones")
     p.set_defaults(func=cmd_config)
 
     p = sub.add_parser("blfs", help="run the blfs book tool "
@@ -3970,9 +5200,19 @@ def main():
     q = usub.add_parser("list", help="list shared users and their groups")
     q.add_argument("filter", nargs="?")
     q.set_defaults(func=cmd_user_list)
-    q = usub.add_parser("create", help="create an shared user (u_<name>)")
+    q = usub.add_parser("create",
+                        help="create an application user (u_<name>) and make "
+                             "it reachable from your own account",
+                        description=_APPLICATION_USER_HELP,
+                        formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("name")
     q.add_argument("--groups", help="also add these groups, e.g. audio,video")
+    q.add_argument("--shared", action="store_true",
+                   help="a directory both accounts can write, linked into "
+                        "your home")
+    q.add_argument("--launcher", action="store_true",
+                   help="a wrapper in ~/bin that runs the program as this user")
+    q.add_argument("--app", help="program the launcher runs (default: <name>)")
     q.set_defaults(func=cmd_user_create)
     q = usub.add_parser("delete", help="delete an shared user + group + home")
     q.add_argument("name")
@@ -4127,6 +5367,11 @@ def main():
     p.set_defaults(func=cmd_files_with_broken_id)
 
     args = ap.parse_args()
+    restore_wget_verification()
+    _hint_generate_ca_bundle()
+    ensure_wget_workaround()
+    _warn_init_mismatch()
+    warn_if_tools_are_stale()
     _STATE["verbose"] = getattr(args, "verbose", False)
     # first run: ask for the group-name prefixes (once), unless we're already
     # running the config command or there's no terminal to prompt at.
