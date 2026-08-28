@@ -4,7 +4,7 @@ Build and maintain an LFS/BLFS system where **every package is owned by its own
 user**.
 
 > **100% vibecode, but tested.** Prompted into existence rather than hand
-> written. 387 regression tests pass. It builds my own system — read it before
+> written. 568 regression tests. It builds my own system — read it before
 > you point it at yours.
 
 ---
@@ -106,6 +106,22 @@ once for your own account; every shared user then joins whatever is there.
 
 ---
 
+## When ownership starts
+
+Book 7.6 creates `/etc/passwd`. Before that no name resolves, so ownership has
+no meaning and nothing tries to set it.
+
+`init-ownership` is a step in the build, right after `init-files` (book 7.6).
+It creates the install group, sets the install directories, gives package users
+to everything already built, and adopts it. From there on every install is owned
+by the package that made it.
+
+```sh
+lfs-helper establish-ownership      # by hand, or to check whether it happened
+```
+
+---
+
 ## Repair
 
 Everything is dry-run by default. `--run` applies.
@@ -121,6 +137,45 @@ Everything is dry-run by default. `--run` applies.
 
 ---
 
+## Names and places
+
+Three kinds of account share one passwd file, so each carries a prefix.
+Without one a package called `man` or `news` collides with a real account.
+
+**One account, one prefix — its own.**
+
+| Thing | Looks like | Lives in |
+|---|---|---|
+| package user | `p_gcc` | `/usr/src/pkgusr/p_gcc` |
+| config-step user | `cfg_bootscripts` | `/usr/src/cfg/cfg_bootscripts` |
+| application user | `u_firefox` | `/usr/src/u_firefox` |
+
+There is no `tmp_` and no `init_`. A temporary step is the same package
+chapter 8 rebuilds, so it is built as that package's user. An init step owns no
+files and gets no account.
+
+Prefixes and locations are set once, in `lfs build-system session`.
+
+Sources, build trees and state are three different things:
+
+| Directory | Job |
+|---|---|
+| `$LFS/sources` | downloaded tarballs, never written by a build |
+| `<package home>/src` | where that package unpacks and builds, owned by its user |
+| `$LFS/build` | scratch for steps with no account. Deleted whole |
+
+Everything the build knows about the tree lives in `/usr/src/lfs-pkgusr`,
+beside the accounts it describes:
+
+| | |
+|---|---|
+| `scripts/` | one shell script per build step |
+| `manifests/` | what each package installed |
+| `logs/` | one log per step, plus `verify.log` |
+| `progress/` | what has been built, and how far |
+| `groups/` | collector groups |
+| `config/` | settings you may edit |
+
 ## Conventions
 
 | Range | Used for |
@@ -133,6 +188,10 @@ Everything is dry-run by default. `--run` applies.
 Install directories are group-writable during the build and become sticky
 (`o+t`) at the end, so packages can no longer overwrite each other.
 
+The account roots are **not** install directories. Only root creates a home
+there, so they stay `root:root 0755` — group-writable with no sticky bit would
+let any package user delete another package's home.
+
 ---
 
 ## Checking your version
@@ -140,7 +199,7 @@ Install directories are group-writable during the build and become sticky
 The tools print a fingerprint of their own contents:
 
 ```sh
-lfs --version              # lfs 1.7.0 (build d64e55c)
+lfs --version              # lfs 1.7.1 (build 4f5f344)
 lfs-helper --version       # inside the chroot
 ```
 
@@ -155,8 +214,11 @@ enter it.
 bash test_lfs_crosschain.sh ./lfs
 ```
 
-387 tests. Each encodes a bug that actually happened, with a comment explaining
+568 tests. Each encodes a bug that actually happened, with a comment explaining
 what broke.
+
+Run it from a directory holding all five scripts — about 100 tests skip
+without them.
 
 ---
 

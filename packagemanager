@@ -75,7 +75,31 @@ except ImportError:       # non-unix: degrade gracefully
 
 # /usr/src holds one directory (== home) per package-user.  Overridable so the
 # tool can be exercised against a fixture tree in testing.
-BASE_DIR = os.environ.get("PKGUSR_BASE", "/usr/src")
+# Where package users live.  Config wins over the built-in default, so a
+# system built with a different layout keeps it; the environment still wins
+# over both, for tests and one-off runs.
+def _base_dir_default():
+    # CONFIG_PATH is defined further down, so read the path the same way it
+    # does rather than depending on definition order.
+    path = os.environ.get("PKGUSR_CONFIG") or "/etc/pkgusr/packagemanager.conf"
+    try:
+        with open(path) as f:
+            for line in f:
+                k, _, v = line.partition("=")
+                if k.strip() == "pkgusr_home" and v.strip():
+                    return v.strip()
+    except OSError:
+        pass
+    return "/usr/src"
+
+
+BASE_DIR = os.environ.get("PKGUSR_BASE") or _base_dir_default()
+
+
+def appuser_home():
+    """Where application users live -- separate from package users, because
+    they are accounts a person uses rather than build trees."""
+    return load_config().get("appuser_home") or BASE_DIR
 INSTALL_SCRIPTS_DIR = os.environ.get("PKGUSR_INSTALL_SCRIPTS", "/etc/pkgusr/install_scripts")
 TMP_DIR = "/tmp/packagemanager"
 
@@ -85,7 +109,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.7.0"
+TOOL_VERSION = "1.10.1"
 
 
 def _build_id():
@@ -105,6 +129,7 @@ def _build_id():
 
 PLAN_VERSION = 1
 _DEFAULT_CONFIG = {"collector_prefix": "sysgroup", "user_prefix": "u",
+                   "pkgusr_prefix": "p", "cfguser_prefix": "cfg",
                    "main_user": ""}
 _config = None
 
@@ -189,6 +214,138 @@ def user_prefix():
     return load_config()["user_prefix"].rstrip("_") + "_"
 
 
+def pkgusr_prefix():
+    """Prefix on PACKAGE users: `p_` gives p_gcc, p_zlib.
+
+    Three kinds of account share one passwd file and one namespace, and
+    without prefixes they are indistinguishable from each other and from the
+    system's own accounts -- a package called `man` or `news` collides with a
+    real one.  `p_` for packages, `u_` for application users, `<collector>_`
+    for the shared-directory groups.
+
+    An explicitly EMPTY value means "no prefix", which is how a tree built
+    before prefixes keeps working; it is not the same as unset.
+    """
+    v = load_config().get("pkgusr_prefix", _DEFAULT_CONFIG["pkgusr_prefix"])
+    v = (v or "").rstrip("_")
+    return (v + "_") if v else ""
+
+
+def cfguser_prefix():
+    """Prefix on CONFIG-STEP users: `cfg_` gives cfg_bootscripts.
+
+    A config step used to be `p_cfg_bootscripts` -- the package prefix stacked
+    on top of the step name's own `cfg_`.  Two prefixes on one account means
+    neither one identifies it: `p_` said "package" while the account lived in
+    the config root.  One account, one prefix.
+    """
+    v = load_config().get("cfguser_prefix", _DEFAULT_CONFIG["cfguser_prefix"])
+    v = (v or "").rstrip("_")
+    return (v + "_") if v else ""
+
+
+def pkgusr_kind(name):
+    """What KIND of account is this -- 'pkg', 'cfg' or 'app'?
+
+    The one place that decides.  pkgusr_name and pkgusr_root both answer from
+    it, so a name cannot be given one kind's prefix and placed in another
+    kind's root -- which is exactly what produced `p_cfg_bootscripts` under
+    /usr/src/cfg.
+
+    Takes a bare name (`gcc`, `cfg_bootscripts`), an account name (`p_gcc`),
+    or a legacy stacked name (`p_cfg_bootscripts`).
+    """
+    n = name or ""
+    ppfx = pkgusr_prefix()
+    if ppfx and n.startswith(ppfx):
+        n = n[len(ppfx):]
+    upfx = user_prefix()
+    if upfx and n.startswith(upfx):
+        return "app"
+    cpfx = cfguser_prefix()
+    if cpfx and n.startswith(cpfx):
+        return "cfg"
+    return "pkg"
+
+
+def pkgusr_name(name):
+    """Package name -> account name, with the prefix ITS KIND carries.
+
+    IDEMPOTENT, and that is the whole point: this is called on names typed by
+    a person (`gcc`), on directory names read back from disk (`p_gcc`), and on
+    values that already went through it.  A second pass must not give p_p_gcc.
+    Because it is idempotent, every caller can apply it without first knowing
+    which kind of name it is holding.
+
+    A legacy stacked name is repaired on the way through: the package prefix is
+    stripped before the kind's own prefix is applied, so `p_cfg_bootscripts`
+    comes back as `cfg_bootscripts`.
+    """
+    if not name:
+        return name
+    kind = pkgusr_kind(name)
+    # an application user or a collector group is not a package and is never
+    # renamed here
+    if kind == "app" or name.startswith(collector_prefix()):
+        return name
+    pfx = cfguser_prefix() if kind == "cfg" else pkgusr_prefix()
+    n = name
+    ppfx = pkgusr_prefix()
+    if ppfx and n.startswith(ppfx):
+        n = n[len(ppfx):]
+    if not pfx or n.startswith(pfx):
+        return n
+    return pfx + n
+
+
+def unprefix_pkgusr(name):
+    """Package-user name -> package name, for display."""
+    pfx = pkgusr_prefix()
+    if pfx and name.startswith(pfx):
+        return name[len(pfx):]
+    return name
+
+
+# Accounts live in subdirectories of BASE_DIR by kind, so `ls /usr/src` says
+# what a thing IS rather than listing a hundred packages and a few config
+# steps as one flat set:
+#
+#     /usr/src/pkgusr/p_gcc            a package
+#     /usr/src/cfg/cfg_bootscripts     a config step that installs files
+#     /usr/src/u_firefox               an application user
+PKGUSR_SUBDIR = os.environ.get("PKGUSR_SUBDIR", "pkgusr")
+CFGUSR_SUBDIR = os.environ.get("CFGUSR_SUBDIR", "cfg")
+
+
+def pkgusr_root(name):
+    """Which root an account belongs under.  Takes any kind of name.
+
+    Answers from pkgusr_kind, the same function pkgusr_name uses, so the
+    prefix an account is given and the root it is placed in cannot disagree.
+    """
+    kind = pkgusr_kind(name)
+    if kind == "app":
+        return BASE_DIR
+    sub = CFGUSR_SUBDIR if kind == "cfg" else PKGUSR_SUBDIR
+    return os.path.join(BASE_DIR, sub) if sub else BASE_DIR
+
+
+def pkgusr_roots():
+    """Every account root, for the passes that walk all of them."""
+    seen, out = set(), []
+    for sub in (PKGUSR_SUBDIR, CFGUSR_SUBDIR):
+        d = os.path.join(BASE_DIR, sub) if sub else BASE_DIR
+        if d not in seen:
+            seen.add(d)
+            out.append(d)
+    return out
+
+
+def pkgusr_home(name):
+    """Where a package user lives.  Takes either kind of name."""
+    return os.path.join(pkgusr_root(name), pkgusr_name(name))
+
+
 def main_user():
     return load_config().get("main_user", "").strip()
 
@@ -255,12 +412,28 @@ def ask_yes_no(question):
 
 def list_all_users():
     """Every package-user, i.e. every directory directly under BASE_DIR."""
-    try:
-        return sorted(d for d in os.listdir(BASE_DIR)
-                      if os.path.isdir(os.path.join(BASE_DIR, d)))
-    except FileNotFoundError:
-        printError(f"{BASE_DIR} does not exist.")
+    # Directory names ARE user names, so they carry the prefix.  Hand back
+    # package names: everything user-facing speaks in package names, and
+    # pkgusr_name() puts the prefix back wherever it is needed.
+    #
+    # A root that does not exist is normal -- a system with no config-step
+    # packages has no cfg/ directory.  ALL of them missing is not, and must
+    # still be reported: swallowing it turns "nothing is installed here" into
+    # a silent empty list, which reads as "no packages".
+    out, found = [], False
+    for root in pkgusr_roots():
+        try:
+            names = os.listdir(root)
+        except OSError:
+            continue
+        found = True
+        out += [unprefix_pkgusr(d) for d in names
+                if os.path.isdir(os.path.join(root, d))]
+    if not found:
+        printError(f"{BASE_DIR} does not exist (looked in "
+                   f"{', '.join(pkgusr_roots())}).")
         return []
+    return sorted(set(out))
 
 
 # --------------------------------------------------------------------------- #
@@ -541,7 +714,7 @@ def gather_user(name):
             u.name, u.uid, u.gid = pw.pw_name, str(pw.pw_uid), str(pw.pw_gid)
         except KeyError:
             pass
-    home = os.path.join(BASE_DIR, name)
+    home = pkgusr_home(name)
     if os.path.isdir(home):
         u.home = home
     pkg_lst = os.path.join(home, "pkg.lst")
@@ -667,7 +840,7 @@ def _warn_if_wrong_file_edited(user, chosen):
     Editing the second is an easy mistake, and the symptom is silent: the
     install runs the unedited script and fails in exactly the same way as
     before, so it looks as though the edit was thrown away."""
-    runtime = os.path.join(BASE_DIR, user, f"install_{user}")
+    runtime = os.path.join(pkgusr_home(user), f"install_{user}")
     if not os.path.isfile(runtime):
         return
     try:
@@ -693,7 +866,7 @@ def resolve_script(user, name_version, script_dir, assume_yes=False,
     we say so.  'install_last' (a read-only record) and 'install_<user>' (the
     engine's runtime copy) are never treated as sources.  --regenerate forces a
     fresh build from the book."""
-    local = os.path.join(BASE_DIR, user, f"install_{name_version}")
+    local = os.path.join(pkgusr_home(user), f"install_{name_version}")
     if (not force_regen and os.path.isfile(local)
             and _script_name_version(local) == name_version):
         printInfo(f"  using LOCAL script (your edits, not the book): {local}")
@@ -810,7 +983,7 @@ def assess(u, expected=None, run_cmd=True):
     # 1) strongest signal: a validate command that prints the installed version.
     #    A per-package 'validate' file in the home persists across versions and
     #    wins over any validate_cmd inside the (regenerated) install script.
-    vfile = os.path.join(u.home or os.path.join(BASE_DIR, u.name or u.search),
+    vfile = os.path.join(u.home or pkgusr_home(u.name or u.search),
                          "validate")
     vcmd = None
     if os.path.isfile(vfile):
@@ -876,7 +1049,7 @@ def cmd_verify(args):
             printError("verify --set-validate-command needs a package name.")
             return
         for name in args.packages:
-            home = os.path.join(BASE_DIR, name)
+            home = pkgusr_home(name)
             if not os.path.isdir(home):
                 printError(f"{name}: no /usr/src/{name} -- add-user it first.")
                 continue
@@ -1000,6 +1173,13 @@ def _cmd_path(name):
 
 PKGUSR_ETC = os.environ.get("PKGUSR_ETC", "/etc/pkgusr")
 
+# The command wrappers, at the ONE location lfs-helper writes them to.
+#
+# This used to be spelled out inside the profile heredoc below while lfs-helper
+# wrote its wrappers somewhere else entirely, so a package user's PATH led with
+# a directory that did not exist.  Same name, same variable, both tools.
+WRAPPERS = os.environ.get("LFS_WRAPPERS", "/usr/lib/pkgusr")
+
 # The shared environment every package user gets, as the package-users hint
 # describes it: .bash_profile and .bashrc are SYMLINKS into a central directory
 # so all package users share one environment, and `build` is the helper each
@@ -1016,7 +1196,7 @@ export LC_ALL=POSIX
 # /usr/local/bin comes FIRST after the wrappers: locally installed
 # overrides belong ahead of /usr/bin, and a temporary wrapper there
 # (the no-verify wget, say) is useless if nothing ever finds it.
-PATH=/usr/lib/pkgusr:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
+PATH=@WRAPPERS@:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin
 export PATH
 
 # a short prompt that makes it obvious which package user you are
@@ -1094,7 +1274,10 @@ def ensure_pkgusr_etc(verbose=True):
         printError(f"cannot create {PKGUSR_ETC}: {e}")
         return False
     for fname, content, mode in (
-            ("bash_profile", _PKGUSR_BASH_PROFILE, 0o644),
+            # @WRAPPERS@ substituted here, not written into the template:
+            # the template is a plain string so $HOME and \\u reach the file
+            # untouched, and the wrapper path is the one value that is ours.
+            ("bash_profile", _PKGUSR_BASH_PROFILE.replace("@WRAPPERS@", WRAPPERS), 0o644),
             ("bashrc",       _PKGUSR_BASHRC,       0o644),
             ("build",        _PKGUSR_BUILD,        0o755)):
         path = os.path.join(PKGUSR_ETC, fname)
@@ -1111,12 +1294,13 @@ def ensure_pkgusr_etc(verbose=True):
 
 
 def init_package_user_home(name, home=None, verbose=True):
+    name = pkgusr_name(name)   # the home belongs to the ACCOUNT, not the package
     """Give a package user the environment the scheme expects.
 
     Without this the account exists but has no .bash_profile, no .bashrc and no
     build helper -- `su - <pkg>` lands in a bare shell with the wrong umask and
     no PATH to the wrapper commands."""
-    home = home or os.path.join(BASE_DIR, name)
+    home = home or pkgusr_home(name)
     if not ensure_pkgusr_etc(verbose=verbose):
         return False
     try:
@@ -1164,9 +1348,13 @@ def create_package_user(name, home=None):
     installed as a package user at all.  Shadow's own tools do the same job:
     one user, a private group of the same name, plus the supplementary
     'install' group."""
+    # Callers hand us a PACKAGE name ("gcc"); the account is p_gcc.  Normalise
+    # once here rather than at each call site -- pkgusr_name is idempotent, so
+    # a caller that already prefixed is unaffected.
+    name = pkgusr_name(name)
     if _user_exists(name):
         return True
-    home = home or os.path.join(BASE_DIR, name)
+    home = home or pkgusr_home(name)
 
     if _have_cmd(find_add_package_user()[0]):
         cmd = find_add_package_user() + [name, name, "10000", "20000",
@@ -1233,7 +1421,7 @@ def cmd_nimgnu_list(args):
     printHeader("collector groups")
     print()
     for name, gid, members in rows:
-        manifest = os.path.join(BASE_DIR, name, "pkg.lst")
+        manifest = os.path.join(pkgusr_home(name), "pkg.lst")
         entries = pkglist_entries(manifest)
         owns = f"  owns {len(entries)} dirs/files" if os.path.isfile(manifest) else ""
         print(f"  {name:<26} gid {gid:<8} members: "
@@ -1402,7 +1590,7 @@ def _resolve_group_arg(value):
 def write_group_manifest(group, background=True):
     """Write /usr/src/<group>/pkg.lst = everything owned by that group, via
     forall_direntries_from (run as root so the whole tree is scanned)."""
-    home = os.path.join(BASE_DIR, group)
+    home = pkgusr_home(group)
     if not os.path.isdir(home):
         return False
     forall = " ".join(shlex.quote(x) for x in find_forall())
@@ -1647,7 +1835,7 @@ def warn_if_nothing_installed(name):
     useful -- but any build whose install step is a no-op leaves a package user
     owning nothing, and the problem only surfaces later when something tries to
     use it."""
-    pkglist = os.path.join(BASE_DIR, name, "pkg.lst")
+    pkglist = os.path.join(pkgusr_home(name), "pkg.lst")
     n = 0
     if os.path.isfile(pkglist):
         try:
@@ -2103,10 +2291,11 @@ def install_local(name, path, run, yes, verb="install", test=False, clean=False)
         printInfo("\nDry run -- to proceed, re-run with --run, or execute:\n"
                   f"  packagemanager_install {name} {path}")
         return
-    if not _user_exists(name) and (yes or ask_yes_no(
-            f"\nPackage-user {name} doesn't exist -- create it first?")):
-        _run(find_add_package_user() + [name, name, "10000", "20000",
-                                        name, "10000", "20000"])
+    _acct = pkgusr_name(name)
+    if not _user_exists(_acct) and (yes or ask_yes_no(
+            f"\nPackage-user {_acct} doesn't exist -- create it first?")):
+        _run(find_add_package_user() + [_acct, _acct, "10000", "20000",
+                                        _acct, "10000", "20000"])
     if not yes and not ask_yes_no(f"Build and {verb} {name} now?"):
         printWarning("Aborted.")
         return
@@ -2248,7 +2437,7 @@ def cmd_install(args):
     clear_status()
     printSuccess(f"Done -- {total} package(s) installed.")
     printInfo(f"  results: packagemanager errors     logs: "
-              f"{os.path.join(BASE_DIR, '<pkg>', 'log')}")
+              f"{os.path.join(BASE_DIR, pkgusr_name('<pkg>'), 'log')}")
 
 
 # =========================================================================== #
@@ -2267,7 +2456,7 @@ _PROTECTED_PREFIXES = ("/etc/", "/var/", "/boot/", "/home/", "/root/", "/srv/",
 
 
 def _pkglist_paths(user):
-    pl = os.path.join(BASE_DIR, user, "pkg.lst")
+    pl = os.path.join(pkgusr_home(user), "pkg.lst")
     return {p for p in pkglist_entries(pl) if p.startswith("/")}
 
 
@@ -2327,7 +2516,7 @@ def _is_git_package(name):
     """A package whose install script builds from a git repo (is_git=1, or it
     clones/pulls) rather than a book tarball."""
     p = (_canonical_script_path(name)
-         or os.path.join(BASE_DIR, name, f"install_{name}"))
+         or os.path.join(pkgusr_home(name), f"install_{name}"))
     if not p or not os.path.isfile(p):
         return False
     try:
@@ -2359,7 +2548,7 @@ def cmd_update(args):
             and any(_is_git_package(p) for p in args.packages):
         for name in args.packages:
             script = _canonical_script_path(name) \
-                or os.path.join(BASE_DIR, name, f"install_{name}")
+                or os.path.join(pkgusr_home(name), f"install_{name}")
             if not _is_git_package(name):
                 printWarning(f"{name}: not a git package and not in the book -- "
                              f"skipping (check the name, or use --local).")
@@ -2614,7 +2803,7 @@ def cmd_update(args):
     printSuccess(f"Done -- {total} package(s) updated"
                  + (f", {errors} error(s)." if errors else "."))
     printInfo(f"  results: packagemanager errors     logs: "
-              f"{os.path.join(BASE_DIR, '<pkg>', 'log')}")
+              f"{os.path.join(BASE_DIR, pkgusr_name('<pkg>'), 'log')}")
 # =========================================================================== #
 # command: remove                                                 [IMPLEMENTED]
 # =========================================================================== #
@@ -2761,7 +2950,7 @@ def clear_status():
 
 
 def _pkg_log_dir(user):
-    return os.path.join(BASE_DIR, user, "log")
+    return os.path.join(pkgusr_home(user), "log")
 
 
 def _maybe_remove_old_sources(user, keep_name_version, keep_sources=False):
@@ -2770,7 +2959,7 @@ def _maybe_remove_old_sources(user, keep_name_version, keep_sources=False):
     Removes automatically; pass keep_sources=True to skip."""
     if keep_sources:
         return
-    home = os.path.join(BASE_DIR, user)
+    home = pkgusr_home(user)
     keep = keep_name_version
     victims = []
     try:
@@ -2988,7 +3177,7 @@ def _run(cmd, show_output=False):
 
 def remove_one(name, args):
     u = gather_user(name)
-    home = os.path.join(BASE_DIR, name)
+    home = pkgusr_home(name)
     has_home = os.path.isdir(home)
     if not u.has_user and not has_home:
         printWarning(f"{name}: nothing to remove (no user, no home).")
@@ -3112,7 +3301,7 @@ def write_pkg_list(user, background=True):
     """Regenerate /usr/src/<user>/pkg.lst.  Runs list_package AS the package
     user (su -) when possible, so it only scans directories that user owns --
     much faster than scanning the whole filesystem as root."""
-    home = os.path.join(BASE_DIR, user)
+    home = pkgusr_home(user)
     if not os.path.isdir(home):
         printError(f"{user}: no package home at {home}")
         return False
@@ -3335,7 +3524,7 @@ def cmd_script(args):
     fixing permissions (no recompile)."""
     name = args.package
     phase = args.phase
-    home = os.path.join(BASE_DIR, name)
+    home = pkgusr_home(name)
     if not _user_exists(name):
         printError(f"{name}: no such package user.")
         return
@@ -3729,7 +3918,7 @@ def _link_xdg_profile(main, u):
             printWarning(f"  could not write {XDG_SKEL}: {e}")
             return
 
-    home = os.path.join(BASE_DIR, u)
+    home = pkgusr_home(u)
     target = os.path.join(home, ".bash_profile")
     if os.path.islink(target) and os.path.realpath(target) == \
             os.path.realpath(XDG_SKEL):
@@ -3756,7 +3945,7 @@ def _setup_application_user(u, args):
       * an optional shared directory both accounts can write
       * an optional launcher in ~/bin so the program runs as that user
     """
-    home = os.path.join(BASE_DIR, u)
+    home = os.path.join(appuser_home(), u)
     main = main_user()
     if not main:
         printWarning("\nNo main user is set, so this account cannot be reached "
@@ -3960,7 +4149,7 @@ def cmd_user_disallow(args):
 
 def cmd_user_delete(args):
     u = _user_prefixed(args.name)
-    home = os.path.join(BASE_DIR, u)
+    home = pkgusr_home(u)
     has_home = os.path.isdir(home)
     if not _user_exists(u) and not has_home:
         printInfo(f"{u}: does not exist.")
@@ -4257,7 +4446,7 @@ def _canonical_script_path(name):
     the file for the currently-installed version; otherwise the versioned file
     whose name matches its own name_version (not the runtime 'install_<user>'
     copy or 'install_last')."""
-    home = os.path.join(BASE_DIR, name)
+    home = pkgusr_home(name)
     if not os.path.isdir(home):
         return None
     u = gather_user(name)
@@ -4429,7 +4618,7 @@ def cmd_regenerate_script(args):
     os.makedirs(script_dir, exist_ok=True)
     written, skipped, failed = 0, 0, 0
     for name in sorted(set(args.packages)):
-        home = os.path.join(BASE_DIR, name)
+        home = pkgusr_home(name)
         if not os.path.isdir(home):
             printWarning(f"{name}: no package-user home at {home} -- skipping "
                          f"(create it first with: packagemanager add-user {name}).")
@@ -4513,7 +4702,7 @@ def cmd_migrate_scripts(args):
 
     pristine, edited, already, cannot = [], [], 0, 0
     for name in sorted(set(names)):
-        if not os.path.isdir(os.path.join(BASE_DIR, name)):
+        if not os.path.isdir(pkgusr_home(name)):
             continue
         st, cand, book_path, book_nv = classify_script(name, script_dir)
         if st == "no-script":
@@ -4526,7 +4715,7 @@ def cmd_migrate_scripts(args):
             continue
         # where the migrated script should live: named for the BOOK version, so
         # it's the default script the next update/reinstall picks up.
-        out_path = os.path.join(BASE_DIR, name, f"install_{book_nv}")
+        out_path = os.path.join(pkgusr_home(name), f"install_{book_nv}")
         if st == "outdated":            # book changed, you made no edits -> safe
             pristine.append((name, cand, book_path, book_nv, out_path))
         else:                           # edited / no-baseline -> hand-merge

@@ -45,12 +45,18 @@ _lfs_tool_subcommands() {
 }
 
 _lfs_packages() {
-    # package users own /usr/src/<name>; that is the cheapest list of what is
-    # installed, and it works without invoking python
-    local d
-    for d in /usr/src/*/; do
-        [ -d "$d" ] || continue
-        basename "$d"
+    # Accounts own a directory under /usr/src, grouped by kind, and carry a
+    # prefix (p_gcc).  Completing on the raw directory names would offer
+    # "p_gcc" where every command wants "gcc", so strip it back off.
+    # Still the cheapest list of what is installed, and no python needed.
+    local d n root
+    for root in "${LFS_PKGUSR_ROOT:-/usr/src/pkgusr}" \
+                "${LFS_CFGUSR_ROOT:-/usr/src/cfg}"; do
+        for d in "$root"/*/; do
+            [ -d "$d" ] || continue
+            n="$(basename "$d")"
+            printf '%s\n' "${n#${LFS_PKGUSR_PREFIX-p_}}"
+        done
     done
 }
 

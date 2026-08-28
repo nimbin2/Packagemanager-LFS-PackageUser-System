@@ -10,17 +10,75 @@
 # General Public License <https://www.gnu.org/licenses/> for details.
 #
 #
-# the package_short_name is the name for te created user
+# the package_short_name is the name for the created user
 # packagemanager_install package_short_name path_to_install_file
 #
 
+PACKAGEMANAGER_INSTALL_VERSION="1.10.1"
 
+# A fingerprint of this file's own contents, the same as the other four tools.
+#
+# Without it `lfs-sanity.sh` section 0 -- "host and chroot copies must MATCH" --
+# could not read this one at all, and printed the usage error instead:
+#     packagemanager_install Please provide an install script with $2
+# A tool you cannot ask "which build are you?" is the one that quietly goes
+# stale, and a stale copy in the chroot has cost more debugging time in this
+# project than anything else.
+_pmi_build_id() {
+    local f="${BASH_SOURCE[0]:-$0}"
+    if [ -r "$f" ] && command -v md5sum >/dev/null 2>&1; then
+        md5sum "$f" 2>/dev/null | cut -c1-7
+    else
+        echo unknown
+    fi
+}
+
+case "${1:-}" in
+    --version|-V)
+        echo "packagemanager_install $PACKAGEMANAGER_INSTALL_VERSION (build $(_pmi_build_id))"
+        exit 0 ;;
+    -h|--help)
+        echo "usage: packagemanager_install <package> <install-script>"
+        echo "       packagemanager_install --version"
+        exit 0 ;;
+esac
+
+
+
+
+# Where an account's home is.  Accounts are grouped by kind under /usr/src, so
+# a directory listing says what a thing IS:
+#     /usr/src/pkgusr/p_gcc            a package
+#     /usr/src/cfg/cfg_bootscripts     a config step that installs files
+#
+# Prefixing is IDEMPOTENT, so this can be handed a package name ("gcc") or an
+# account name ("p_gcc") and gives the same answer either way.  Building the
+# path by hand instead is what once made the build cd into
+# /usr/src/pkgusr/man-pages while the account home was p_man-pages.
+PKGUSR_ROOT="${LFS_PKGUSR_ROOT:-/usr/src/pkgusr}"
+CFGUSR_ROOT="${LFS_CFGUSR_ROOT:-/usr/src/cfg}"
+PKGUSR_PREFIX="${LFS_PKGUSR_PREFIX-p_}"
+
+pkgusr_home_for() {
+    local n="$1" bare
+    case "$n" in
+        "") printf '%s' "$PKGUSR_ROOT"; return ;;
+    esac
+    if [ -n "$PKGUSR_PREFIX" ]; then
+        case "$n" in "$PKGUSR_PREFIX"*) ;; *) n="${PKGUSR_PREFIX}${n}" ;; esac
+    fi
+    bare="${n#"$PKGUSR_PREFIX"}"
+    case "$bare" in
+        cfg_*) printf '%s/%s' "$CFGUSR_ROOT" "$n" ;;
+        *)     printf '%s/%s' "$PKGUSR_ROOT" "$n" ;;
+    esac
+}
 
 skel=/etc/pkgusr/skel-package
 user_name=""
 install_script=""
 install_script_basename=""
-install_user_dir="/usr/src/$user_name"
+install_user_dir="$(pkgusr_home_for "$user_name")"
 sourced=false
 date_log="$(date +%Y-%m-%d_%H-%m-%S)"
 home_user="n76310"
@@ -245,7 +303,7 @@ addUserToGroup() {
     fi
     checkIfUserInGroup $change_name $change_group &&
         return
-    echo "$change_group to $change_name" | tee /usr/src/$change_name/log/install_nimgnu_group-$date_log.log
+    echo "$change_group to $change_name" | tee "$(pkgusr_home_for "$change_name")/log/install_nimgnu_group-$date_log.log"
 
     echoBlue "\n\n##########################\n"
     find $change_dir -group $change_name
@@ -397,7 +455,7 @@ EOF
 
 installPkg() {
     user_name="$1"
-    install_user_dir="/usr/src/$user_name"
+    install_user_dir="$(pkgusr_home_for "$user_name")"
     install_dir=/etc/pkgusr/install_scripts
     install_script="$2"
     install_script_basename="$(basename $2)"

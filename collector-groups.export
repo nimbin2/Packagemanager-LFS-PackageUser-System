@@ -1,0 +1,16 @@
+# lfs collector groups -- import with: lfs-helper import-groups <file>
+# prefix|nimgnu
+dir|/usr/lib/bfd-plugins|nimgnu_bfd-plugins
+dir|/usr/lib/perl5/5.42/core_perl|nimgnu_perl
+dir|/usr/lib/perl5/5.42/core_perl/ExtUtils|nimgnu_perl
+dir|/usr/lib/perl5/5.42/site_perl|nimgnu_perl
+dir|/usr/lib/python3.13/site-packages|nimgnu_python
+dir|/usr/lib/cmake|nimgnu_cmake
+dir|/usr/lib/udev/rules.d|nimgnu_udev
+dir|/usr/share/zsh/site-functions|nimgnu_zsh
+group|nimgnu_bfd-plugins|p_binutils,p_gcc
+group|nimgnu_perl|p_perl,p_xml-parser
+group|nimgnu_cmake|p_expat,p_openssl
+group|nimgnu_python|p_python,p_flit-core,p_packaging,p_wheel,p_setuptools,p_meson,p_markupsafe,p_jinja2,urllib3,charset-normalizer,idna,certifi,soupsieve,requests,beautifulsoup4
+group|nimgnu_zsh|p_ninja,p_meson,p_kmod
+group|nimgnu_udev|p_udev,p_e2fsprogs
