@@ -118,7 +118,7 @@ CACHE_VERSION = 4
 # tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
 # of generated install scripts changes (phases, dispatcher, ...), and
 # CACHE_VERSION when the parsed/cached data structure changes.
-BLFS_VERSION = "1.10.1"
+BLFS_VERSION = "1.11.6"
 
 
 def _build_id():

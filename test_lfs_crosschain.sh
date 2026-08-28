@@ -1526,39 +1526,161 @@ fi
 
 # ---- what the built system needs before it can fetch anything --------------- #
 # LFS ships no download tool, so a freshly booted system cannot get the sources
-# for its own next package.  The tarball has to be on disk before the chroot is
-# sealed, and get-sources is the last moment there is still a network.
+# for its own next package.  The tarballs have to be on disk before the chroot
+# is sealed, and get-sources is the last moment there is still a network.
 #
-# Resolved from the BLFS BOOK, not a hardcoded URL: the book already knows where
-# wget comes from and keeps it current, and a second list of links is a second
-# thing to go stale.
+# The LIST belongs to `packagemanager setup`, which is what installs them.  A
+# copy in lfs would be a second thing to go stale -- the first version of this
+# did exactly that, with a `bootstrap_packages` config key in lfs resolving wget
+# separately from the tool that installs it.
 python3 - "$LFS_TOOL" <<'PYBOOT'
-import sys, importlib.machinery as m
-lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+import re, sys
 src = open(sys.argv[1]).read()
 problems = []
-for fn in ("bootstrap_packages", "bootstrap_sources"):
-    if not hasattr(lfs, fn):
-        problems.append("there is no %s" % fn)
-if hasattr(lfs, "bootstrap_packages"):
-    lfs.load_config = lambda: {}
-    if lfs.bootstrap_packages() != ["wget"]:
-        problems.append("wget is not the default bootstrap package")
-    lfs.load_config = lambda: {"bootstrap_packages": ""}
-    if lfs.bootstrap_packages():
-        problems.append("bootstrap packages cannot be turned off")
-    lfs.load_config = lambda: {"bootstrap_packages": "wget curl"}
-    if lfs.bootstrap_packages() != ["wget", "curl"]:
-        problems.append("more than one bootstrap package is not accepted")
-if "blfs" not in src or '"sources"' not in src:
-    problems.append("the URLs are not resolved from the BLFS book")
+if not re.search(r"^def bootstrap_sources\(", src, re.M):
+    problems.append("there is no bootstrap_sources")
+m = re.search(r"^def bootstrap_sources\(.*?(?=\n\ndef )", src, re.S | re.M)
+if m:
+    body = m.group(0)
+    if "packagemanager" not in body or "--sources" not in body:
+        problems.append("lfs does not ask packagemanager what it needs")
+    # lfs must not keep its own copy of the list.  CODE only -- the docstring
+    # explains why the list lives elsewhere, and naming it there is the point.
+    code = "\n".join("" if l.lstrip().startswith("#") else l
+                     for l in body.splitlines())
+    code = "".join(code.split('"""')[::2])
+    if "wget" in code:
+        problems.append("lfs still names the packages itself")
+if "bootstrap_packages" in src.replace("`bootstrap_packages`", ""):
+    problems.append("the old bootstrap_packages config key is still here")
 if problems:
     for p in problems:
         print("  FAIL  %s" % p)
     sys.exit(1)
-print("  PASS  the bootstrap tarball is resolved from the book, not hardcoded")
+print("  PASS  lfs asks packagemanager what the new system needs downloaded")
 PYBOOT
 _count_rc $?
+
+# and packagemanager must answer, without needing a booted system
+pm_src="$(dirname "$LFS_TOOL")/packagemanager"
+if [ -f "$pm_src" ]; then
+  _p=""
+  _out="$(python3 "$pm_src" setup --sources 2>/dev/null)"
+  _n="$(printf '%s\n' "$_out" | grep -c '^https\?://')"
+  [ "${_n:-0}" -ge 7 ] \
+      || _p="$_p;setup --sources listed only $_n urls (expected the wheels at least)"
+  # WHEELS, not sdists: a modern sdist needs its build backend and pip cannot
+  # fetch one with no index -- BackendUnavailable: Cannot import hatchling.build
+  printf '%s\n' "$_out" | grep -q 'requests-.*\.whl' \
+      || _p="$_p;requests is not taken as a wheel"
+  printf '%s\n' "$_out" | grep -q 'beautifulsoup4-.*\.whl' \
+      || _p="$_p;beautifulsoup4 is not taken as a wheel"
+  # and its dependencies, because it installs with --no-deps
+  for _d in urllib3 charset_normalizer idna certifi soupsieve; do
+      printf '%s\n' "$_out" | grep -q "$_d" \
+          || _p="$_p;$_d is missing, and --no-deps will not pull it in"
+  done
+  # wget comes from the BOOK, not a hardcoded URL
+  grep -q '_SETUP_BLFS_PACKAGES' "$pm_src" \
+      || _p="$_p;wget is not resolved from the BLFS book"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "packagemanager setup declares what it needs, wheels and all"
+  fi
+fi
+
+# ---- setup INSTALLS what it declares  (1.11.2) ------------------------------ #
+# `--sources` worked and `--run` said "not implemented".  Everything below is a
+# guarantee the old last_build_step.sh held and dropped when it was removed.
+if [ -f "$pm_src" ]; then
+python3 - "$pm_src" <<'PYSETUP'
+import sys, re, importlib.machinery as m
+src = open(sys.argv[1]).read()
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+problems = []
+
+def body(fn):
+    mm = re.search(r"^def %s\(.*?(?=\n\ndef |\n\n# )" % fn, src, re.S | re.M)
+    return mm.group(0) if mm else ""
+
+# ONE implementation.  `pip` and `setup` want the same thing -- a module
+# installed as its own package user -- and a second copy of it is how the two
+# would drift apart, which is the species of bug this project keeps having.
+if not re.search(r"^def pip_install_module\(", src, re.M):
+    problems.append("there is no shared pip_install_module")
+if "pip_install_module" not in body("cmd_pip"):
+    problems.append("cmd_pip does not use the shared implementation")
+if "pip_install_module" not in body("cmd_setup"):
+    problems.append("setup does not use the shared implementation")
+
+# THE ACCOUNT NAME IS ASKED FOR, NEVER ASSEMBLED.
+# create_package_user normalises internally, so an unprefixed name creates
+# `p_requests` and then hands `requests` to usermod and su:
+#     usermod: user 'requests' does not exist
+# Same species as `chown: invalid user: 'wget:wget'` at step 104 of 105.
+b = body("pip_install_module")
+if not re.search(r"pkgusr_name\(\s*_sanitise_user_name", b):
+    problems.append("the pip account name skips the naming chokepoint")
+
+# offline, and in order.  pip cannot reach an index on a fresh system: no CA
+# certificates, so a lookup is a hang rather than an error.
+sb = body("cmd_setup")
+if "no_deps=True" not in sb:
+    problems.append("setup lets pip resolve dependencies it cannot fetch")
+if "find_links" not in sb:
+    problems.append("setup does not install from the local wheels")
+if "--no-index" not in b:
+    problems.append("pip is still allowed to reach for an index")
+
+# wget comes from the ordinary install path, not a private copy of it
+if "install" not in sb or "wget" not in sb:
+    problems.append("setup no longer installs wget")
+if re.search(r"^def _setup_install_wget\(", src, re.M):
+    wb = body("_setup_install_wget")
+    if '"install"' not in wb:
+        problems.append("wget is installed by some path other than `install`")
+
+# IDEMPOTENT.  The old final step ran exactly once, at the end of a six-hour
+# build; this one has to be safe to run again after fixing whatever failed.
+if "dist-info" not in src:
+    problems.append("setup cannot tell what is already installed")
+d, v, fn = pm._wheel_dist(
+    "https://x/packages/py3/c/charset_normalizer/charset_normalizer-3.4.0-py3-none-any.whl")
+if (d, v) != ("charset_normalizer", "3.4.0"):
+    problems.append("the wheel filename is parsed as %r %r" % (d, v))
+if fn != "charset_normalizer-3.4.0-py3-none-any.whl":
+    problems.append("the wheel filename is not recovered from the url")
+
+if problems:
+    for x in problems:
+        print("  FAIL  %s" % x)
+    sys.exit(1)
+print("  PASS  setup installs wget and the wheels, offline, as package users")
+PYSETUP
+_count_rc $?
+
+# It must REFUSE rather than half-run when the wheels were never downloaded.
+# There is no network on a fresh system, so "try it and see" is a hang.
+_sbx="$T/setup-empty"; mkdir -p "$_sbx"
+_o="$(LFS_SOURCES_DIR="$_sbx" python3 "$pm_src" setup --run --yes 2>&1)"; _rc=$?
+_p=""
+[ "$_rc" -ne 0 ] || _p="$_p;setup --run succeeded with no wheels on disk"
+printf '%s\n' "$_o" | grep -q 'get-sources' \
+    || _p="$_p;it does not say where the wheels were supposed to come from"
+printf '%s\n' "$_o" | grep -q 'requests-.*\.whl' \
+    || _p="$_p;it does not name the files it could not find"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "setup stops when the wheels are missing, and says which"
+fi
+fi
+
 
 
 # the dry run must print EVERY url, not a sample
@@ -3552,6 +3674,255 @@ PY60
         ok "the shared rules are consulted before the local copy"
     else
         bad "the local copy runs even when lfs-helper is available"
+    fi
+
+    # ---- one set of wrappers, not two  (1.11.3) ------------------------------ #
+    # The wrappers ARE the rule about what a package user may do: chown skipped,
+    # chgrp skipped, `install -d` on an existing directory allowed to succeed.
+    # lfs-helper writes them to /usr/lib/pkgusr, where they outlive the build and
+    # where the package-user profile already points.  This script wrote its own
+    # 480-line copy into a fresh /tmp directory on EVERY run: a second answer to
+    # the same question, and the profile pointed at neither of them.
+    _p=""
+    grep -q '^_wrapper_dir_from_lfs_helper()' "$pmi" \
+        || _p="$_p;there is no way to ask lfs-helper for the wrappers"
+    grep -q 'lfs-helper wrapper-dir' "$pmi" \
+        || _p="$_p;the wrapper directory is assumed rather than asked for"
+    # every call site must go through the resolver first
+    _n_ask="$(grep -c '_wrapper_dir_from_lfs_helper' "$pmi")"
+    _n_own="$(grep -c '_make_build_wrappers "\$_wrapdir"' "$pmi")"
+    [ "${_n_ask:-0}" -gt "${_n_own:-0}" ] \
+        || _p="$_p;a call site still builds its own wrappers without asking"
+    # and the SHARED directory must never be deleted afterwards -- that would
+    # take the wrappers away from every package user on the system
+    grep -q '_wraptmp' "$pmi" \
+        || _p="$_p;the cleanup does not distinguish the shared dir from a temporary one"
+    if grep -q 'rm -rf "$_wrapdir"' "$pmi" && ! grep -q '_wraptmp.*=.*1.*rm -rf "$_wrapdir"' "$pmi"; then
+        _p="$_p;the wrapper directory is removed unconditionally"
+    fi
+    if [ -n "$_p" ]; then
+        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+            [ -n "$m" ] && bad "$m"
+        done
+    else
+        ok "both tools use one set of wrappers, and only a temporary one is deleted"
+    fi
+
+    # the account home is asked for, not re-derived from the layout
+    _hf="$(sed -n '/^pkgusr_home_for() {/,/^}/p' "$pmi")"
+    case "$_hf" in
+        *"lfs-helper pkgusr-home"*) ok "the account home comes from the chokepoint" ;;
+        *) bad "packagemanager_install re-derives where an account lives" ;;
+    esac
+fi
+
+# ---- the kernel and the bootloader are yours  (1.11.6) --------------------- #
+# Both are decisions about the whole MACHINE, and getting either wrong costs
+# the system you are building on.  The build must not do them by default, and
+# must not let you find that out after the reboot.
+_h="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$_h" ]; then
+  _p=""
+  grep -q '_say_what_is_yours_to_finish' "$_h" \
+      || _p="$_p;the build never says the kernel and bootloader are yours"
+  _sf="$(sed -n '/^_say_what_is_yours_to_finish() {/,/^}/p' "$_h")"
+  printf '%s' "$_sf" | grep -qi 'kernel' \
+      || _p="$_p;the closing note does not mention the kernel"
+  printf '%s' "$_sf" | grep -qi 'refind' \
+      || _p="$_p;the closing note does not say how to add a bootloader entry"
+  # it is a note, not an action: nothing in it may write anything
+  printf '%s' "$_sf" | grep -qE '^\s*(cp|mv|rm|dd|mkfs|chmod|chown|install) ' \
+      && _p="$_p;the closing note runs commands instead of printing them"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the build ends by saying the kernel and bootloader are yours"
+  fi
+fi
+
+# and no bootloader is set up unless it was asked for, by name
+python3 - "$LFS_TOOL" <<'PYBL'
+import sys, re, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+# the default must be "none" with NO config at all -- not "none" because some
+# other key happened to be unset
+lfs.load_config = lambda: {}
+if lfs.bootloader() != "none":
+    problems.append("the default bootloader is %r, not 'none'" % lfs.bootloader())
+lfs.load_config = lambda: {"bootloader": ""}
+if lfs.bootloader() != "none":
+    problems.append("an empty bootloader setting does not mean 'none'")
+# and the prompt must say the machine keeps booting as it does now
+src = open(sys.argv[1]).read()
+m2 = re.search(r'\("bootloader",.*?\),\n\s*\("esp"', src, re.S)
+if m2 and "DEFAULT" not in m2.group(0):
+    problems.append("the prompt does not say that doing nothing is the default")
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  no bootloader is touched unless it was asked for by name")
+PYBL
+_count_rc $?
+
+# ---- $LFS may never be the running system  (1.11.5) ------------------------ #
+# Every path this tool writes is $LFS/something.  With $LFS set to the host --
+# a config holding "/", an `export LFS=/` in the wrong shell, a typo in the
+# interview -- `restart --run` deletes the top-level directories of the machine
+# you are sitting on, and _verify_lfs_ownership runs `chown -R lfs /usr`.
+# The chroot bind mounts were guarded; the tree itself was not.
+python3 - "$LFS_TOOL" <<'PYHOST'
+import sys, os, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+
+for fn in ("_is_host_path", "_refuse_host_tree"):
+    if not hasattr(lfs, fn):
+        problems.append("there is no %s" % fn)
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+
+# the host, by every spelling
+for p in ("/", "/usr", "/etc", "/boot", "/var", "/home", "/bin", "/lib"):
+    if not lfs._is_host_path(p):
+        problems.append("%s is not recognised as the running system" % p)
+
+# by another name: a symlink to /
+d = tempfile.mkdtemp()
+link = os.path.join(d, "root-link")
+try:
+    os.symlink("/", link)
+    if not lfs._is_host_path(link):
+        problems.append("a symlink to / is not recognised")
+except OSError:
+    pass
+
+# a path INSIDE a system tree is the system too, however deep
+for p in ("/usr/src/lfs", "/etc/lfs", "/var/tmp/lfs"):
+    if not lfs._is_host_path(p):
+        problems.append("%s is not recognised as part of the system" % p)
+
+# ...and a real build tree must still be allowed, even though it has the same
+# layout.  A check that refuses /mnt/lfs/usr refuses every build there is.
+tree = os.path.join(d, "lfs")
+os.makedirs(os.path.join(tree, "usr"), exist_ok=True)
+os.makedirs(os.path.join(tree, "etc"), exist_ok=True)
+for p in (tree, "/mnt/lfs", "/home/someone/lfs", "/media/disk/lfs"):
+    if lfs._is_host_path(p):
+        problems.append("a legitimate build tree is refused: %s" % p)
+
+# ONE rule, not two: the interview and the hard stop must agree, or a path
+# refused by one is accepted by the other.
+src = open(sys.argv[1]).read()
+import re
+body = re.search(r"def _refuse_host_tree\(lfs\):.*?\n\n\ndef ", src, re.S)
+if body and "_is_host_path" not in body.group(0):
+    problems.append("the hard stop keeps its own copy of the rule")
+if "_is_host_path" not in re.search(r"for k, desc, default in _SESSION_KEYS:.*?\n\n", src, re.S).group(0):
+    problems.append("the interview accepts a mount point the tools will refuse")
+
+# the destructive paths must go through it
+for fn in ("require_lfs_for_root", "_verify_lfs_ownership"):
+    b = re.search(r"def %s\(.*?(?=\n\ndef )" % fn, src, re.S)
+    if b and "_refuse_host_tree" not in b.group(0):
+        problems.append("%s does not check the tree is not the host" % fn)
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  $LFS is refused when it is the running system, by any spelling")
+PYHOST
+_count_rc $?
+
+# ---- an answer that is collected must be acted on, or said  (1.11.4) ------- #
+# `strip` is asked for during the interview and nothing does it.  The prompt
+# says NOT YET IMPLEMENTED, but that was six hours and a whole build ago, and
+# the build otherwise ends as though every answer had been acted on.
+_h="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$_h" ]; then
+  _p=""
+  grep -q '_warn_if_strip_was_asked_for' "$_h" \
+      || _p="$_p;nothing tells you the strip answer was ignored"
+  # it must READ the answer, not assume it
+  _sf="$(sed -n '/^_warn_if_strip_was_asked_for() {/,/^}/p' "$_h")"
+  printf '%s' "$_sf" | grep -q 'LFS_STRIP' \
+      || _p="$_p;the strip notice does not read LFS_STRIP"
+  # and only when it was actually asked for
+  printf '%s' "$_sf" | grep -q 'return 0' \
+      || _p="$_p;the strip notice fires even when nobody asked for it"
+  # said at the END, with the other things you still have to do
+  _i1="$(grep -n '_warn_if_strip_was_asked_for$' "$_h" | tail -1 | cut -d: -f1)"
+  _i2="$(grep -n '^    _warn_if_no_login$' "$_h" | tail -1 | cut -d: -f1)"
+  [ -n "$_i1" ] && [ -n "$_i2" ] \
+      || _p="$_p;the notice is not part of the build's last word"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "a build that ignored your strip answer says so at the end"
+  fi
+fi
+
+# ---- a suppressed failure is a bug waiting to be found  (1.11.4) ----------- #
+# `cmd 2>/dev/null || true` has cost this project more debugging than anything
+# else: a tree came out with every package home root:root 755 and not one line
+# said why.  The pattern is not banned -- mkdir -p on a directory that exists is
+# fine -- but a failure that CHANGES WHAT THE SYSTEM LOOKS LIKE must be said.
+_h="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$_h" ]; then
+  _p=""
+  grep -q '^soft() {' "$_h" || _p="$_p;there is no way to report a non-fatal failure"
+  # the ownership and permission calls are the ones that matter
+  _leak="$(grep -nE '(real_chmod|real_chown|real_chgrp|chown|chgrp) .*2>/dev/null \|\| true' "$_h" \
+           | grep -v 'SUPPRESSED DELIBERATELY' | wc -l)"
+  # ANY comment above is not enough -- the surrounding prose explains what the
+  # call does, not why its failure may be thrown away, and a reintroduced
+  # suppression inherits whatever comment happened to be there.  The line
+  # immediately above must say which of the two cases this is, in those words.
+  _undoc=0
+  while IFS= read -r _ln; do
+      [ -n "$_ln" ] || continue
+      _n="${_ln%%:*}"
+      sed -n "$((_n-1))p" "$_h" \
+          | grep -qE 'SUPPRESSED DELIBERATELY|benign:' || _undoc=$((_undoc+1))
+  done <<< "$(grep -nE '(real_chmod|real_chown|real_chgrp) .*2>/dev/null \|\| true' "$_h")"
+  [ "${_undoc:-0}" = 0 ] \
+      || _p="$_p;$_undoc suppressed ownership call(s) are not marked deliberate or benign"
+  # and the two that are deliberate must say so in those words
+  grep -q 'SUPPRESSED DELIBERATELY' "$_h" \
+      || _p="$_p;the deliberate suppressions are not marked as such"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "every suppressed ownership failure says why it is suppressed"
+  fi
+fi
+
+# lfs-helper must actually offer the doors the other tool now knocks on.
+_h="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$_h" ]; then
+    _p=""
+    for _c in wrapper-dir make-wrappers grant-dir pkgusr-home owner-name; do
+        grep -qE "^    $_c\)" "$_h" \
+            || _p="$_p;lfs-helper has no '$_c' command"
+    done
+    # `case` takes the first match, so a repeated entry is unreachable code
+    # pretending to be a second decision.  Six of them were.
+    _dups="$(sed -n '/^case "${1:-}" in/,/^esac/p' "$_h" \
+             | grep -oE '^    [a-z][a-z0-9|-]*\)' | sort | uniq -d)"
+    [ -z "$_dups" ] || _p="$_p;the dispatch repeats: $(echo $_dups | tr -d ')')"
+    if [ -n "$_p" ]; then
+        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+            [ -n "$m" ] && bad "$m"
+        done
+    else
+        ok "every shared decision is reachable as one lfs-helper command"
     fi
 fi
 
@@ -6073,7 +6444,7 @@ if [ -f "$helper_src" ]; then
 fi
 
 # nothing outside the chokepoints may build an account path by hand
-for _f in packagemanager_install lfs-completion.bash last_build_step.sh; do
+for _f in packagemanager_install lfs-completion.bash; do
   _p="$(dirname "$LFS_TOOL")/$_f"
   [ -f "$_p" ] || continue
   if grep -qE '"?/usr/src/\$[a-z_]+' "$_p"; then
@@ -6872,6 +7243,7 @@ helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
 if [ -f "$helper_src" ]; then
   _o="$( SNAP_ROOT=/
       eval "$(_slice_fn "$helper_src" never_claim_list)"
+      eval "$(_slice_fn "$helper_src" _never_claim_load)"
       eval "$(_slice_fn "$helper_src" is_never_claimed)"
       for f in /usr/share/info/dir /etc/ld.so.cache /var/cache/ldconfig/aux-cache; do
           is_never_claimed "$f" || echo "$f can still be claimed by a package"
@@ -7457,6 +7829,7 @@ helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
 if [ -f "$helper_src" ]; then
   _o="$( ETC=/etc; SNAP_ROOT=/
       eval "$(_slice_fn "$helper_src" never_claim_list)"
+      eval "$(_slice_fn "$helper_src" _never_claim_load)"
       eval "$(_slice_fn "$helper_src" is_never_claimed)"
       for f in /etc/passwd /etc/passwd- /etc/group /etc/group- \
                /etc/shadow /etc/gshadow /etc/.pwd.lock; do
@@ -7844,6 +8217,7 @@ if [ -f "$helper_src" ]; then
   _o="$( ETC=/etc; SNAP_ROOT=/; STATE=/usr/src/lfs-pkgusr
       WRAPPERS=/usr/lib/pkgusr
       eval "$(_slice_fn "$helper_src" never_claim_list)"
+      eval "$(_slice_fn "$helper_src" _never_claim_load)"
       eval "$(_slice_fn "$helper_src" is_never_claimed)"
       command -v is_never_claimed >/dev/null 2>&1 \
           || { echo "there is no is_never_claimed"; exit 0; }
@@ -7900,7 +8274,7 @@ _count_rc $?
 # ---- add-user names the account through the chokepoint ---------------------- #
 # It used its argument raw for the ACCOUNT and pkg_owner_name only for the HOME.
 # Fine while every caller passes an already-prefixed owner -- cmd_build does.
-# last_build_step.sh does not: `lfs-helper add-user wget` produced an account
+# last_build_step.sh did not: `lfs-helper add-user wget` produced an account
 # called `wget` living in /usr/src/pkgusr/p_wget, and the sanity report found
 # both halves without being able to connect them:
 #     !! accounts without a known prefix: wget urllib3 requests ...
@@ -7929,13 +8303,11 @@ if [ -f "$helper_src" ]; then
       ok "add-user gives the account and its home the same name"
   fi
 
-  # last_build_step.sh is the caller that exposed it -- it passes bare names
-  _lbs="$(dirname "$LFS_TOOL")/last_build_step.sh"
-  if [ -f "$_lbs" ]; then
-      grep -q 'lfs-helper add-user' "$_lbs" \
-          && ok "the final step still creates its users through add-user" \
-          || bad "the final step no longer goes through add-user"
-  fi
+  # last_build_step.sh was the caller that exposed it -- it passed bare names.
+  # It is gone (1.10.0) and this checked a file that no longer exists, so it
+  # never ran again.  The requirement outlives it: `packagemanager setup` is
+  # the next caller to create accounts from outside the tool, and it must go
+  # through add-user rather than useradd.  Assert that when setup lands.
 fi
 
 # ---- the sanity report reads the sorted state, and knows when a build is done #
@@ -8003,6 +8375,7 @@ helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
 if [ -f "$helper_src" ]; then
   _o="$( ETC=/etc; SNAP_ROOT=/; STATE=/usr/src/lfs-pkgusr; WRAPPERS=/usr/lib/pkgusr
       eval "$(_slice_fn "$helper_src" never_claim_list)"
+      eval "$(_slice_fn "$helper_src" _never_claim_load)"
       eval "$(_slice_fn "$helper_src" is_never_claimed)"
       command -v is_never_claimed >/dev/null 2>&1 \
           || { echo "there is no is_never_claimed"; exit 0; }
@@ -8265,25 +8638,10 @@ if [ -f "$helper_src" ]; then
   fi
 fi
 
-# and the final step must ASK rather than rebuild the name itself
-_lbs="$(dirname "$LFS_TOOL")/last_build_step.sh"
-if [ -f "$_lbs" ]; then
-  _p=""
-  _n="$(grep -c 'lfs-helper owner-name' "$_lbs")"
-  [ "${_n:-0}" -ge 2 ] \
-      || _p="$_p;the final step still assumes the account name ($_n of 2 sites)"
-  # every chown/su in there must use the resolved name, never the bare argument
-  case "$(grep -c 'lfs-helper add-user' "$_lbs")" in
-      0) _p="$_p;the final step no longer creates its users through add-user" ;;
-  esac
-  if [ -n "$_p" ]; then
-      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-          [ -n "$m" ] && bad "$m"
-      done
-  else
-      ok "the final step asks for the account name it was given"
-  fi
-fi
+# The caller that exposed this was last_build_step.sh, which is gone (1.10.0).
+# The rule is not: any script outside the tool that needs an account name must
+# ASK -- `lfs-helper owner-name` -- instead of gluing a prefix on itself.
+# `packagemanager setup` inherits it; assert it there when setup lands.
 
 # ---- the ESP hint prints a path you can actually type ----------------------- #
 # Two sources feed it and they disagree about the prefix: `lsblk -rno NAME`
@@ -8457,6 +8815,210 @@ if [ -f "$helper_src" ]; then
           done ;;
   esac
   rm -rf "$_st"
+fi
+
+# ---- unpacked sources are scratch, and no scan should walk them ------------- #
+# Build trees moved from /build into each package user's home in 1.7.6.  The
+# snapshot scans followed; the ownership scans did not.  So `lfs-helper verify`
+# began walking every unpacked source tree in the system -- it ran for minutes
+# with no output -- and a finished tree filled the sanity report with tcl's own
+# documentation:
+#
+#     !! files with no owner (first 40):
+#          /usr/src/pkgusr/p_tcl/src/tcl8.6.16/html/Keywords/Z.htm
+#
+# A tarball can carry any uid it likes.  Unpacked sources are not installed,
+# nothing owns them, and asking who does has no answer.
+helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$helper_src" ]; then
+  _p=""
+  _slice_fn "$helper_src" scan_prune_paths | grep -q 'PKGUSR_BUILD_SUBDIR' \
+      || _p="$_p;the prune list does not cover the per-package build trees"
+  # ONE list -- there were five and they had already diverged
+  for _fn in _vfy_orphans _has_orphaned_files _vfy_build_user_leftovers; do
+      _slice_fn "$helper_src" "$_fn" | grep -q 'SCAN_PRUNE' \
+          || _p="$_p;$_fn does not use the shared prune list"
+  done
+  # an ARRAY, not a string through eval: the patterns contain *, and eval lets
+  # the shell expand them before find ever sees them
+  case "$(_slice_fn "$helper_src" scan_prune_set)" in
+      *'SCAN_PRUNE+=('*) ;;
+      *) _p="$_p;the prune list is not built as an array" ;;
+  esac
+  if _slice_fn "$helper_src" _vfy_orphans | grep -q 'eval find'; then
+      _p="$_p;the orphan scan splices its prune list through eval"
+  fi
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "every ownership scan skips the same scratch, from one list"
+  fi
+
+  # end to end: a build tree is pruned, a real file is not
+  _pt="$T/prune"
+  mkdir -p "$_pt/usr/src/pkgusr/p_tcl/src/tcl8.6.16/html" "$_pt/usr/bin"
+  touch "$_pt/usr/src/pkgusr/p_tcl/src/tcl8.6.16/html/Z.htm" "$_pt/usr/bin/real"
+  if [ "$(id -u)" = 0 ]; then
+    chown 4321 "$_pt/usr/src/pkgusr/p_tcl/src/tcl8.6.16/html/Z.htm" "$_pt/usr/bin/real"
+    _r="$( SNAP_ROOT="$_pt"; STATE="$_pt/usr/src/lfs-pkgusr"
+        PKGUSR_BUILD_SUBDIR=src
+        PKGUSR_ROOT="$_pt/usr/src/pkgusr"; CFGUSR_ROOT="$_pt/usr/src/cfg"
+        pkgusr_roots() { printf '%s\n%s\n' "$PKGUSR_ROOT" "$CFGUSR_ROOT"; }
+        eval "$(_slice_fn "$helper_src" scan_prune_paths)"
+        eval "$(_slice_fn "$helper_src" scan_prune_set)"
+        scan_prune_set
+        find "$_pt" -xdev -nouser "${SCAN_PRUNE[@]}" 2>/dev/null \
+            | sed "s|$_pt||" | sort | tr '\n' ' ' )"
+    case "$_r" in
+        "/usr/bin/real ") ok "an unpacked source tree is skipped, an installed file is not" ;;
+        *) bad "the prune list is wrong: got [$_r]" ;;
+    esac
+  fi
+  rm -rf "$_pt"
+fi
+
+# the sanity report has to skip the same thing, or it reports what verify does not
+san="$(dirname "$LFS_TOOL")/lfs-sanity.sh"
+if [ -f "$san" ]; then
+  _p=""
+  grep -q 'PKGROOT/\*/src' "$san" \
+      || _p="$_p;the sanity report still walks the package build trees"
+  # a config step writing root-owned files is not an orphaned manifest
+  grep -q 'writes ROOT-owned files' "$san" \
+      || _p="$_p;root-owned config files are still reported as missing an account"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the sanity report skips scratch and does not invent findings"
+  fi
+fi
+
+# ---- verify must not work in silence, or one fork at a time ----------------- #
+# `lfs-helper verify` ran for over five minutes printing nothing, on a tree it
+# had already verified clean.  Two separate faults:
+#
+#   * a fork per path, twice over -- `stat -c %U` and a process substitution
+#     inside is_never_claimed -- across 66265 manifest paths
+#   * no output at all until every pass had finished
+#
+# A command that works for minutes in silence is indistinguishable from one that
+# has hung, and was reported as one.
+helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$helper_src" ]; then
+  _p=""
+  # the never-claim list is read once, not per call
+  _slice_fn "$helper_src" is_never_claimed | grep -q '< <(never_claim_list)' \
+      && _p="$_p;is_never_claimed forks for every path it is asked about"
+  _slice_fn "$helper_src" _never_claim_load | grep -q . \
+      || _p="$_p;the never-claim list is not cached"
+  # owners come from one batched stat, not one per path
+  case "$(_slice_fn "$helper_src" _vfy_manifest_ownership)" in
+      *'xargs -0 -r stat'*) ;;
+      *) _p="$_p;the ownership pass still runs one stat per path" ;;
+  esac
+  # a REAL tab: stat does not expand \t, so '%U\tname' comes back as one field
+  # and the map silently stays empty -- correct but slow, the hardest wrong to see
+  # comments stripped: the fix NAMES the broken format while explaining it
+  case "$(_slice_fn "$helper_src" _vfy_manifest_ownership \
+          | grep -vE '^[[:space:]]*#')" in
+      *'%U\t%n'*) _p="$_p;the stat format uses a literal backslash-t" ;;
+  esac
+  # and it must say what it is doing, before it does it
+  _nd="$(_slice_fn "$helper_src" cmd_verify | grep -c 'detail "# ')"
+  [ "${_nd:-0}" -ge 5 ] \
+      || _p="$_p;verify announces only $_nd of its passes"
+  case "$(_slice_fn "$helper_src" _vfy_manifest_ownership)" in
+      *'[%d/%d]'*) ;;
+      *) _p="$_p;the long pass shows no progress" ;;
+  esac
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "verify says what it is doing, and does it in one pass not 66000"
+  fi
+
+  # the batched lookup must actually map something -- an empty map is the bug
+  _pf="$T/statmap"; mkdir -p "$_pf"
+  touch "$_pf/a" "$_pf/b" "$_pf/c"
+  printf '%s\n' "$_pf/a" "$_pf/b" "$_pf/c" > "$_pf/man"
+  _n="$( _TAB=$'\t'
+      declare -A own=()
+      while IFS="$_TAB" read -r o nm; do
+          [ -n "$nm" ] && own["$nm"]="$o"
+      done < <(grep -v '^[[:space:]]*$' "$_pf/man" \
+               | tr '\n' '\0' | xargs -0 -r stat -c "%U${_TAB}%n" 2>/dev/null)
+      echo "${#own[@]}" )"
+  [ "$_n" = 3 ] \
+      && ok "the batched owner lookup maps every path it is given" \
+      || bad "the batched owner lookup mapped $_n of 3 paths"
+  rm -rf "$_pf"
+fi
+
+# ---- the build must not end quietly with no way to log in ------------------- #
+# init-accounts asks for a root password, but it is skippable: a scripted run
+# has no terminal, and an interactive one can be answered with a blank line.
+# So the LAST thing build-all says is whether anyone can actually log in --
+# because it is the last moment it can still be fixed.  After the reboot the
+# chroot is gone, and the way back is booting the host and mounting the tree.
+helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$helper_src" ]; then
+  _p=""
+  _slice_fn "$helper_src" _warn_if_no_login | grep -q . \
+      || _p="$_p;nothing checks whether the system can be logged into"
+  # it must be the LAST thing build-all does
+  _ba="$(_slice_fn "$helper_src" cmd_build_all)"
+  case "$_ba" in
+      *_warn_if_no_login*) ;;
+      *) _p="$_p;build-all can finish without saying whether you can log in" ;;
+  esac
+  _last="$(printf '%s\n' "$_ba" | grep -vE '^[[:space:]]*(#|$)' | tail -3)"
+  case "$_last" in
+      *_warn_if_no_login*) ;;
+      *) _p="$_p;the login check is not the last thing build-all does" ;;
+  esac
+  # it must check the RESULT, not that the step ran
+  case "$(_slice_fn "$helper_src" _warn_if_no_login)" in
+      *shadow*) ;;
+      *) _p="$_p;it trusts init-accounts instead of checking for a password" ;;
+  esac
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the build's last word is whether you can log in afterwards"
+  fi
+
+  # all three outcomes, against a real shadow file
+  _lg="$T/login"; mkdir -p "$_lg"
+  _run_login() {   # <shadow contents> -> "ok" or "warn"
+      ( ETC="$_lg"; say(){ :; }; ok(){ :; }; warn(){ echo warn; }
+        printf 'root:x:0:0::/root:/bin/bash\nbob:x:1000:1000::/home/bob:/bin/bash\n' > "$_lg/passwd"
+        printf '%s' "$1" > "$_lg/shadow"
+        eval "$(_slice_fn "$helper_src" _warn_if_no_login)"
+        _warn_if_no_login | head -1 ) 2>/dev/null
+  }
+  _bad=""
+  [ -z "$(_run_login 'root:$6$a:1::::::
+bob:!:1::::::')" ] || _bad="$_bad;a root password is not accepted"
+  [ -z "$(_run_login 'root:*:1::::::
+bob:$6$b:1::::::')" ] || _bad="$_bad;a user password is not accepted"
+  [ -n "$(_run_login 'root:*:1::::::
+bob:!:1::::::')" ] || _bad="$_bad;a system nobody can log into is not reported"
+  if [ -n "$_bad" ]; then
+      printf '%s\n' "${_bad#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "a locked-out system is reported; a usable one is not"
+  fi
+  rm -rf "$_lg"
 fi
 
 echo

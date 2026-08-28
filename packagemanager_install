@@ -14,7 +14,7 @@
 # packagemanager_install package_short_name path_to_install_file
 #
 
-PACKAGEMANAGER_INSTALL_VERSION="1.10.1"
+PACKAGEMANAGER_INSTALL_VERSION="1.11.6"
 
 # A fingerprint of this file's own contents, the same as the other four tools.
 #
@@ -64,6 +64,15 @@ pkgusr_home_for() {
     case "$n" in
         "") printf '%s' "$PKGUSR_ROOT"; return ;;
     esac
+    # ASK, if there is anything to ask.  lfs-helper owns this rule and the
+    # layout it depends on is configurable; a second copy of it here is right
+    # only until someone changes the layout.  The rest of this function is the
+    # fallback for a system with no lfs-helper.
+    if command -v lfs-helper >/dev/null 2>&1; then
+        local _h
+        _h="$(lfs-helper pkgusr-home "$n" 2>/dev/null)"
+        case "$_h" in /*) printf '%s' "$_h"; return ;; esac
+    fi
     if [ -n "$PKGUSR_PREFIX" ]; then
         case "$n" in "$PKGUSR_PREFIX"*) ;; *) n="${PKGUSR_PREFIX}${n}" ;; esac
     fi
@@ -99,8 +108,30 @@ home_user_dir="/home/${home_user}"
 #   install -d  on an existing directory  -> succeed, change nothing
 #   chmod       on a directory we do not own -> skip, keep going
 #   chown/chgrp on anything                  -> skip (a package user may not)
-# Anything else is passed straight through.  This is the same approach
-# lfs-helper uses during the chroot build.
+# Anything else is passed straight through.
+#
+# ONE SET OF WRAPPERS, NOT TWO.  lfs-helper writes these to /usr/lib/pkgusr,
+# where they outlive the build and where the package-user profile already
+# points; this script wrote its OWN copy to a fresh /tmp directory on every
+# run.  Two implementations of "what may a package user do", free to disagree
+# about it -- the species of bug that costs this project the most.  Ask for
+# them when lfs-helper is on the system, which it is on anything these tools
+# built; the copy below is the fallback for a system without it.
+_wrapper_dir_from_lfs_helper() {
+    command -v lfs-helper >/dev/null 2>&1 || return 1
+    local d
+    d="$(lfs-helper wrapper-dir 2>/dev/null)" || return 1
+    [ -n "$d" ] || return 1
+    # Missing or incomplete -- write them.  Idempotent, so this also repairs a
+    # tree whose wrappers predate a fix to them.
+    if [ ! -x "$d/install" ] || [ ! -x "$d/chown" ]; then
+        lfs-helper make-wrappers --run >/dev/null 2>&1 || return 1
+    fi
+    [ -x "$d/install" ] || return 1
+    printf '%s' "$d"
+}
+
+# The temporary copy: only for a system with no lfs-helper.
 _make_build_wrappers() {
     local d="$1"
     mkdir -p "$d" || return 1
@@ -571,14 +602,16 @@ installPkg() {
     chown $user_name: $install_user_dir/install_*
     chown -R $user_name: $install_user_dir/log/
     # pipefail so tee doesn't hide a failing build/install; capture the real code
-    _wrapdir="/tmp/pkgusr-wrappers.$$"
-    _make_build_wrappers "$_wrapdir" || _wrapdir=""
-    chmod 755 "$_wrapdir" 2>/dev/null || true
+    _wrapdir="$(_wrapper_dir_from_lfs_helper)" && _wraptmp=0 || {
+        _wrapdir="/tmp/pkgusr-wrappers.$$"; _wraptmp=1
+        _make_build_wrappers "$_wrapdir" || _wrapdir=""
+        chmod 755 "$_wrapdir" 2>/dev/null || true
+    }
     su - -c "set -o pipefail; \
              ${_wrapdir:+PATH='$_wrapdir':\$PATH; export PATH; } \
              bash ~/install_$user_name $parameter 2>&1 | tee ~/log/packagemanager_install-$date_log.log" $user_name
     install_rc=${PIPESTATUS[0]}
-    [ -n "${_wrapdir:-}" ] && rm -rf "$_wrapdir"
+    [ "${_wraptmp:-0}" = 1 ] && [ -n "${_wrapdir:-}" ] && rm -rf "$_wrapdir"
 
     if echo "$user_name" | grep "^u_"; then
         gpasswd -d $user_name install # remove install group if nimgnu_group
@@ -787,14 +820,16 @@ diagnose_install_failure() {
         auto_grant_from_log "$_log" "$user_name" || break
         _round=$((_round + 1))
         echo -e "\033[0;33m# retrying $user_name ($parameter), round $_round ...\033[0m"
-        _wrapdir="/tmp/pkgusr-wrappers.$$"
-    _make_build_wrappers "$_wrapdir" || _wrapdir=""
-    chmod 755 "$_wrapdir" 2>/dev/null || true
+        _wrapdir="$(_wrapper_dir_from_lfs_helper)" && _wraptmp=0 || {
+        _wrapdir="/tmp/pkgusr-wrappers.$$"; _wraptmp=1
+        _make_build_wrappers "$_wrapdir" || _wrapdir=""
+        chmod 755 "$_wrapdir" 2>/dev/null || true
+    }
     su - -c "set -o pipefail; \
              ${_wrapdir:+PATH='$_wrapdir':\$PATH; export PATH; } \
              bash ~/install_$user_name $parameter 2>&1 | tee ~/log/packagemanager_install-$date_log.log" $user_name
         install_rc=${PIPESTATUS[0]}
-    [ -n "${_wrapdir:-}" ] && rm -rf "$_wrapdir"
+    [ "${_wraptmp:-0}" = 1 ] && [ -n "${_wrapdir:-}" ] && rm -rf "$_wrapdir"
     done
 
     if [ "$install_rc" != "0" ]; then

@@ -3,6 +3,7 @@
 #   make install                    -> /usr
 #   make install PREFIX=/usr/local  -> /usr/local
 #   make uninstall
+#   make clean                   -> scratch files, not installed ones
 #   make check                   -> run the regression tests
 #
 # DESTDIR is honoured, so this works for staged installs and for installing
@@ -22,12 +23,11 @@ SYSCONFDIR  ?= $(DESTDIR)/etc
 # The four tools, plus the bash engine packagemanager calls.
 TOOLS       := lfs lfs-helper packagemanager packagemanager_install blfs
 COMPLETION  := lfs-completion.bash
-LAST_STEP   := last_build_step.sh
 TESTS       := test_lfs_crosschain.sh
 
 INSTALL     ?= install
 
-.PHONY: all install uninstall check help
+.PHONY: all install uninstall check clean help
 
 all: help
 
@@ -35,6 +35,7 @@ help:
 	@echo "make install [PREFIX=...] [DESTDIR=...]   install the tools"
 	@echo "make uninstall [PREFIX=...]               remove them"
 	@echo "make check                                 run the tests"
+	@echo "make clean                                 remove scratch files"
 	@echo ""
 	@echo "installs into: $(PREFIX)/bin"
 
@@ -63,18 +64,15 @@ install:
 	        "$(SYSCONFDIR)/pkgusr/skel-u_xdg/.bash_profile"; \
 	    echo "    installed (XDG_RUNTIME_DIR is filled in on first use)"; \
 	fi
-	@echo "==> last build step -> $(SYSCONFDIR)/lfs"
-	$(INSTALL) -d $(SYSCONFDIR)/lfs
-	@if [ -f "$(SYSCONFDIR)/lfs/$(LAST_STEP)" ]; then \
-	    echo "    kept your existing $(SYSCONFDIR)/lfs/$(LAST_STEP)"; \
-	    $(INSTALL) -m 644 $(LAST_STEP) "$(SYSCONFDIR)/lfs/$(LAST_STEP).new"; \
-	    echo "    new version alongside it as $(LAST_STEP).new"; \
-	else \
-	    $(INSTALL) -m 755 $(LAST_STEP) "$(SYSCONFDIR)/lfs/$(LAST_STEP)"; \
-	fi
 	@echo "==> tests -> $(SHAREDIR)"
 	$(INSTALL) -d $(SHAREDIR)
-	$(INSTALL) -m 644 $(TESTS) $(SHAREDIR)/ 2>/dev/null || true
+# The tests are optional -- say so when they are absent, rather than hiding a
+# real failure.  `2>/dev/null || true` hid both cases alike.
+	@if [ -f "$(TESTS)" ]; then \
+	    $(INSTALL) -m 644 $(TESTS) $(SHAREDIR)/ && echo "    $(TESTS)"; \
+	else \
+	    echo "    (not shipped: $(TESTS))"; \
+	fi
 	@echo ""
 	@echo "Installed.  Check with:"
 	@echo "    $(PREFIX)/bin/lfs --version"
@@ -88,10 +86,17 @@ uninstall:
 	rm -rfv $(SHAREDIR)
 	@echo ""
 	@echo "Left alone (they are yours):"
-	@echo "    $(SYSCONFDIR)/lfs/$(LAST_STEP)"
 	@echo "    $(SYSCONFDIR)/pkgusr/skel-u_xdg/.bash_profile"
 	@echo "    /usr/share/lfs        books, settings, snapshots"
 	@echo "    /etc/pkgusr           packagemanager settings"
 
 check:
 	@bash $(TESTS) ./lfs
+
+# Nothing here is compiled, so clean removes only what running the tools here
+# leaves behind: Python bytecode and the test suite's scratch directories.
+# It never touches an installed tree -- that is what uninstall is for.
+clean:
+	rm -rf __pycache__ *.pyc
+	rm -rf /tmp/lfstest.* /tmp/lfstest-count.*
+	@echo "clean.  (installed files are untouched -- use 'make uninstall')"

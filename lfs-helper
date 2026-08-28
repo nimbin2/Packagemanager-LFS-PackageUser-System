@@ -22,7 +22,7 @@ set -u
 # Bump on every change that alters behaviour.  `lfs-helper --version` makes it
 # possible to tell at a glance whether the copy inside the chroot is the one
 # that was just fixed -- guessing at that has wasted a lot of time.
-LFS_HELPER_VERSION="1.10.1"
+LFS_HELPER_VERSION="1.11.6"
 
 # A fingerprint of this file's own contents.  A hand-maintained version number
 # goes stale the moment someone forgets to bump it -- and the reason for
@@ -185,6 +185,35 @@ say()    { echo "$*"; }
 ok()     { echo "${C_OK}$*${C_OFF}"; }
 # yellow on stderr: something needs attention, and is not part of normal flow
 warn()   { echo "${C_WARN}$*${C_OFF}" >&2; }
+
+# `cmd ... 2>/dev/null || true` -- the pattern that has cost this project more
+# debugging than any other.  A whole tree came out with every package home
+# root:root 755, and not one line of output said why; the reason it took a
+# filesystem check, an su test and three rounds of guessing was that the
+# failure had been suppressed at the point it happened.
+#
+# There are two honest reasons to write it, and they are different:
+#
+#   soft <what> -- <cmd ...>    the command MAY fail and the build carries on,
+#                               but the failure is SAID.  Use this wherever a
+#                               failure changes what the system looks like:
+#                               ownership, modes, group membership, backups.
+#
+#   <cmd> 2>/dev/null || true   only where failing is NORMAL and means nothing:
+#                               mkdir -p on a directory that exists, appending
+#                               to a log that may not be writable, sorting a
+#                               file in place.  Every remaining one carries a
+#                               comment saying which.
+soft() {
+    local what="$1"; shift
+    [ "${1:-}" = "--" ] && shift
+    local err rc
+    err="$("$@" 2>&1 >/dev/null)"; rc=$?
+    [ "$rc" = 0 ] && return 0
+    warn "!! $what"
+    [ -n "$err" ] && warn "   $err"
+    return 0
+}
 # yellow on stdout: needs attention, but IS part of the flow -- a retry, a
 # question, a directory being granted.  Same colour because it means the same
 # thing; stdout because it belongs in sequence with the build output.
@@ -214,7 +243,13 @@ mkstate() {
     mkdir -p "$STATE" "$SCRIPTS" "$MANIFESTS" "$LOGS" \
              "$STATE_PROGRESS" "$STATE_GROUPS" "$STATE_CONF" || return 0
     if [ "$(id -u)" = 0 ]; then
+        # SUPPRESSED DELIBERATELY.  mkstate runs at the top of every command,
+        # including ones from before book 7.6, when the `install` group does
+        # not exist yet and this cannot succeed.  Reporting it would print a
+        # failure on every invocation for the first third of a build, which is
+        # how a report becomes noise.  seal-install-dirs sets it for real.
         set_install_dir_owner "$STATE" 2>/dev/null || true
+        # SUPPRESSED DELIBERATELY: same moment, same reason as the line above.
         real_chmod 1775 "$STATE" 2>/dev/null || true
     fi
 }
@@ -655,7 +690,8 @@ cmd_init_pkgusr() {
         # o+t (sticky) is deliberately deferred to seal-install-dirs, because
         # it would stop package users replacing files the temporary system
         # installed as root.
-        real_chmod g+w "$d" 2>/dev/null || true
+        soft "$d is not group-writable -- package users cannot install into it" \
+            -- real_chmod g+w "$d"
         n=$((n+1))
     done < <(install_dirs_list)
     ok "# $n install directories are now root:install (group-writable)"
@@ -798,11 +834,14 @@ EOF
 
 # Steps that are not packages, and must never get a package user.
 #
-# last-step, init-* and refind are actions, not software: they own no files of
-# their own and installing "as" them makes no sense.  A `last-step` user
-# appeared because a manifest existed under that name, and everything the step
-# touched -- including wget's binary, installed as the wget user -- was then
-# handed to it.
+# init-* and refind are actions, not software: they own no files of their own
+# and installing "as" them makes no sense.  A `last-step` user appeared because
+# a manifest existed under that name, and everything the step touched --
+# including wget's binary, installed as the wget user -- was then handed to it.
+#
+# `last-step` itself was removed in 1.10.0 and no tool generates it any more.
+# It stays in the match below for trees generated before that: their steporder
+# and manifests still carry the name, and the rule must still say no.
 #
 # cfg_* is NOT decidable from the name.  Most chapter-9 "configuration"
 # sections write a file (/etc/hostname, /etc/hosts) and are root's work, but
@@ -1493,7 +1532,11 @@ ensure_pkgusr_roots() {
         # another package's home. With it, only the owner can. Group write then
         # grants only the ability to CREATE, which nothing unprivileged does --
         # `add-user` is root-only -- so this is consistency, not capability.
+        # SUPPRESSED DELIBERATELY, same reason as mkstate: the roots are
+        # created before the `install` group exists.  `lfs-helper verify`
+        # checks the result afterwards, which is the honest place to find out.
         set_install_dir_owner "$r" 2>/dev/null || true
+        # SUPPRESSED DELIBERATELY: same moment, same reason as the line above.
         real_chmod 1775 "$r" 2>/dev/null || true
     done < <(pkgusr_roots)
 }
@@ -1741,7 +1784,8 @@ grant_dir_access() {
     if [ -n "$curgrp" ] && [ "$curgrp" != root ] \
        && case "$curgrp" in "$COLLECTOR_PREFIX"*) true ;; *) false ;; esac \
        && id -nG "$user" 2>/dev/null | tr ' ' '\n' | grep -qx "$curgrp"; then
-        real_chmod g+rwx "$dir" 2>/dev/null || true
+        soft "$dir is group $curgrp but not group-writable -- the grant will not take" \
+            -- real_chmod g+rwx "$dir"
         say "    $dir -> already group $curgrp, and '$user' is a member"
         return 0
     fi
@@ -1836,7 +1880,8 @@ grant_dir_access() {
     # is already a member of the group by then, that grant is automatic (see
     # the fast path at the top of this function).
     real_chgrp "$grp" "$dir" 2>/dev/null || return 1
-    real_chmod g+rwx "$dir" 2>/dev/null || true
+    soft "$dir is group $grp but not group-writable -- the grant will not take" \
+        -- real_chmod g+rwx "$dir"
     say "    $dir -> group $grp (owner $owner, + $user)"
     mkdir -p "$(dirname "$GRANTED")"
     grep -qxF "$grp|$user|$owner" "$GRANTED" 2>/dev/null \
@@ -2403,8 +2448,10 @@ EOF
     # an install directory: root:install and group-writable during the build.
     # Inheriting that would let any package user rewrite the wrappers -- that
     # is, rewrite the rule that stops it changing ownership.
-    chmod 0755 "$WRAPPERS" 2>/dev/null || true
-    chown root:root "$WRAPPERS" "$WRAPPERS"/* 2>/dev/null || true
+    soft "could not set $WRAPPERS to 0755 -- a package user may be able to rewrite the wrappers" \
+        -- chmod 0755 "$WRAPPERS"
+    soft "could not give $WRAPPERS to root -- the wrappers are writable by whoever owns them now" \
+        -- chown root:root "$WRAPPERS" "$WRAPPERS"/*
 }
 
 # Re-apply the install-directory permissions.
@@ -2682,15 +2729,32 @@ NCLIST
     printf '%s\n' "$STATE"
 }
 
-is_never_claimed() {
-    local f="${1%/}" p
-    [ -n "$f" ] || return 1
+# The list, read ONCE into an array.
+#
+# is_never_claimed used to run `< <(never_claim_list)` on every call, which is a
+# process substitution -- a fork -- per path.  `verify` calls it for every path
+# in every manifest: 66265 forks on a finished system, and that was only half of
+# them.  The command ran for minutes in silence.
+_TAB=$'\t'
+_NEVER_CLAIM=()
+_never_claim_load() {
+    [ "${#_NEVER_CLAIM[@]}" -gt 0 ] && return 0
+    local p
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         p="${SNAP_ROOT%/}${p}"
-        [ "$f" = "${p%/}" ] && return 0
-        case "$f" in "${p%/}"/*) return 0 ;; esac
+        _NEVER_CLAIM+=( "${p%/}" )
     done < <(never_claim_list)
+}
+
+is_never_claimed() {
+    local f="${1%/}" p
+    [ -n "$f" ] || return 1
+    _never_claim_load
+    for p in "${_NEVER_CLAIM[@]}"; do
+        [ "$f" = "$p" ] && return 0
+        case "$f" in "$p"/*) return 0 ;; esac
+    done
     return 1
 }
 
@@ -2845,8 +2909,12 @@ _install_staged_tree() {
             continue
         fi
         mkdir -p "$dest" || { rc=1; break; }
-        real_chown --reference="$d" "$dest" 2>/dev/null || true
-        real_chmod --reference="$d" "$dest" 2>/dev/null || true
+        # A staged directory that does not inherit the live one's owner and
+        # mode is how a package quietly takes /usr/bin.
+        soft "$dest did not inherit the owner of $d" \
+            -- real_chown --reference="$d" "$dest"
+        soft "$dest did not inherit the mode of $d" \
+            -- real_chmod --reference="$d" "$dest"
     done < <(find "$stage" -mindepth 1 -type d 2>/dev/null | sort)
     [ "$rc" = 0 ] || return 1
 
@@ -3348,9 +3416,11 @@ cmd_build() {
                 real_chown "$owner:$owner" "$_stage" 2>/dev/null \
                     || warn "# could not give $_stage to '$owner'"
             fi
-            real_chmod 755 "$_stage" 2>/dev/null || true
+            soft "$_stage is not 755 -- the package user may not be able to stage into it" \
+                -- real_chmod 755 "$_stage"
             # the parent too, or the package user cannot traverse into it
-            real_chmod 755 "$(dirname "$_stage")" 2>/dev/null || true
+            soft "$(dirname "$_stage") is not 755 -- the package user cannot traverse into the staging tree" \
+                -- real_chmod 755 "$(dirname "$_stage")"
         else
             _stage=""
         fi
@@ -3383,7 +3453,8 @@ cmd_build() {
         # already owned correctly and nothing has to be chowned afterwards
         user_exists "$owner" && real_chown "$owner:$owner" "$_bldroot" 2>/dev/null
     fi
-    real_chmod 755 "$_bldroot" 2>/dev/null || true
+    soft "$_bldroot is not 755 -- the build may not be able to enter its own tree" \
+        -- real_chmod 755 "$_bldroot"
 
     local envpass="LFS_CC_PHASE='$phase' BUILD_ROOT='$_bldroot'"
     [ -n "$_stage" ] && envpass="$envpass DESTDIR='$_stage'"
@@ -3851,6 +3922,7 @@ cmd_build() {
             echo "# installed $(date '+%Y-%m-%d %H:%M:%S') by lfs-helper"
             [ -n "${_book_of_script:-}" ] && echo "# from: $_book_of_script"
         } > "$_home/VERSION"
+        # benign: a note in the package's own home, rewritten every install
         real_chown "$owner:$owner" "$_home/VERSION" 2>/dev/null || true
     fi
 
@@ -4028,6 +4100,33 @@ _needs_adoption() {
 
 
 # Give one user access to one directory, using the normal rules.
+# The wrappers, on demand.
+#
+# `packagemanager_install` shipped its own 480-line copy and wrote it to a
+# fresh /tmp directory on every run -- a second set of wrappers, with its own
+# idea of what `chown` should do, for the same job. This is the door it asks
+# through instead. Idempotent: writing them again is how a fixed wrapper
+# reaches a system that already has the old one.
+cmd_make_wrappers() {
+    need_root
+    local run=0
+    case "${1:-}" in --run) run=1 ;; esac
+    if [ "$run" != 1 ]; then
+        say "# would write the package-user wrappers to $WRAPPERS"
+        say "#   $(cd "$WRAPPERS" 2>/dev/null && echo "currently: $(ls | tr '\n' ' ')")"
+        say "# apply with: lfs-helper make-wrappers --run"
+        return 0
+    fi
+    make_wrappers
+    ok "wrappers written to $WRAPPERS"
+    printf '%s\n' "$WRAPPERS"
+}
+
+# Where they are, for a caller that only needs the path.
+cmd_wrapper_dir() {
+    printf '%s\n' "$WRAPPERS"
+}
+
 cmd_grant_dir() {
     need_root
     local dir="${1:?usage: lfs-helper grant-dir <dir> <user> [--run]}"
@@ -4109,10 +4208,8 @@ _has_orphaned_files() {
     local r="${SNAP_ROOT%/}" hit
     # see _vfy_orphans: before 7.6 nothing resolves, so everything looks orphaned
     _user_db_ready || return 1
-    hit="$(find "${r:-/}" -xdev -nouser \
-                -not -path "$r/dev/*"  -not -path "$r/proc/*" \
-                -not -path "$r/sys/*"  -not -path "$r/run/*" \
-                -not -path "$r/sources/*" \
+    scan_prune_set
+    hit="$(find "${r:-/}" -xdev -nouser "${SCAN_PRUNE[@]}" \
                 -print -quit 2>/dev/null)"
     [ -n "$hit" ]
 }
@@ -4472,7 +4569,7 @@ cmd_sort_users() {
             continue
         fi
         if [ "$run" = 1 ]; then
-            cp -p "$f" "$f.bak" 2>/dev/null || true
+            soft "no backup of $f -- editing it without one" -- cp -p "$f" "$f.bak"
             cat "$tmp" > "$f"
             rm -f "$tmp"
             ok "  $f sorted by id (previous kept as $f.bak)"
@@ -4607,7 +4704,10 @@ _vfy_manifest_ownership() {
     # gave man-pages (the first chapter-8 package) uid 10000 and binutils --
     # built first, in chapter 5 -- a much higher one, which makes the uids
     # useless for reading the build order off the passwd file.
-    for man in $(_manifests_in_build_order) $(_manifests_in_build_order dirs); do
+    local _mans _nman=0 _ntot
+    _mans="$(_manifests_in_build_order) $(_manifests_in_build_order dirs)"
+    _ntot="$(printf '%s\n' $_mans | grep -c .)"
+    for man in $_mans; do
         [ -e "$man" ] || continue
         [ -s "$man" ] || continue
         case "$man" in *.dirs) kind=dir ;; *) kind=file ;; esac
@@ -4642,6 +4742,30 @@ _vfy_manifest_ownership() {
             _vfy_n_fixed=$((_vfy_n_fixed + 1))
         fi
 
+        # Which package, live.  This pass walks every path in every manifest,
+        # and it used to print nothing until it had finished.  A command that
+        # works for minutes in silence is indistinguishable from one that has
+        # hung -- and was reported as one.
+        _nman=$((_nman + 1))
+        [ -t 1 ] && printf '\r  [%d/%d] %-24s\033[K' "$_nman" "$_ntot" "$name" >&2
+
+        # Every owner in ONE stat call, not one call per path.
+        #
+        # `stat -c %U` per path is a fork per path, and `verify` walks every
+        # path in every manifest -- 66265 of them on a finished system.  With
+        # is_never_claimed forking too that was ~130000 processes, which is
+        # where the minutes went.  xargs batches them into a handful.
+        # A REAL tab in the format string.  `stat -c '%U\t%n'` prints a
+        # literal backslash-t -- stat does not expand escapes -- so every line
+        # came back as one field, the map stayed empty, and the loop below fell
+        # through to the per-path stat it was written to avoid.  It would have
+        # been correct and slow, which is the hardest kind of wrong to notice.
+        declare -A _own_of=()
+        while IFS="$_TAB" read -r _o _f; do
+            [ -n "$_f" ] && _own_of["$_f"]="$_o"
+        done < <(grep -v '^[[:space:]]*$' "$man" \
+                 | tr '\n' '\0' | xargs -0 -r stat -c "%U${_TAB}%n" 2>/dev/null)
+
         while IFS= read -r p; do
             [ -n "$p" ] || continue
             p="$(strip_host_prefix "$p")"
@@ -4653,7 +4777,8 @@ _vfy_manifest_ownership() {
             is_never_claimed "$p" && continue
             case "$p" in "${BUILD_ROOT:-${SNAP_ROOT%/}/build}"/*) continue ;; esac
             _vfy_n_checked=$((_vfy_n_checked + 1))
-            cur="$(stat -c %U "$p" 2>/dev/null)" || continue
+            cur="${_own_of[$p]:-}"
+            [ -n "$cur" ] || cur="$(stat -c %U "$p" 2>/dev/null)" || continue
             [ "$cur" = "$owner" ] && continue
             # A shared install directory belongs to root:install, never to a
             # package -- even when the package's manifest records creating it.
@@ -4676,6 +4801,8 @@ _vfy_manifest_ownership() {
             fi
         done < "$man"
     done
+    [ -t 1 ] && printf '\r\033[K' >&2
+    return 0
 }
 
 # --- rule 2: shared install directories belong to root:install ------------- #
@@ -4715,8 +4842,12 @@ _vfy_install_dirs() {
                         "$(stat -c '%U:%G' "$live" 2>/dev/null) $mode" \
                         "root:install $want_mode"
             if [ "$fix" = 1 ]; then
+                # COUNTED AS FIXED, so it must not fail in silence: the next
+                # run would find the same directory and report it again with
+                # no explanation of why the repair never took.
                 set_install_dir_owner "$live" || true
-                real_chmod "$want_mode" "$live" 2>/dev/null || true
+                soft "could not set $live to $want_mode -- counted as fixed but it did not take" \
+                    -- real_chmod "$want_mode" "$live"
                 _vfy_n_fixed=$((_vfy_n_fixed + 1))
             fi
         fi
@@ -4724,8 +4855,53 @@ _vfy_install_dirs() {
 }
 
 # --- rule 3: every file has an owner that exists here ---------------------- #
+# The paths no ownership scan should walk, as find arguments.
+#
+# ONE list, because there were five and they had already diverged: the snapshot
+# scans excluded the build scratch and the orphan scan did not, so when build
+# trees moved from /build into each package user's home (1.7.6) the orphan scan
+# started walking every unpacked source tree in the system.  `lfs-helper verify`
+# went from seconds to minutes with no output, and the sanity report filled up
+# with tcl's own documentation:
+#
+#     !! files with no owner (first 40):
+#          /usr/src/pkgusr/p_tcl/src/tcl8.6.16/html/Keywords/Z.htm
+#
+# A tarball can contain any uid it likes.  Unpacked sources are scratch -- they
+# are not installed, nothing owns them, and asking who does has no answer.
+scan_prune_paths() {
+    local r="${SNAP_ROOT%/}"
+    printf '%s\n' \
+        "$r/dev" "$r/proc" "$r/sys" "$r/run" "$r/tmp" \
+        "$r/sources" "${BUILD_ROOT:-$r/build}" "$STATE"
+    # every package's unpacked source tree, wherever the homes are
+    local d
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        printf '%s\n' "$d/*/$PKGUSR_BUILD_SUBDIR"
+    done < <(pkgusr_roots)
+}
+
+# The same list as a find argument ARRAY, in SCAN_PRUNE.
+#
+# An array, not a string spliced through `eval`: the patterns contain `*`, and
+# eval lets the shell expand them against the real filesystem before find ever
+# sees them.  `/usr/src/pkgusr/*/src/*` then becomes a handful of literal
+# directory names instead of a wildcard, and the prune silently matches almost
+# nothing -- which is exactly how it looked like it was working.
+SCAN_PRUNE=()
+scan_prune_set() {
+    local p
+    SCAN_PRUNE=()
+    while IFS= read -r p; do
+        [ -n "$p" ] || continue
+        SCAN_PRUNE+=( -not -path "$p" -not -path "$p/*" )
+    done < <(scan_prune_paths)
+}
+
 _vfy_orphans() {
     local fix="$1" r="${SNAP_ROOT%/}" p n=0
+    scan_prune_set
     # NOT before book 7.6 has written /etc/passwd.
     #
     # `find -nouser` asks whether a uid resolves to a name.  With no passwd file
@@ -4751,10 +4927,7 @@ _vfy_orphans() {
             real_chown -h lfs:lfs "$p" 2>/dev/null \
                 && _vfy_n_fixed=$((_vfy_n_fixed + 1))
         fi
-    done < <(find "${r:-/}" -xdev -nouser \
-                  -not -path "$r/dev/*"  -not -path "$r/proc/*" \
-                  -not -path "$r/sys/*"  -not -path "$r/run/*" \
-                  -not -path "$r/sources/*" 2>/dev/null)
+    done < <(find "${r:-/}" -xdev -nouser "${SCAN_PRUNE[@]}" 2>/dev/null)
     [ "$n" -gt 5 ] && say "  ... and $((n - 5)) more with no owner"
     [ -n "$VERIFY_LOG" ] && say "  all $n: grep ^no-owner $VERIFY_LOG"
 }
@@ -4774,6 +4947,7 @@ _vfy_orphans() {
 # which package they belong to.
 _vfy_build_user_leftovers() {
     local fix="$1" r="${SNAP_ROOT%/}" p n=0
+    scan_prune_set
     _user_db_ready || return 0
     user_exists lfs || return 0
     while IFS= read -r p; do
@@ -4797,13 +4971,7 @@ _vfy_build_user_leftovers() {
     # the chroot and should be root's.  Its CONTENTS are not -- scratch has no
     # owner worth arguing about.  The state directory is under $SRCROOT, which
     # is excluded wholesale.
-    done < <(find "${r:-/}" -xdev -user lfs \
-                  -not -path "$r/dev/*"   -not -path "$r/proc/*" \
-                  -not -path "$r/sys/*"   -not -path "$r/run/*" \
-                  -not -path "$r/tmp/*" \
-                  -not -path "$r/sources" -not -path "$r/sources/*" \
-                  -not -path "${BUILD_ROOT:-$r/build}/*" \
-                  -not -path "$STATE/*" \
+    done < <(find "${r:-/}" -xdev -user lfs "${SCAN_PRUNE[@]}" \
                   -not -path "$SRCROOT/*" 2>/dev/null)
     [ "$n" -gt 5 ] && say "  ... and $((n - 5)) more still owned by the build user"
     [ "$n" -gt 0 ] && [ -n "$VERIFY_LOG" ] \
@@ -4813,9 +4981,17 @@ _vfy_build_user_leftovers() {
 
 _vfy_make_lfs_user() {
     if have_shadow_tools; then
-        groupadd -g "$LFS_BUILD_UID" lfs 2>/dev/null || true
-        useradd -M -u "$LFS_BUILD_UID" -g lfs -s /bin/bash \
-                -c "build user from outside the chroot" lfs 2>/dev/null || true
+        # Failing here is NORMAL on a second run -- the account exists.  It
+        # is not normal on the first, and that case used to look identical.
+        if ! getent group lfs >/dev/null 2>&1; then
+            soft "could not create the 'lfs' group" \
+                -- groupadd -g "$LFS_BUILD_UID" lfs
+        fi
+        if ! id lfs >/dev/null 2>&1; then
+            soft "could not create the 'lfs' build user" \
+                -- useradd -M -u "$LFS_BUILD_UID" -g lfs -s /bin/bash \
+                   -c "build user from outside the chroot" lfs
+        fi
     else
         printf 'lfs:x:%s:\n' "$LFS_BUILD_UID" >> "$ETC/group"
         printf 'lfs:x:%s:%s:build user from outside the chroot:/:/bin/bash\n' \
@@ -4855,7 +5031,7 @@ _vfy_user_order() {
         if ! cmp -s "$f" "$tmp"; then
             _vfy_report order "$f" "build order" "id order"
             if [ "$fix" = 1 ]; then
-                cp -p "$f" "$f.bak" 2>/dev/null || true
+                soft "no backup of $f -- editing it without one" -- cp -p "$f" "$f.bak"
                 cat "$tmp" > "$f"
                 _vfy_n_fixed=$((_vfy_n_fixed + 1))
             fi
@@ -5156,6 +5332,8 @@ _vfy_unclaimed() {
         [ -n "$p" ] || continue
         is_never_claimed "$p" || printf '%s\n' "$p" >> "$_keep"
     done < "$found"
+    # benign: $_keep is a filtered copy of $found -- if the move fails the
+    # unfiltered list is still correct, just longer
     mv -f "$_keep" "$found" 2>/dev/null || true
 
     n="$(LC_ALL=C comm -23 "$found" "$list" 2>/dev/null | wc -l | tr -d ' ')"
@@ -5199,6 +5377,7 @@ cmd_verify() {
 
     local problems=0 fixed=0
 
+    detail "# checking for accounts that share an id ..."
     # ---- 1. two accounts sharing one id ----------------------------------- #
     # Ownership is a number: a collision makes files report as the wrong name
     # and a package unable to write its own files.
@@ -5207,6 +5386,7 @@ cmd_verify() {
         warn "   (verify cannot repair this: which name owns what is yours to decide)"
     fi
 
+    detail "# checking the shared install directories ..."
     # ---- 2. the shared install directories -------------------------------- #
     # root:install, group-writable.  A staged install used to stamp the package
     # user's ownership onto these, handing /usr and /usr/bin to one package and
@@ -5217,6 +5397,7 @@ cmd_verify() {
     # to be a second copy that did neither.
     _vfy_install_dirs "$fix" || problems=$((problems+1))
 
+    detail "# checking every package owns the files it installed ..."
     # ---- 3. every manifest's files belong to its package ------------------- #
     #
     # A SECOND copy of _vfy_manifest_ownership used to live here, inline, and
@@ -5246,9 +5427,11 @@ cmd_verify() {
         ok "package files: $checked path(s) owned by the right package"
     fi
 
+    detail "# looking for files no manifest claims ..."
     # ---- 3b. files no manifest claims ------------------------------------- #
     _vfy_unclaimed || problems=$((problems+1))
 
+    detail "# looking for files with no owner ..."
     # ---- 4. files with no owner at all ------------------------------------ #
     if _has_orphaned_files; then
         warn "some files are owned by a uid with no passwd entry"
@@ -5272,6 +5455,7 @@ cmd_verify() {
         ok "every file has a real owner"
     fi
 
+    detail "# checking homes, the build user and the uid order ..."
     # ---- 4b. the passes the dead copy had and this one did not ------------- #
     # homes owned by their own user, the build user's leftovers, and the uid
     # order.  They were written, and reachable only from the definition bash
@@ -5281,6 +5465,7 @@ cmd_verify() {
     _vfy_build_user_leftovers "$fix" || true
     _vfy_user_order "$fix" || true
 
+    detail "# looking for left-over staging trees ..."
     # ---- 5. staging trees left behind ------------------------------------- #
     local st n_stage=0
     for st in "$STATE"/stage/*; do
@@ -5760,19 +5945,12 @@ cmd_build_all() {
             warn "    lfs-helper build-all"
             return 0
         fi
-        # Seal immediately BEFORE the final step.  By now every package is
-        # built, so the install directories no longer need to be writable by
-        # everyone -- and last-step runs after the seal, which is the correct
-        # order: it installs new files (allowed under the sticky bit) rather
-        # than replacing other packages' (which is what the seal prevents).
-        if [ "$s" = "last-step" ] && ! _install_dirs_are_sealed; then
-            say ""
-            say "Everything before the final step is built -- sealing the"
-            say "install directories now, so packages can no longer overwrite"
-            say "each other's files:"
-            say ""
-            _vfy_seal_install_dirs
-        fi
+        # The seal happens once, after the loop -- see the end of this
+        # function.  There used to be a second one here, firing just before
+        # `last-step` because that step still INSTALLED software (wget) and had
+        # to do it under the sticky bit.  `last-step` is gone; the final step
+        # is now `init-accounts`, which runs as root and installs nothing, so
+        # there is nothing left to seal early for.
 
         say ""
         say "===== [$i/$total] $s ====="
@@ -5833,6 +6011,116 @@ cmd_build_all() {
     # cosmetic, so it is safe to do without asking.
     say ""
     _vfy_user_order 1 || true
+
+    _warn_if_strip_was_asked_for
+    _warn_if_no_login
+    _say_what_is_yours_to_finish
+}
+
+# The two things this tool deliberately does not do.
+#
+# The kernel and the bootloader are decisions about the whole MACHINE, not
+# about a package, and getting either wrong costs you the system you are
+# building on -- so they are yours, on purpose, and the build ends by saying
+# so rather than leaving you to discover it after the reboot.
+#
+# rEFInd is opt-in for the same reason and stays that way: the machine booted
+# in order to build LFS at all, so it already has a working bootloader, and
+# adding a menu entry to it is not something a build should do because nobody
+# said no.
+_say_what_is_yours_to_finish() {
+    say ""
+    say "# Two things are yours to finish, on purpose:"
+    say "#"
+    say "#   1. THE KERNEL.  Nothing here configures, builds or installs one."
+    say "#      Book 10.3, from inside the chroot:"
+    say "#          cd /sources && tar -xf linux-*.tar.xz && cd linux-*"
+    say "#          make menuconfig && make && make modules_install"
+    say "#          cp -iv arch/x86/boot/bzImage /boot/vmlinuz-lfs"
+    say "#"
+    say "#   2. THE BOOTLOADER.  Nothing was written to any ESP, boot sector"
+    say "#      or partition table, and your current bootloader is untouched."
+    say "#      Add an entry for this system by hand, or let the tools add a"
+    say "#      rEFInd entry beside your existing one:"
+    say "#          lfs config bootloader refind"
+    say "#          lfs config esp /boot/efi"
+    say "#          lfs-helper build refind --force"
+    say "#      That only ever ADDS to a mounted ESP: it never formats, never"
+    say "#      writes a raw device, and never replaces what boots you today."
+}
+
+# You asked for stripping.  Nothing did it, and nothing will say so.
+#
+# `lfs build-system session` stores the answer and the prompt says NOT YET
+# IMPLEMENTED -- but that was six hours ago, at the top of an interview, and
+# the build otherwise finishes as though every answer had been acted on.  A
+# setting that is collected, carried into the chroot environment, and then
+# silently ignored is worse than one that was never offered.
+#
+# Said at the END, next to the login warning, because that is where the things
+# you still have to do yourself are collected.
+_warn_if_strip_was_asked_for() {
+    [ "${LFS_STRIP:-0}" = 1 ] || return 0
+    say ""
+    warn "# you asked for debug symbols to be stripped, and NOTHING DID IT."
+    warn "#"
+    warn "#   Stripping rewrites every binary, and in this system a file's"
+    warn "#   owner is the record of which package installed it -- so it has"
+    warn "#   to run as that owner, package by package.  That is not written"
+    warn "#   yet, and doing it as root would hand the whole tree to root."
+    warn "#"
+    warn "#   The system is complete and correct; it is only larger than you"
+    warn "#   asked for.  Book 8.85 also removes libtool .la files."
+    return 1
+}
+
+# Can anyone actually log into this system?
+#
+# THE LAST THING SAID, because it is the last thing that can still be fixed.
+# A fresh LFS has root with no password.  Depending on the login manager that is
+# either "anyone can log in as root" or "nobody can log in at all", and you find
+# out after the reboot -- when the chroot is gone and there is no way back in
+# short of booting the host again and mounting the tree by hand.
+#
+# init-accounts asks for it, but it is skippable: a scripted run has no
+# terminal, and an interactive one can be answered with a blank line.  So this
+# checks the RESULT rather than trusting that the step ran.
+_warn_if_no_login() {
+    local root_ok=0 user_ok=0 u
+    if grep -qE '^root:[^:*!]' "$ETC/shadow" 2>/dev/null; then
+        root_ok=1
+    fi
+    # any non-system account with a real password
+    while IFS=: read -r u _ uid _; do
+        case "$uid" in ''|*[!0-9]*) continue ;; esac
+        [ "$uid" -ge 1000 ] && [ "$uid" -lt 10000 ] || continue
+        grep -qE "^$u:[^:*!]" "$ETC/shadow" 2>/dev/null && { user_ok=1; break; }
+    done < "$ETC/passwd"
+
+    if [ "$root_ok" = 1 ] || [ "$user_ok" = 1 ]; then
+        say ""
+        ok "# you can log in after rebooting:"
+        [ "$root_ok" = 1 ] && ok "#     root has a password"
+        [ "$user_ok" = 1 ] && ok "#     '$u' has a password"
+        return 0
+    fi
+
+    say ""
+    warn "=============================================================="
+    warn "!! NOBODY CAN LOG INTO THIS SYSTEM."
+    warn ""
+    warn "   root has no password, and no other account has one either."
+    warn "   Depending on the login manager that means either anyone can"
+    warn "   log in as root, or nobody can log in at all -- and you would"
+    warn "   find out after the reboot, with the chroot gone."
+    warn ""
+    warn "   Fix it NOW, while you are still in here:"
+    warn "       lfs-helper init-accounts --force"
+    warn ""
+    warn "   or, from outside the chroot:"
+    warn "       chroot /mnt/lfs /usr/bin/passwd root"
+    warn "=============================================================="
+    return 1
 }
 
 # Are the install directories already sticky?  Checking a handful of the ones
@@ -6333,6 +6621,8 @@ Look around / tidy up:
     lfs-helper verify [--fix]         does the tree match the manifests?
     lfs-helper pkgusr-info [<name>]   where each package came from
     lfs-helper pkgusr-home <name>     print an account's home directory
+    lfs-helper wrapper-dir            print where the build wrappers live
+    lfs-helper make-wrappers --run    (re)write the build wrappers
     lfs-helper owner-name <package>   print the account name for a package
     lfs-helper manifests [<name>]     what each package installed
     lfs-helper which-package <path>   which package installed this file
@@ -6380,12 +6670,8 @@ case "${1:-}" in
     clean-state)     shift; cmd_clean_state "$@" ;;
     which-package)   shift; cmd_which_package "$@" ;;
     grant-dir)       shift; cmd_grant_dir "$@" ;;
-    verify)          shift; cmd_verify "$@" ;;
-    install-as)      shift; cmd_install_as "$@" ;;
-    pkgusr-info)     shift; cmd_pkgusr_info "$@" ;;
-    pkgusr-home)     shift; cmd_pkgusr_home "$@" ;;
-    owner-name)      shift; cmd_owner_name "$@" ;;
-    clean-state)     shift; cmd_clean_state "$@" ;;
+    make-wrappers)   shift; cmd_make_wrappers "$@" ;;
+    wrapper-dir)     shift; cmd_wrapper_dir "$@" ;;
     export-groups) shift; cmd_export_groups "$@" ;;
     import-groups) shift; cmd_import_groups "$@" ;;
     prune-locales) shift; cmd_prune_locales "$@" ;;
@@ -6397,6 +6683,7 @@ case "${1:-}" in
     # itself the moment book 7.6 has created the user database; this is for
     # doing it by hand, or checking whether it has happened.
     establish-ownership) shift; cmd_establish_ownership "$@" ;;
+    check-login)     shift; _warn_if_no_login ;;
     init-accounts)   shift; cmd_init_accounts "$@" ;;
     # The repair commands people were told to run for years.  verify is the
     # ONE implementation; these are aliases, not second copies -- a command

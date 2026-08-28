@@ -4,8 +4,8 @@ Build and maintain an LFS/BLFS system where **every package is owned by its own
 user**.
 
 > **100% vibecode, but tested.** Prompted into existence rather than hand
-> written. 568 regression tests. It builds my own system — read it before
-> you point it at yours.
+> written. Every fix carries a regression test. It builds my own system —
+> read it before you point it at yours.
 
 ---
 
@@ -48,7 +48,7 @@ make uninstall
 `/usr` is the default: the chroot invokes these by name, and
 `packagemanager` runs `packagemanager_install` off `$PATH`.
 
-Installs the four tools, the completion script, and `last_build_step.sh`.
+Installs the four tools, `packagemanager_install`, and the completion script.
 
 **Requires:** Python 3.9+, bash, coreutils, tar. Book parsing needs
 `beautifulsoup4` and `requests`.
@@ -77,6 +77,18 @@ failure, or a cancel.
 ---
 
 ## Use the built system
+
+A fresh system has no download tool, and `lfs` and `blfs` need `requests` and
+`beautifulsoup4` to read the books. Bootstrap both, offline, from what
+`get-sources` already downloaded:
+
+```sh
+packagemanager setup            # what it would do
+packagemanager setup --run
+```
+
+Each module is installed as its own package user. Run it again after fixing a
+failure; it skips what is already there.
 
 ```sh
 packagemanager install <pkg> --recursive --run
@@ -199,7 +211,7 @@ let any package user delete another package's home.
 The tools print a fingerprint of their own contents:
 
 ```sh
-lfs --version              # lfs 1.7.1 (build 4f5f344)
+lfs --version              # name, version, build id
 lfs-helper --version       # inside the chroot
 ```
 
@@ -214,7 +226,7 @@ enter it.
 bash test_lfs_crosschain.sh ./lfs
 ```
 
-568 tests. Each encodes a bug that actually happened, with a comment explaining
+Each test encodes a bug that actually happened, with a comment explaining
 what broke.
 
 Run it from a directory holding all five scripts — about 100 tests skip
@@ -224,7 +236,12 @@ without them.
 
 ## Caveats
 
-- The kernel and the bootloader's kernel line are yours to finish.
+- **The kernel and the bootloader are yours.** Nothing here configures, builds
+  or installs a kernel, and nothing is written to any ESP, boot sector or
+  partition table. The machine keeps booting exactly as it does now. The build
+  ends by saying so and printing what to run.
+- A rEFInd entry can be added beside your existing bootloader if you ask for it
+  (`lfs config bootloader refind`). It only ever adds to a mounted ESP.
 - `lfs-helper` and `packagemanager_install` duplicate some logic. Unifying them
   is worthwhile but not done.
 - Tested on x86_64 only.

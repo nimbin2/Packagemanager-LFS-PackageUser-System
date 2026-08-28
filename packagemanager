@@ -109,7 +109,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.10.1"
+TOOL_VERSION = "1.11.6"
 
 
 def _build_id():
@@ -3391,6 +3391,77 @@ def _pip_owner_of_python():
     return "python"
 
 
+# One module, installed the package-user way.  Shared by `packagemanager pip`
+# and `packagemanager setup`, because they want exactly the same thing and a
+# second copy of it is how the two would drift apart.
+def pip_install_module(mod, site, grp, find_links=None, upgrade=False,
+                       no_deps=False, target=None):
+    """Install ONE Python module as its own package user.  True on success.
+
+    `target` is an explicit file to install (a wheel in the sources directory);
+    without it pip is given the module NAME and finds it however it can.
+    """
+    # THE ACCOUNT NAME COMES FROM THE CHOKEPOINT.
+    #
+    # This read `_sanitise_user_name(mod)` and used the result for every call
+    # below.  create_package_user normalises internally, so the account it made
+    # was `p_requests` -- and then usermod and su were handed the bare
+    # `requests`, which does not exist:
+    #     usermod: user 'requests' does not exist
+    # The same species as `chown: invalid user: 'wget:wget'`: half the code
+    # asking for the name, half assuming it.
+    user = pkgusr_name(_sanitise_user_name(mod))
+    printHeader(f"{mod}  ->  package user '{user}'")
+
+    if not _user_exists(user):
+        if not create_package_user(user):
+            printError(f"could not create {user}")
+            return False
+        report_created_user(user)
+
+    # THE COLLECTOR GROUP IS GRANTED THROUGH ONE DOOR.
+    #
+    # lfs-helper owns the rules: join the group the directory already carries,
+    # ask which group should own it when there is none, never create one for
+    # root, never hand a package's tree to the install group.  This did its own
+    # groupadd/chgrp -R/chmod -R instead -- a third implementation, after
+    # lfs-helper's and packagemanager_install's, and the only one that never
+    # asked what the directory already carried.
+    if shutil.which("lfs-helper"):
+        _run(["lfs-helper", "grant-dir", site, user, "--run"])
+    else:
+        if not _group_exists(grp):
+            printInfo(f"creating collector group {grp}")
+            _run([_cmd_path("groupadd"), grp])
+        _run([_cmd_path("usermod"), "-a", "-G", grp, user])
+        if _group_exists(grp):
+            _run(["chgrp", "-R", grp, site])
+            _run(["chmod", "-R", "g+w", site])
+
+    # PIP_USER=0 / PYTHONNOUSERSITE=1: without these pip quietly falls back
+    # to ~/.local when site-packages is not writable, and then reports
+    # "Requirement already satisfied" from there ever after -- so the module
+    # is installed for exactly one user and importable by nobody else.
+    env = ["env", "PIP_USER=0", "PYTHONNOUSERSITE=1"]
+    pip_args = ["pip3", "install"]
+    if upgrade:
+        pip_args.append("--upgrade")
+    if no_deps:
+        pip_args.append("--no-deps")
+    if find_links:
+        pip_args += ["--no-index", "--find-links", find_links]
+    pip_args.append(target or mod)
+
+    cmd = ["su", "-s", "/bin/bash", user, "-c",
+           " ".join(shlex.quote(x) for x in env + pip_args)]
+    printInfo(" ".join(pip_args) + f"   (as {user})")
+    if _run(cmd, show_output=True):
+        printSuccess(f"{mod} installed as package-user {user}")
+        return True
+    printError(f"{mod} failed -- see the output above")
+    return False
+
+
 def cmd_pip(args):
     """Install or update a Python module AS A PACKAGE USER.
 
@@ -3404,8 +3475,7 @@ def cmd_pip(args):
     if not site:
         printError("no system site-packages directory found -- is Python installed?")
         return 1
-    owner = _pip_owner_of_python()
-    grp = collector_prefix() + owner
+    grp = collector_prefix() + _pip_owner_of_python()
 
     modules = args.modules
     if not modules:
@@ -3413,43 +3483,10 @@ def cmd_pip(args):
         return 1
 
     for mod in modules:
-        user = _sanitise_user_name(mod)
-        printHeader(f"{mod}  ->  package user '{user}'")
-
-        if not _user_exists(user):
-            if not create_package_user(user):
-                printError(f"could not create {user}")
-                continue
-            report_created_user(user)
-
-        # the collector group is what lets this user write into Python's tree
-        if not _group_exists(grp):
-            printInfo(f"creating collector group {grp}")
-            _run([_cmd_path("groupadd"), grp])
-        _run(["usermod", "-a", "-G", grp, user])
-        if _group_exists(grp):
-            _run(["chgrp", "-R", grp, site])
-            _run(["chmod", "-R", "g+w", site])
-
-        # PIP_USER=0 / PYTHONNOUSERSITE=1: without these pip quietly falls back
-        # to ~/.local when site-packages is not writable, and then reports
-        # "Requirement already satisfied" from there ever after -- so the module
-        # is installed for exactly one user and importable by nobody else.
-        env = ["env", "PIP_USER=0", "PYTHONNOUSERSITE=1"]
-        pip_args = ["pip3", "install"]
-        if args.upgrade:
-            pip_args.append("--upgrade")
-        if args.find_links:
-            pip_args += ["--no-index", "--find-links", args.find_links]
-        pip_args.append(mod)
-
-        cmd = ["su", "-s", "/bin/bash", user, "-c",
-               " ".join(shlex.quote(x) for x in env + pip_args)]
-        printInfo(" ".join(pip_args) + f"   (as {user})")
-        if _run(cmd, show_output=True):
-            printSuccess(f"{mod} installed as package-user {user}")
-        else:
-            printError(f"{mod} failed -- see the output above")
+        pip_install_module(mod, site, grp,
+                           find_links=args.find_links,
+                           upgrade=args.upgrade,
+                           no_deps=getattr(args, "no_deps", False))
     return 0
 
 def cmd_add_user(args):
@@ -3804,6 +3841,215 @@ def cmd_user_list(args):
         groups = user_supplementary_groups(n)
         print(f"  {n:<26} groups: {', '.join(groups) if groups else '-'}")
     print(f"\n{len(names)} user(s).")
+
+
+_SETUP_HELP = """\
+Bootstrap the tooling on a freshly booted system.
+
+LFS ships no download tool, so a new system cannot fetch even the sources for
+its own next package.  And `lfs` and `blfs` need `requests` and
+`beautifulsoup4` to read the books, so without them the tools cannot run on the
+system they just built.
+
+    packagemanager setup --sources     what it needs downloaded
+    packagemanager setup --run         install it
+
+The tarballs must be on disk BEFORE the reboot, while the host still has a
+network -- `lfs build-system get-sources` asks this command for the list.
+"""
+
+# What a freshly booted system needs before it can fetch anything itself.
+#
+# wget comes from the BLFS BOOK: the book already knows its URL and keeps it
+# current, and a second list of download links is a second thing to go stale.
+_SETUP_BLFS_PACKAGES = ["wget"]
+
+# The Python modules `lfs` and `blfs` need to parse the books.
+#
+# WHEELS, not source tarballs, and not from the book.  A modern sdist needs its
+# build backend -- beautifulsoup4 wants hatchling, requests wants setuptools --
+# and with no package index reachable pip cannot fetch one:
+#     BackendUnavailable: Cannot import 'hatchling.build'
+# A wheel is already built, so pip only unpacks it.  All of these are pure
+# Python, so the "any" wheel works on every architecture.
+#
+# Dependencies first: setup installs with --no-deps, so pip will not pull them.
+_SETUP_WHEELS = [
+    "https://files.pythonhosted.org/packages/py3/u/urllib3/urllib3-2.2.3-py3-none-any.whl",
+    "https://files.pythonhosted.org/packages/py3/c/charset_normalizer/charset_normalizer-3.4.0-py3-none-any.whl",
+    "https://files.pythonhosted.org/packages/py3/i/idna/idna-3.10-py3-none-any.whl",
+    "https://files.pythonhosted.org/packages/py3/c/certifi/certifi-2024.8.30-py3-none-any.whl",
+    "https://files.pythonhosted.org/packages/py3/s/soupsieve/soupsieve-2.6-py3-none-any.whl",
+    "https://files.pythonhosted.org/packages/py3/r/requests/requests-2.32.3-py3-none-any.whl",
+    "https://files.pythonhosted.org/packages/py3/b/beautifulsoup4/beautifulsoup4-4.12.3-py3-none-any.whl",
+]
+
+
+def setup_sources():
+    """Every URL this command needs, resolved once."""
+    import subprocess
+    urls = []
+    for pkg in _SETUP_BLFS_PACKAGES:
+        try:
+            out = subprocess.run(["blfs", "sources", pkg],
+                                 capture_output=True, text=True, timeout=120)
+        except (OSError, subprocess.SubprocessError):
+            printWarning("could not run `blfs sources %s` -- is blfs installed?"
+                      % pkg)
+            continue
+        got = [l.strip() for l in (out.stdout or "").splitlines()
+               if l.strip().startswith(("http://", "https://", "ftp://"))]
+        if not got:
+            printWarning("the BLFS book gave no download for '%s' "
+                      "(try: blfs fetch)" % pkg)
+            continue
+        urls += got
+    return urls + _SETUP_WHEELS
+
+
+# Where the tarballs and wheels are, on the booted system.
+#
+# Book 3.1's /sources, kept: `lfs build-system get-sources` put them there
+# while the host still had a network, and that is the last moment there was
+# one.  Overridable, because a tree can be mounted anywhere.
+def setup_sources_dir():
+    return os.environ.get("LFS_SOURCES_DIR") or "/sources"
+
+
+def _wheel_dist(url):
+    """(distribution, version, filename) from a wheel URL.
+
+    PEP 427 fixes the filename: {dist}-{version}-{python}-{abi}-{platform}.whl,
+    so the first two fields are exactly what pip records in site-packages as
+    <dist>-<version>.dist-info.  That is what makes the check below an
+    identity, not a guess.
+    """
+    fn = url.rsplit("/", 1)[-1]
+    parts = fn[:-4].split("-") if fn.endswith(".whl") else fn.split("-")
+    if len(parts) < 2:
+        return fn, "", fn
+    return parts[0], parts[1], fn
+
+
+def _wheel_installed(site, dist, version):
+    return bool(site) and os.path.isdir(
+        os.path.join(site, "%s-%s.dist-info" % (dist, version)))
+
+
+def _setup_state():
+    """What is already true, so setup can be run twice and do nothing twice."""
+    site = _pip_site_dir()
+    wheels = []
+    for url in _SETUP_WHEELS:
+        dist, ver, fn = _wheel_dist(url)
+        wheels.append((dist, ver, fn, url, _wheel_installed(site, dist, ver)))
+    return {
+        "site": site,
+        "wget": shutil.which("wget"),
+        "wheels": wheels,
+    }
+
+
+def _setup_install_wget(yes):
+    """Install wget through the ordinary BLFS path.
+
+    Invoked as a command rather than called as a function: `packagemanager
+    install wget --run` is a build plan, a script, a package user and a
+    manifest, and there is no version of "just the wget part" of that which is
+    not a second implementation of it.
+    """
+    cmd = [sys.executable, os.path.abspath(__file__), "install", "wget", "--run"]
+    if yes:
+        cmd.append("--yes")
+    printInfo("  $ " + " ".join(cmd[2:]))
+    try:
+        return subprocess.run(cmd).returncode == 0
+    except (OSError, subprocess.SubprocessError) as e:
+        printError("could not install wget: %s" % e)
+        return False
+
+
+def cmd_setup(args):
+    if args.sources:
+        for u in setup_sources():
+            print(u)
+        return
+
+    st = _setup_state()
+    srcdir = getattr(args, "sources_dir", None) or setup_sources_dir()
+    force = getattr(args, "force", False)
+    todo_wget = not st["wget"] or force
+    todo_wheels = [w for w in st["wheels"] if force or not w[4]]
+
+    printHeader("packagemanager setup")
+    print()
+    print("  site-packages : %s" % (st["site"] or "NOT FOUND -- is Python installed?"))
+    print("  sources       : %s" % srcdir)
+    print()
+    print("  wget          : %s" % ("installed at %s" % st["wget"] if st["wget"]
+                                    else "MISSING -- will build from the BLFS book"))
+    for dist, ver, fn, url, have in st["wheels"]:
+        print("  %-13s %s" % (dist, "%s installed" % ver if have
+                              else "%s to install" % ver))
+
+    if not st["site"]:
+        printError("\nNo system site-packages directory: nothing can be installed.")
+        sys.exit(1)
+
+    if not todo_wget and not todo_wheels:
+        print()
+        printSuccess("Nothing to do -- wget and every module are already installed.")
+        printInfo("Re-do it anyway with: packagemanager setup --run --force")
+        return
+
+    if not args.run:
+        print()
+        printInfo("Dry run -- to apply, re-run with --run.")
+        return
+
+    # The wheels are already on disk and pip must not reach for an index: this
+    # system has no CA certificates yet, so anything that tries is a hang, not
+    # an error.
+    missing = [fn for _d, _v, fn, _u, _h in todo_wheels
+               if not os.path.isfile(os.path.join(srcdir, fn))]
+    if missing:
+        printError("\nThese wheels are not in %s:" % srcdir)
+        for fn in missing:
+            print("    %s" % fn)
+        printWarning("They had to be downloaded before the reboot:")
+        printWarning("    lfs build-system get-sources --run   (on the host)")
+        sys.exit(1)
+
+    failed = []
+    if todo_wget:
+        printHeader("wget")
+        if not _setup_install_wget(getattr(args, "yes", False)):
+            failed.append("wget")
+        else:
+            # A system with no certificates cannot verify anything it fetches.
+            # This is the same call the tool makes on every invocation; doing it
+            # here means the very next download works.
+            ensure_wget_workaround()
+
+    if todo_wheels:
+        grp = collector_prefix() + _pip_owner_of_python()
+        # IN ORDER, with --no-deps: pip cannot reach an index to resolve
+        # anything, so the order in _SETUP_WHEELS is the dependency order and
+        # each module must already have what it imports.
+        for dist, ver, fn, url, _have in todo_wheels:
+            if not pip_install_module(dist, st["site"], grp,
+                                      find_links=srcdir, no_deps=True,
+                                      target=os.path.join(srcdir, fn)):
+                failed.append(dist)
+
+    print()
+    if failed:
+        printError("setup finished with %d failure(s): %s"
+                   % (len(failed), ", ".join(failed)))
+        printInfo("Fix them and run it again -- it skips what is already done.")
+        sys.exit(1)
+    printSuccess("setup complete.")
+    printInfo("Check it: python3 -c 'import requests, bs4' && wget --version | head -1")
 
 
 def cmd_user_create(args):
@@ -5502,6 +5748,24 @@ def main():
                    help="wait for it instead of running as a disowned task")
     p.set_defaults(func=cmd_reload_pkg_list)
 
+    p = sub.add_parser(
+        "setup",
+        help="bootstrap the tooling on a freshly booted system",
+        description=_SETUP_HELP,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--sources", action="store_true",
+                   help="print the download URLs this needs, one per line, "
+                        "and exit (used by `lfs build-system get-sources`)")
+    p.add_argument("--run", action="store_true", help="apply (default: dry run)")
+    p.add_argument("--force", action="store_true",
+                   help="re-install everything, including what is already there")
+    p.add_argument("--sources-dir", dest="sources_dir",
+                   help="where the downloaded tarballs and wheels are "
+                        "(default: /sources)")
+    p.add_argument("--yes", action="store_true",
+                   help="answer yes to the questions the wget build asks")
+    p.set_defaults(func=cmd_setup)
+
     p = sub.add_parser("pip", help="install or update a Python module as a "
                        "package user (not as root)")
     p.add_argument("action", choices=["install", "update", "upgrade"],
@@ -5510,9 +5774,13 @@ def main():
     p.add_argument("--find-links", metavar="DIR",
                    help="install from local wheels in DIR instead of the network "
                         "(there is no network inside the chroot)")
+    p.add_argument("--no-deps", action="store_true",
+                   help="do not let pip pull dependencies -- name them yourself, "
+                        "in order (what `setup` does, offline)")
     p.set_defaults(func=lambda a: cmd_pip(
         argparse.Namespace(modules=a.modules,
                            upgrade=(a.action in ("update", "upgrade")),
+                           no_deps=a.no_deps,
                            find_links=a.find_links)))
 
     p = sub.add_parser("add-user",

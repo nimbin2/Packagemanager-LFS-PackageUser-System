@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.10.1"
+LFS_VERSION = "1.11.6"
 
 
 def _build_id():
@@ -1222,6 +1222,84 @@ def _lfs_dir():
     return os.environ.get("LFS") or load_config().get("lfs_mount")
 
 
+# THE ONE THING THAT COULD DESTROY THE MACHINE YOU ARE BUILDING ON.
+#
+# Every path in this tool is `$LFS/something`.  If $LFS is the running system,
+# `$LFS/usr` is the HOST's /usr -- and `build-system restart --run` deletes the
+# top-level directories of the tree it is given.  Nothing checked that the tree
+# was not the host's own: a config holding `/` as the mount point, an
+# `export LFS=/` in the wrong shell, or a typo in the interview was enough.
+#
+# The chroot's bind mounts are already guarded (restart refuses while /dev is
+# mounted, because deleting through it would reach the host's /dev).  This is
+# the other half: refusing when the tree IS the host.
+#
+# It lives in require_lfs_for_root because that is the single door every
+# command resolves $LFS through -- put it anywhere else and the next command
+# added is the one that misses it.
+_HOST_DIRS = ("/", "/usr", "/etc", "/boot", "/bin", "/sbin", "/lib", "/lib64",
+              "/var", "/home", "/root", "/opt", "/srv", "/run", "/dev",
+              "/proc", "/sys",
+              # merged-/usr: /bin is a symlink to usr/bin, so realpath("/bin")
+              # is "/usr/bin" and the names above never match it.  A check that
+              # only looked at the resolved path let $LFS=/bin through.
+              "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64", "/usr/share",
+              "/usr/include", "/usr/local", "/usr/src")
+
+# Trees that belong to the running system whole.  Anything inside one of these
+# is the host, however deep -- $LFS=/usr/src/lfs is not a build tree, it is a
+# directory in the system's own /usr.  /home and /srv are deliberately NOT
+# here: /home/you/lfs is a perfectly ordinary place to build.
+_HOST_TREES = ("/usr/", "/etc/", "/boot/", "/bin/", "/sbin/", "/lib/",
+               "/lib64/", "/proc/", "/sys/", "/dev/", "/run/", "/var/")
+
+
+def _is_host_path(p):
+    """True if this path is part of the running system.  The test behind both
+    the interview's refusal and the hard stop below, so they cannot disagree."""
+    try:
+        real = os.path.realpath(p)
+    except OSError:
+        return False
+    # BOTH spellings.  On a merged-/usr system /bin resolves to /usr/bin, so
+    # checking only the resolved path misses the name the person typed, and
+    # checking only the name misses where it actually points.
+    given = os.path.abspath(os.path.expanduser(str(p))).rstrip("/") or "/"
+    if real in _HOST_DIRS or given in _HOST_DIRS:
+        return True
+    for t in _HOST_TREES:
+        if real.startswith(t) or given.startswith(t):
+            return True
+    try:
+        if os.path.samefile(real, "/"):
+            return True
+    except OSError:
+        pass
+    for d in ("/usr", "/etc", "/boot"):
+        cand = os.path.join(real, d.lstrip("/"))
+        try:
+            if os.path.exists(cand) and os.path.samefile(cand, d):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _refuse_host_tree(lfs):
+    """Hard stop if $LFS is, or contains, the running system."""
+    if not _is_host_path(lfs):
+        return lfs
+    real = os.path.realpath(lfs)
+    sys.stderr.write(
+        "\n!! REFUSING: %s is part of the running system.\n"
+        "   Every path this tool writes is $LFS/something, so this would\n"
+        "   build into, and `restart` would delete, the machine you are\n"
+        "   sitting on.\n"
+        "\n   Set it to the mount point of the LFS partition:\n"
+        "       lfs build-system session\n" % real)
+    sys.exit(2)
+
+
 def require_lfs_for_root():
     """Ensure an LFS mount is known (book rule: root needs $LFS after 2.4).  Falls
     back to the saved session config and exports it so child shells inherit it."""
@@ -1232,6 +1310,7 @@ def require_lfs_for_root():
             "  Configure it once:  lfs build-system session\n"
             "  or for this shell:   export LFS=/mnt/lfs\n")
         sys.exit(2)
+    _refuse_host_tree(d)
     os.environ["LFS"] = d
     return d
 
@@ -1301,10 +1380,10 @@ _SESSION_KEYS = [
     ("locale",           "system locale (see 'locale -a')", "en_US.UTF-8"),
     ("paper_size",       "paper size for groff: A4 or letter", "A4"),
     # Everything below is a decision the build used to discover halfway
-    # through, or at the very end -- `last_build_step.sh` blocked on `passwd
-    # root` after a six-hour build, and its own comment admits the
-    # non-interactive path leaves the system "unbootable-but-known".  Asking
-    # here is what lets `lfs run` and `build-all` finish without a person.
+    # through, or at the very end -- the old final step blocked on `passwd
+    # root` after a six-hour build, and its non-interactive path left the
+    # system "unbootable-but-known".  Asking here is what lets `lfs run` and
+    # `build-all` finish without a person.
     ("timezone",         "time zone for the built system (e.g. Europe/Berlin, "
                          "or UTC)", "UTC"),
     # Deleting a working cross-toolchain should never happen by default, so
@@ -1320,10 +1399,11 @@ _SESSION_KEYS = [
     ("strip",            "strip debug symbols at the end?  Saves several GB, "
                          "but rewrites every binary -- slower, and harder to "
                          "debug a crash afterwards.  NOT YET IMPLEMENTED: the "
-                         "answer is stored and nothing acts on it (yes/no)",
+                         "answer is stored and the build says so at the end "
+                         "rather than acting on it (yes/no)",
                          "no"),
-    # The account you will actually log in as.  last_build_step.sh reads this;
-    # without it, a freshly booted system has only root, with no password.
+    # The account you will actually log in as.  The `init-accounts` step reads
+    # this; without it, a freshly booted system has only root, with no password.
     ("main_user",        "login account to create on the built system "
                          "(blank for none)", ""),
 ]
@@ -1353,6 +1433,17 @@ def _prompt_session_config(cfg, force=False):
             continue
         val = input(f"  {desc} [{cur}]: ").strip()
         val = val if val else cur
+        # Refuse a mount point that is the running system, HERE, where you can
+        # simply type another one.  The guard in require_lfs_for_root catches
+        # it later too, but by then it is stored, every command refuses, and
+        # the fix is to work out which config key to edit.
+        if k == "lfs_mount" and val:
+            while _is_host_path(val):
+                sys.stderr.write(
+                    "    !! %s is part of the running system -- refusing.\n"
+                    "       The LFS mount point is an empty directory the LFS\n"
+                    "       partition mounts on, e.g. /mnt/lfs.\n" % val)
+                val = input(f"  {desc} [{cur}]: ").strip() or cur
         if k == "collector_import_file" and val:
             # Accepting a path that is not there means the groups silently
             # never get imported and every sharing question comes back.
@@ -1598,6 +1689,12 @@ def _verify_lfs_ownership():
     lfs = _lfs_dir()
     if not lfs:
         return
+    # This function runs `chown -R lfs` on $LFS/usr, $LFS/lib64, $LFS/var and
+    # $LFS/etc.  It resolves $LFS itself rather than going through
+    # require_lfs_for_root, so it was the one destructive path with no check
+    # that the tree is not the running system -- and on a host, /usr has no
+    # package users, so _handover_is_safe would have said yes.
+    _refuse_host_tree(lfs)
     import pwd as _pwd
     try:
         want = _pwd.getpwnam("lfs").pw_uid
@@ -2838,17 +2935,15 @@ CONFIG_KEYS = [
     ("editor",          "editor for --edit; default: $EDITOR or vim"),
     ("sudo",            "prefix suggested root commands with 'sudo' "
                         "(on/off; default off)"),
-    ("bootstrap_packages",
-                        "BLFS packages the built system needs before it can "
-                        "fetch anything at all (default: wget). Their tarballs "
-                        "are downloaded by get-sources, while there is still a "
-                        "network; `packagemanager setup` installs them on the "
-                        "booted system. Blank for none"),
-    ("bootloader",      "which bootloader to set up: none (default), refind, "
-                        "or grub. GRUB's book instructions run "
-                        "'grub-install /dev/sda', which writes to a disk's boot "
-                        "sector -- with 'refind' that section is skipped "
-                        "entirely and a rEFInd script is generated instead"),
+    ("bootloader",      "which bootloader to set up: none (DEFAULT -- nothing "
+                        "is written to any ESP, boot sector or partition "
+                        "table, and the machine keeps booting exactly as it "
+                        "does now), refind, or grub. GRUB's book instructions "
+                        "run 'grub-install /dev/sda', which writes to a disk's "
+                        "boot sector -- with 'refind' that section is skipped "
+                        "entirely and a rEFInd script is generated instead, "
+                        "which only ADDS an entry beside your existing "
+                        "bootloader"),
     ("esp",             "path of the EFI System Partition inside the built "
                         "system (e.g. /boot/efi). rEFInd installs there; it is "
                         "never formatted, and an existing installation is left "
@@ -3476,7 +3571,7 @@ def write_chroot_env(lfs, quiet=False):
                 f'# languages to keep -- see `lfs-helper prune-locales`\n'
                 f'export LFS_LOCALES="{cfg.get("locales") or "en de"}"\n'
                 f'# answers collected by `lfs build-system session`, so the\n'
-                f'# chroot side never has to stop and ask.  last_build_step.sh\n'
+                f'# chroot side never has to stop and ask.  `init-accounts`\n'
                 f'# reads LFS_MAIN_USER instead of blocking on a prompt after\n'
                 f'# a six-hour build.\n'
                 f'export LFS_TIMEZONE="{cfg.get("timezone") or "UTC"}"\n'
@@ -4081,59 +4176,35 @@ def _gen_blfs_extra(outdir, order, unresolved):
 
 
 
-def bootstrap_packages():
-    """BLFS packages the built system needs before it can fetch anything.
-
-    Just wget by default: it is the one thing LFS leaves out that makes a fresh
-    system unable to download its own next package.  `packagemanager setup`
-    installs it; this is only about having the tarball on disk in time.
-    """
-    v = load_config().get("bootstrap_packages")
-    if v is None:
-        return ["wget"]
-    return [p for p in str(v).replace(",", " ").split() if p]
-
-
 def bootstrap_sources():
-    """Their download URLs, asked of the BLFS book.
+    """What the built system needs downloaded before it can fetch anything.
 
-    `blfs` runs on the host and keeps its own book store, so this works before
-    the chroot exists.  Asking the book rather than hardcoding URLs means there
-    is one place that knows where wget comes from, and it is the same place
-    `packagemanager` will ask when it installs it.
+    ASKED OF `packagemanager setup`, which owns that decision -- wget and the
+    Python modules the tools need are its job to install, so the list of what
+    to download is its to declare.  This command only has to make sure they are
+    on disk before the chroot is sealed, because get-sources is the last moment
+    there is still a network.
+
+    Two tools, one list.  A copy here would be a second thing to go stale, and
+    the first version of this did exactly that: `bootstrap_packages` in lfs's
+    own config, resolving wget separately from the tool that installs it.
     """
     import subprocess
-    urls = []
-    for pkg in bootstrap_packages():
-        try:
-            out = subprocess.run(["blfs", "sources", pkg],
-                                 capture_output=True, text=True, timeout=120)
-        except (OSError, subprocess.SubprocessError):
-            warn("! could not run `blfs sources %s` -- is blfs installed?" % pkg)
-            continue
-        got = [l.strip() for l in (out.stdout or "").splitlines()
-               if l.strip().startswith(("http://", "https://", "ftp://"))]
-        if not got:
-            warn("! the BLFS book gave no download for '%s'." % pkg)
-            warn("  A fresh system will have no way to fetch anything.  Either")
-            warn("  fetch a book (blfs fetch) or drop it:")
-            warn("      lfs config bootstrap_packages ''")
-            continue
-        urls += got
+    try:
+        out = subprocess.run(["packagemanager", "setup", "--sources"],
+                             capture_output=True, text=True, timeout=180)
+    except (OSError, subprocess.SubprocessError):
+        warn("! could not run `packagemanager setup --sources`.")
+        warn("  The built system will have no way to fetch anything until you")
+        warn("  put a download tool on it by hand.")
+        return []
+    urls = [l.strip() for l in (out.stdout or "").splitlines()
+            if l.strip().startswith(("http://", "https://", "ftp://"))]
+    if not urls:
+        warn("! `packagemanager setup --sources` listed nothing.")
+        for line in (out.stderr or "").splitlines():
+            warn("    %s" % line)
     return urls
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 def _write_tool_stamps(lfs, tools):
     """Record the md5 of every tool we copied in.
