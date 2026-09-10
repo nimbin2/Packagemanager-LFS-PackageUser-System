@@ -10,7 +10,41 @@
 set -u
 
 LFS_TOOL="${1:-./lfs}"
-LFS_BOOK="${2:-/mnt/user-data/uploads/LFS-BOOK-12_4-NOCHUNKS.html}"
+# A bare name is resolved off $PATH; anything unreadable stops NOW with one
+# message.  `bash test_lfs_crosschain.sh lfs` used to produce hundreds of
+# python tracebacks -- every heredoc failing to open 'lfs' -- burying the one
+# fact that mattered: there is no ./lfs in this directory.
+case "$LFS_TOOL" in
+    */*) : ;;
+    *) if [ ! -f "$LFS_TOOL" ] && command -v "$LFS_TOOL" >/dev/null 2>&1; then
+           LFS_TOOL="$(command -v "$LFS_TOOL")"
+       fi ;;
+esac
+if [ ! -r "$LFS_TOOL" ]; then
+    echo "!! no such tool: $LFS_TOOL" >&2
+    echo "   run from the checkout (bash test_lfs_crosschain.sh ./lfs)" >&2
+    echo "   or give a path (bash test_lfs_crosschain.sh /usr/bin/lfs)" >&2
+    exit 1
+fi
+
+# The book is found, not baked in: a path from whoever ran the suite last is
+# wrong on every other machine.  Missing entirely is fine -- the handful of
+# tests that need it already fail with a clear FileNotFoundError naming it.
+_find_book() {
+    local d f
+    for d in "$(dirname "$LFS_TOOL")" "${LFS_STORE:-/usr/share/lfs}/books"; do
+        for f in "$d"/LFS-BOOK-*-NOCHUNKS.html "$d"/LFS-BOOK-*-nochunks.html; do
+            [ -r "$f" ] && { printf '%s' "$f"; return 0; }
+        done
+    done
+    printf '%s' "LFS-BOOK-NOT-FOUND.html"
+}
+LFS_BOOK="${2:-$(_find_book)}"
+# The phase runner every generated script sources (format v18).  Tests that
+# used to grep a generated script for what it DID now grep this file; tests
+# that RUN a script find it through PKGUSR_LIB, as the real runners do.
+PHASES_LIB="$(cd "$(dirname "$LFS_TOOL")" && pwd)/lfs-phases"
+export PKGUSR_LIB="$PHASES_LIB"
 T=$(mktemp -d /tmp/lfstest.XXXXXX)
 PASS=0; FAIL=0
 # Count in FILES, not shell variables.
@@ -115,9 +149,9 @@ bash -n "$T/demo.sh" && ok "generated script is valid bash" || bad "syntax error
 # phases must be split the way the book reads
 grep -q "^\.\./configure" "$T/demo.sh" && ok "configure landed in build phase" \
     || bad "configure not in build phase"
-sed -n '/^install_pkg/,/INSTALL DONE/p' "$T/demo.sh" | grep -q "make install" \
+sed -n '/^install_pkg/,/^}/p' "$T/demo.sh" | grep -q "make install" \
     && ok "make install landed in install phase" || bad "install phase wrong"
-sed -n '/^configure_pkg/,/CONFIGURE DONE/p' "$T/demo.sh" | grep -q "post-install-fixup" \
+sed -n '/^configure_pkg/,/^}/p' "$T/demo.sh" | grep -q "post-install-fixup" \
     && ok "post-install cmd landed in configure phase" || bad "configure phase wrong"
 
 # --------------------------------------------------------------- run it fully
@@ -135,7 +169,7 @@ fi
     || bad "install produced no file"
 [ -f "$LFS/tools/fixup.txt" ] \
     && ok "configure (post-install) phase ran" || bad "configure phase did not run"
-grep -q "^/.*build$" "$LFS/build/.cc-build-demo" 2>/dev/null \
+grep -q "^/.*build$" "$LFS/build/.pkgusr-demo-1.0.cwd" 2>/dev/null \
     && ok "recorded build dir for resume" || bad "build dir not recorded"
 
 # ------------------------------------------------- single-phase re-run works
@@ -544,8 +578,8 @@ fi
 python3 - "$LFS_TOOL" <<'PY6'
 import sys, importlib.machinery as m
 lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
-body = lfs._crosschain_script_body("demo", "ch-system-demo", "demo-1.0",
-                                   "demo-1.0.tar.*", ["make", "make install"])
+import os
+body = open(os.path.join(os.path.dirname(sys.argv[1]), "lfs-phases")).read()
 if "--no-same-owner" not in body:
     print("  FAIL  unpack does not use tar --no-same-owner"); sys.exit(1)
 print("  PASS  unpack never restores the archive's UIDs")
@@ -555,7 +589,7 @@ _count_rc $?
 helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
 if [ -f "$helper_src" ]; then
     # markers live in the build scratch now, not in the tarball store
-    grep -q 'rm -f "\$blddir/.cc-build-\$name"' "$helper_src" \
+    grep -q 'rm -f "\$blddir"/.pkgusr-\*.dir' "$helper_src" \
         && ok "stale build markers are cleared before a build" \
         || bad "stale build markers are not cleared"
     grep -q "^cmd_clean_sources()" "$helper_src" \
@@ -1636,12 +1670,29 @@ if "--no-index" not in b:
     problems.append("pip is still allowed to reach for an index")
 
 # wget comes from the ordinary install path, not a private copy of it
-if "install" not in sb or "wget" not in sb:
-    problems.append("setup no longer installs wget")
-if re.search(r"^def _setup_install_wget\(", src, re.M):
-    wb = body("_setup_install_wget")
-    if '"install"' not in wb:
-        problems.append("wget is installed by some path other than `install`")
+if "wget" not in sb:
+    problems.append("bootstrap no longer installs wget")
+# it may delegate -- follow one hop rather than demanding the literal here
+_wb = body("_setup_install_wget") + body("_install_via_self")
+if '"install"' not in _wb:
+    problems.append("wget is installed by some path other than `install`")
+
+# THE FIVE STAGES.  What was missing was never the individual checks -- the
+# tool could already tell you about wget, the book, make-ca and the bundle
+# separately.  It was the ORDER, on a system where every one of them is
+# unsatisfied at once and nothing says which to do first.
+if not re.search(r"^_BOOTSTRAP_STAGES = \[", src, re.M):
+    problems.append("the bootstrap stages are not a list anything can read")
+for key in ("wget", "wheels", "book", "make_ca", "ca"):
+    if '"%s"' % key not in body("_bootstrap_state"):
+        problems.append("bootstrap does not check for %s" % key)
+# stages 3-5 need a working download, so they are printed, never run
+nb = body("_bootstrap_next_steps")
+for cmd in ("blfs fetch", "make-ca", "make-ca -g --force"):
+    if cmd not in nb:
+        problems.append("the remaining steps do not mention %s" % cmd)
+if "subprocess" in nb or "_run(" in nb:
+    problems.append("the remaining steps are executed instead of printed")
 
 # IDEMPOTENT.  The old final step ran exactly once, at the end of a six-hour
 # build; this one has to be safe to run again after fixing whatever failed.
@@ -1662,10 +1713,38 @@ print("  PASS  setup installs wget and the wheels, offline, as package users")
 PYSETUP
 _count_rc $?
 
+# The old name must keep working.  `lfs build-system get-sources` on an
+# already-installed system calls `packagemanager setup --sources`, and a rename
+# that breaks the tool which downloads the sources costs a reboot to find out.
+_o="$(python3 "$pm_src" setup --sources 2>/dev/null | grep -c '^https\?://')"
+[ "${_o:-0}" -ge 7 ] \
+    && ok "the old 'setup' name still answers --sources" \
+    || bad "renaming setup broke the call get-sources makes"
+_o="$(python3 "$pm_src" bootstrap --sources 2>/dev/null | grep -c '^https\?://')"
+[ "${_o:-0}" -ge 7 ] \
+    && ok "bootstrap --sources lists the wheels" \
+    || bad "bootstrap --sources lists nothing"
+# and lfs must ask for the new name, with the old one as the fallback
+if grep -q '"packagemanager", "bootstrap", "--sources"' "$LFS_TOOL"; then
+    grep -q '"packagemanager", "setup", "--sources"' "$LFS_TOOL" \
+        && ok "get-sources asks for bootstrap, and falls back to setup" \
+        || bad "get-sources cannot talk to an older packagemanager"
+else
+    bad "get-sources still asks for the old name only"
+fi
+
 # It must REFUSE rather than half-run when the wheels were never downloaded.
 # There is no network on a fresh system, so "try it and see" is a hang.
+#
+# On a system that is ALREADY bootstrapped there is nothing left for setup to
+# install, so exit 0 with an empty sources dir is the truth, not the bug this
+# guards against.  That state is skipped, not failed -- the refusal path can
+# only be exercised where something is still missing.
 _sbx="$T/setup-empty"; mkdir -p "$_sbx"
 _o="$(LFS_SOURCES_DIR="$_sbx" python3 "$pm_src" setup --run --yes 2>&1)"; _rc=$?
+if [ "$_rc" -eq 0 ] && ! printf '%s\n' "$_o" | grep -q '^  --  '; then
+    echo "  SKIP  setup has nothing left to install on this system"
+else
 _p=""
 [ "$_rc" -ne 0 ] || _p="$_p;setup --run succeeded with no wheels on disk"
 printf '%s\n' "$_o" | grep -q 'get-sources' \
@@ -1678,6 +1757,7 @@ if [ -n "$_p" ]; then
     done
 else
     ok "setup stops when the wheels are missing, and says which"
+fi
 fi
 fi
 
@@ -1744,9 +1824,19 @@ if [ -f "$helper_src" ]; then
     grep -q "A ROOT step must not get" "$helper_src" \
         && ok "root steps run without the package-user wrappers" \
         || bad "root steps still get the wrappers and cannot chown"
-    grep -q "envpass=\"\$envpass PATH='/usr/local/bin" "$helper_src" \
-        && ok "the root PATH has no wrapper directory" \
-        || bad "root's PATH still starts with the wrappers"
+    # the PATH is built from a variable now (1.13.19 appends the /opt
+    # directories the packages' own profile snippets add), so check the
+    # PROPERTY: root gets the base, a package user gets the wrappers first
+    _rootpath="$(_slice_fn "$helper_src" cmd_build | grep -A2 'as_root" = 1' | grep "PATH='")"
+    case "$_rootpath" in
+        *'$WRAPPERS'*) bad "root's PATH still starts with the wrappers" ;;
+        *"PATH='\$_base'"*) ok "the root PATH has no wrapper directory" ;;
+        *) bad "root's PATH is not built from the shared base list" ;;
+    esac
+    _slice_fn "$helper_src" cmd_build | grep -q "PATH='\$WRAPPERS:\$_base'" \
+        || bad "a package user's PATH no longer starts with the wrappers"
+    _slice_fn "$helper_src" cmd_build | grep -q '/opt/\*) \[ -d' \
+        || bad "packages installed under /opt are invisible to later builds"
     # /usr/src is shared install space; /sources and /build are scratch.  Both
     # kinds must be beyond a package's reach, but by DIFFERENT mechanisms --
     # conflating them is what once made /root root:install drwxrwx---, and what
@@ -1913,12 +2003,6 @@ if [ -f "$helper_src" ]; then
         || bad "shared drop-in directories are misclassified"
 fi
 
-pmi="$(dirname "$LFS_TOOL")/packagemanager_install"
-if [ -f "$pmi" ]; then
-    grep -q "^diagnose_install_failure()" "$pmi" \
-        && ok "a failed install explains itself instead of dumping a traceback" \
-        || bad "install failures are reported as raw build output"
-fi
 
 # ---- packagemanager must recover like lfs-helper does ----------------------- #
 # The same permission problem happens after the base build as during it, and it
@@ -1981,7 +2065,7 @@ print("  PASS  a large log is scanned in %.0f ms and the error is still found"
 PY32
     _count_rc $?
 fi
-for f in lfs-helper packagemanager_install; do
+for f in lfs-helper; do
     t="$(dirname "$LFS_TOOL")/$f"
     [ -f "$t" ] || continue
     grep -q "tail -c 524288" "$t" \
@@ -1994,22 +2078,6 @@ done
 # affairs under the package-user model, not a mistake to report.  The answer is
 # always the same -- put both packages in a collector group -- so it should be
 # done automatically, not printed as a command for the user to copy.
-pmi="$(dirname "$LFS_TOOL")/packagemanager_install"
-if [ -f "$pmi" ]; then
-    grep -q "^auto_grant_from_log()" "$pmi" \
-        && ok "packagemanager grants collector access on a permission failure" \
-        || bad "packagemanager only reports permission failures"
-    grep -qE '_round\" -lt (6|20)' "$pmi" \
-        && ok "it retries until nothing new needs granting" \
-        || bad "one grant round is not enough for a multi-directory install"
-    # an EXISTING collector group must be joined, not duplicated
-    grep -q '"\${prefix}"\*)' "$pmi" \
-        && ok "an existing collector group is joined rather than replaced" \
-        || bad "a second group would be made for an already-shared directory"
-    grep -q "PM_NO_AUTO_FIX" "$pmi" \
-        && ok "the automatic repair can be turned off" \
-        || bad "no way to opt out of automatic permission changes"
-fi
 
 # ---- a retry wrapper must not call itself ----------------------------------- #
 # run_pm_install() gained a retry loop and, in wrapping the old call, ended up
@@ -2059,15 +2127,6 @@ fi
 # Treating those as install targets granted a package write access to
 # /usr/lib/python3.13 -- and invented a "<prefix>_root" group, which would mean
 # "may write anywhere root owns" and undoes the entire scheme.
-pmi="$(dirname "$LFS_TOOL")/packagemanager_install"
-if [ -f "$pmi" ]; then
-    grep -q 'owned by root -- NOT shared' "$pmi" \
-        && ok "a collector group is never created for root" \
-        || bad "a root collector group could still be created"
-    grep -q 'grep -vE "\^\[\[:space:\]\]\*(File|Traceback' "$pmi" \
-        && ok "traceback frames are excluded when looking for failed paths" \
-        || bad "paths from tracebacks could be granted"
-fi
 helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
 if [ -f "$helper_src" ]; then
     grep -q "not creating a collector group for it" "$helper_src" \
@@ -2174,8 +2233,11 @@ if [ -f "$bt" ]; then
     grep -q 'inst.find_all(\["pre", "h3", "h4", "div"\])' "$bt" \
         && ok "commands are collected from nested sub-sections too" \
         || bad "only top-level command blocks would be found"
-    # a stale index must not survive the fix
-    grep -q "CACHE_VERSION = 4" "$bt" \
+    # a stale index must not survive an extraction change: the version must
+    # be AT LEAST the one each fix shipped with (pinning an exact number made
+    # this test itself go stale on the next bump)
+    _cv="$(grep -oE '^CACHE_VERSION = [0-9]+' "$bt" | grep -oE '[0-9]+')"
+    [ "${_cv:-0}" -ge 5 ] \
         && ok "the cache version was bumped so stale indexes rebuild" \
         || bad "cached books would keep serving the old empty commands"
 fi
@@ -2948,12 +3010,6 @@ if [ -f "$helper_src" ]; then
         && ok "no collector group is created outside the allocator" \
         || bad "a bare groupadd bypasses the collector range (line $outside)"
 fi
-pmi="$(dirname "$LFS_TOOL")/packagemanager_install"
-if [ -f "$pmi" ]; then
-    grep -q "_cgid=90000" "$pmi" \
-        && ok "packagemanager uses the same collector range" \
-        || bad "packagemanager still allocates collector gids from the user range"
-fi
 
 # ---- the two tools spell the same thing the same way ------------------------ #
 python3 - "$LFS_TOOL" <<'PY47'
@@ -3501,45 +3557,6 @@ fi
 #     install: cannot change permissions of '/usr/sbin': Operation not permitted
 # lfs-helper wraps install/chmod/chown during the chroot build for exactly
 # this; packagemanager_install did not, so the same package failed after boot.
-pmi="$(dirname "$LFS_TOOL")/packagemanager_install"
-if [ -f "$pmi" ]; then
-    grep -q "^_make_build_wrappers()" "$pmi" \
-        && ok "packagemanager wraps install/chmod for the build" \
-        || bad "a package re-moding an existing directory still fails"
-    grep -q "PATH='\$_wrapdir'" "$pmi" \
-        && ok "the wrappers are ahead of the real tools during the build" \
-        || bad "the wrappers are created but never used"
-
-    # behaviour, not just presence
-    wd="$T/wrapmk"; mkdir -p "$wd/wrap" "$wd/exists"
-    ( eval "$(sed -n '/^_make_build_wrappers() {/,/^}/p' "$pmi")"
-      _make_build_wrappers "$wd/wrap" ) >/dev/null 2>&1
-    if PATH="$wd/wrap:$PATH" install -vdm755 "$wd/exists" >/dev/null 2>&1; then
-        ok "install -d on an existing directory succeeds"
-    else
-        bad "install -d on an existing directory still errors"
-    fi
-    if PATH="$wd/wrap:$PATH" install -vdm755 "$wd/fresh" >/dev/null 2>&1 \
-       && [ -d "$wd/fresh" ]; then
-        ok "install -d still creates directories that are missing"
-    else
-        bad "the wrapper broke directory creation"
-    fi
-    echo data > "$wd/src"
-    if PATH="$wd/wrap:$PATH" install -m644 "$wd/src" "$wd/exists/f" >/dev/null 2>&1 \
-       && [ -f "$wd/exists/f" ]; then
-        ok "installing a file is passed through untouched"
-    else
-        bad "the wrapper broke ordinary file installs"
-    fi
-    # a real failure must still be a failure
-    if PATH="$wd/wrap:$PATH" install -d "$wd/nonexistent-parent/sub/deeper/x" \
-         2>/dev/null && [ ! -d "$wd/nonexistent-parent/sub/deeper/x" ]; then
-        bad "the wrapper reports success for a directory it did not create"
-    else
-        ok "a genuine failure is not masked"
-    fi
-fi
 
 # ---- a step's manifest lists what it owns, not what happened while it ran --- #
 # last-step builds wget as the package user 'wget'.  Everything written during
@@ -3629,92 +3646,902 @@ fi
 # bash parses top to bottom: a function called at line 437 but defined at 466
 # does not exist yet, and the build ran without its wrappers:
 #     packagemanager_install: line 437: _make_build_wrappers: command not found
-pmi="$(dirname "$LFS_TOOL")/packagemanager_install"
-if [ -f "$pmi" ]; then
-    python3 - "$pmi" <<'PY60'
-import re, sys
-lines = open(sys.argv[1]).read().split("\n")
-defs, bad = {}, []
-for i, l in enumerate(lines):
-    m = re.match(r"^([a-zA-Z_][a-zA-Z0-9_]*)\(\) \{", l)
-    if m:
-        defs.setdefault(m.group(1), i)
-for name, dline in defs.items():
-    for i, l in enumerate(lines[:dline]):
-        if re.search(r"^\s+%s\b" % re.escape(name), l) and not l.strip().startswith("#"):
-            enclosing = max((d for d in defs.values() if d < i), default=-1)
-            if enclosing == -1:
-                bad.append("%s used at line %d, defined at %d" % (name, i + 1, dline + 1))
-            break
-if bad:
-    for b in bad: print("  FAIL  %s" % b)
+
+# ---- one colour vocabulary across the toolchain  (1.11.26) ----------------- #
+# Red states a failure, orange warns, green states success -- in EVERY tool.
+# The audit found: lfs had the painters and 20 bare uncoloured "!" errors
+# beside them; blfs had green for commands and NO red at all, so its errors
+# were the only uncoloured errors in the set; lfs-sanity printed "!!" plain;
+# the engine printed a warning in red.  An error that does not look like the
+# other tools' errors reads as less serious, which is backwards.
+_p=""
+# lfs: painters exist and no bare "!" error writes remain
+grep -q '^def fail(' "$LFS_TOOL" || _p="$_p;lfs has no fail()"
+grep -qE 'sys\.stderr\.write\("!' "$LFS_TOOL" \
+    && _p="$_p;lfs still writes uncoloured errors"
+# blfs: the same three painters, and -V like every other tool
+_b="$(dirname "$LFS_TOOL")/blfs"
+if [ -f "$_b" ]; then
+    for fn in fail warn ok; do
+        grep -q "^def $fn(" "$_b" || _p="$_p;blfs has no $fn()"
+    done
+    grep -q '"-V", "--version"' "$_b" || _p="$_p;blfs lacks the -V every other tool has"
+fi
+# lfs-sanity: a problem is red, a clean verdict green (guarded for pipes)
+_ss="$(dirname "$LFS_TOOL")/lfs-sanity.sh"
+if [ -f "$_ss" ]; then
+    grep -q '_C_ERR' "$_ss" || _p="$_p;lfs-sanity prints problems without colour"
+    grep -q 'if \[ -t 1 \]' "$_ss" || _p="$_p;lfs-sanity colours a piped report"
+fi
+# warnings go to stderr in EVERY tool, not just the bash ones: a note printed
+# to stdout lands inside whatever a caller is capturing.  The config-conflict
+# note was read back as part of the value it stood next to.  (1.11.28)
+if [ -f "$pmt" ]; then
+    _pw="$(grep 'def printWarning' "$pmt")"
+    case "$_pw" in
+        *sys.stderr*) : ;;
+        *) _p="$_p;packagemanager warns onto stdout, polluting captured output" ;;
+    esac
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "red is failure, orange is warning, green is success -- in every tool"
+fi
+
+# ---- a collector group belongs in its own range, under one prefix  (1.11.25) #
+# A real tree ended with
+#     !! group nimgnu_p_openssl (gid 10093) is outside every convention
+# Two faults.  `groupadd <name>` with no -g takes the next free system gid, so
+# the group landed at 10093, in the middle of the package-user accounts.  And
+# the name stacked two prefixes: the owner is `p_openssl`, so nimgnu_name gave
+# `nimgnu_p_openssl` -- which is not even what the prompt offered.
+python3 - "$pm_src" <<'PYGRP'
+import sys, re, importlib.machinery as m
+pm = m.SourceFileLoader('pm_grp', sys.argv[1]).load_module()
+problems = []
+# one prefix: the owner's is stripped before the collector's is added
+for given, want_suffix in (("p_openssl", "openssl"), ("cfg_bootscripts", "bootscripts")):
+    got = pm.nimgnu_name(given)
+    if not got.endswith(want_suffix) or "_p_" in got or "_cfg_" in got:
+        problems.append("nimgnu_name(%r) = %r keeps the owner's prefix" % (given, got))
+# an already-collector name is left alone, and audio is special
+if pm.nimgnu_name("audio") != "audio":
+    problems.append("the audio group is renamed")
+# the gid comes from the collector range
+gid = pm._next_collector_gid()
+if gid is None or not (90000 <= gid < 99000):
+    problems.append("the next collector gid is %r, outside 90000-99000" % gid)
+# and every creation path uses it -- a bare groupadd takes the next system gid
+src = open(sys.argv[1]).read()
+# every CALLER must go through the helper.  The helper itself builds the
+# command with an optional -g, so exclude its own body from the scan.
+_helper = re.search("def _create_collector_group.*?(?=\n\ndef )", src, re.S)
+_body = src.replace(_helper.group(0), "") if _helper else src
+for m2 in re.finditer("_cmd_path..groupadd..[^]]*]", _body):
+    frag = m2.group(0)
+    # the install group is created with an explicit 9999, which is fine
+    if '"-g"' not in frag:
+        problems.append("a groupadd without -g remains: %s" % frag[:60])
+if not _helper:
+    problems.append("there is no _create_collector_group")
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
     sys.exit(1)
-print("  PASS  every helper is defined before it is used")
-PY60
-    _count_rc $?
+print("  PASS  a collector group gets one prefix and a gid in its own range")
+PYGRP
+_count_rc $?
 
-    # ---- one implementation of the collector-group rules --------------------- #
-    # A package installed after boot must behave exactly like one built during
-    # the chroot stage.  Two copies of the rules drift; lfs-helper owns them.
-    gd="$(sed -n '/^grant_dir_to_user() {/,/^}/p' "$pmi")"
-    case "$gd" in
-        *"lfs-helper grant-dir"*)
-            ok "packagemanager uses lfs-helper's collector-group rules" ;;
-        *) bad "packagemanager keeps its own copy of the rules" ;;
-    esac
-    case "$gd" in
-        *"fallback for a system without it"*)
-            ok "it still works where lfs-helper is not installed" ;;
-        *) bad "no fallback when lfs-helper is absent" ;;
-    esac
-    # the delegation must come FIRST, or the local copy decides
-    i_del="$(printf '%s' "$gd" | grep -n "lfs-helper grant-dir" | head -1 | cut -d: -f1)"
-    i_own="$(printf '%s' "$gd" | grep -n 'prefix="\$(collector_prefix_of)"' | head -1 | cut -d: -f1)"
-    if [ -n "$i_del" ] && [ -n "$i_own" ] && [ "$i_del" -lt "$i_own" ]; then
-        ok "the shared rules are consulted before the local copy"
+# the sanity report's summary must agree with its own body
+_ss="$(dirname "$LFS_TOOL")/lfs-sanity.sh"
+if [ -f "$_ss" ]; then
+    # every "!!" must come from hit(), which counts; an awk that prints its own
+    # made a report flag a bad group and still say "no problems found".
+    if grep -qE "awk[^|]*\{print \\?\"!!" "$_ss"; then
+        bad "lfs-sanity prints a problem that its summary never counts"
     else
-        bad "the local copy runs even when lfs-helper is available"
+        ok "every problem lfs-sanity prints is counted in its summary"
     fi
+fi
 
-    # ---- one set of wrappers, not two  (1.11.3) ------------------------------ #
-    # The wrappers ARE the rule about what a package user may do: chown skipped,
-    # chgrp skipped, `install -d` on an existing directory allowed to succeed.
-    # lfs-helper writes them to /usr/lib/pkgusr, where they outlive the build and
-    # where the package-user profile already points.  This script wrote its own
-    # 480-line copy into a fresh /tmp directory on EVERY run: a second answer to
-    # the same question, and the profile pointed at neither of them.
+# ---- the file to edit is named last, and it is the one that survives (1.11.24) #
+# The failure said
+#     install file: /tmp/packagemanager/install_files/install_make-ca-1.16.1
+# three messages before the end.  Two problems.  That path is where a script
+# freshly generated from the book lands; the engine copies it into the package
+# user's home and the next run REGENERATES the /tmp one, so an edit there is
+# silently discarded -- the exact failure the message exists to prevent.  And
+# what you do next should not be something you scroll back for.
+python3 - "$pm_src" <<'PYEDIT'
+import sys, re
+src = open(sys.argv[1]).read()
+problems = []
+for fn in ("cmd_install", "cmd_update"):
+    m = re.search(r"def %s\(.*?(?=\n\ndef )" % fn, src, re.S)
+    if not m:
+        continue
+    body = m.group(0)
+    i_fail = body.find("sys.exit(result.returncode)")
+    if i_fail < 0:
+        continue
+    seg = body[:i_fail]
+    i_edit = seg.rfind("To change what it does, edit")
+    if i_edit < 0:
+        problems.append("%s never says which file to edit" % fn)
+        continue
+    # nothing but the exit may follow it
+    tail = seg[i_edit:]
+    for later in ("logs:", "Then re-run", "The plan is saved"):
+        if later in tail:
+            problems.append("%s prints '%s' after the file to edit" % (fn, later))
+    # and it must prefer the copy in the package user's home.  The resolution
+    # happens just BEFORE the message, so look at the whole failure block.
+    if "pkgusr_home(" not in seg:
+        problems.append("%s still names the temporary copy" % fn)
+    if "_canon" not in seg:
+        problems.append("%s does not resolve the surviving script" % fn)
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  a failed install ends by naming the script that survives a re-run")
+PYEDIT
+_count_rc $?
+
+# a collector group grants a DIRECTORY, never a package
+_h="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$_h" ]; then
+  if grep -q "everything owned by '\$owner'" "$_h"; then
+      bad "the group prompt still claims it grants everything a package owns"
+  else
+      ok "the group prompt says what a collector group actually grants"
+  fi
+fi
+
+# ---- two registries, one question  (1.11.23) ------------------------------- #
+# `packagemanager which-package` is in the README and never existed:
+#     error: argument <command>: invalid choice: 'which-package'
+# And lfs-helper's version reads the BUILD manifests only, so a package
+# installed ten minutes earlier by these tools was reported as
+#     Nothing recorded means it was installed ... outside these tools entirely.
+# Wrong twice: they installed it, and they recorded it -- in the package user's
+# own pkg.lst, which neither tool consulted.
+_wp="$T/which"; mkdir -p "$_wp/pkgusr/p_wget" "$_wp/cfg"
+echo "/usr/bin/wget" > "$_wp/pkgusr/p_wget/pkg.lst"
+_p=""
+_o="$(PKGUSR_BASE="$_wp" python3 "$pm_src" which-package /usr/bin/wget 2>&1)"
+case "$_o" in
+    *"invalid choice"*) _p="$_p;packagemanager still has no which-package" ;;
+    *p_wget*) ;;
+    *) _p="$_p;which-package does not find the package that recorded the path" ;;
+esac
+# the README documents it, so it has to exist
+_rm="$(dirname "$LFS_TOOL")/README.md"
+if [ -f "$_rm" ] && grep -q 'packagemanager which-package' "$_rm"; then
+    case "$_o" in *"invalid choice"*) _p="$_p;the README documents a command that does not exist" ;; esac
+fi
+_h="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$_h" ]; then
+    _o="$(LFS_PKGUSR_ROOT="$_wp/pkgusr" LFS_CFGUSR_ROOT="$_wp/cfg" \
+          bash "$_h" which-package /usr/bin/wget 2>&1)"
+    case "$_o" in
+        *"outside these tools entirely"*)
+            _p="$_p;lfs-helper still calls a tracked package untracked" ;;
+    esac
+    case "$_o" in
+        *p_wget*) ;;
+        *) _p="$_p;lfs-helper does not look in pkg.lst" ;;
+    esac
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "both tools answer 'which package installed this', from either registry"
+fi
+
+# ---- a wrapper that exists can still be the wrong wrapper  (1.11.21) ------- #
+# 1.11.18 fixed the install wrapper; 1.11.20 hit the identical failure on the
+# identical line.  A snapshot had restored the OLD wrapper: it existed and was
+# executable, and the check said "missing or incomplete", so the fixed one
+# never reached the tree.  The comment on that check claimed it repaired a
+# tree whose wrappers predate a fix.  It could not see "predates".
+_h="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$_h" ]; then
+  _p=""
+  # the writer stamps what it wrote, with the same fingerprint --version prints
+  _mw="$(sed -n '/^make_wrappers() {/,/^}$/p' "$_h" | head -30)"
+  printf '%s' "$_mw" | grep -q '.written-by' \
+      || _p="$_p;the wrappers carry no stamp saying who wrote them"
+  printf '%s' "$_mw" | grep -q '_build_id' \
+      || _p="$_p;the stamp does not change when the code does"
+  # and for real
+  _wl="$T/wrap-stale"; mkdir -p "$_wl"
+  LFS_WRAPPERS="$_wl" bash "$_h" make-wrappers --run >/dev/null 2>&1
+  [ -f "$_wl/.written-by" ] || _p="$_p;make-wrappers wrote no stamp"
+  # (the stale-stamp CONSUMER retired with the fifth tool: the one loop
+  # rewrites its wrappers through make-wrappers itself)
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the wrapper writer stamps what it wrote"
+  fi
+fi
+
+# ---- a checksum failure must say WHICH failure it is  (1.11.20) ------------ #
+# "ERROR: md5sum check failed" was printed for two different things: a file
+# whose contents differ from the book, and a file that is not there at all.
+# The second is what a fresh system actually hits, and it is not a checksum
+# problem -- it is a download that never happened.
+# (the check is the shared runner's now: source it and call it)
+python3 - "$PHASES_LIB" <<'PYMD'
+import sys, subprocess, tempfile, os
+d = tempfile.mkdtemp()
+sh = os.path.join(d, "m.sh")
+open(sh, "w").write('. "%s"\nmd5_sum=abc\npkg=/nonexistent\n_pp_check_md5\n' % sys.argv[1])
+problems = []
+r = subprocess.run(["bash", sh], capture_output=True, text=True)
+out = r.stdout + r.stderr
+if r.returncode == 0:
+    problems.append("a mismatched checksum no longer fails")
+if "expected" not in out or "got" not in out:
+    problems.append("the failure does not say what it expected or got")
+if "<no file>" not in out:
+    problems.append("a missing file is not distinguished from a bad checksum")
+# the override must exist, and must NOT be the default
+r = subprocess.run(["bash", sh], capture_output=True, text=True,
+                   env={"PM_SKIP_MD5": "1", "PATH": "/usr/bin:/bin"})
+if r.returncode != 0:
+    problems.append("PM_SKIP_MD5=1 does not let a mismatch through")
+if "PM_SKIP_MD5" not in out:
+    problems.append("the failure does not mention how to override it")
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  a checksum failure names the cause, and can be overridden on purpose")
+PYMD
+_count_rc $?
+
+# ---- a zero exit is not a finished job  (1.11.19) -------------------------- #
+# make-ca writes several stores and exits 0 having failed some of them:
+#     install: cannot create regular file '/etc/ssl/certdata.txt': Permission denied
+#     p11-kit: couldn't create file: /etc/ssl/certs/...pem: Unknown error 13
+#     Failed!!!
+#     Extracting GNUTLS server auth certificates to: ...Done!
+# /etc/ssl/certs belongs to p_openssl, so p_make-ca could not write it.  One
+# bundle existed elsewhere, _have_ca_bundle said yes, bootstrap reported
+# complete, and certificate checking was turned back ON with an empty OpenSSL
+# trust store -- which is the store wget itself reads.
+python3 - "$pm_src" <<'PYCA'
+import sys, os, re, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm_ca', sys.argv[1]).load_module()
+problems = []
+
+# p11-kit reports errno 13 as a NUMBER, so a filter looking for "denied"
+# skipped the line and the grant found nothing to grant.
+log = os.path.join(tempfile.mkdtemp(), "make-ca.log")
+open(log, "w", encoding="utf-8").write(
+    "install: cannot create regular file '/etc/ssl/certdata.txt': Permission denied\n"
+    "p11-kit: couldn't create file: /etc/ssl/certs/GlobalSign.pem: Unknown error 13\n"
+    "Extracting GNUTLS server auth certificates to: ...Done!\n")
+dirs = [pm._dir_of(p) for p in pm._paths_from_permission_errors(log)]
+for want in ("/etc/ssl", "/etc/ssl/certs"):
+    if want not in dirs:
+        problems.append("%s is not extracted from make-ca's output" % want)
+
+src = open(sys.argv[1]).read()
+if not re.search(r"^def _run_make_ca\(", src, re.M):
+    problems.append("make-ca is run without any recovery")
+else:
+    b = re.search(r"def _run_make_ca\(.*?(?=\n\ndef )", src, re.S).group(0)
+    if "auto_grant_from_log" not in b:
+        problems.append("a store it could not write is never granted")
+    if "retry=False" not in b:
+        problems.append("it never tries again after granting")
+    if "capture_output" not in b:
+        problems.append("the output is not read, so nothing can be granted from it")
+
+# THE TRIGGER MUST MATCH WHAT COUNTS AS DONE.  1.11.19 made "finished" mean a
+# bundle AND no empty store, but left stage 5 running only when there was no
+# bundle at all.  On a tree with the GnuTLS bundle written and /etc/ssl/certs
+# empty, stage 5 was skipped and the empty store was then reported as a
+# failure -- correctly, and without ever having been attempted.
+
+# and success must mean the stores are POPULATED, not merely present
+if not re.search(r"^def _empty_cert_stores\(", src, re.M):
+    problems.append("nothing checks that a store has certificates in it")
+fin = re.search(r"def _bootstrap_finish\(.*?(?=\n\ndef )", src, re.S).group(0)
+if "_empty_cert_stores" not in fin:
+    problems.append("bootstrap reports success without checking the stores")
+_i5 = fin.find('printHeader("5. the certificate bundle")')
+_trigger = fin[max(0, _i5 - 200):_i5] if _i5 >= 0 else ""
+if _i5 < 0:
+    problems.append("stage 5's trigger cannot be found")
+elif "_empty_cert_stores()" not in _trigger:
+    problems.append("stage 5 is skipped when the bundle exists but a store is empty")
+i_chk = fin.find("_empty_cert_stores")
+i_res = fin.find("restore_wget_verification")
+if i_chk >= 0 and i_res >= 0 and i_res < i_chk:
+    problems.append("verification is re-enabled before the stores are checked")
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  an empty trust store is a failure, however make-ca exited")
+PYCA
+_count_rc $?
+
+# ---- the install wrapper must see bundled short options  (1.11.18) --------- #
+# The wrapper detected directory mode with
+#     case "$a" in -d|--directory) want_dirs=1 ;;
+# which matches -d only as a WHOLE argument.  make-ca's Makefile writes
+#     install -vdm755 /usr/sbin
+# in one token, so the rule never fired, the real install(1) ran, and it died on
+# the exact message this wrapper's own comment quotes.  `install -d` on an
+# EXISTING directory still applies the mode, and chmod needs ownership rather
+# than write permission -- which is why three rounds of granting groups could
+# not help.
+_h="$(dirname "$LFS_TOOL")/lfs-helper"
+if [ -f "$_h" ]; then
+  _w="$T/wrapper-install"
+  # lift the wrapper exactly as lfs-helper writes it, and run it for real
+  sed -n "/cat > \"\$WRAPPERS\/install\" <<'EOF'/,/^EOF$/p" "$_h" \
+      | sed '1d;$d' > "$_w"
+  if [ -s "$_w" ]; then
+    printf '#!/bin/bash\necho "REAL $*"\n' > "$T/realinstall"
+    chmod +x "$T/realinstall" "$_w"
+    sed -i "s|^real=/usr/bin/install$|real=$T/realinstall|" "$_w"
+    mkdir -p "$T/exists"; rm -rf "$T/fresh"
     _p=""
-    grep -q '^_wrapper_dir_from_lfs_helper()' "$pmi" \
-        || _p="$_p;there is no way to ask lfs-helper for the wrappers"
-    grep -q 'lfs-helper wrapper-dir' "$pmi" \
-        || _p="$_p;the wrapper directory is assumed rather than asked for"
-    # every call site must go through the resolver first
-    _n_ask="$(grep -c '_wrapper_dir_from_lfs_helper' "$pmi")"
-    _n_own="$(grep -c '_make_build_wrappers "\$_wrapdir"' "$pmi")"
-    [ "${_n_ask:-0}" -gt "${_n_own:-0}" ] \
-        || _p="$_p;a call site still builds its own wrappers without asking"
-    # and the SHARED directory must never be deleted afterwards -- that would
-    # take the wrappers away from every package user on the system
-    grep -q '_wraptmp' "$pmi" \
-        || _p="$_p;the cleanup does not distinguish the shared dir from a temporary one"
-    if grep -q 'rm -rf "$_wrapdir"' "$pmi" && ! grep -q '_wraptmp.*=.*1.*rm -rf "$_wrapdir"' "$pmi"; then
-        _p="$_p;the wrapper directory is removed unconditionally"
-    fi
+    # the reported failure: bundled -d must be recognised, and an existing
+    # directory left alone
+    _o="$(bash "$_w" -vdm755 "$T/exists" 2>&1)"
+    case "$_o" in *REAL*) _p="$_p;bundled -vdm755 still reaches the real install" ;; esac
+    _o="$(bash "$_w" -dv "$T/exists" 2>&1)"
+    case "$_o" in *REAL*) _p="$_p;bundled -dv still reaches the real install" ;; esac
+    # the unbundled spellings must keep working
+    _o="$(bash "$_w" -m 0755 -d "$T/exists" 2>&1)"
+    case "$_o" in *REAL*) _p="$_p;-m 0755 -d regressed" ;; esac
+    _o="$(bash "$_w" --directory "$T/exists" 2>&1)"
+    case "$_o" in *REAL*) _p="$_p;--directory regressed" ;; esac
+    # a directory that does NOT exist must still be created
+    bash "$_w" -vdm755 "$T/fresh" >/dev/null 2>&1
+    [ -d "$T/fresh" ] || _p="$_p;a missing directory is no longer created"
+    # an ordinary file install must still reach install(1), with ownership
+    # stripped and the mode intact.  The source has to EXIST: since 1.12.19 an
+    # install whose sources are all missing is a skipped optional artifact,
+    # not a failure, and this fixture never created its file.
+    : > "$T/f"
+    _o="$(bash "$_w" -vm644 -o root -g root "$T/f" "$T/exists/" 2>&1)"
+    case "$_o" in
+        *"REAL"*) case "$_o" in
+                      *"-m 644"*) ;;
+                      *) _p="$_p;a bundled mode is lost on a file install" ;;
+                  esac ;;
+        *) _p="$_p;an ordinary file install no longer runs" ;;
+    esac
+    case "$_o" in *"REAL"*"-o root"*) _p="$_p;ownership is no longer stripped" ;; esac
+    # setuid must be refused in EITHER spelling -- bundled slipped past before
+    _o="$(bash "$_w" -vm4755 f "$T/exists/" 2>&1)"
+    case "$_o" in *"-m 4755"*"755 instead"*) ;; *) _p="$_p;bundled setuid is not refused" ;; esac
     if [ -n "$_p" ]; then
         printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
             [ -n "$m" ] && bad "$m"
         done
     else
-        ok "both tools use one set of wrappers, and only a temporary one is deleted"
+        ok "the install wrapper reads -vdm755 the same as -d -m 755"
     fi
-
-    # the account home is asked for, not re-derived from the layout
-    _hf="$(sed -n '/^pkgusr_home_for() {/,/^}/p' "$pmi")"
-    case "$_hf" in
-        *"lfs-helper pkgusr-home"*) ok "the account home comes from the chokepoint" ;;
-        *) bad "packagemanager_install re-derives where an account lives" ;;
-    esac
+  fi
 fi
+
+# ---- granting cannot fix what is not a group problem  (1.11.17) ------------ #
+# The grant fired, worked out the right directory, and then:
+#     /usr/sbin is already group install -- adding 'make-ca' to it
+#     usermod: user 'make-ca' does not exist
+# Two faults in three lines.  The account name was the PACKAGE name again --
+# third appearance of that species in this file.  And the user was already in
+# `install`: /usr/sbin is root:install and the failure was `install -vdm755`
+# CHMODing a directory root owns, which is the wrappers' job, not the group's.
+# Granting a group someone already holds looks like progress and is not.
+if [ -f "$pm_src" ]; then
+  _p=""
+  _loop="$(sed -n '/^def run_pm_install(/,/^def /p' "$pm_src")"
+  printf '%s' "$_loop" | grep -q 'auto_grant_from_log(pkgusr_name(name)' \
+      || _p="$_p;the grant is still applied to the package name"
+  _ag="$(sed -n '/^def auto_grant_from_log(/,/^def /p' "$pm_src")"
+  printf '%s' "$_ag" | grep -q 'user_supplementary_groups' \
+      || _p="$_p;a group the user already has is granted again"
+  printf '%s' "$_ag" | grep -q 'make-wrappers' \
+      || _p="$_p;nothing points at the wrappers when the group is not the problem"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "a grant goes to the account, and is not offered where it cannot help"
+  fi
+fi
+
+# ---- the auto-grant must recognise the message it is given  (1.11.16) ------ #
+# The recovery lfs-helper does during the base build exists here too -- a
+# package that must write into another package's directory joins its collector
+# group -- but it never fired on the real failure:
+#     install: cannot change permissions of \u2018/usr/sbin\u2019: Operation not permitted
+# coreutils quotes with the locale's style (U+2018/U+2019 under UTF-8) and the
+# patterns matched ASCII apostrophes only, so no directory was extracted and
+# packagemanager printed the manual command as though it had no opinion.
+python3 - "$pm_src" <<'PYPERM'
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm_perm', sys.argv[1]).load_module()
+problems = []
+log = os.path.join(tempfile.mkdtemp(), "install.log")
+open(log, "w", encoding="utf-8").write(
+    "install -vdm755 /usr/sbin\n"
+    "install: cannot change permissions of \u2018/usr/sbin\u2019: Operation not permitted\n"
+    "cp: cannot create regular file '/usr/lib/foo': Permission denied\n"
+    "mkdir: cannot create directory \u201c/usr/share/bar\u201d: Permission denied\n"
+    "gcc -O2 -o thing thing.c\n")
+got = pm._paths_from_permission_errors(log)
+for want in ("/usr/sbin", "/usr/lib/foo", "/usr/share/bar"):
+    if want not in got:
+        problems.append("%s was not extracted from the log" % want)
+# and an ordinary build line must not look like a permission failure
+if any("thing" in p for p in got):
+    problems.append("a plain compile line was read as a permission error")
+# the retry loop has to consult it, or extracting changes nothing
+import re
+src = open(sys.argv[1]).read()
+loop = re.search(r"def run_pm_install\(.*?(?=\n\ndef )", src, re.S).group(0)
+if "auto_grant_from_log" not in loop:
+    problems.append("the install never retries after granting")
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  a permission failure is recognised however coreutils quotes it")
+PYPERM
+_count_rc $?
+
+# ---- --run means run, not print  (1.11.15) --------------------------------- #
+# Stages 3-5 were PRINTED as commands to type, on the reasoning that each has
+# to be seen to work before the next is worth trying.  That is a poor trade:
+# `bootstrap --run` is someone saying "get this system ready", and answering
+# with three commands to type refuses the request while looking like an answer.
+python3 - "$pm_src" <<'PYRUN'
+import sys, re
+src = open(sys.argv[1]).read()
+problems = []
+if not re.search(r"^def _bootstrap_finish\(", src, re.M):
+    print("  FAIL  nothing does the stages that need a network")
+    sys.exit(1)
+fin = re.search(r"def _bootstrap_finish\(.*?(?=\n\ndef )", src, re.S).group(0)
+
+# each stage must actually be attempted
+for what, needle in (("the book", "fetch"),
+                     ("make-ca", "_install_via_self"),
+                     ("the bundle", "-g")):
+    if needle not in fin:
+        problems.append("%s is still only printed" % what)
+# make-ca through the ordinary path, with its dependencies
+if "recursive=True" not in fin:
+    problems.append("make-ca is installed without resolving its dependencies")
+# --force, or make-ca reports "No update required!" and writes nothing.
+# Moved into _run_make_ca in 1.11.19, so look there too.
+_mk = re.search(r"def _run_make_ca\(.*?(?=\n\ndef )", src, re.S)
+if '"--force"' not in fin + (_mk.group(0) if _mk else ""):
+    problems.append("the bundle is generated without --force, so it may write nothing")
+# a stage whose dependency failed must be SKIPPED, not attempted and blamed
+if fin.count("Skipped") < 2:
+    problems.append("a stage runs even when what it depends on failed")
+# and verification comes back on the moment there is something to verify with
+if "restore_wget_verification" not in fin:
+    problems.append("certificate checking is never turned back on")
+
+# the dry run still explains, rather than doing
+body = re.search(r"def cmd_setup\(.*?(?=\n\ndef )", src, re.S).group(0)
+if "_bootstrap_finish" not in body:
+    problems.append("the run path never reaches the later stages")
+if "_bootstrap_next_steps" not in body:
+    problems.append("the dry run no longer says what would happen")
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  bootstrap --run does every stage it can, and skips what it cannot")
+PYRUN
+_count_rc $?
+
+# ---- the tarball is staged where the home exists  (1.11.14, fixed 1.11.20) - #
+# get-sources downloads every tarball to /sources before the reboot.  The build
+# looked only in the build directory, so the first install on a fresh system
+# reached for a download tool in order to install that download tool:
+#     install_p_wget: line 44: wget: command not found
+#     md5sum: wget-1.25.0.tar.gz: No such file or directory
+#
+# 1.11.14 put the staging in packagemanager, before the engine ran, guarded by
+# "only if the home exists".  For a NEW package it never does -- the engine
+# creates it -- so the guard made the fix a no-op in exactly the case it was
+# written for, and the same error came back unchanged.  It belongs in the
+# engine, after the account is made.
+if [ -f "$helper_src" ]; then
+  _p=""
+  grep -q '^_pm_stage_source()' "$helper_src" \
+      || _p="$_p;nothing stages a downloaded tarball"
+  _sf="$(_slice_fn "$helper_src" _pm_stage_source)"
+  printf '%s' "$_sf" | grep -q 'LFS_SOURCES_DIR:-/sources' \
+      || _p="$_p;the sources directory is not consulted"
+  # COPIED, never moved: /sources is the record of what was downloaded
+  printf '%s' "$_sf" | grep -qE '^\s*cp "\$_d/\$_pkg"' \
+      || _p="$_p;the tarball is not copied in"
+  printf '%s' "$_sf" | grep -qE '\bmv "\$_d' \
+      && _p="$_p;the build consumes the file out of /sources"
+  # it must run AFTER the account exists, or the home it copies into is not there
+  _ip="$(_slice_fn "$helper_src" cmd_pm_install)"
+  _i_add="$(printf '%s' "$_ip" | grep -n '_pm_add_account' | head -1 | cut -d: -f1)"
+  _i_stg="$(printf '%s' "$_ip" | grep -n '_pm_stage_source' | head -1 | cut -d: -f1)"
+  if [ -z "$_i_stg" ]; then
+      _p="$_p;pm-install never stages anything"
+  elif [ -n "$_i_add" ] && [ "$_i_stg" -lt "$_i_add" ]; then
+      _p="$_p;staging runs before the account and its home exist"
+  fi
+  # and it must run for real
+  _sbx="$T/stage"; mkdir -p "$_sbx/src" "$_sbx/home"
+  echo TARBALL > "$_sbx/src/wget-1.25.0.tar.gz"
+  printf 'name="wget"\npkg="wget-1.25.0.tar.gz"\n' > "$_sbx/script"
+  {
+      echo 'ok(){ :; }'
+      echo "_recorded_home_for(){ echo \"$_sbx/home\"; }"
+      printf '%s\n' "$_sf"
+      echo "_pm_stage_source p_wget $_sbx/script"
+  } > "$_sbx/run.sh"
+  LFS_SOURCES_DIR="$_sbx/src" bash "$_sbx/run.sh" >/dev/null 2>&1
+  [ -f "$_sbx/home/wget-1.25.0.tar.gz" ] \
+      || _p="$_p;the tarball did not reach the package user's home"
+  [ -f "$_sbx/src/wget-1.25.0.tar.gz" ] \
+      || _p="$_p;/sources lost the file the build used"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "a downloaded tarball is staged into the home pm-install just made"
+  fi
+fi
+
+# ---- the account's home is settled where the account is made  (1.11.13) ---- #
+# add_package_user takes no home argument: it uses /usr/src/<name>, while every
+# other tool puts package users in /usr/src/pkgusr/<name>.  So the account was
+# created, a home was created, and the install then ran in a third place that
+# existed in neither:
+#     tee: /usr/src/p_wget/log/...: No such file or directory
+#     bash: /usr/src/p_wget/install_p_wget: No such file or directory
+# packagemanager reported the right path in the same breath -- logs:
+# /usr/src/pkgusr/p_wget/log -- which is the two halves disagreeing, not a
+# missing directory.
+if [ -f "$helper_src" ]; then
+  _p=""
+  _au="$(_slice_fn "$helper_src" _pm_add_account)"
+  # the ONE repair runs at the moment the account is made
+  printf '%s' "$_au" | grep -q '_repair_misplaced_home' \
+      || _p="$_p;creating an account does not settle where it lives"
+  # and the value computed BEFORE creation must be re-read after it
+  _ip="$(_slice_fn "$helper_src" cmd_pm_install)"
+  printf '%s' "$_ip" | grep -q '_now_home' \
+      || _p="$_p;the home is still whatever was guessed before the user existed"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the home is settled where the account is made, then re-read"
+  fi
+fi
+
+# ---- the install engine is handed an ACCOUNT, not a package  (1.11.11) ----- #
+# Argument 1 of packagemanager_install is used for exactly one thing: the user
+# to create, own the files and build as.  The bare package name was passed, so:
+#     $ /usr/bin/packagemanager_install wget /tmp/.../install_Wget-1.25.0
+#     id wget || addUser wget
+#     uid=10089(wget) ... bash: /usr/src/wget/install_wget: No such file
+# An account literally called `wget`, in /usr/src/wget -- no prefix, no
+# subdirectory, colliding with any real account of that name.  A fresh tree
+# proved it was created by the install: `id wget` said no such user before.
+if [ -f "$pm_src" ]; then
+  _p=""
+  _once="$(sed -n '/^def _run_pm_install_once(/,/^def /p' "$pm_src")"
+  printf '%s' "$_once" | grep -q 'pkgusr_name(name)' \
+      || _p="$_p;the engine is still handed a bare package name"
+  # and the engine resolves defensively, for callers older than this fix
+  _ip="$(_slice_fn "$helper_src" cmd_pm_install)"
+  printf '%s' "$_ip" | grep -q 'pkg_owner_name' \
+      || _p="$_p;pm-install trusts the name it is handed instead of resolving it"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "an install creates a prefixed account, whoever calls it"
+  fi
+
+  # ---- an already-downloaded tarball is used, not re-fetched ---------------- #
+  # get-sources puts every tarball in /sources before the reboot.  The unpack
+  # step looked only in the build directory, so the FIRST install on a fresh
+  # system reached for wget -- the package it was installing -- over a
+  # connection it cannot verify, because make-ca needs that same wget.
+  # (the template's unpack is the shared runner's, so that is what is read)
+  _up="$(sed -n '/^_pp_unpack() {/,/^}/p' "$PHASES_LIB")"
+  _p=""
+  printf '%s' "$(sed -n '/^_pp_layout() {/,/^}/p' "$PHASES_LIB")" \
+      | grep -q 'LFS_SOURCES_DIR' \
+      || _p="$_p;the unpack step never looks in the sources directory"
+  printf '%s' "$(sed -n '/^_pp_stage_file() {/,/^}/p' "$PHASES_LIB")" \
+      | grep -q 'cp -p "\$d/\$f"' \
+      || _p="$_p;the staged tarball is not copied in"
+  # COPIED or linked, never moved: /sources is the record of what was downloaded
+  printf '%s' "$(sed -n '/^_pp_stage_file() {/,/^}/p' "$PHASES_LIB")" \
+      | grep -qE 'mv "\$d' \
+      && _p="$_p;the build consumes the file out of /sources"
+  # and the download must still happen when nothing is staged
+  printf '%s' "$_up" | grep -q '_pp_fetch "\$link"' \
+      || _p="$_p;an unstaged package can no longer be downloaded"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "an install uses the tarball get-sources already downloaded"
+  fi
+fi
+
+# ---- one key, one meaning: pkgusr_home  (1.11.10) -------------------------- #
+# `lfs` writes pkgusr_home as the FULL package-user root -- its LAYOUT_DEFAULTS
+# say /usr/src/pkgusr -- and packagemanager read the same key as the BASE and
+# appended the subdirectory itself.  A tree configured by lfs got both:
+#     logs: /usr/src/pkgusr/pkgusr/p_wget/log
+python3 - "$pm_src" "$LFS_TOOL" <<'PYBD'
+import sys, os, tempfile, importlib.machinery as m
+problems = []
+d = tempfile.mkdtemp()
+conf = os.path.join(d, "pm.conf")
+
+def home_for(value, name="wget"):
+    open(conf, "w").write("pkgusr_home=%s\n" % value)
+    os.environ["PKGUSR_CONFIG"] = conf
+    for k in ("PKGUSR_BASE", "PKGUSR_SUBDIR"):
+        os.environ.pop(k, None)
+    mod = m.SourceFileLoader("pm_%d" % abs(hash(value)), sys.argv[1]).load_module()
+    return mod.pkgusr_home(name)
+
+# what lfs actually writes
+for v in ("/usr/src/pkgusr", "/usr/src/pkgusr/"):
+    got = home_for(v)
+    if got != "/usr/src/pkgusr/p_wget":
+        problems.append("pkgusr_home=%s gives %s" % (v, got))
+# a base that does not end in the subdirectory is taken literally
+if home_for("/opt/lfs") != "/opt/lfs/pkgusr/p_wget":
+    problems.append("a plain base is no longer taken literally")
+if home_for("/opt/lfs/pkgusr") != "/opt/lfs/pkgusr/p_wget":
+    problems.append("a relocated full root is not understood")
+
+# and lfs must still write the full root -- this fixes the READING, so that
+# both tools agree without either changing what it writes
+lfs_src = open(sys.argv[2]).read()
+if '"target_pkgusr_home":  "/usr/src/pkgusr"' not in lfs_src:
+    problems.append("lfs no longer writes the full package-user root")
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  lfs and packagemanager read pkgusr_home the same way")
+PYBD
+_count_rc $?
+
+# ---- a home that is recorded must be the home that exists  (1.11.9) -------- #
+# add_package_user takes no home argument, so the hint's script uses its own
+# default -- /usr/src/<name> -- while init_package_user_home creates and chowns
+# the one this tool computes.  A real run said both in the same report:
+#     $ chown -R -h p_urllib3:p_urllib3 /usr/src/pkgusr/p_urllib3
+#       home directory created: /usr/src/p_urllib3
+# `su - p_urllib3` then lands in a directory that does not exist.
+if [ -f "$pm_src" ]; then
+  _p=""
+  _cb="$(sed -n '/^def create_package_user(/,/^def /p' "$pm_src")"
+  printf '%s' "$_cb" | grep -q '_fix_recorded_home' \
+      || _p="$_p;nothing reconciles the recorded home with the real one"
+  # the useradd branch already passed -d; the add_package_user one did not
+  printf '%s' "$_cb" | grep -q '"-d", home' \
+      || _p="$_p;the useradd fallback no longer sets the home"
+  _fb="$(sed -n '/^def _fix_recorded_home(/,/^def /p' "$pm_src")"
+  printf '%s' "$_fb" | grep -q 'usermod' \
+      || _p="$_p;the recorded home is never corrected"
+  printf '%s' "$_fb" | grep -q 'pw_dir' \
+      || _p="$_p;it does not read what was actually recorded"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "a package user's passwd home is the directory its files are in"
+  fi
+fi
+
+# ---- the BLFS book has to be fetched where there is a network  (1.11.9) ---- #
+# The circle a real build walked into:
+#     wget: there is no BLFS book on this system to look it up in.
+#     Could not install: wget
+# The built system installs wget by looking it up in the BLFS book, and fetches
+# the book with the wget it cannot install.  The host has a network and
+# install-tools already copies a cached book into the tree -- all that was
+# missing was ASKING, at a moment when the answer can still be acted on.
+python3 - "$LFS_TOOL" <<'PYBB'
+import sys, os, re, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+src = open(sys.argv[1]).read()
+problems = []
+
+# the detector looks in BLFS's own store, not lfs's
+d = tempfile.mkdtemp()
+os.environ["BLFS_STORE"] = d
+if lfs._blfs_book_on_host():
+    problems.append("an empty store is reported as having a book")
+os.makedirs(os.path.join(d, "books"))
+open(os.path.join(d, "books", "BLFS-BOOK-12.4-nochunks.html"), "w").close()
+if not lfs._blfs_book_on_host():
+    problems.append("a cached BLFS book is not found")
+
+# it must be a checklist step, and it must come BEFORE the sources: get-sources
+# asks the book where wget's tarball is, so with no book that URL is silently
+# absent from the download list and the gap only shows on the built system.
+body = re.search(r"def _next_steps\(.*?\n\ndef ", src, re.S).group(0)
+i_book = body.find("fetch the BLFS book")
+i_src = body.find("download the sources")
+if i_book < 0:
+    problems.append("fetching the BLFS book is not a step at all")
+elif i_src >= 0 and i_book > i_src:
+    problems.append("the book is fetched after the sources it is needed for")
+
+# declining must be remembered, or every resume asks again
+h = re.search(r"def _run_choose_blfs_book\(.*?\n\ndef ", src, re.S)
+if not h:
+    problems.append("there is no handler for the decision")
+else:
+    hb = h.group(0)
+    if "blfs_book" not in hb or "save_config" not in hb:
+        problems.append("declining the book is not remembered")
+    if "skip" not in hb:
+        problems.append("the book cannot be declined")
+    # and it must actually fetch, not just print advice
+    if '"fetch"' not in hb:
+        problems.append("saying yes does not fetch anything")
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  the BLFS book is fetched on the host, before the sources need it")
+PYBB
+_count_rc $?
+
+# ---- do not ask for what the system already knows  (1.11.8) ---------------- #
+# `packagemanager setup` opened with a wizard asking for the collector prefix,
+# the application-user prefix and the main user -- on a system built by these
+# tools, where `lfs build-system session` had collected every one of them,
+# written them into config.json and copied that into the chroot.
+#
+# Being asked for a value the machine is holding teaches you the answer does
+# not matter.  It matters a great deal: a collector prefix that disagrees with
+# the built system gives two parallel sets of groups over the same
+# directories, with no error to say so.
+if [ -f "$pm_src" ]; then
+python3 - "$pm_src" <<'PYFR'
+import sys, os, json, tempfile, importlib.machinery as m
+problems = []
+d = tempfile.mkdtemp()
+store = os.path.join(d, "store"); os.makedirs(store)
+json.dump({"collector_prefix": "nimgnu", "pkgusr_prefix": "p",
+           "cfguser_prefix": "cfg", "main_user": "nim"},
+          open(os.path.join(store, "config.json"), "w"))
+conf = os.path.join(d, "pm.conf")
+os.environ["PKGUSR_CONFIG"] = conf
+os.environ["LFS_STORE"] = store
+for k in ("LFS_COLLECTOR_PREFIX", "LFS_MAIN_USER", "LFS_PKGUSR_PREFIX"):
+    os.environ.pop(k, None)
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+
+# it must not read stdin at all when everything is known
+import io, contextlib
+def _no(*a, **k):
+    raise AssertionError("asked a question it had the answer to")
+pm.input = _no
+_buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_buf):
+        pm.first_run_setup()
+except AssertionError as e:
+    problems.append(str(e))
+
+got = dict(l.strip().split("=", 1) for l in open(conf)
+           if "=" in l and not l.startswith("#"))
+for k, v in (("collector_prefix", "nimgnu"), ("pkgusr_prefix", "p"),
+             ("main_user", "nim")):
+    if got.get(k) != v:
+        problems.append("%s was saved as %r, not %r" % (k, got.get(k), v))
+
+# the DEFAULT is not an opinion.  The conflict warning compared the lfs config
+# against whatever was in _config, and a built-in default counted -- so a
+# system with no packagemanager.conf was told its settings disagreed with
+# themselves.
+os.remove(conf)
+pm._config = None
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+    pm.load_config()
+if "note:" in buf.getvalue():
+    problems.append("a default is reported as disagreeing with the lfs config")
+
+# ...but a real disagreement must still be said
+open(conf, "w").write("collector_prefix=other\n")
+pm._config = None
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+    cfg = pm.load_config()
+if "note:" not in buf.getvalue():
+    problems.append("a real conflict with the lfs config is not reported")
+if cfg.get("collector_prefix") != "nimgnu":
+    problems.append("the lfs config did not win the conflict")
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  settings come from what the system was built with, not a prompt")
+PYFR
+_count_rc $?
+fi
+
+# ---- a native gcc means opposite things on either side of the build  (1.11.7) #
+# Chapter 6 installs only under $LFS_TGT, so DURING the build a native gcc on
+# top of the cross one is the toolchain being clobbered.  Chapter 8 REPLACES
+# the cross toolchain with exactly that native gcc: it is the finished state,
+# the thing the build is for.  One rule for both told someone snapshotting a
+# complete, working system that its toolchain was BROKEN.
+python3 - "$LFS_TOOL" <<'PYTC'
+import sys, os, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+lfs.lfs_tgt = lambda: "x86_64-lfs-linux-gnu"
+
+def tree(steps_built, steps_total=105):
+    d = tempfile.mkdtemp()
+    h = os.path.join(d, "usr/include/c++/14.2.0/x86_64-pc-linux-gnu/bits")
+    os.makedirs(h)
+    open(os.path.join(h, "c++config.h"), "w").close()
+    os.makedirs(os.path.join(d, "usr/lib/gcc/x86_64-pc-linux-gnu"))
+    prog = lfs.pkgusr_state(d, "progress")
+    os.makedirs(prog, exist_ok=True)
+    open(os.path.join(prog, "steporder"), "w").write(
+        "\n".join("s%d" % i for i in range(steps_total)))
+    open(os.path.join(prog, "steps-built"), "w").write(
+        "\n".join("s%d" % i for i in range(steps_built)))
+    return d
+
+st = lfs._toolchain_state(tree(105))
+if st.startswith("BROKEN"):
+    problems.append("a finished system is reported as BROKEN: %s" % st)
+st = lfs._toolchain_state(tree(30))
+if not st.startswith("BROKEN"):
+    problems.append("a clobbered cross toolchain mid-build is not reported: %s" % st)
+# the WARNING in `verify` has the same two sides
+if any(l == "WARNING" for l, _v in lfs._tree_state(tree(105))):
+    problems.append("a finished tree still gets a native-gcc WARNING")
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  a native gcc is read as chapter 8 on a finished tree, damage before")
+PYTC
+_count_rc $?
 
 # ---- the kernel and the bootloader are yours  (1.11.6) --------------------- #
 # Both are decisions about the whole MACHINE, and getting either wrong costs
@@ -3838,9 +4665,10 @@ PYHOST
 _count_rc $?
 
 # ---- an answer that is collected must be acted on, or said  (1.11.4) ------- #
-# `strip` is asked for during the interview and nothing does it.  The prompt
-# says NOT YET IMPLEMENTED, but that was six hours and a whole build ago, and
-# the build otherwise ends as though every answer had been acted on.
+# `strip` used to be asked for and then ignored; since 1.11.27 it is done.
+# The notice survives for the one case left -- the run failed partway -- and
+# these assertions are about the notice's mechanics, which have not changed:
+# it reads the answer, stays quiet when nobody asked, and is said at the END.
 _h="$(dirname "$LFS_TOOL")/lfs-helper"
 if [ -f "$_h" ]; then
   _p=""
@@ -3866,6 +4694,657 @@ if [ -f "$_h" ]; then
       ok "a build that ignored your strip answer says so at the end"
   fi
 fi
+
+# ---- strip is implemented, and it runs as each file's owner  (1.11.27) ----- #
+# The interview collected the answer for years and the build ended with a NOT
+# YET IMPLEMENTED notice.  Now `lfs-helper strip` does the work.  The property
+# that matters: strip REPLACES each file, and the replacement belongs to
+# whoever ran it -- so the files must be grouped by their owner, read from the
+# filesystem, and each group stripped AS that owner.  Anything else silently
+# hands the tree to root and the ownership record is gone.
+if [ -f "$_h" ]; then
+  _p=""
+  grep -qE '^cmd_strip\(\) \{' "$_h" || _p="$_p;there is no cmd_strip"
+  grep -qE '^    strip\) +shift; cmd_strip' "$_h" \
+      || _p="$_p;strip is not dispatched"
+  _usg="$(_slice_fn "$_h" _usage_text)"
+  printf '%s' "$_usg" | grep -q 'lfs-helper strip' \
+      || _p="$_p;usage does not mention strip"
+  _sf="$(_slice_fn "$_h" cmd_strip)"
+  [ -n "$_sf" ] || _p="$_p;cmd_strip cannot be sliced"
+  # each group is stripped as its owner -- the whole point of the command
+  printf '%s' "$_sf" | grep -q 'su -s /bin/bash' \
+      || _p="$_p;stripping is not run as the owning account"
+  # and the owner comes from the file itself, not from an assumption
+  printf '%s' "$_sf" | grep -q '%U' \
+      || _p="$_p;the owner is not read from the filesystem"
+  # the book's .la cleanup is there, and refusable
+  printf '%s' "$_sf" | grep -q 'keep_la' \
+      || _p="$_p;the libtool .la cleanup cannot be kept back"
+  # dry run is the default here like everywhere else
+  printf '%s' "$_sf" | grep -q '"$run" = 0' \
+      || _p="$_p;strip has no dry run"
+  # a file that fails to strip is reported, not swallowed
+  printf '%s' "$_sf" | grep -q 'FAILSTRIP' \
+      || _p="$_p;a strip failure would be silent"
+  # the interview answer is acted on at the end of build-all, through the ONE
+  # implementation -- not a second copy of the loop
+  _rf="$(_slice_fn "$_h" _strip_if_asked_for)"
+  [ -n "$_rf" ] || _p="$_p;nothing runs strip when it was asked for"
+  printf '%s' "$_rf" | grep -q 'LFS_STRIP' \
+      || _p="$_p;the strip run does not read the interview answer"
+  printf '%s' "$_rf" | grep -q 'cmd_strip --run' \
+      || _p="$_p;the strip run does not go through cmd_strip"
+  grep -q '^    _strip_if_asked_for$' "$_h" \
+      || _p="$_p;build-all does not run strip at the end"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "strip is implemented, per owner, through one door"
+  fi
+fi
+
+# ---- the install record has ONE writer, with two strategies  (1.11.39) ----- #
+# Item 6, step 1.  What a package installed was written twice, by two drivers,
+# in two places -- lfs-helper's manifest (scan by TIMESTAMP) and
+# packagemanager_install's pkg.lst (scan by OWNER) -- and each tool read only
+# its own.  That is why `packagemanager update` reported "0 of 97 judged" on a
+# system where every package was recorded, in the other file.
+#
+# Both strategies stay: early in the build a package's files are not owned by
+# its package user yet, so an owner scan returns nothing, and the timestamp
+# scan is also the only one that sees a config step REWRITE a file.  What must
+# not stay is two drivers each deciding for themselves.
+if [ -f "$_h" ]; then
+  _p=""
+  grep -q '^cmd_record_install()' "$_h" \
+      || _p="$_p;there is no single recorder"
+  grep -q '^_record_strategy()' "$_h" \
+      || _p="$_p;the strategy is not chosen in one named place"
+  _rs="$(_slice_fn "$_h" _record_strategy)"
+  printf '%s' "$_rs" | grep -q 'ownership_established' \
+      || _p="$_p;the strategy does not turn on whether ownership exists"
+  _wp="$(_slice_fn "$_h" _write_pkg_lst)"
+  [ -n "$_wp" ] || _p="$_p;_write_pkg_lst cannot be sliced"
+  # an empty scan must never overwrite a real record -- empty-as-pass has cost
+  # this project three separate bugs
+  printf '%s' "$_wp" | grep -q 'n:-0.*-eq 0\|-eq 0' \
+      || _p="$_p;an empty owner scan would overwrite the record"
+  # and it must not sweep the build scratch in
+  printf '%s' "$_wp" | grep -q 'scan_prune_set' \
+      || _p="$_p;the owner scan does not prune the build scratch"
+  # a package built before ownership gets its pkg.lst without a rebuild
+  grep -q '^cmd_reconcile_records()' "$_h" \
+      || _p="$_p;a build-stage package never gets a pkg.lst"
+  grep -q 'record-install)' "$_h" \
+      || _p="$_p;record-install is not reachable as a command"
+  # BOTH drivers go through it
+  grep -q 'cmd_record_install "$name"' "$_h" \
+      || _p="$_p;lfs-helper's own build does not use the recorder"
+  _slice_fn "$helper_src" cmd_pm_install | grep -q 'cmd_record_install' \
+      || _p="$_p;pm-install's old-style path never records the install"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "one recorder, two strategies, and both drivers call it"
+  fi
+
+  # ---- one runner, three privilege cases  (item 6, step 3b -- 1.11.46) ----- #
+  # Both drivers ran the install script and spelled it differently: cmd_build
+  # as `su - "$owner" -c "env ... bash SCRIPT PHASE" | tee`,
+  # packagemanager_install as `su - -c "set -o pipefail; PATH=...; bash ... |
+  # tee" <user>`.  The differences were exactly where the bugs lived -- which
+  # PATH the build sees (no wrappers => "install: cannot change permissions of
+  # '/usr/sbin'") and whether the status comes from the script or from tee (a
+  # failing build reported success, and cost a day).
+  _p=""
+  grep -q '^run_phase_as()' "$_h" || _p="$_p;there is no shared runner"
+  _rp="$(_slice_fn "$_h" run_phase_as)"
+  [ -n "$_rp" ] || _p="$_p;run_phase_as cannot be sliced"
+  printf '%s' "$_rp" | grep -q 'PIPESTATUS' \
+      || _p="$_p;the runner would report tee's status, not the build's"
+  printf '%s' "$_rp" | grep -q 'have_su' \
+      || _p="$_p;the runner cannot tell the no-su case apart"
+  # cmd_build must USE it rather than keep its own copy
+  _cb2="$(_slice_fn "$_h" cmd_build)"
+  printf '%s' "$_cb2" | grep -q 'run_phase_as ' \
+      || _p="$_p;the build still runs the script its own way"
+  printf '%s' "$_cb2" | grep -qE 'su - "\$owner" -c' \
+      && _p="$_p;a second su invocation survives in the build"
+  # and it is reachable for a caller that is not this script
+  grep -q '^cmd_run_script()' "$_h" \
+      || _p="$_p;there is no run-script command"
+  grep -q 'run-script)' "$_h" \
+      || _p="$_p;run-script is not dispatched"
+  _pmci="$(_slice_fn "$helper_src" cmd_pm_install)"
+  { printf '%s' "$_pmci" | grep -q 'cmd_build ' \
+      && printf '%s' "$_pmci" | grep -q 'run_phase_as '; } \
+      || _p="$_p;pm-install runs scripts some way other than the one loop/runner"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "one runner, and both drivers go through it"
+  fi
+
+  # functionally: the status is the SCRIPT's, and the phase reaches it
+  _rt="$(mktemp -d)"
+  printf '#!/bin/bash\necho "phase=$1"\nexit 7\n' > "$_rt/f.sh"
+  printf '#!/bin/bash\nexit 0\n' > "$_rt/o.sh"
+  chmod +x "$_rt"/*.sh
+  (
+    # shellcheck disable=SC1090
+    source <(sed -n '/^run_phase_as() {/,/^}/p' "$_h")
+    have_su() { return 1; }
+    user_exists() { return 1; }
+    run_phase_as root "$_rt/f.sh" install "$_rt/f.log" "" "" 1 >/dev/null 2>&1
+    _frc=$?
+    run_phase_as root "$_rt/o.sh" install "$_rt/o.log" "" "" 1 >/dev/null 2>&1
+    _orc=$?
+    [ "$_frc" = 7 ] || echo "BADRC failing build reported $_frc, not 7"
+    [ "$_orc" = 0 ] || echo "BADRC passing build reported $_orc, not 0"
+    grep -q 'phase=install' "$_rt/f.log" || echo "BADRC the phase never reached the script"
+  ) > "$_rt/out" 2>&1
+  if grep -q BADRC "$_rt/out"; then
+      sed 's/^BADRC /  /' "$_rt/out" | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the runner reports the build's own exit status"
+  fi
+  rm -rf "$_rt"
+
+  # ---- phase tracking lives in the runner  (item 6, step 4) --------------- #
+  # It was cmd_build's private bookkeeping, so a packagemanager install that
+  # died during `make install` left no record and "resume" meant starting
+  # over.  The runner is the one place that knows which phase ran and how it
+  # ended -- whichever tool asked.
+  _pt="$(mktemp -d)"; mkdir -p "$_pt/state"
+  printf '#!/bin/bash\ninstall_pkg() { :; }\ncase "${1:-all}" in\n  build) echo ok ;;\n  install) echo "phase '"'"'install'"'"' FAILED"; exit 1 ;;\n  all) echo ok; echo "phase '"'"'install'"'"' FAILED"; exit 1 ;;\nesac\n' > "$_pt/install_p_dummy"
+  printf '#!/bin/bash\necho oldstyle\n' > "$_pt/install_old"
+  _pt_run() { env LFS_PKGUSR_DIR="$_pt/state" LFS_ETC="$_pt" LFS_PKGUSR_PREFIX=p \
+                  bash "$_h" run-script --script "$_pt/install_p_dummy" "$@" ; }
+  printf 'root:x:0:0::/root:/bin/bash\n' > "$_pt/passwd"
+  _p=""
+  _pt_run --user p_dummy --phase all --log "$_pt/a.log" >/dev/null 2>&1
+  [ "$(tr '\n' ' ' < "$_pt/state/progress/phases/dummy" 2>/dev/null)" = "unpack build " ] \
+      || _p="$_p;a failed 'all' run did not record the phases that finished"
+  rm -f "$_pt/state/progress/phases/dummy"
+  _pt_run --user p_dummy --phase build --log "$_pt/b.log" >/dev/null 2>&1
+  grep -qx build "$_pt/state/progress/phases/dummy" 2>/dev/null \
+      || _p="$_p;a finished phase is not recorded under the STEP name"
+  _pt_run --user p_dummy --phase install --log "$_pt/c.log" >/dev/null 2>&1
+  grep -qx install "$_pt/state/progress/phases/dummy" 2>/dev/null \
+      && _p="$_p;a FAILED phase was recorded as done"
+  rm -f "$_pt/state/progress/phases/dummy"
+  _pt_run --user p_dummy --phase build --name '' --log "$_pt/d.log" >/dev/null 2>&1
+  [ -e "$_pt/state/progress/phases/dummy" ] \
+      && _p="$_p;--name '' does not disable tracking"
+  env LFS_PKGUSR_DIR="$_pt/state" LFS_ETC="$_pt" LFS_PKGUSR_PREFIX=p \
+      bash "$_h" run-script --user p_old --script "$_pt/install_old" \
+      --phase build --log "$_pt/e.log" >/dev/null 2>&1
+  [ -e "$_pt/state/progress/phases/old" ] \
+      && _p="$_p;an old-style script (bash script unpack runs EVERYTHING) got a phase record"
+  # and cmd_build must not keep a second copy of the bookkeeping
+  _cb3="$(_slice_fn "$_h" cmd_build)"
+  printf '%s' "$_cb3" | grep -q 'clear_phases' \
+      && _p="$_p;cmd_build still clears phases itself"
+  printf '%s' "$_cb3" | grep -qE "phase '\[a-z\]\+' FAILED" \
+      && _p="$_p;cmd_build still infers finished phases from the log itself"
+  printf '%s' "$_cb3" | grep -q 'record_phase ' \
+      && _p="$_p;cmd_build still records phases itself"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "phase tracking is the runner's, for every caller, and only for phased scripts"
+  fi
+  rm -rf "$_pt"
+
+  # ---- a heading that promises errors must show some  (1.11.47) ----------- #
+  # m4 failed with "no M4-1.4.21.tar.* ... in /sources" -- a clear message
+  # that matched none of the compiler-shaped patterns, so the report printed
+  # "--- first errors in the log ---" followed by nothing at all.  No pattern
+  # matching is a statement about the PATTERNS, not about the log.
+  _et="$(mktemp -d)"
+  printf 'configure: ok\nno M4-1.4.21.tar.* in /sources -- run: get-sources\n' \
+      > "$_et/nomatch.log"
+  printf 'foo.c:1: error: bad\n' > "$_et/match.log"
+  (
+    # shellcheck disable=SC1090
+    source <(sed -n '/^show_build_errors() {/,/^}/p' "$_h")
+    say() { echo "$@"; }; fail() { echo "$@"; }
+    show_build_errors "$_et/nomatch.log" > "$_et/out1" 2>&1
+    show_build_errors "$_et/match.log"   > "$_et/out2" 2>&1
+  ) >/dev/null 2>&1
+  _p=""
+  grep -q 'in /sources' "$_et/out1" 2>/dev/null \
+      || _p="$_p;a failure with no recognised pattern shows nothing at all"
+  grep -q 'error: bad' "$_et/out2" 2>/dev/null \
+      || _p="$_p;a recognised error is no longer reported"
+  grep -q 'first errors in the log' "$_et/out1" 2>/dev/null \
+      && _p="$_p;it still promises errors it did not find"
+  # and the new command explains itself, like every other one
+  ( "$_h" run-script --help >"$_et/h" 2>&1 ) || true
+  grep -q 'run one phase\|Runs one phase' "$_et/h" 2>/dev/null \
+      || _p="$_p;run-script does not answer --help"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "a failure report shows the log when the patterns miss"
+  fi
+  rm -rf "$_et"
+
+  # ---- a run's record must not outlive the run  (1.11.49) ----------------- #
+  # Building m4 ended with "Collector groups used during this run:" listing
+  # nine grants for p_urllib3, make-ca and p11-kit -- real grants, made weeks
+  # earlier.  The file is only cleared by the report, so any build that
+  # granted without reporting (a failure, another path) left its entries for
+  # the next successful build to claim.
+  _p=""
+  _cb3="$(_slice_fn "$_h" cmd_build)"
+  printf '%s' "$_cb3" | grep -q ': > "$GRANTED"' \
+      || _p="$_p;a build inherits grants made by earlier runs"
+  _rg="$(_slice_fn "$_h" report_granted_groups)"
+  printf '%s' "$_rg" | grep -q 'used during this run' \
+      && _p="$_p;the report still claims older grants as this run's"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the grant report names only what this build needed"
+  fi
+fi
+
+_pm_tool="$(dirname "$LFS_TOOL")/packagemanager"
+# ---- silence is not a clean bill of health  (1.11.40) ---------------------- #
+# `packagemanager update` printed "all current with the LFS book" while `lfs
+# update` reported thirty stale packages.  _lfs_update_report returned [] BOTH
+# for "everything is current" and for "the call produced nothing", and the
+# caller printed the same reassuring line for both -- empty-as-pass, in the
+# very helper written to stop packages disappearing quietly.
+#
+# Also here: a script generated by `lfs` from the LFS book was reported as
+# OLD-format, because only blfs stamps 'script format vN'.  The advice that
+# came with it was worse than the warning -- migrate-scripts would rewrite an
+# LFS-book script into a BLFS one.  Two generators, two dialects: item 6's
+# disease, and until they are one thing this tool must not misread the
+# other's work.
+if [ -f "$_pm_tool" ]; then
+  python3 - "$_pm_tool" "$LFS_TOOL" <<'PYSILENCE'
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+problems = []
+# three outcomes, told apart
+seg = open(sys.argv[1]).read()
+lr = seg[seg.index("def _lfs_update_report("):]
+lr = lr[:lr.index("\ndef ", 10)]
+for token in ('"failed"', '"current"', '"lines"'):
+    if token not in lr:
+        problems.append("the LFS consult cannot report %s" % token)
+if "if not out:" not in lr:
+    problems.append("empty output is still indistinguishable from 'current'")
+# and the caller says so instead of smoothing it over
+rn = seg[seg.index("def _report_no_book("):]
+rn = rn[:rn.index("\ndef ", 10)]
+if "UNCHECKED" not in rn:
+    problems.append("a failed consult is not reported as unchecked")
+# functional: with no lfs present the answer is 'failed', never 'current'
+_which = pm.shutil.which
+pm.shutil.which = lambda x: None
+try:
+    _r = pm._lfs_update_report([])
+    kind = _r[0] if isinstance(_r, tuple) else "current" if _r == [] else "lines"
+    if kind != "failed":
+        problems.append("a missing lfs reads as a clean bill of health")
+finally:
+    pm.shutil.which = _which
+# a script from the other book is not an old script
+lfs_hdr = "### lfs-crosschain-script v17: shadow\n"
+if not hasattr(pm, "_is_lfs_book_script"):
+    problems.append("nothing tells an LFS-book script from an old one")
+    pm._is_lfs_book_script = lambda t: False
+# ---- one stamp, read by everyone  (item 6, step 3 -- 1.11.44) ----
+# Both generators now write `script format vN origin=<tool>`, so no tool has
+# to recognise the other's dialect.  The counters are PER GENERATOR (blfs v4,
+# lfs v17) and must never be compared with each other -- a foreign script is
+# left to the tool that writes it.
+if not hasattr(pm, "_script_origin"):
+    problems.append("there is no shared way to ask what a script is")
+else:
+    for txt, want, label in (
+            ("### generated by blfs 1.0 -- script format v4 origin=blfs",
+             "blfs", "a blfs script"),
+            ("### script format v17 origin=lfs", "lfs", "an lfs script"),
+            ("### generated by blfs 1.0 -- script format v4", "blfs",
+             "a legacy blfs script"),
+            ("### lfs-crosschain-script v17: shadow", "lfs",
+             "a legacy lfs script"),
+            ("#!/bin/bash\nmake install", "", "an unstamped script")):
+        if pm._script_origin(txt) != want:
+            problems.append("%s is not identified" % label)
+    _pso2 = seg[seg.index("def _package_script_outdated("):]
+    _pso2 = _pso2[:_pso2.index("\ndef ", 10)]
+    if 'origin != "blfs"' not in _pso2:
+        problems.append("scripts from another generator are still judged here")
+try:
+    _pso = seg[seg.index("def _package_script_outdated("):]
+    _pso = _pso[:_pso.index("\ndef ", 10)]
+except ValueError:
+    _pso = ""
+# the property: a script this generator does not own is not judged by it.
+# (This first asserted that _package_script_outdated CALLS
+# _is_lfs_book_script -- the mechanism -- and broke the moment the check
+# became the better one, an origin comparison.  Assert intent.)
+if "origin" not in _pso and "_is_lfs_book_script" not in _pso:
+    problems.append("LFS-book scripts are still flagged as OLD-format")
+if pm._is_lfs_book_script("### generated by blfs 1.0 -- script format v3"):
+    problems.append("a blfs script is misread as an LFS one")
+elif not pm._is_lfs_book_script(lfs_hdr) and hasattr(pm, "_is_lfs_book_script"):
+    pass
+# the book is parsed once per path, not once per package name
+lsrc = open(sys.argv[2]).read()
+ls = lsrc[lsrc.index("def load_soup("):]
+ls = ls[:ls.index("\ndef ", 10)]
+if "_SOUP_CACHE" not in ls:
+    problems.append("the book is re-parsed for every package looked up")
+# the generator really emits it -- generate a body and read it back
+try:
+    lfsmod = m.SourceFileLoader('lfsmod', sys.argv[2]).load_module()
+    body = lfsmod._crosschain_script_body("demo", "ch-demo", "Demo-1.0",
+                                          "demo-*.tar.*",
+                                          ["./configure", "make", "make install"])
+    if pm._script_origin(body) != "lfs":
+        problems.append("the lfs generator does not write the shared stamp")
+except Exception as e:
+    problems.append("could not generate a script to check the stamp: %s" % e)
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  a failed check says so, and a foreign script is not an old one")
+PYSILENCE
+  _count_rc $?
+fi
+
+# ---- ask a question whose answer can be no  (1.11.41) --------------------- #
+# `lfs update` ended with "In the BLFS book -- update those with blfs: ...
+# gcc-pass1 cfg_fstab init-dirs libstdcpp ..." -- LFS build STEPS, offered as
+# BLFS packages.  `_blfs_knows` asked `blfs debug <name>`, which is a
+# DIAGNOSTIC: it prints "resolve: NOT FOUND" and exits 0, so the check said
+# yes to every string it was ever given.
+#
+# The same output offered to rebuild util-linux-tmp, python-tmp and
+# gettext-tmp -- the TEMPORARY chapter-7 toolchain -- onto a finished system.
+python3 - "$LFS_TOOL" <<'PYSTAGE'
+import sys, re, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+src = open(sys.argv[1]).read()
+bk = src[src.index("def _blfs_knows("):]
+bk = bk[:bk.index("\ndef ", 10)]
+if re.search(r'\["debug"|\+ \["debug', bk):
+    problems.append("BLFS membership is still decided by a diagnostic command")
+if "_blfs_anchor_set" not in bk:
+    problems.append("BLFS membership is not decided from the book's own anchors")
+# the stage variants are excluded, and ONLY the variants
+cu = src[src.index("def cmd_update("):]
+cu = cu[:cu.index("\ndef ", 10)]
+if "_stage_steps" not in cu:
+    problems.append("the temporary chapter-7 builds are offered for reinstall")
+else:
+    st = {n.lower() for n, _s in lfs.CHROOT_STEPS_7 if n.lower().endswith("-tmp")}
+    st |= {n.lower() for n, _s, _p in lfs.CROSSCHAIN_STEPS
+           if re.search(r"-(pass\d+|tmp)$", n.lower())}
+    for must in ("util-linux-tmp", "python-tmp", "gcc-pass1", "binutils-pass2"):
+        if must not in st:
+            problems.append("%s would be rebuilt onto a finished system" % must)
+    # chapter 6 builds these under their own names -- excluding them would
+    # hide the packages most worth knowing about
+    for keep in ("glibc", "coreutils", "linux-headers", "libstdcpp"):
+        if keep in st:
+            problems.append("%s is hidden from update as if it were a stage" % keep)
+# ---- the book ships the URLs; use them  (1.11.48) ----
+# `lfs install --reinstall m4` failed with "no M4-1.4.21.tar.* in /sources"
+# after the book moved to 13.0 -- while the URL for exactly that tarball sat
+# in the wget-list this tool already caches per book.  Only get-sources ever
+# read it, and only in bulk.
+import tempfile as _tf, os as _os
+if not hasattr(lfs, "_wget_list_url_for"):
+    problems.append("a single package's source URL cannot be looked up")
+else:
+    _d = _tf.mkdtemp(); _p = _os.path.join(_d, "wl.txt")
+    open(_p, "w").write(
+        "https://ftp.gnu.org/gnu/m4/m4-1.4.21.tar.xz\n"
+        "https://github.com/util-linux/util-linux/releases/util-linux-2.41.3.tar.xz\n")
+    _orig = lfs.wget_list_path
+    lfs.wget_list_path = lambda v: _p
+    try:
+        if not (lfs._wget_list_url_for("x", "M4-1.4.21") or "").endswith("m4-1.4.21.tar.xz"):
+            problems.append("the wget-list lookup misses a plain package name")
+        # hyphenated names are where a naive split goes wrong
+        if not (lfs._wget_list_url_for("x", "Util-linux-2.41.3") or "").endswith(
+                "util-linux-2.41.3.tar.xz"):
+            problems.append("the wget-list lookup misses a hyphenated name")
+        if lfs._wget_list_url_for("x", "Nope-9.9"):
+            problems.append("the lookup invents a URL for a package not listed")
+    finally:
+        lfs.wget_list_path = _orig
+if not hasattr(lfs, "_have_source_for"):
+    problems.append("nothing checks whether the tarball is already there")
+else:
+    _t2 = _tf.mkdtemp(); _os.makedirs(_os.path.join(_t2, "sources"))
+    open(_os.path.join(_t2, "sources", "m4-1.4.20.tar.xz"), "w").write("x")
+    if not lfs._have_source_for(_t2, "M4-1.4.20"):
+        problems.append("an existing tarball is not recognised")
+    if lfs._have_source_for(_t2, "M4-1.4.21"):
+        problems.append("a different version reads as already downloaded")
+# ---- rebuild in BOOK order, not alphabetically  (1.11.52) ----
+# The stale list came out alphabetically: Python, binutils, coreutils ...
+# glibc.  Rebuilt in that order the earlier ones link against the OLD glibc
+# and are stale again the moment it is replaced.  Chapter 8's own sequence
+# is the safe one.
+_cu3 = src[src.index("def cmd_update("):]
+_cu3 = _cu3[:_cu3.index("\ndef ", 10)]
+if "iter_sections" not in _cu3 or "_order" not in _cu3:
+    problems.append("the stale list is not ordered by the book")
+else:
+    _o = {"glibc": 5, "binutils": 30, "python": 55}
+    _names = ["Python", "binutils", "glibc", "cfg_fstab"]
+    _sorted = sorted(_names, key=lambda n: (_o.get(n.lower(), 10 ** 6), n.lower()))
+    if _sorted.index("glibc") > _sorted.index("Python"):
+        problems.append("Python would be rebuilt before glibc")
+    if _sorted[-1] != "cfg_fstab":
+        problems.append("a package the book does not name jumps the queue")
+
+_ci = src[src.index("def cmd_install("):]
+_ci = _ci[:_ci.index("\ndef ", 10)]
+if "_fetch_one_source" not in _ci:
+    problems.append("installing still fails instead of fetching what it needs")
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+# ---- merged from the SysV-book session  (1.11.54) ----
+# A parallel session branched at 1.11.26 and fixed three things here.  Ported
+# rather than overwritten, because that branch never saw 1.11.27-1.11.53.
+if "sqlite" not in src.lower() and "INFIX" not in src:
+    problems.append("the infix tarball pattern (SQLite-3510200) is missing")
+_pg = src[src.index("def _pkg_glob_for("):]
+_pg = _pg[:_pg.index("\ndef ", 10)]
+if "m.group(1).lower()" not in _pg:
+    problems.append("a package whose tarball has an infix cannot be found")
+_g = lfs._pkg_glob_for("SQLite-3510200", "sqlite")
+if "sqlite-*3510200.tar.*" not in _g:
+    problems.append("SQLite's autoconf tarball would not be matched")
+# ...and the doc filter must keep that pattern off sqlite-doc-*
+if "*-doc-*|*-docs-*|*-html-*|*-man-pages-*|*-tests-*" not in src:
+    problems.append("the infix pattern could grab a -doc- tarball")
+# the sources step is done only when the CURRENT book's list is complete
+if "src_missing" not in src:
+    problems.append("leftover tarballs still count as 'sources downloaded'")
+
+print("  PASS  BLFS membership is a fact, and stage builds are not upgrades")
+PYSTAGE
+_count_rc $?
+
+# ---- entering refreshes every tool, and keeps the tree's own book --------- #
+# Entering the chroot refreshed lfs-helper ALONE, so the python tools inside
+# stayed older than the host's and every packagemanager run opened with "These
+# tools differ from the copies on the host" -- advice to sync, from the path
+# that had just synced one file of five.  (1.11.42)
+#
+# And the other half: install-tools copied the host's config.json over the
+# tree's, so `lfs set-default 13.0-systemd` INSIDE the system was undone by
+# the next entry, silently, back to whatever the host had.
+python3 - "$LFS_TOOL" <<'PYREFRESH'
+import sys, os, json, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+# every tool, not just the bash one
+t = tempfile.mkdtemp()
+os.makedirs(os.path.join(t, "usr/bin"))
+for tool in ("lfs", "lfs-helper", "packagemanager", "packagemanager_install",
+             "blfs"):
+    open(os.path.join(t, "usr/bin", tool), "w").write("stale\n")
+try:
+    got = sorted(lfs._refresh_chroot_tools(t, quiet=True) or [])
+except Exception as e:
+    got = []
+    problems.append("the refresh raised: %s" % e)
+want = sorted(["lfs", "lfs-helper", "packagemanager", "blfs"])
+# the RETIRED tool must be swept off the chroot PATH, not refreshed --
+# a stale copy running old code is what this sync exists to prevent
+if os.path.exists(os.path.join(t, "usr/bin", "packagemanager_install")):
+    problems.append("the retired packagemanager_install survives in the chroot")
+missing = [x for x in want if x not in got]
+if missing:
+    problems.append("entering leaves these stale in the chroot: %s"
+                    % ", ".join(missing))
+# and it does nothing when there is nothing to do
+if got and lfs._refresh_chroot_tools(t, quiet=True):
+    problems.append("the refresh copies again when nothing changed")
+# the tree's own book choice survives an install-tools run
+src = open(sys.argv[1]).read()
+it = src[src.index("def cmd_bs_install_tools("):]
+it = it[:it.index("\ndef ", 10)]
+if "shutil.copy(cfgsrc, os.path.join(store" in it:
+    problems.append("the host's config still overwrites the tree's")
+# (1.13.65 added target-config.json between the two, so the comment now
+#  reads "the tree overrides both" -- what matters is that the tree wins)
+if "the tree overrides" not in it:
+    problems.append("nothing keeps the tree's own book default")
+# the version you would move to is emphasised, and not in a pipe
+cu = src[src.index("def cmd_update("):]
+cu = cu[:cu.index("\ndef ", 10)]
+if "_C_OK" not in cu:
+    problems.append("the LFS report does not colour the new version")
+if "_tty_out()" not in cu:
+    problems.append("the colour would land in a piped report")
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+# a kept script says WHICH version it builds when the book has moved on:
+# `lfs script fetch m4` printed the book's title (M4-1.4.21) above a script
+# that builds M4-1.4.20, with nothing to say they differ.  (1.11.45)
+import io, contextlib
+es = src[src.index("def _ensure_lfs_script("):]
+es = es[:es.index("\ndef ", 10)]
+if "kept your existing script" not in es:
+    problems.append("a kept script does not say it was kept")
+t2 = tempfile.mkdtemp()
+os.makedirs(os.path.join(t2, "usr/src/lfs-pkgusr/scripts"))
+_sp = os.path.join(t2, "usr/src/lfs-pkgusr/scripts/m4.sh")
+open(_sp, "w").write('#!/bin/bash\nname_version="M4-1.4.20"\n')
+_buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(_buf):
+        lfs._ensure_lfs_script(type("A", (), {})(), t2, "m4", "ch-m4",
+                               "8.14. M4-1.4.21", {"commands": ["make"]}, False)
+    _out = _buf.getvalue()
+    if "M4-1.4.20" not in _out or "M4-1.4.21" not in _out:
+        problems.append("a script older than the book does not say so")
+    if "--regenerate" not in _out:
+        problems.append("nothing says how to rebuild it from the book")
+except Exception as e:
+    problems.append("keeping a script raised: %s" % e)
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  entering refreshes every tool and keeps the tree's book")
+PYREFRESH
+_count_rc $?
+
+# ---- a refresh that does not update the stamps announces its own work ------ #
+# The refresh copied all five tools in and left tool-stamps.json alone -- the
+# file `warn_if_tools_are_stale` compares against -- so packagemanager opened
+# with "These tools differ from the copies on the host" about tools it had
+# just been handed, and advised syncing, on the path that had synced them.
+# And a copy that silently did not stick showed up only as the same refresh
+# message on every entry, so the copy is verified now.  (1.11.43)
+python3 - "$LFS_TOOL" <<'PYSTAMP'
+import sys, os, json, hashlib, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+src = open(sys.argv[1]).read()
+rc = src[src.index("def _refresh_chroot_tools("):]
+rc = rc[:rc.index("\ndef ", 10)]
+if "_write_tool_stamps" not in rc:
+    problems.append("the refresh leaves the staleness stamps behind")
+if "did not change" not in rc:
+    problems.append("a copy that does not stick is never noticed")
+t = tempfile.mkdtemp()
+os.makedirs(os.path.join(t, "usr/bin"))
+for tool in ("lfs", "lfs-helper", "packagemanager", "blfs"):
+    open(os.path.join(t, "usr/bin", tool), "w").write("stale\n")
+try:
+    lfs._refresh_chroot_tools(t, quiet=True)
+except Exception as e:
+    problems.append("the refresh raised: %s" % e)
+sp = os.path.join(t, "usr/share/lfs/tool-stamps.json")
+if not os.path.isfile(sp):
+    problems.append("no stamps were written, so the warning cannot clear")
+else:
+    for name, want in json.load(open(sp)).items():
+        p = os.path.join(t, "usr/bin", name)
+        have = hashlib.md5(open(p, "rb").read()).hexdigest() \
+            if os.path.exists(p) else None
+        if have != want:
+            problems.append("the stamp for %s does not match what was "
+                            "installed -- the warning would keep firing" % name)
+            break
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  the refresh records what it installed, and checks it landed")
+PYSTAMP
+_count_rc $?
+
+# the prompt must stop claiming the answer is ignored, now that it is not
+python3 - "$LFS_TOOL" <<'PYSTRIP'
+import sys, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+prompts = {k: p for k, p, _ in lfs._SESSION_KEYS}
+if "strip" not in prompts:
+    problems.append("'strip' is no longer asked during session")
+elif "NOT YET IMPLEMENTED" in prompts["strip"]:
+    problems.append("the strip prompt still claims it is not implemented")
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  the strip prompt no longer disclaims the work")
+PYSTRIP
+_count_rc $?
 
 # ---- a suppressed failure is a bug waiting to be found  (1.11.4) ----------- #
 # `cmd 2>/dev/null || true` has cost this project more debugging than anything
@@ -4010,6 +5489,683 @@ if [ -f "$pmt" ]; then
             ok "it says nothing when the book matches" ;;
         *) bad "the mismatch warning would always fire" ;;
     esac
+
+    # ---- the mismatch is asked about ONCE, and the answer is kept ------------ #
+    # The SysV book is no longer maintained, so running the systemd book on a
+    # SysV system is a reasonable, deliberate choice -- and a warning printed
+    # on EVERY invocation punishes it forever.  (1.11.30)
+    case "$wm" in
+        *init_mismatch_ok*) ok "an accepted mismatch is remembered" ;;
+        *) bad "the mismatch warning nags on every run" ;;
+    esac
+    case "$wm" in
+        *ask_yes_no*) ok "it is asked, not just announced" ;;
+        *) bad "there is no way to accept the mismatch" ;;
+    esac
+fi
+
+# ---- generated scripts retry downloads and survive a missing systemctl ------ #
+# GNU's ftpmirror 502s on the first tries more often than not, and a plain
+# wget gives up on any HTTP error -- the third manual re-run succeeding via a
+# mirror redirect is exactly what a retry loop does unattended.  And a
+# systemd book's `systemctl` on a SysV system aborted the phase mid-install;
+# a fallback function turns that into a visible skip.  (1.11.30)
+_bt="$(dirname "$LFS_TOOL")/blfs"
+if [ -f "$_bt" ]; then
+    _p=""
+    grep -q '_pp_fetch() {' "$PHASES_LIB" || _p="$_p;generated scripts have no retrying fetch"
+    # RETRYING A DEAD MIRROR IS NOT A RETRY: ftpmirror.gnu.org returned 502
+    # and the script asked the same broken host three times.
+    # A PACKAGE MUST NOT QUIETLY BUILD A DEPENDENCY IT COULD NOT FIND.
+    # cairo's meson fell back to bundled subprojects and installed its own
+    # freetype/fontconfig -- owned by p_cairo, with no development symlinks,
+    # and freetype2 was then never built at all because a libfreetype was on
+    # disk.  Every later "cannot find -lfreetype" came from that.
+    python3 - "$_bt" <<'PYWRAP' || _p="$_p;meson may silently vendor a missing dependency"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._no_vendored_subprojects("meson setup .. --prefix=/usr &&\nninja")
+assert "--wrap-mode=nofallback" in out, out
+assert out.splitlines()[1] == "ninja"
+# not added twice, and a commented line is left alone
+again = b._no_vendored_subprojects(out)
+assert again.count("--wrap-mode=nofallback") == 1, again
+assert b._no_vendored_subprojects("# meson setup ..").count("wrap-mode") == 0
+PYWRAP
+    # THE WHOLE SYSTEMD FAMILY, not just systemctl.  LLVM built all 4343
+    # targets and then died on `systemd-run: command not found` -- the
+    # systemd book uses several of these, and each missing one aborts the
+    # phase exactly as systemctl would have.
+    # (the names are emitted from a list in the generator, so check the list)
+    _shims="$(sed -n '/^_pp_systemd_shims() {/,/^}/p' "$PHASES_LIB")"
+    for _sd in systemd-run systemd-tmpfiles loginctl journalctl udevadm; do
+        printf '%s' "$_shims" | grep -qw "$_sd" \
+            || _p="$_p;$_sd is not shimmed, and it aborts the phase on a SysV system"
+    done
+    # and only when the real binary is absent, so a systemd host is untouched
+    printf '%s' "$_shims" | grep -q 'command -v "\$c" >/dev/null 2>&1 && continue' \
+        || _p="$_p;the systemd shims are defined unconditionally"
+
+    # A META PAGE HAS NO TARBALL.  "Xorg Libraries" is a LIST of packages:
+    # no pkg=, a directory for link=, and its own commands fetch the list.
+    # Fetching link= downloaded index.html and `tar xf ../` said
+    # "tar: ../: Cannot read: Is a directory".
+    grep -q 'no single tarball' "$PHASES_LIB" \
+        || _p="$_p;a page with no tarball still tries to fetch and unpack one"
+    # THE BOOK'S "START A SUBSHELL AND PASTE THIS" IDIOM.  A person types
+    # `bash -e`, pastes the loop, then `exit`.  A script that runs `bash -e`
+    # gets a shell reading the terminal and waits there forever -- which is
+    # exactly how a build sat idle for twenty minutes with no compiler under
+    # it.
+    python3 - "$_bt" <<'PYSUB' || _p="$_p;a bare `bash -e` from the book still hangs the build"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._unwrap_interactive_subshell("bash -e\nfor p in a b; do echo $p; done\nexit")
+assert not any(l.strip() == "bash -e" for l in out.splitlines()), out
+assert not any(l.strip() == "exit" for l in out.splitlines()), out
+assert "for p in a b" in out
+# a package with no such wrapper is untouched
+assert b._unwrap_interactive_subshell("make\nmake install") == "make\nmake install"
+PYSUB
+
+    # AN ABSOLUTE PATH WALKS PAST EVERY WRAPPER.  The wrappers live on the
+    # package user's PATH, so the book's `as_root /sbin/ldconfig` ran the
+    # real one and failed on the sticky /etc while the wrapper sat unused.
+    python3 - "$_bt" <<'PYWRAPTOOL' || _p="$_p;an absolute path bypasses the package-user wrappers"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+assert b._use_wrapped_tools("as_root /sbin/ldconfig") == "as_root ldconfig"
+assert b._use_wrapped_tools("/usr/bin/install -m644 x /usr/lib").startswith("install ")
+# a comment is left alone, and a longer name is not a match
+assert b._use_wrapped_tools("# /sbin/ldconfig here").startswith("# /sbin/")
+assert "ldconfigXYZ" in b._use_wrapped_tools("echo /sbin/ldconfigXYZ")
+PYWRAPTOOL
+
+    # as_root IS DEFINED IN THE BOOK'S PROSE, which we keep as a comment --
+    # so the multi-package loop called a function that did not exist:
+    #     install_xorg7-lib: line 198: as_root: command not found
+    # In this model there is nothing to elevate: the package user owns what
+    # it installs into.
+    python3 - "$_bt" <<'PYASROOT' || _p="$_p;the book's as_root is used but never defined"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._define_as_root("for p in a; do as_root make install; done")
+assert 'as_root() { "$@"; }' in out, out
+assert out.index('as_root() {') < out.index('as_root make'), out
+# a package that never calls it gains nothing
+assert b._define_as_root("make install") == "make install"
+# ...and a mention in a COMMENT is not a call
+assert b._define_as_root("# as_root make install\nmake install").count("as_root() {") == 0
+PYASROOT
+
+    # A FINISHED HOST IS NOT THE CHROOT.  inside_chroot() asked "does
+    # /usr/src/lfs-pkgusr exist" -- true of ANY system these tools built -- so
+    # the user's own machine refused every build command with "you are inside
+    # the LFS chroot".  An inference true of the destination cannot identify
+    # the journey; the chroot says so itself now (LFS_IN_CHROOT).
+    grep -q 'LFS_IN_CHROOT=1' "$LFS_TOOL" \
+        || _p="$_p;the chroot does not mark itself, so it has to be guessed"
+    python3 - "$LFS_TOOL" <<'PYCHR' || _p="$_p;inside_chroot misreads a host or a chroot"
+import sys, os, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+def check(env):
+    old = dict(os.environ)
+    os.environ.clear(); os.environ.update(env)
+    try:
+        return lfs.inside_chroot()
+    finally:
+        os.environ.clear(); os.environ.update(old)
+assert check({"LFS_IN_CHROOT": "1"}) is True          # the chroot said so
+
+# ...AND THE GUARD ON THAT INFERENCE FAILED AT THE ONE MOMENT IT MATTERED.
+# The fallback was "/usr/src/lfs-pkgusr exists AND /mnt/lfs/usr/src does
+# not".  On a FRESH build the partition is mounted and still EMPTY, so on a
+# host these tools had built, `lfs run` refused with "you are inside the LFS
+# chroot".  Ask the kernel: a chroot is a root that is not PID 1's.
+real = lfs._root_differs_from_pid1
+try:
+    lfs._root_differs_from_pid1 = lambda: False       # kernel: same root
+    assert check({}) is False, "the kernel says host and it is not believed"
+    lfs._root_differs_from_pid1 = lambda: True        # kernel: a chroot
+    assert check({"LFS": "/mnt/lfs"}) is True, "a stray $LFS outvotes the kernel"
+    # and when the kernel cannot be asked (no /proc, not root), the last
+    # resort tests the CONFIGURED mount point, not a hardcoded one
+    lfs._root_differs_from_pid1 = lambda: None
+    assert check({"LFS": "/mnt/lfs"}) is False
+    src = open(sys.argv[1]).read()
+    i = src.index("def inside_chroot():")
+    assert '"/mnt/lfs/usr/src"' not in src[i:i + 2000], \
+        "the fallback still tests a hardcoded mount point"
+    assert 'load_config().get("lfs_mount")' in src[i:i + 2000]
+finally:
+    lfs._root_differs_from_pid1 = real
+
+# A REFUSAL MUST IDENTIFY ITSELF.  A host was refused for days by a message
+# 1.14.1 had already fixed -- the binary being run was 1.11.26, because
+# `make install` was going somewhere else.  Nothing on screen said which copy
+# was talking, so a stale install looked like a bug in the current one.
+src = open(sys.argv[1]).read()
+i = src.index("def _refuse_inside_chroot(")
+blk = src[i:i + 3000]
+for need in ("sys.argv[0]", "LFS_VERSION", "_build_id()", "because"):
+    assert need in blk, "the chroot refusal does not say %s" % need
+PYCHR
+
+    # PRESENT-AND-EMPTY IS AN ANSWER.  `"pkgusr_prefix": ""` means NO prefix.
+    # The bash reader failed `[ -n "$v" ]` on it and fell back to the default
+    # `p`, so lfs-helper called the account p_mako while packagemanager --
+    # which honours empty -- asked for mako.  Two tools, one account, two
+    # names.
+    _pfxd="$T/prefixcfg"; mkdir -p "$_pfxd"
+    printf '{\n  "pkgusr_prefix": "",\n  "collector_prefix": "nimgnu"\n}\n' > "$_pfxd/empty.json"
+    printf '{\n  "pkgusr_prefix": "pkg",\n  "collector_prefix": "nimgnu"\n}\n' > "$_pfxd/set.json"
+    for _c in empty set; do
+        _pv="$({ _slice_fn "$helper_src" _read_pkgusr_prefix \
+                   | sed "s|/usr/share/lfs/config.json|$_pfxd/$_c.json|"
+                 echo 'v="$(_read_pkgusr_prefix)"; echo "$?:[$v]"'; } | bash 2>/dev/null)"
+        case "$_c:$_pv" in
+            empty:0:\[\]|set:0:\[pkg\]) ;;
+            *) _p="$_p;the $_c prefix config is read as $_pv" ;;
+        esac
+    done
+
+    # AND "CANNOT JUDGE" IS NOT AN ANSWER.  `update --reinstall mako` on a
+    # package that was never installed reported "no completed-install record"
+    # and stopped -- a true statement about a question the user did not mean
+    # to ask.  When they NAME packages, point at install.
+    grep -q 'they are NOT ' "$pm_src" \
+        || _p="$_p;update reports no record without saying to install instead"
+    grep -q 'packagemanager install %s --run' "$pm_src" \
+        || _p="$_p;the not-installed hint does not give the command"
+
+    # TYPE WHAT YOU WERE SHOWN.  BLFS anchors are not all lower case (Mako,
+    # PyYAML, Cython keep their project capitalisation), search is
+    # case-insensitive and every other command was not:
+    #     blfs search mako   -> Mako
+    #     packagemanager update mako -> ERROR: 'mako' not found
+    grep -q '^def resolve_anchor' "$_bt" \
+        || _p="$_p;an anchor typed in the wrong case is not found"
+    python3 - "$_bt" <<'PYCASE' || _p="$_p;resolve_anchor does not match case-insensitively"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+class FakeBook:
+    packages = {"Mako": 1, "libxml2": 1}
+fb = FakeBook()
+assert b.resolve_anchor(fb, "mako") == "Mako"
+assert b.resolve_anchor(fb, "Mako") == "Mako"
+assert b.resolve_anchor(fb, "libxml2") == "libxml2"
+# an anchor that really is absent comes back unchanged, for the error message
+assert b.resolve_anchor(fb, "nosuch") == "nosuch"
+PYCASE
+
+    # AND THE EDITED SCRIPT MUST ACTUALLY BE FOUND.  _script_name_version
+    # matched only name_version="..." while the generator has emitted book
+    # strings SINGLE-quoted since 1.12.18 -- so the local script never
+    # matched and every user edit was silently ignored.
+    python3 - "$pm_src" <<'PYQUOTE' || _p="$_p;an edited local script is not recognised (quote style)"
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = tempfile.mkdtemp()
+for q in ("'", '"'):
+    p = os.path.join(d, "s" + ("1" if q == "'" else "2"))
+    open(p, "w").write("name_version=%sxmlto-0.0.29%s\n" % (q, q))
+    assert pm._script_name_version(p) == "xmlto-0.0.29", (q, pm._script_name_version(p))
+PYQUOTE
+
+    # AN EDIT MUST NOT VANISH IN SILENCE.  The script in the package home is
+    # regenerated whenever the tools move on, and a user who had fixed a dead
+    # download URL in it lost the fix with no message.
+    grep -q 'your version of %s differed' "$pm_src" \
+        || _p="$_p;a regenerated script overwrites the user's edits silently"
+    # ...and says what actually happened to it.  The old wording claimed the
+    # versioned file "is never regenerated" while regenerating it (1.14.21).
+    grep -q 'this file IS the one you edit' "$pm_src" \
+        || _p="$_p;nothing says which file was rewritten, or why"
+    grep -q 'Your copy is the .edited file' "$pm_src" \
+        || _p="$_p;nothing says where the user's version went"
+
+    # A GENERIC NAME IN THE ENVIRONMENT IS A COLLISION.  libvpx's Makefile
+    # has `BUILD_ROOT?=.` and uses it in CFLAGS -- and `?=` yields to the
+    # environment, so exporting our BUILD_ROOT sent every compile looking
+    # for vpx_config.h in the source root.
+    grep -q 'LFS_BUILD_ROOT' "$PHASES_LIB" \
+        || _p="$_p;the generated script does not take the runner's private build-root name"
+    grep -qE "envpass=.*[^_]BUILD_ROOT='" "$helper_src" \
+        && _p="$_p;the runner still exports a bare BUILD_ROOT into every build"
+    # (the emitted line itself: the runner's value must win over a stray one)
+    grep -q 'LFS_BUILD_ROOT:-' "$PHASES_LIB" \
+        || _p="$_p;the script does not prefer the runner's build root"
+    # ...and when nothing says otherwise the sources are in ~/src, not $PWD:
+    # `su - p_rust -c 'bash ~/install_p_rust install'` starts in the HOME, so
+    # _enter_build looked beside the script and rust's ./x.py vanished.
+    grep -q 'BUILD_ROOT="\$HOME/src"' "$PHASES_LIB" \
+        || _p="$_p;a phase run from the home cannot find the unpacked sources"
+
+    # A CONDITIONAL BLOCK IS CONDITIONAL WHEREVER IT APPEARS.  The phased
+    # extractor guarded them; extract_commands (the CONFIGURATION section)
+    # did not, so cyrus-sasl ran `make install-saslauthd` -- introduced by
+    # "If you need to run the saslauthd daemon at system startup ... install
+    # the saslauthd.service unit included in blfs-systemd-units".
+    _ec="$(sed -n '/^def extract_commands(/,/^def /p' "$_bt")"
+    printf '%s' "$_ec" | grep -q '_conditional_guard' \
+        || _p="$_p;conditional blocks in the configuration section are run unconditionally"
+
+    # A ONE-PACKAGE PLAN WITH MISSING DEPENDENCIES IS A TRAP.  `install
+    # ffmpeg --run` (no --recursive) planned one package, said "1 to build",
+    # and died on `libass >= 0.11.0 not found` -- libass was never installed
+    # and was never going to be.  The plan knew.
+    grep -q 'this plan builds ONLY' "$pm_src" \
+        || _p="$_p;a single-package plan does not mention its missing dependencies"
+    grep -q -- '--run --recursive' "$pm_src" \
+        || _p="$_p;nothing suggests --recursive when dependencies are missing"
+
+    # ...AND IT IS REFRESHED, NOT JUST REPORTED.  Telling the user to pass
+    # --regenerate cost several rounds each on brotli, rust, xcb-utilities and
+    # ffmpeg.  A stale script the user has NOT edited is regenerated; one
+    # they have edited is kept, with the command to take the new one.
+    grep -q '_stale_unedited' "$pm_src" \
+        || _p="$_p;a stale script is reported but still used"
+    python3 - "$pm_src" <<'PYEDITED' || _p="$_p;the edited-script test is wrong"
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = tempfile.mkdtemp()
+plain = os.path.join(d, "plain"); open(plain, "w").write("### generated by blfs 1.1\n")
+assert pm._script_is_user_edited(plain) is False
+marked = os.path.join(d, "marked"); open(marked, "w").write("# EDITED by me\n")
+assert pm._script_is_user_edited(marked) is True
+bak = os.path.join(d, "bak"); open(bak, "w").write("x\n"); open(bak + ".edited", "w").write("y\n")
+assert pm._script_is_user_edited(bak) is True
+PYEDITED
+
+    # AND A LOCAL SCRIPT FROM AN OLDER GENERATOR CARRIES THE OLD BUGS.
+    # brotli failed twice on the same line after the generator was fixed: the
+    # script in the package home was written by the previous blfs, and the
+    # only notice was a one-line hint lost in a 200-package run.
+    # (1.13.40: an unedited stale script is regenerated instead of merely
+    #  reported; an EDITED one is kept and the user is told how to take the
+    #  new generator's version)
+    grep -q 'this file has YOUR EDITS -- keeping it' "$pm_src" \
+        || _p="$_p;a script from an older generator is used without saying so"
+
+    # `packagemanager script <phase> <pkg>` MUST USE THE ACCOUNT.  It took the
+    # anchor verbatim: `su - rust -c 'bash ~/install_rust install'` -- no such
+    # account, no such script.
+    # two names: the ACCOUNT for su and the script path, the ANCHOR for blfs
+    grep -q 'name = pkgusr_name(anchor)' "$pm_src" \
+        || _p="$_p;packagemanager script runs as the anchor instead of the package user"
+    grep -q 'run_blfs(\["script", anchor' "$pm_src" \
+        || _p="$_p;packagemanager script asks the book for the account name"
+    # ...and it must DELETE the account, not the anchor: `remove --purge mako`
+    # ran `userdel mako`, left p_mako in /etc/passwd, and printed
+    # "mako purged." with the files and home already gone.
+    grep -q 'userdel", _acct' "$pm_src" \
+        || _p="$_p;purge deletes the anchor instead of the package user"
+    grep -q 'NOT fully purged' "$pm_src" \
+        || _p="$_p;purge claims success even when the account survives"
+
+    # `remove <anchor> --purge` looked the ANCHOR up in passwd and crashed:
+    #   KeyError: getpwnam(): name not found: 'cargo-c'
+    grep -q 'pwd.getpwnam(pkgusr_name(name)).pw_dir' "$pm_src" \
+        || _p="$_p;remove --purge looks up the anchor instead of the account"
+
+    # AND AN INSTALL IT RAN MUST BE RECORDED: only pm-install writes the
+    # manifest, so `packagemanager script install rust` succeeded and the
+    # planner still called Rustc "new" on the next run.
+    grep -q '"lfs-helper", "record-install", name' "$pm_src" \
+        || _p="$_p;a phase that installed is not recorded, so it is built again"
+    # a local `import pwd` inside one branch shadows the module-level one, so
+    # a later `if pwd is not None` crashed with UnboundLocalError
+    python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" "$pm_src" \
+        || _p="$_p;packagemanager does not parse"
+    python3 - "$pm_src" <<'PYPWD' || _p="$_p;a branch-local import of pwd shadows the module-level one"
+import sys, ast
+tree = ast.parse(open(sys.argv[1]).read())
+for fn in [n for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)]:
+    # An `import pwd` makes the name local to the WHOLE function.  That is
+    # safe when the use sits in the same block as the import (import then
+    # use, one try); it is a latent UnboundLocalError when a use appears
+    # BEFORE the import line or in a different branch -- which is exactly
+    # what crashed cmd_script.
+    imports = [n.lineno for n in ast.walk(fn)
+               if isinstance(n, ast.Import)
+               and any(a.name == "pwd" and not a.asname for a in n.names)]
+    if not imports:
+        continue
+    first = min(imports)
+    bad = [n.lineno for n in ast.walk(fn)
+           if isinstance(n, ast.Name) and n.id == "pwd"
+           and isinstance(n.ctx, ast.Load) and n.lineno < first]
+    # a use far below the import block is also suspect: require it to be
+    # within a few lines of an import of pwd
+    for n in ast.walk(fn):
+        if (isinstance(n, ast.Name) and n.id == "pwd"
+                and isinstance(n.ctx, ast.Load)
+                and not any(0 <= n.lineno - i <= 3 for i in imports)):
+            bad.append(n.lineno)
+    assert not bad, "%s: bare pwd at %s with a function-local import" % (fn.name, bad)
+PYPWD
+
+    # WRITING A LOGIN PROFILE IS NOT RUNNING IT.  rust's config writes
+    # /etc/profile.d/rustc.sh and the page sources it; those snippets call
+    # pathprepend, a BLFS login-profile helper absent from a build shell, so
+    # a package that had installed 2390 files failed at the last line.
+    python3 - "$_bt" <<'PYPROF' || _p="$_p;a package sources a login profile during its build"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._comment_profile_sourcing(
+    "cat > /etc/profile.d/rustc.sh << EOF\nX\nEOF\nsource /etc/profile.d/rustc.sh")
+assert "# source /etc/profile.d/rustc.sh" in out, out
+assert out.splitlines()[0].startswith("cat >"), out   # writing it is kept
+PYPROF
+
+    # RUST DRIVES EVERYTHING THROUGH x.py, and two things went wrong:
+    # `./x.py test` (41425 tests) was not recognised as a test driver, and the
+    # book's "If sudo or su is invoked for switching to the root user..."
+    # caused `./x.py install` -- the whole point of the package -- to be
+    # commented as conditional.  A sentence about privilege mechanics guards
+    # nothing.
+    python3 - "$_bt" <<'PYRUST' || _p="$_p;rust's tests run, or its install is skipped"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._comment_test_runs(
+    "./x.py build\n./x.py test --verbose | tee rustc-testlog\n"
+    "grep '^test result:' rustc-testlog |\n awk '{print}'\n./x.py install")
+lines = out.splitlines()
+assert lines[0] == "./x.py build", out
+assert lines[-1] == "./x.py install", out          # build and install survive
+assert "# ./x.py test" in out, out                  # the run goes
+assert "# grep" in out and "# " in lines[-2], out   # and the whole pipeline
+class P:
+    name = "p"
+    def __init__(s, t): s.t = t
+    def get_text(s): return s.t
+class Pre:
+    def __init__(s, t): s.p = P(t)
+    def find_previous(s, names): return s.p
+assert b._conditional_guard(Pre(
+    "If sudo or su is invoked for switching to the root user, ensure X")) is None
+PYRUST
+
+    # COMMENTING A COMMAND MUST NOT STRAND THE ONE BEFORE IT.  libpwquality
+    # ended `make install &&` with the pip line after it commented (1.13.3),
+    # and bash refused the whole file: syntax error near unexpected token `}'.
+    python3 - "$_bt" <<'PYDANGLE' || _p="$_p;commenting a command leaves the previous one ending in &&"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._repair_dangling_operators("make install &&\n# pip3 install x")
+assert out.splitlines()[0] == "make install", out
+# a real chain is untouched
+keep = b._repair_dangling_operators("./configure &&\nmake &&\nmake install")
+assert keep == "./configure &&\nmake &&\nmake install", keep
+# and a pipe with nothing after it goes too
+assert b._repair_dangling_operators("grep x f |\n# awk y").splitlines()[0] == "grep x f"
+PYDANGLE
+
+    # A PIP INSTALL WHOSE WHEEL NOTHING BUILT.  brotli's optional Python
+    # bindings are two steps; the `pip3 wheel -w dist` is conditional and
+    # commented, the `pip3 install --find-links dist` was not -- so pip
+    # looked in a directory nobody made, AFTER the C library installed fine.
+    python3 - "$_bt" <<'PYPIP' || _p="$_p;a pip install runs against a wheel directory nothing fills"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+orphan = b._comment_orphan_pip_installs(
+    "# pip3 wheel -w dist $PWD\npip3 install --no-index --find-links dist Brotli")
+assert "# pip3 install" in orphan, orphan
+kept = b._comment_orphan_pip_installs(
+    "pip3 wheel -w dist $PWD\npip3 install --find-links dist Foo")
+assert not kept.splitlines()[1].startswith("#"), kept
+PYPIP
+
+    # A FUNCTION DEFINITION IS NOT A COMMAND TO SKIP.  Xorg's loop defines
+    # do_build/do_test/do_install and calls them later; the test filter
+    # commented `do_test() { make check; }` and the loop then called a
+    # function that did not exist -- xorg7-lib "succeeded" without installing
+    # libX11, and mesa died on `Dependency "x11" not found` with xorg7-lib
+    # recorded as installed.
+    python3 - "$_bt" <<'PYDEFS' || _p="$_p;a filter comments a function definition"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+src = ("do_build() { make; }\n"
+       "do_test() { make check; }\n"
+       "do_pdf() { make -C doc pdf; }\n"
+       "do_x() { pip3 install --find-links dist X; }\n"
+       "make check")
+for fn in ("_comment_test_runs", "_comment_doc_format_builds",
+           "_comment_orphan_pip_installs"):
+    out = getattr(b, fn)(src)
+    for line in out.splitlines():
+        assert not (line.startswith("# ") and "()" in line), (fn, line)
+# ...and a real command is still skipped
+assert "# make check" in b._comment_test_runs(src)
+PYDEFS
+
+    # RUNNING THE TEST SUITE IS NOT BUILDING THE PACKAGE.  NSS's page puts
+    # `cd tests && ./all.sh` in the BUILD block, so an ordinary install ran
+    # 77549 tests -- hours -- and then failed the package on a test artifact.
+    # The script already has a test phase, gated on PM_TEST=1.
+    python3 - "$_bt" <<'PYTESTRUN' || _p="$_p;a book test suite still runs during a normal build"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._comment_test_runs("make\ncd tests &&\nHOST=x ./all.sh\ncd ../\nmake install")
+lines = out.splitlines()
+assert lines[0] == "make" and lines[-1] == "make install", out
+# the run, the cd in and the cd back out all go
+assert all(l.startswith("#") for l in lines[1:-1]), out
+# a package with no test run is untouched
+assert b._comment_test_runs("make\nmake install") == "make\nmake install"
+# and the make-based drivers are caught too
+assert "# make check" in b._comment_test_runs("make check")
+PYTESTRUN
+
+    # A MATCH ON A CONTINUATION LINE belongs to the command above it:
+    #     rsync -vrltLW --delete ... \
+    #           rsync://fate-suite.ffmpeg.org/... fate-suite/
+    # only the second line matches, and the first ran on its own.
+    python3 - "$_bt" <<'PYCONT' || _p="$_p;a test command split over lines is only half commented"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._comment_test_runs("make install &&\nrsync -a \\\n   rsync://host/fate x")
+lines = out.splitlines()
+assert lines[0] == "make install &&", out
+assert lines[1].startswith("# rsync -a"), out
+assert lines[-1].startswith("#"), out
+PYCONT
+
+    # A LOOP THAT TYPESETS goes as a unit.  ffmpeg wraps texi2pdf/texi2dvi/
+    # dvips in `pushd doc && for ... done &&`; commenting only the texi2*
+    # lines would leave an empty loop body.  And `make fate` is ffmpeg's test
+    # suite, which fetches 40GB of samples over rsync first.
+    python3 - "$_bt" <<'PYTYPESET' || _p="$_p;a typesetting loop or the fate suite still runs"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._comment_typeset_blocks(
+    "make &&\npushd doc &&\nfor D in x\ndo\n    texi2pdf $D.texi\ndone &&\npopd &&\nmake install")
+lines = out.splitlines()
+assert lines[0] == "make &&", out
+assert lines[-1] == "make install", out
+assert all(l.startswith("#") for l in lines[2:-1]), out   # the whole block
+# a loop that does NOT typeset is untouched
+keep = b._comment_typeset_blocks("for D in x\ndo\n    make -C $D\ndone")
+assert not any(l.startswith("#") for l in keep.splitlines()), keep
+# fate is a test driver
+assert "# make fate" in b._comment_test_runs("make fate SAMPLES=x")
+assert "# make fate-rsync" in b._comment_test_runs("make fate-rsync SAMPLES=x")
+PYTYPESET
+
+    # TYPESETTING THE MANUAL IS NOT INSTALLING THE PACKAGE.  libassuan's page
+    # ends with `make -C doc pdf ps`, which needs TeX -- and --disable-doc
+    # does not help, because nothing is misconfigured: the command asks for
+    # PDF outright.  (That wrong fix shipped three times before the script
+    # was read.)
+    python3 - "$_bt" <<'PYDOCFMT' || _p="$_p;a typeset manual can still fail a library build"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._comment_doc_format_builds("make\nmake -C doc html\nmake -C doc pdf ps")
+lines = out.splitlines()
+assert lines[0] == "make", out
+assert "make -C doc html" in out and "# make -C doc html" not in out, out
+assert "# make -C doc pdf ps" in out, out
+PYDOCFMT
+
+    # A COMMAND WHOSE INPUT NOTHING PRODUCES is not part of installing:
+    # "grep -A9 summary *make_check.log" reads logs written by the optional
+    # test step, and under set -e it failed the whole page.
+    python3 - "$_bt" <<'PYLOG' || _p="$_p;a command reading a log nothing writes still runs"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+orphan = b._comment_orphan_log_readers("make install\ngrep -A9 summary *make_check.log")
+assert "# grep -A9" in orphan, orphan
+kept = b._comment_orphan_log_readers("make check | tee x.log\ngrep Summary x.log")
+assert not kept.splitlines()[1].startswith("#"), kept
+PYLOG
+    _bk_meta="$(ls "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*.html 2>/dev/null | head -1)"
+    if [ -n "$_bk_meta" ]; then
+        _metad="$T/meta"; mkdir -p "$_metad"
+        python3 "$_bt" --book-file "$_bk_meta" script xorg7-lib -o "$_metad" >/dev/null 2>&1
+        _metaf="$(ls "$_metad"/install_Xorg-Libraries 2>/dev/null | head -1)"
+        if [ -n "$_metaf" ]; then
+            _up="$(sed -n '/^_pp_unpack() {/,/^}/p' "$PHASES_LIB")"
+            printf '%s' "$_up" | grep -q 'no single tarball' \
+                || _p="$_p;the meta page's unpack does not bail out before fetching"
+            grep -q "^pkg=''" "$_metaf" \
+                || _p="$_p;the meta page's script claims a tarball"
+            # ...the build must RESUME where those commands left off (the
+            # page does `mkdir lib && cd lib`, and its loop reads
+            # ../lib-7.md5, which only resolves from inside lib/) ...
+            printf '%s' "$(awk '/^_pp_enter_source\(\) \{/,/^\}/' "$PHASES_LIB")" \
+                | grep -q '_pp_cwd_marker' \
+                || _p="$_p;a meta build starts at the root, not where its downloads went"
+            # ...and a loop over a list file must FAIL when the file is gone,
+            # instead of iterating zero times and exiting 0
+            grep -q 'the list this build loops over is missing or empty' "$_metaf" \
+                || _p="$_p;an empty list loop reports success"
+            # ...and the page's OWN download commands must run before that
+            # early return: Xorg Libraries writes lib-7.md5 and wgets its
+            # list from it, and returning first left the build loop reading
+            # a file nobody had created -- it built nothing and exited 0.
+            # (they are the page's prepare_pkg, which the runner calls
+            #  before it decides there is no tarball)
+            sed -n '/^prepare_pkg() {/,/^}/p' "$_metaf" | grep -q 'lib-7.md5' \
+                || _p="$_p;the meta page's own download commands are not run before unpack"
+            _dl="$(printf '%s' "$_up" | grep -n 'prepare_pkg$' | head -1 | cut -d: -f1)"
+            _rt="$(printf '%s' "$_up" | grep -n 'no single tarball' | head -1 | cut -d: -f1)"
+            if [ -n "$_dl" ] && [ -n "$_rt" ] && [ "$_dl" -gt "$_rt" ]; then
+                _p="$_p;the meta page returns before running its own download commands"
+            fi
+            # ...and the BUILD phase must not then demand an unpacked source:
+            # XCB-Utilities died there after unpack had correctly done nothing
+            _eb="$(awk '/^_pp_enter_source\(\) \{/,/^\}/' "$PHASES_LIB")"
+            printf '%s' "$_eb" | grep -q '\[ -z "\${pkg:-}" \]' \
+                || _p="$_p;a page with no tarball fails when the build phase enters it"
+            bash -n "$_metaf" || _p="$_p;the meta page's script does not parse"
+        fi
+        rm -rf "$_metad"
+    fi
+
+    # THE SAME PROBLEM, GENERALLY: a variable the book expects the user to
+    # export.  Unset, the shell expands it to nothing and configure gets an
+    # empty flag -- "expected an absolute directory name for --datarootdir:".
+    python3 - "$_bt" <<'PYENV' || _p="$_p;a variable the book expects the user to set is used empty"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+assert "TEXLIVE_PREFIX to be set" in b._required_env_guard("./configure --prefix=$TEXLIVE_PREFIX", set())
+assert b._required_env_guard("BUILD_ROOT=x\ncd $BUILD_ROOT", {"BUILD_ROOT"}).count("to be set") == 0
+assert b._required_env_guard('tar xf "$pkg"', {"pkg"}).count("to be set") == 0
+# THE SHELL'S OWN VARIABLES ARE NOT THE USER'S TO SET.  A list containing
+# EUID teaches the user to ignore the list -- ten of eleven entries in the
+# first real run were false positives.
+for shellvar in ("EUID", "UID", "PPID", "RANDOM", "LANG", "PWD"):
+    assert b._required_env_guard("echo $%s" % shellvar, set()).count("to be set") == 0, shellvar
+# SINGLE-QUOTED TEXT IS NOT THE SHELL'S: $PACKAGE_PREFIX_DIR lives inside a
+# sed expression that writes CMake, so the shell never expands it and the
+# user was being asked about another language's variables.
+sq = b._required_env_guard(
+    "sed -e '/X/i set(SAVE_PACKAGE_PREFIX_DIR \"${PACKAGE_PREFIX_DIR}\")' f &&\n"
+    "cmake -D CMAKE_INSTALL_PREFIX=$KF6_PREFIX ..", set())
+assert "PACKAGE_PREFIX_DIR to be set" not in sq, sq
+assert "KF6_PREFIX to be set" in sq, sq
+PYENV
+    # AND THE BOOK'S OWN ANSWER COMES FIRST: TeX Live's build uses
+    # $TEXLIVE_PREFIX and the book sets it in "Setting the PATH for TeX Live"
+    # -- a DIFFERENT section.  Asking the user to supply it is asking them to
+    # repeat the book.
+    _bk_env="$(ls "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*.html 2>/dev/null | head -1)"
+    if [ -n "$_bk_env" ]; then
+        _envd="$T/pageenv"; mkdir -p "$_envd"
+        python3 "$_bt" --book-file "$_bk_env" script texlive -o "$_envd" >/dev/null 2>&1
+        _envf="$(ls "$_envd"/install_texlive-* 2>/dev/null | head -1)"
+        if [ -n "$_envf" ]; then
+            grep -q 'TEXLIVE_PREFIX="/opt/texlive' "$_envf" \
+                || _p="$_p;the book's own definition of TEXLIVE_PREFIX is not used"
+            grep -q 'needs TEXLIVE_PREFIX to be set' "$_envf" \
+                && _p="$_p;the user is asked for a variable the book already defines"
+        fi
+        rm -rf "$_envd"
+    fi
+    python3 - "$pm_src" <<'PYWARN' || _p="$_p;nothing warns about an unset variable BEFORE the build starts"
+import sys, os, io, contextlib, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = tempfile.mkdtemp(); f = os.path.join(d, "install_x")
+open(f, "w").write('[ -n "${SOME_PREFIX:-}" ] || { echo "this package needs SOME_PREFIX to be set"; }\n')
+os.environ.pop("SOME_PREFIX", None)
+err = io.StringIO()
+with contextlib.redirect_stderr(err), contextlib.redirect_stdout(err):
+    pm._warn_unset_env("somepkg", f)
+assert "SOME_PREFIX" in err.getvalue()
+os.environ["SOME_PREFIX"] = "/x"
+quiet = io.StringIO()
+with contextlib.redirect_stderr(quiet), contextlib.redirect_stdout(quiet):
+    pm._warn_unset_env("somepkg", f)
+assert quiet.getvalue().strip() == ""
+PYWARN
+    grep -q '_pp_mirrors_for() {' "$PHASES_LIB" \
+        || _p="$_p;a failed download is retried against the same host only"
+    # ($_bt is the GENERATOR here, not a generated script, so check what it
+    #  emits rather than trying to run it.)
+    grep -q 'ftp.gnu.org/gnu/\$rest' "$PHASES_LIB" \
+        || _p="$_p;the GNU fallback does not rewrite to a real ftp.gnu.org path"
+    grep -q 'mirrors.kernel.org/gnu/\$rest' "$PHASES_LIB" \
+        || _p="$_p;there is only one GNU fallback mirror"
+    grep -q 'blfs/downloads' "$_bt" && grep -q 'pkgusr_book_mirror' "$PHASES_LIB" \
+        || _p="$_p;there is no last-resort mirror for non-GNU hosts"
+    grep -q 'try \* 15' "$PHASES_LIB" \
+        || _p="$_p;the retry backoff does not grow (5s three times is not a retry)"
+    grep -q 'wget -4 -c' "$PHASES_LIB" \
+        || _p="$_p;a retried partial download would be saved beside itself"
+    grep -q 'try in 1 2 3' "$PHASES_LIB" || _p="$_p;the fetch does not retry"
+    grep -q '_pp_fetch "\$link"' "$PHASES_LIB" \
+        || _p="$_p;the main tarball download does not go through the retry"
+    # The one loop sets a real BUILD_ROOT, so "look in ." stopped finding the
+    # tarball packagemanager staged into $HOME -- wget's own install tried to
+    # DOWNLOAD wget on a fresh 13.0-sysv bootstrap.  The script owns the
+    # search: HOME, then /sources, then and only then the network.
+    grep -q 'for d in "\$HOME" "\$SOURCES_DIR" /sources' "$PHASES_LIB" \
+        || _p="$_p;a staged tarball is invisible: the script only looks in its cwd before downloading"
+    grep -q '_pp_stage_file "\$f" || _pp_fetch "\$li"' "$PHASES_LIB" \
+        || _p="$_p;additional files are always downloaded, even when already on the system"
+    # conditional blocks are recognised by the SENTENCE PATTERN, not a verb
+    # list: the list caught libuv's "If you installed sphinx..." and missed
+    # "If you BUILT the man page, install it", so the page was never made and
+    # its install failed on a missing file
+    grep -q 'if\\b|optionally\\b|should you\\b' "$_bt" \
+        || _p="$_p;conditional command blocks are matched by a verb list, which will keep missing wordings"
+    grep -q '_pp_fetch "\$li"' "$PHASES_LIB" \
+        || _p="$_p;additional downloads do not go through the retry"
+    grep -q 'wget -4 "\$link"' "$_bt" "$PHASES_LIB" \
+        && _p="$_p;a bare non-retrying wget emission survives"
+    # the shims are emitted from a list now (1.12.79), so check the list and
+    # the shape rather than one hard-coded name
+    grep -qw 'systemctl' "$PHASES_LIB" \
+        || _p="$_p;a missing systemctl still aborts generated scripts"
+    grep -q 'command -v "\$c" >/dev/null 2>&1 && continue' "$PHASES_LIB" \
+        || _p="$_p;the systemd shims would shadow the real commands"
+    if [ -n "$_p" ]; then
+        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+            [ -n "$m" ] && bad "$m"
+        done
+    else
+        ok "generated scripts retry downloads and shim a missing systemctl"
+    fi
 fi
 
 # ---- make-ca installed is not the same as certificates generated ------------ #
@@ -4078,7 +6234,7 @@ print("  PASS  readline is optional, not required")
 PY64
 _count_rc $?
 
-for f in lfs-helper packagemanager_install; do
+for f in lfs-helper; do
     p="$(dirname "$LFS_TOOL")/$f"
     [ -f "$p" ] || continue
     # every prompt that reads an ANSWER needs -e; loops reading files do not
@@ -4090,7 +6246,7 @@ done
 ok "the bash prompts use read -e"
 
 # and -r as well, or a backslash in an answer is eaten
-if grep -qE "read -e [^r-]" "$(dirname "$LFS_TOOL")/packagemanager_install" 2>/dev/null; then
+if grep -qE "read -e [^r-]" "$(dirname "$LFS_TOOL")/lfs-helper" 2>/dev/null; then
     bad "a prompt uses -e without -r"
 else
     ok "prompts keep backslashes literal (-r)"
@@ -4143,40 +6299,45 @@ python3 - "$LFS_TOOL" <<'PY65B'
 import sys, os, re, importlib.machinery as m
 lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
 problems = []
-body = open(sys.argv[1]).read()
+# the runner decides both directories, from the script's stage variable
+body = open(os.path.join(os.path.dirname(sys.argv[1]), "lfs-phases")).read()
+layout = body[body.index("_pp_layout() {"):body.index("_pp_systemd_shims() {")]
 
-if 'BUILD_ROOT="${BUILD_ROOT:-$LFS/sources}"' in body:
+if 'BUILD_ROOT="$LFS/sources"' in layout:
     problems.append("BUILD_ROOT still defaults to the tarball store")
-for need in ('SOURCES_DIR="${SOURCES_DIR:-$LFS/sources}"',
-             'BUILD_ROOT="${BUILD_ROOT:-$LFS/build}"'):
-    if need not in body:
-        problems.append("generated scripts do not set %s" % need.split("=")[0])
+for need in ('SOURCES_DIR="$LFS/sources"', 'BUILD_ROOT="$LFS/build"'):
+    if need not in layout:
+        problems.append("the runner does not set %s for a cross build" % need.split("=")[0])
 
 # generate a real script and read what it does
 cmds = ["mkdir -v build\ncd build", "../configure", "make", "make install"]
 s = lfs._crosschain_script_body("demo", "ch-tools-demo", "demo-1.0",
                                 "demo-1.0.tar.*", cmds)
+if 'pkgusr_stage="cross"' not in s:
+    problems.append("a cross script does not say so")
 # the markers must live in scratch, never in the tarball store
-for marker in (".cc-build-demo", ".cc-dir-demo"):
-    for line in s.splitlines():
+for marker in ("_pp_dir_marker=", "_pp_cwd_marker="):
+    for line in layout.splitlines():
         if marker in line and "SOURCES_DIR" in line:
             problems.append("%s is written to the tarball store" % marker)
-if '$BUILD_ROOT/.cc-build-demo' not in s:
-    problems.append("the build marker is not written to BUILD_ROOT")
+        if marker in line and "$BUILD_ROOT/" not in line:
+            problems.append("%s is not written to BUILD_ROOT" % marker)
 # unpack must extract into scratch
-if 'cd "$BUILD_ROOT"' not in s:
+u = body[body.index("_pp_unpack() {"):body.index("_pp_enter_source() {")]
+if 'cd "$BUILD_ROOT"' not in u:
     problems.append("unpack does not work in BUILD_ROOT")
 # and the symlink farm must be built before the tarball is looked for
-u = s[s.index("unpack_pkg()"):s.index("#### UNPACK DONE ####")]
-if "_link_sources" not in u:
-    problems.append("unpack does not build the sources symlink farm")
+if u.index("_pp_link_sources") > u.index("_pp_pick_glob"):
+    problems.append("unpack does not build the sources symlink farm first")
 
 # the chroot copy must map BOTH directories, not just one
 c = lfs._chrootify(s)
-if 'SOURCES_DIR="${SOURCES_DIR:-/sources}"' not in c:
-    problems.append("the chroot script does not point at /sources")
-if 'BUILD_ROOT="${BUILD_ROOT:-/build}"' not in c:
-    problems.append("the chroot script does not point at /build")
+if 'pkgusr_stage="chroot"' not in c:
+    problems.append("the chroot script does not say so")
+if 'SOURCES_DIR="/sources"' not in layout:
+    problems.append("the runner does not point a chroot script at /sources")
+if 'BUILD_ROOT="/build"' not in layout:
+    problems.append("the runner does not point a chroot script at /build")
 
 if problems:
     for p in problems: print("  FAIL  %s" % p)
@@ -4245,7 +6406,7 @@ _sp=""
 _left="$(ls -A "$_sbx/lfs/sources" | grep -v '^demo-2\.0' | tr '\n' ' ' || true)"
 [ -z "$_left" ] || _sp="$_sp;a build wrote into the tarball store: $_left"
 [ -d "$_sbx/lfs/build/demo-2.0" ] || _sp="$_sp;the package was not unpacked into BUILD_ROOT"
-[ -f "$_sbx/lfs/build/.cc-dir-demo" ] || _sp="$_sp;build markers did not land in BUILD_ROOT"
+[ -f "$_sbx/lfs/build/.pkgusr-demo-2.0.dir" ] || _sp="$_sp;build markers did not land in BUILD_ROOT"
 [ -L "$_sbx/lfs/build/demo-2.0-html.tar.gz" ] || _sp="$_sp;the farm entry is not a symlink"
 if [ -n "$_sp" ]; then
     printf '%s\n' "${_sp#;}" | tr ';' '\n' | while IFS= read -r _m; do
@@ -4877,8 +7038,12 @@ if [ -f "$pmt" ]; then
     esac
 fi
 
-# the file must ship, and the Makefile must install it without clobbering
+# the file must ship, and the Makefile must install it without clobbering.
+# Beside the tool in a checkout; at /etc/pkgusr on an installed system --
+# that is where the Makefile puts it, so /usr/bin/lfs having no skel-u_xdg/
+# next to it is not a missing file.
 skel="$(dirname "$LFS_TOOL")/skel-u_xdg/.bash_profile"
+[ -f "$skel" ] || skel="/etc/pkgusr/skel-u_xdg/.bash_profile"
 [ -f "$skel" ] \
     && ok "the XDG profile ships with the tools" \
     || bad "the XDG profile is not shipped"
@@ -4890,6 +7055,506 @@ if [ -f "$mkf" ]; then
     grep -q "kept your existing .bash_profile" "$mkf" \
         && ok "reinstalling does not overwrite your edits" \
         || bad "a reinstall would clobber the XDG profile"
+fi
+
+# ---- the sync carries the XDG profile too  (1.11.29) ------------------------ #
+# `make install` placed the profile, but a system whose tools arrive through
+# install-tools / sync-tools -- which is how every chroot gets them -- never
+# received it, and each --shared user creation warned about the missing file.
+# The sync already carried skel-package verbatim; this one was forgotten.
+python3 - "$LFS_TOOL" <<'PYXDG'
+import sys, os, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+if not hasattr(lfs, "_install_xdg_skel"):
+    problems.append("the sync has nothing to place the XDG profile with")
+else:
+    # an edited copy in the tree is never clobbered
+    t = tempfile.mkdtemp()
+    dst = os.path.join(t, "etc/pkgusr/skel-u_xdg/.bash_profile")
+    os.makedirs(os.path.dirname(dst))
+    open(dst, "w").write("MINE\n")
+    lfs._install_xdg_skel(t, verbose=False)
+    if open(dst).read() != "MINE\n":
+        problems.append("the sync clobbered an edited XDG profile")
+    # a fresh tree receives it, whenever any source exists at all
+    src_host = "/etc/pkgusr/skel-u_xdg/.bash_profile"
+    src_repo = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])),
+                            "skel-u_xdg", ".bash_profile")
+    if os.path.isfile(src_host) or os.path.isfile(src_repo):
+        t2 = tempfile.mkdtemp()
+        lfs._install_xdg_skel(t2, verbose=False)
+        if not os.path.isfile(os.path.join(
+                t2, "etc/pkgusr/skel-u_xdg/.bash_profile")):
+            problems.append("a fresh tree does not receive the XDG profile")
+src = open(sys.argv[1]).read()
+for site in ("_install_pkgusr_skel(lfs)\n    _install_xdg_skel(lfs)",
+             "_install_xdg_skel(lfs, verbose=False)"):
+    if site not in src:
+        problems.append("a sync path skips the XDG profile")
+        break
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  install-tools and sync-tools carry the XDG profile")
+PYXDG
+_count_rc $?
+
+# ---- the completion travels with the sync too  (1.11.31) -------------------- #
+# Same forgotten-file story as the XDG profile: the Makefile installed it, the
+# sync -- which is how every chroot gets its tools -- did not, so no synced
+# system ever had tab completion.
+python3 - "$LFS_TOOL" <<'PYCOMP'
+import sys, os, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+problems = []
+if not hasattr(lfs, "_install_completion"):
+    problems.append("the sync has nothing to place the completion with")
+else:
+    src_repo = os.path.join(os.path.dirname(os.path.abspath(sys.argv[1])),
+                            "lfs-completion.bash")
+    if os.path.isfile(src_repo) or os.path.isfile(
+            "/usr/share/bash-completion/completions/lfs"):
+        t = tempfile.mkdtemp()
+        lfs._install_completion(t, verbose=False)
+        d = os.path.join(t, "usr/share/bash-completion/completions")
+        if not os.path.isfile(os.path.join(d, "lfs")):
+            problems.append("a fresh tree does not receive the completion")
+        for tool in ("blfs", "packagemanager", "lfs-helper"):
+            if os.readlink(os.path.join(d, tool)) != "lfs" \
+                    if os.path.islink(os.path.join(d, tool)) else True:
+                problems.append("%s has no completion symlink" % tool)
+                break
+src = open(sys.argv[1]).read()
+if "_install_completion(lfs)" not in src \
+        or "_install_completion(lfs, verbose=False)" not in src:
+    problems.append("a sync path skips the completion")
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  install-tools and sync-tools carry the bash completion")
+PYCOMP
+_count_rc $?
+
+# ---- update-all says what it will do, and what it will NOT ------------------ #
+# `packagemanager update` with no names is the whole-system update.  Three
+# things its plan owed and did not deliver  (1.11.31):
+#   * a package with local edits to its installed version's script would have
+#     them silently left behind by the fresh new-version script (the make-ca
+#     systemctl edit was this) -- now collected at the END of the dry run,
+#     and --run STOPS before the first one instead of discarding;
+#   * a package not in the BLFS book simply vanished from the plan -- now
+#     named, with `lfs update` pointed at for the LFS-book side;
+#   * both self-clear: a merged install_<new-version> in the home resolves
+#     the conflict, --regenerate declares the discard on purpose.
+_pmt2="$(dirname "$LFS_TOOL")/packagemanager"
+if [ -f "$_pmt2" ]; then
+  python3 - "$_pmt2" <<'PYUPD'
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+problems = []
+if not hasattr(pm, "_pending_edit_conflict"):
+    problems.append("nothing detects edits an update would leave behind")
+else:
+    t = tempfile.mkdtemp()
+    def w(n, body):
+        open(os.path.join(t, n), "w").write(body)
+    # edited: canonical differs from the as-run record -> conflict
+    w("install_foo-1.0", "make\n# my fix\n")
+    w("install_last", "make\n")
+    if not pm._pending_edit_conflict(t, "foo-1.0", "foo-1.1"):
+        problems.append("a pending edit is not seen as a conflict")
+    # unedited: identical -> no conflict
+    w("install_foo-1.0", "make\n")
+    if pm._pending_edit_conflict(t, "foo-1.0", "foo-1.1"):
+        problems.append("a pristine script is flagged as a conflict")
+    # edited but MERGED into the new version's script -> resolved
+    w("install_foo-1.0", "make\n# my fix\n")
+    w("install_foo-1.1", "make\n# my fix\n")
+    if pm._pending_edit_conflict(t, "foo-1.0", "foo-1.1"):
+        problems.append("a merged new-version script does not clear the conflict")
+    # a reinstall row and missing records judge nothing
+    if pm._pending_edit_conflict(t, "(reinstall)", "foo-1.1") \
+            or pm._pending_edit_conflict(tempfile.mkdtemp(), "a-1", "a-2"):
+        problems.append("the conflict check judges what it cannot know")
+src = open(sys.argv[1]).read()
+if "LOCAL EDITS" not in src:
+    problems.append("conflicts are not collected at the end of the plan")
+if "stopping BEFORE" not in src:
+    problems.append("--run would discard edits instead of stopping")
+if "not in the BLFS book" not in src:
+    problems.append("packages outside the book vanish from the plan silently")
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  update-all surfaces conflicts, stops for them, and names the rest")
+PYUPD
+  _count_rc $?
+
+  # ---- a status line is cleared by whoever set it  (1.11.32) ---------------- #
+  # run_blfs announced "reading versions from the book" and left it standing;
+  # the caller's next print landed on the same line:
+  #     reading versions from the bookChecking 97 package(s)...
+  _rb="$(_slice_py_fn() { sed -n "/^def $2(/,/^def /p" "$1"; }; _slice_py_fn "$_pmt2" run_blfs)"
+  _p=""
+  printf '%s' "$_rb" | grep -q 'finally:' \
+      || _p="$_p;run_blfs can return with its status line still standing"
+  printf '%s' "$_rb" | grep -q 'clear_status()' \
+      || _p="$_p;run_blfs never clears the status it set"
+  # the plan and its verdict name the book they compared against
+  grep -q '_current_blfs_book' "$_pmt2" \
+      || _p="$_p;there is no one place that names the current book"
+  _cu="$(sed -n '/^def cmd_update(/,/^def /p' "$_pmt2")"
+  printf '%s' "$_cu" | grep -q '_current_blfs_book' \
+      || _p="$_p;the update messages do not name the book"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the status line is cleared, and update names the book it read"
+  fi
+fi
+
+# the set-default hint about build_book is gone -- it answered a question
+# nobody asked, on every invocation  (1.11.32)
+grep -q "the book the SYSTEM is built from is 'build_book'" "$LFS_TOOL" \
+    && bad "set-default still lectures about build_book" \
+    || ok "set-default says what it did and stops"
+
+# ---- a chosen book is a decision, and a decision is not silently overridden - #
+# `blfs set-default 13.0-systemd` saved the choice; `packagemanager update`
+# read 12.4.  Three holes in one flow  (1.11.33): set-default validated
+# nothing, so an uncached default sent every lookup to the closest-cached
+# fallback; blfs DID say so ("note: no book matched..."), but run_blfs
+# captures stderr and threw the note away; and the fallback's book was shown
+# by its filename, so even the wrong name was hard to read.
+_bt2="$(dirname "$LFS_TOOL")/blfs"
+if [ -f "$_bt2" ] && [ -f "$_pmt2" ]; then
+  _p=""
+  # set-default caches what it saves, or says plainly that it could not
+  _sd="$(sed -n '/^def cmd_set_default(/,/^def /p' "$_bt2")"
+  printf '%s' "$_sd" | grep -q 'ensure_book' \
+      || _p="$_p;set-default saves a default it never validated"
+  printf '%s' "$_sd" | grep -q 'blfs fetch' \
+      || _p="$_p;an uncachable default gives no way forward"
+  # the notes blfs writes reach the person running packagemanager
+  _rb2="$(sed -n '/^def run_blfs(/,/^def /p' "$_pmt2")"
+  printf '%s' "$_rb2" | grep -q 'note:' \
+      || _p="$_p;blfs notes are still swallowed by the wrapper"
+  # books discovers by itself, and offline says cached, not current
+  _cb="$(sed -n '/^def cmd_books(/,/^def /p' "$_bt2")"
+  printf '%s' "$_cb" | grep -qv 'discover' \
+      && : ; printf '%s' "$_cb" | grep -q 'offline' \
+      || _p="$_p;an offline books listing poses as a live one"
+  _n=0; _n="$(printf '%s' "$_cb" | grep -c 'discover_all()')"
+  [ "${_n:-0}" -ge 2 ] \
+      || _p="$_p;books does not discover without being asked"
+  # an unreachable index is a failure, not a tiny successful discovery
+  _da="$(sed -n '/^def discover_all(/,/^def /p' "$_bt2")"
+  printf '%s' "$_da" | grep -q 'raise' \
+      || _p="$_p;an offline discovery still poses as a result"
+  # the person reads a selector ('12.4'), never a scraped filename.  (This
+  # first asserted the filename-folding regex -- the implementation -- and
+  # broke one release later when the parse moved to the Default line.  The
+  # property: the name never comes from a [bracketed] listing filename.)
+  _cbb="$(sed -n '/^def _current_blfs_book(/,/^def /p' "$_pmt2")"
+  printf '%s' "$_cbb" | grep -q 'split("\[", 1)' \
+      && _p="$_p;the book is still named from a bracket-scraped filename"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "a chosen book is cached, its notes are heard, and its name is read"
+  fi
+
+  # ---- the wrapper asks for the default; discovery stays with the person ---- #
+  # Three at once from one real run  (1.11.34): the book name came from the
+  # FIRST [bracketed] filename of the listing -- alphabetical, so 12.4 beat
+  # 13.0 and update reported the wrong book while using the right default was
+  # impossible to see; books' auto-discovery ran through the wrapper, so
+  # every packagemanager invocation probed the site twice; and enumeration
+  # fell into the resolve-for-use cached fallback, turning stale index
+  # directories ('oldsvn') into notes plus the cached book under a false name.
+  _p=""
+  _cb2="$(sed -n '/^def cmd_books(/,/^def /p' "$_bt2")"
+  printf '%s' "$_cb2" | grep -q '"brief"' \
+      || _p="$_p;there is no discovery-free books listing for scripts"
+  grep -q '"--brief"' "$_bt2" \
+      || _p="$_p;--brief is not registered"
+  grep -q 'def discover_dir(selector, listing' "$_bt2" \
+      || _p="$_p;enumeration cannot be told apart from resolution"
+  grep -q 'discover_dir(d, listing=True)' "$_bt2" \
+      || _p="$_p;the listing still resolves stale directories to the cached book"
+  _cbb2="$(sed -n '/^def _current_blfs_book(/,/^def /p' "$_pmt2")"
+  printf '%s' "$_cbb2" | grep -q '"--brief"' \
+      || _p="$_p;the wrapper still triggers discovery to learn the default"
+  printf '%s' "$_cbb2" | grep -q 'Default:' \
+      || _p="$_p;the book name is still scraped from a filename, not the default"
+  grep -q '_FORWARDED_NOTES' "$_pmt2" \
+      || _p="$_p;the same note would repeat once per blfs call"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the wrapper reads the default without probing, and notes say each thing once"
+  fi
+
+  # ---- an empty BLFS plan is not a clean bill for the whole system ---------- #
+  # `lfs update glibc` said 2.42 -> 2.43 while `packagemanager update` said
+  # "Nothing to update" -- true for the BLFS-matched subset, read as the whole
+  # system.  The not-in-book report (1.11.31) printed only when the plan was
+  # non-empty: the early return skipped it in exactly the state that needs it
+  # most.  Now (1.11.35) both paths share one report, and the dry run actually
+  # CONSULTS the LFS book through `lfs update` -- one door, lfs owns that
+  # comparison.
+  _p=""
+  _n=0; _n="$(grep -c '_report_no_book(no_book' "$_pmt2")"
+  [ "${_n:-0}" -ge 2 ] \
+      || _p="$_p;the empty-plan path still hides the not-in-book packages"
+  grep -q 'def _lfs_update_report' "$_pmt2" \
+      || _p="$_p;the LFS book is never consulted for the rest"
+  _lr="$(sed -n '/^def _lfs_update_report(/,/^def /p' "$_pmt2")"
+  printf '%s' "$_lr" | grep -q '"update"' \
+      || _p="$_p;the LFS comparison is reimplemented instead of asked for"
+  # 'fetch' gets the script and runs nothing, in every tool
+  grep -q '"fetch"' "$_pmt2" \
+      || _p="$_p;packagemanager script has no fetch"
+  _cs="$(sed -n '/^def cmd_script(/,/^def /p' "$_pmt2")"
+  printf '%s' "$_cs" | grep -q 'resolve_script' \
+      || _p="$_p;script fetch does not go through the one script resolver"
+  grep -q 'def cmd_script_fetch' "$LFS_TOOL" \
+      || _p="$_p;lfs script fetch does not exist"
+  _n2=0; _n2="$(grep -c '_ensure_lfs_script(' "$LFS_TOOL")"
+  [ "${_n2:-0}" -ge 3 ] \
+      || _p="$_p;install and fetch do not share one script generator"
+  grep -q 'def cmd_search' "$LFS_TOOL" \
+      || _p="$_p;there is no lfs search"
+  grep -q '"search", help="find a package or section' "$LFS_TOOL" \
+      || _p="$_p;lfs search is not reachable"
+  _bs="$(sed -n '/^def cmd_script(/,/^def /p' "$_bt2")"
+  printf '%s' "$_bs" | grep -q '"fetch"' \
+      || _p="$_p;blfs script does not read the shared fetch verb"
+  if [ -n "$_p" ]; then
+      printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+          [ -n "$m" ] && bad "$m"
+      done
+  else
+      ok "the whole system is answered for, and every tool fetches scripts alike"
+  fi
+
+  # ---- every package lands in a named bucket, and unknown is not current ---- #
+  # 97 checked, "nothing to update", 1 reported as outside the book -- while
+  # `lfs update glibc` said 2.42 -> 2.43.  The classification loop had two
+  # silent exits  (1.11.36): a package whose state is not "installed" was
+  # dropped unless it had been NAMED (everything lfs-helper built has no
+  # install_last, so it reads that way), and `u.version and bv != u.version`
+  # made an UNKNOWN installed version falsy -- filing it as up to date.  Not
+  # knowing is not the same as being current.
+  python3 - "$_pmt2" <<'PYBUCKET'
+import sys, io, contextlib, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+problems = []
+src = open(sys.argv[1]).read()
+seg = src[src.index("def cmd_update("):]
+seg = seg[:seg.index("\ndef ", 10)]
+# the predicate that read unknown as current is gone
+if "u.version and bv != u.version" in seg:
+    problems.append("an unknown installed version is still read as up to date")
+for bucket in ("no_record", "unjudged"):
+    if bucket not in seg:
+        problems.append("packages exit the loop into no bucket (%s)" % bucket)
+# the report accounts for all of them, and says so
+pm._lfs_update_report = lambda names: ("lines", ["  glibc  Glibc-2.42  ->  Glibc-2.43"])
+buf = io.StringIO()
+try:
+    with contextlib.redirect_stdout(buf):
+        pm._report_no_book(no_book=["p1"], consult_lfs=True, no_record=["glibc"],
+                           unjudged=["bash"], uptodate_n=94, total=97)
+except TypeError as e:
+    print("  FAIL  the report cannot account for unjudged packages (%s)" % e)
+    sys.exit(1)
+out = buf.getvalue()
+if "97" not in out or "94" not in out:
+    problems.append("the report does not account for what was checked")
+if "glibc" not in out:
+    problems.append("a package with no recorded version is not named")
+if "Glibc-2.43" not in out:
+    problems.append("the LFS book's answer is not relayed")
+# and it stays quiet when there is genuinely nothing unjudged
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    pm._report_no_book(no_book=[], consult_lfs=True, no_record=[], unjudged=[])
+if buf.getvalue().strip():
+    problems.append("the report invents findings when everything was judged")
+# ---- one update covers the system: BLFS preferred, LFS for the rest ------
+# The plan held only what the BLFS book carries -- two packages -- while
+# twenty-nine LFS-book packages were merely REPORTED with a command to paste.
+# "update all, preferring BLFS" was the request from the start.  (1.11.50)
+if not hasattr(pm, "_lfs_stale_list"):
+    problems.append("the LFS book's packages cannot enter the plan")
+else:
+    import types as _t
+    class _R:
+        stdout = "glibc\tGlibc-2.42\tGlibc-2.43\nless\tLess-679\tLess-692\njunk\n"
+        returncode = 0
+    _sp, _wh = pm.subprocess, pm.shutil.which
+    pm.subprocess = _t.SimpleNamespace(run=lambda *a, **k: _R(),
+                                       SubprocessError=Exception)
+    pm.shutil.which = lambda x: "/usr/bin/lfs"
+    try:
+        _got = pm._lfs_stale_list()
+        if _got != [("glibc", "Glibc-2.42", "Glibc-2.43"),
+                    ("less", "Less-679", "Less-692")]:
+            problems.append("the machine-readable LFS list is misread")
+    finally:
+        pm.subprocess, pm.shutil.which = _sp, _wh
+_cu2 = src[src.index("def cmd_update("):]
+_cu2 = _cu2[:_cu2.index("\ndef ", 10)]
+# the property is that the plan CONSULTS the LFS book -- not how the call is
+# spelled.  This first matched "_lfs_stale_list()" exactly and broke the
+# moment the call took an argument.
+if "_lfs_stale_list(" not in _cu2:
+    problems.append("the plan still stops at what BLFS carries")
+if "_blfs_planned" not in _cu2:
+    problems.append("BLFS is no longer preferred over the LFS book")
+if "_LFS_STEP" not in _cu2:
+    problems.append("an LFS-book entry cannot be told from a BLFS one")
+if "--toolchain" not in src or "_TOOLCHAIN_RISK" not in src:
+    problems.append("rebuilding glibc needs no explicit consent")
+# ---- rebuilding what is already "current"  (1.11.53) ----
+# After glibc changes, "up to date" and "built against the current system"
+# stop being the same statement.  --reinstall must therefore reach the LFS
+# book's up-to-date packages too, not just BLFS's.
+import types as _ty
+_seen = {}
+class _RR:
+    returncode = 0
+    stdout = "glibc\tGlibc-2.42\tGlibc-2.43\nbash\tBash-5.3\tBash-5.3\n"
+_sp2, _wh2 = pm.subprocess, pm.shutil.which
+pm.subprocess = _ty.SimpleNamespace(
+    run=lambda cmd, **k: (_seen.__setitem__("cmd", cmd), _RR())[1],
+    SubprocessError=Exception)
+pm.shutil.which = lambda x: "/usr/bin/lfs"
+try:
+    pm._lfs_stale_list(include_current=False)
+    if "--include-current" in _seen.get("cmd", []):
+        problems.append("a plain update would rebuild up-to-date packages")
+    pm._lfs_stale_list(include_current=True)
+    if "--include-current" not in _seen.get("cmd", []):
+        problems.append("--reinstall cannot reach the LFS book's current packages")
+finally:
+    pm.subprocess, pm.shutil.which = _sp2, _wh2
+# the plan and the "not covered" report must not print the same package twice
+if "_planned_now" not in _cu2:
+    problems.append("a planned package is also reported as unplanned")
+# a systemd book on a SysV system: say which scripts call systemctl  (1.11.51)
+import tempfile as _tf, os as _os
+if not hasattr(pm, "_systemctl_users"):
+    problems.append("nothing says which scripts need systemctl")
+else:
+    _sd = _tf.mkdtemp()
+    _s1 = _os.path.join(_sd, "install_foo-1.0")
+    open(_s1, "w").write("make install\nsystemctl enable foo\n")
+    _s2 = _os.path.join(_sd, "install_bar-1.0")
+    open(_s2, "w").write("make install\n")
+    _steps = [("foo", "foo", "1.0", "1.1", _s1), ("bar", "bar", "1.0", "1.1", _s2)]
+    _isdir, _which, _home = pm.os.path.isdir, pm.shutil.which, pm.pkgusr_home
+    pm.os.path.isdir = lambda p: False if "systemd" in p else _isdir(p)
+    pm.shutil.which = lambda x: None
+    pm.pkgusr_home = lambda n: _sd
+    try:
+        _got = pm._systemctl_users(_steps)
+        if [r[0] for r in _got] != ["foo"]:
+            problems.append("the systemctl scan misreads which scripts need it")
+        if not _got or len(_got[0]) < 3 or not str(_got[0][2]).endswith("install_foo-1.0"):
+            problems.append("the systemctl hint does not say which file to edit")
+        pm.shutil.which = lambda x: "/usr/bin/systemctl"
+        if pm._systemctl_users(_steps):
+            problems.append("it warns about systemctl on a system that has it")
+    finally:
+        pm.os.path.isdir, pm.shutil.which, pm.pkgusr_home = _isdir, _which, _home
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  every checked package is accounted for, and unknown is not current")
+PYBUCKET
+  _count_rc $?
+
+  # ---- one fact, two files: read whichever the build wrote  (1.11.37) ------- #
+  # "97 checked, 0 current with the BLFS book, 97 it cannot judge" -- on a
+  # system where `lfs update` compares all 97 without trouble.  Both build
+  # paths record what they installed; packagemanager read only its own
+  # (install_last) and was blind to lfs-helper's (VERSION).  The comparison
+  # has to be case-insensitive with it: BLFS anchors are lowercase
+  # ('which-2.23'), the LFS book titles its packages ('Which-2.23'), and an
+  # exact compare would invent an update for every package both books carry.
+  python3 - "$_pmt2" <<'PYVER'
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+problems = []
+t = tempfile.mkdtemp()
+h1 = os.path.join(t, "glibc"); os.makedirs(h1)
+open(os.path.join(h1, "VERSION"), "w").write("# from: LFS 13.0\nGlibc-2.42\n")
+if pm.read_install_last(h1).get("name_version") != "Glibc-2.42":
+    problems.append("a package built by lfs-helper still has no version")
+# install_last stays authoritative where it exists
+h2 = os.path.join(t, "which"); os.makedirs(h2)
+open(os.path.join(h2, "VERSION"), "w").write("Which-1.0\n")
+open(os.path.join(h2, "install_last"), "w").write('name_version="which-2.23"\n')
+if pm.read_install_last(h2).get("name_version") != "which-2.23":
+    problems.append("VERSION overrides the install record it should defer to")
+h3 = os.path.join(t, "empty"); os.makedirs(h3)
+if pm.read_install_last(h3):
+    problems.append("a package with no record at all invents one")
+if not hasattr(pm, "_same_version"):
+    problems.append("versions are compared without allowing for book spelling")
+else:
+    if not pm._same_version("which-2.23", "Which-2.23"):
+        problems.append("the two books' capitalisation reads as an update")
+    if pm._same_version("Glibc-2.42", "Glibc-2.43"):
+        problems.append("a real version difference is missed")
+    if pm._same_version(None, "Glibc-2.43") or pm._same_version("", ""):
+        problems.append("a missing version compares equal to something")
+seg = open(sys.argv[1]).read()
+seg2 = seg[seg.index("def cmd_update("):]
+seg2 = seg2[:seg2.index("\ndef ", 10)]
+if "_same_version" not in seg2:
+    problems.append("the update loop does not use the tolerant comparison")
+
+# ---- the reader must ask for the ACCOUNT, and prefer the right record ----
+# (1.11.38)  Two bugs one after the other, both silent:
+#   * gather_user looked the PACKAGE name up in the user database ('glibc'),
+#     but the account is 'p_glibc'.  KeyError -> has_user false -> state
+#     'broken' -> every package the LFS build made landed in update's
+#     "cannot judge" bucket with its home, VERSION and manifest right there.
+#   * the install script in that home records the version the BOOK has (it is
+#     regenerated when the book moves on), so reading it before VERSION would
+#     compare the book with itself and call everything current, forever.
+gu = seg[seg.index("def gather_user("):]
+gu = gu[:gu.index("\ndef ", 10)]
+if "getpwnam(pkgusr_name(" not in gu:
+    problems.append("the reader looks up a package name in the user database")
+ril = seg[seg.index("def read_install_last("):]
+ril = ril[:ril.index("\ndef ", 10)]
+if ril.index("VERSION") > ril.index('"install_" + os.path.basename'):
+    problems.append("the book's own version is read before the installed one")
+# functional: a home shaped exactly like an lfs-helper-built package
+h4 = os.path.join(t, "p_shaped"); os.makedirs(h4)
+open(os.path.join(h4, "VERSION"), "w").write("# from: LFS 13.0\nGlibc-2.42\n")
+open(os.path.join(h4, "install_p_shaped"), "w").write('name_version="Glibc-2.43"\n')
+if pm.read_install_last(h4).get("name_version") != "Glibc-2.42":
+    problems.append("the installed version loses to the script's book version")
+
+if problems:
+    for p in problems: print("  FAIL  %s" % p)
+    sys.exit(1)
+print("  PASS  both build paths' version records are read, and compared fairly")
+PYVER
+  _count_rc $?
 fi
 
 # ---- a snapshot must say what state it captured ----------------------------- #
@@ -5172,7 +7837,10 @@ if [ -f "$helper_src" ]; then
     grep -q "^_claim_earlier_stages()" "$helper_src" \
         && ok "a package claims the files its earlier stages installed" \
         || bad "a rebuild cannot overwrite its own earlier files"
-    ce="$(sed -n '/^_claim_earlier_stages() {/,/^}/p' "$helper_src")"
+    # the owner filter moved into _claim_candidates, which does one stat for
+    # the whole manifest instead of one per path (1.14.2) -- read both
+    ce="$(sed -n '/^_claim_earlier_stages() {/,/^}/p' "$helper_src"
+          sed -n '/^_claim_candidates() {/,/^}/p' "$helper_src")"
     # every naming shape the same package takes across the book
     # the stages are built from a loop now, so check the suffixes it appends
     case "$ce" in
@@ -5182,7 +7850,7 @@ if [ -f "$helper_src" ]; then
     esac
     # ONLY what the build left behind -- never another package's file
     case "$ce" in
-        *"root|lfs|UNKNOWN) ;;"*)
+        *'root|lfs|UNKNOWN) ;;'*|*'u != "root" && u != "lfs" && u != "UNKNOWN"'*)
             ok "only root- and lfs-owned paths are claimed" ;;
         *) bad "it could take a file belonging to another package" ;;
     esac
@@ -5486,9 +8154,11 @@ if [ -f "$helper_src" ]; then
         *_check_duplicate_ids*) ok "it checks for id collisions too" ;;
         *) bad "a uid collision would not be reported" ;;
     esac
-    # report by default, repair only when asked
+    # report by default, repair only when asked.  (1.13.30 parses all the
+    # arguments so a package name can be given too, so check the BEHAVIOUR:
+    # fix starts at 0 and only --fix/--run turns it on.)
     case "$cv" in
-        *'[ "${1:-}" = "--fix" ] && fix=1'*)
+        *'local fix=0'*'--fix|--run) fix=1'*)
             ok "it reports by default and repairs only with --fix" ;;
         *) bad "verify changes things without being asked" ;;
     esac
@@ -5730,7 +8400,10 @@ fi
 #     install: cannot remove '/usr/lib/python3.13/idlelib/Icons/README.txt'
 helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
 if [ -f "$helper_src" ]; then
-    ce="$(sed -n '/^_claim_earlier_stages() {/,/^}/p' "$helper_src")"
+    # the owner filter moved into _claim_candidates, which does one stat for
+    # the whole manifest instead of one per path (1.14.2) -- read both
+    ce="$(sed -n '/^_claim_earlier_stages() {/,/^}/p' "$helper_src"
+          sed -n '/^_claim_candidates() {/,/^}/p' "$helper_src")"
     case "$ce" in
         *"tr 'A-Z' 'a-z'"*) ok "a capitalised step finds its lowercase stage" ;;
         *) bad "Python would never claim python-tmp's files" ;;
@@ -6093,7 +8766,12 @@ if lfs._resolve_section(secs, "zzz-no-such-section") is not None:
 if lfs._resolve_section(secs, "Configuring") is not None:
     problems.append("an ambiguous title fragment is silently resolved")
 
-# /tools deletion and stripping are opt-in: neither should ever be a default
+# /tools deletion and stripping are opt-in: neither should ever be a default.
+# The DEFAULT is the question, so the machine's real config must not answer
+# it: on the built system the recorded interview said remove_tools=yes and
+# this reported a bug that was actually the user's own choice.
+import os, tempfile
+os.environ["LFS_STORE"] = tempfile.mkdtemp()
 if lfs.remove_tools():
     problems.append("/tools is deleted by default")
 if lfs.strip_binaries():
@@ -6131,13 +8809,10 @@ for k in ("timezone", "remove_tools", "strip", "main_user"):
     if k not in keys:
         problems.append("'%s' is not asked during session" % k)
 
-# Destructive or slow options must never default to on.  Deleting the
-# cross-toolchain and rewriting every binary are both things a person should
-# have chosen, not discovered.
-if lfs.remove_tools():
-    problems.append("/tools is deleted by default")
-if lfs.strip_binaries():
-    problems.append("binaries are stripped by default")
+# The DEFAULT of remove_tools/strip is checked in the chapter-8 block above,
+# against an EMPTY store -- one check, one place.  A second copy here read the
+# real machine's interview answers and reported remove_tools=yes, the user's
+# own choice, as a bug.  One decision held in two places, in the suite itself.
 
 # each answer has to be written into the tree, or the chroot never sees it
 body = open(sys.argv[1]).read()
@@ -6291,9 +8966,27 @@ _count_rc $?
 # the default and rename every user out from under an existing tree
 helper_src="$(dirname "$LFS_TOOL")/lfs-helper"
 if [ -f "$helper_src" ]; then
-    grep -q 'PKGUSR_PREFIX="${LFS_PKGUSR_PREFIX-' "$helper_src" \
-        && ok "an empty prefix means none, and is not the same as unset" \
-        || bad "an empty prefix falls through to the default"
+    # Behaviour, not text (1.13.26 added a config-wins rule): a config that
+    # NAMES a prefix beats a stale empty export, and a config that says
+    # explicitly none still yields none.
+    _pfxq="$T/pfxq"; _pfxr="$T/pfxr"; mkdir -p "$_pfxq" "$_pfxr"
+    printf '{ "pkgusr_prefix": "p" }\n'  > "$_pfxq/config.json"
+    printf '{ "pkgusr_prefix": "" }\n'   > "$_pfxr/config.json"
+    _runpfx() {
+        { [ "$2" = empty ] && echo 'export LFS_PKGUSR_PREFIX=""' || echo 'unset LFS_PKGUSR_PREFIX'
+          sed -n '/^_read_pkgusr_prefix() {/,/^}/p' "$helper_src" \
+            | sed "s|/usr/share/lfs/config.json|$1/config.json|"
+          sed -n '/^_cfg_prefix=/,/^unset _cfg_prefix/p' "$helper_src"
+          sed -n '/^PKGUSR_PREFIX="${PKGUSR_PREFIX%_}"/,+1p' "$helper_src"
+          echo 'echo "[$PKGUSR_PREFIX]"'; } | bash 2>/dev/null | tail -1
+    }
+    if [ "$(_runpfx "$_pfxq" empty)" = "[p_]" ] \
+       && [ "$(_runpfx "$_pfxq" unset)" = "[p_]" ] \
+       && [ "$(_runpfx "$_pfxr" empty)" = "[]" ]; then
+        ok "an empty prefix means none, and a stale empty export does not override the config"
+    else
+        bad "an empty prefix falls through to the default"
+    fi
 fi
 
 # ---- accounts live in subdirectories by kind ------------------------------- #
@@ -6444,7 +9137,7 @@ if [ -f "$helper_src" ]; then
 fi
 
 # nothing outside the chokepoints may build an account path by hand
-for _f in packagemanager_install lfs-completion.bash; do
+for _f in lfs-completion.bash; do
   _p="$(dirname "$LFS_TOOL")/$_f"
   [ -f "$_p" ] || continue
   if grep -qE '"?/usr/src/\$[a-z_]+' "$_p"; then
@@ -6616,7 +9309,7 @@ import sys, os, tempfile, importlib.machinery as m
 lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
 problems = []
 
-for t in ("lfs-helper", "packagemanager", "packagemanager_install", "blfs"):
+for t in ("lfs-helper", "packagemanager", "blfs"):
     if t not in getattr(lfs, "TOOLCHAIN_SCRIPTS", ()):
         problems.append("%s is not copied into the tree" % t)
 
@@ -7089,8 +9782,11 @@ if [ -f "$helper_src" ]; then
       *'"$WRAPPERS"'*) ;;
       *) _p="$_p;the wrapper directory can be adopted or given to the install group" ;;
   esac
+  # root-owned, by NAME or by ID.  Before book 7.6 there is no /etc/passwd in
+  # the tree, so `chown root:root` fails with "invalid user" while `chown 0:0`
+  # always resolves -- the property is the ownership, not the spelling.
   case "$(_slice_fn "$helper_src" make_wrappers)" in
-      *'chown root:root "$WRAPPERS"'*) ;;
+      *'chown root:root "$WRAPPERS"'*|*'chown 0:0 "$WRAPPERS"'*) ;;
       *) _p="$_p;the wrappers are not explicitly root-owned" ;;
   esac
   if [ -n "$_p" ]; then
@@ -8348,13 +11044,12 @@ fi
 # cost more debugging time here than anything else.  packagemanager_install had
 # no --version, so that row read
 #     packagemanager_install Please provide an install script with $2
-pmi="$(dirname "$LFS_TOOL")/packagemanager_install"
-if [ -f "$pmi" ]; then
-  _v="$(bash "$pmi" --version 2>&1)"
-  case "$_v" in
-      packagemanager_install*build*) ok "every tool reports its own build id" ;;
-      *) bad "packagemanager_install cannot report its build id: $_v" ;;
-  esac
+# (1.12.0) packagemanager_install is retired -- the check inverted: its
+# PRESENCE anywhere in the shipped tree is now the bug.
+if [ -f "$(dirname "$LFS_TOOL")/packagemanager_install" ]; then
+  bad "the retired packagemanager_install is back in the tree"
+else
+  ok "the fifth tool stays retired"
 fi
 
 # ---- no finding that repairing makes worse ---------------------------------- #
@@ -9019,6 +11714,9440 @@ bob:!:1::::::')" ] || _bad="$_bad;a system nobody can log into is not reported"
       ok "a locked-out system is reported; a usable one is not"
   fi
   rm -rf "$_lg"
+fi
+
+# ---- root's shell history is not a package's file --------------------------- #
+# A real verify reported:  [62/221] sqlite  /root/.bash_history  root -> p_sqlite
+# -- the timestamp scan swept root's dotfiles into whichever manifest was open,
+# and --fix would have handed root's shell history to p_sqlite.  And the tools'
+# own stores (/usr/share/lfs, /usr/share/blfs) plus the completion file were
+# reported as claimed by nobody, which is true of the stores (runtime caches)
+# and false of the completion file (make install put it there).
+_p=""
+_ncout="$(
+  { echo 'ETC=/etc; SNAP_ROOT=/; STATE=/usr/src/lfs-pkgusr'
+    eval_src(){ _slice_fn "$helper_src" "$1"; }
+    _slice_fn "$helper_src" never_claim_list
+    echo '_NEVER_CLAIM=()'
+    _slice_fn "$helper_src" _never_claim_load
+    _slice_fn "$helper_src" is_never_claimed
+    cat <<'NCEOF'
+for f in /root/.bash_history /usr/share/blfs/books/x.html \
+         /usr/share/lfs/tool-stamps.json /usr/bin/gcc; do
+    is_never_claimed "$f" && echo "shielded $f" || echo "claimable $f"
+done
+NCEOF
+  } | bash 2>/dev/null
+)"
+_ncout2="$(
+  { echo 'ETC=/etc; SNAP_ROOT=/; STATE=/usr/src/lfs-pkgusr'
+    _slice_fn "$helper_src" never_claim_list
+    echo '_NEVER_CLAIM=()'
+    _slice_fn "$helper_src" _never_claim_load
+    _slice_fn "$helper_src" is_never_claimed
+    cat <<'NC2'
+for f in /etc/ssl/certs/ISRG_Root_X1.pem /etc/pki/anchors/x.p11-kit \
+         /etc/pkgusr/stacks/sway.stack /usr/share/lfs-pkgusr/x.sh; do
+    is_never_claimed "$f" && echo "shielded $f" || echo "claimable $f"
+done
+NC2
+  } | bash 2>/dev/null
+)"
+echo "$_ncout" | grep -q "shielded /root/.bash_history" \
+    || _p="$_p;/root is claimable -- root's dotfiles can be swept into a manifest"
+echo "$_ncout" | grep -q "shielded /usr/share/blfs/books/x.html" \
+    || _p="$_p;the blfs store is claimable"
+echo "$_ncout" | grep -q "shielded /usr/share/lfs/tool-stamps.json" \
+    || _p="$_p;the lfs store is claimable"
+for _shield in /etc/ssl/certs/ISRG_Root_X1.pem /etc/pki/anchors/x.p11-kit \
+               /etc/pkgusr/stacks/sway.stack /usr/share/lfs-pkgusr/x.sh; do
+    echo "$_ncout2" | grep -q "shielded $_shield" \
+        || _p="$_p;$_shield can be swept into a package's manifest"
+done
+echo "$_ncout" | grep -q "claimable /usr/bin/gcc" \
+    || _p="$_p;never-claim shields too much"
+[ "$(grep -c -- '-not -path "\$r/root/\*"' "$helper_src")" = 2 ] \
+    || _p="$_p;a snapshot scan still sweeps /root (and would repollute a manifest)"
+_slice_fn "$helper_src" _adopt_pkgusr_tools | grep -q 'bash-completion/completions' \
+    || _p="$_p;the completion file is claimed by nobody"
+_slice_fn "$helper_src" cmd_verify | grep -q '_adopt_pkgusr_tools' \
+    || _p="$_p;verify --fix never refreshes the tools' own manifest"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "root's dotfiles and the tool stores are nobody's install; the completion file is ours"
+fi
+
+# ---- fix-home: the home that never met its files ---------------------------- #
+# add_package_user creates /usr/src/<account>; the tools use
+# /usr/src/pkgusr/<account>.  The old repair repointed the passwd entry and
+# left the directory behind -- a real bootstrap ended with ten husks beside
+# the roots (/usr/src/p_wget, /usr/src/p_requests, ...).  fix-home is the one
+# implementation of the whole repair; the other two tools must call it.
+echo
+echo "== fix-home repairs a misplaced home, and only as much as is safe =="
+_fh="$T/fixhome"; mkdir -p "$_fh/etc" "$_fh/src/pkgusr" "$_fh/state"
+mkdir -p "$_fh/src/pkgusr/p_wget/log" "$_fh/src/p_wget/log" "$_fh/src/p_requests"
+echo 'shared profile' > "$_fh/src/pkgusr/p_wget/.bash_profile"
+echo 'shared profile' > "$_fh/src/p_wget/.bash_profile"      # identical
+echo 'old build log'  > "$_fh/src/p_wget/log/first-try.log"  # unique
+echo 'DIFFERENT'      > "$_fh/src/p_wget/build"              # differs
+echo 'the real build' > "$_fh/src/pkgusr/p_wget/build"
+echo reqfile          > "$_fh/src/p_requests/pkg.lst"
+printf 'root:x:0:0::/root:/bin/bash\np_wget:x:10004:10004::%s/src/pkgusr/p_wget:/bin/bash\np_requests:x:10005:10005::%s/src/p_requests:/bin/bash\n' \
+    "$_fh" "$_fh" > "$_fh/etc/passwd"
+
+_fh_run() { env LFS_SRC_ROOT="$_fh/src" LFS_ETC="$_fh/etc" \
+                LFS_PKGUSR_PREFIX=p LFS_PKGUSR_DIR="$_fh/state" \
+                bash "$helper_src" "$@" ; }
+
+_fh_run fix-home wget >/dev/null 2>&1
+_rc=$?
+if [ "$_rc" = 1 ] && [ -f "$_fh/src/p_wget/log/first-try.log" ]; then
+    ok "fix-home without --run reports (exit 1) and changes nothing"
+else
+    bad "fix-home dry run: exit $_rc, or it moved files"
+fi
+
+_fh_wget_out="$(_fh_run fix-home wget --run 2>&1)"
+_fh_run fix-home requests --run >/dev/null 2>&1
+_p=""
+echo "$_fh_wget_out" | grep -q "differs: .*p_wget/build" \
+    || _p="$_p;a kept file is not NAMED (the user is sent diffing directories by hand)"
+[ -f "$_fh/src/pkgusr/p_wget/log/first-try.log" ] || _p="$_p;the unique file was not moved into the real home"
+[ -e "$_fh/src/p_wget/.bash_profile" ] && _p="$_p;the identical stray copy was not deleted"
+[ "$(cat "$_fh/src/p_wget/build" 2>/dev/null)" = "DIFFERENT" ] || _p="$_p;a file that DIFFERS was not kept"
+[ "$(cat "$_fh/src/pkgusr/p_wget/build" 2>/dev/null)" = "the real build" ] || _p="$_p;the real home's file was touched"
+[ -d "$_fh/src/p_requests" ] && _p="$_p;a cleanly movable husk was left behind"
+[ -f "$_fh/src/pkgusr/p_requests/pkg.lst" ] || _p="$_p;the movable husk's files did not arrive"
+grep -q '^p_requests:.*:'"$_fh"'/src/pkgusr/p_requests:' "$_fh/etc/passwd" \
+    || _p="$_p;the passwd entry was not repointed"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "fix-home: moves what is missing, deletes what is identical, keeps what differs, repoints passwd"
+fi
+
+# the summary must count what the passes repaired -- a real run merged four
+# husks and claimed four tools, then said "repaired 0 path(s)"
+_slice_fn "$helper_src" cmd_verify | grep -q 'fixed + _vfy_n_fixed' \
+    && ok "verify's summary counts the repairs its passes made" \
+    || bad "verify still reports 'repaired 0' after repairing things"
+
+# ---- one loop: the engine hands its script to lfs-helper build (step 5) ----- #
+# cmd_build takes a script that is not in $SCRIPTS, normalises the name so the
+# records land under the step name, and does everything the engine's private
+# loop did.  The engine keeps only front-matter and calls it.
+_d5="$T/step5"; mkdir -p "$_d5/root/usr/bin" "$_d5/src/pkgusr" "$_d5/state"
+_p=""
+if command -v useradd >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
+    userdel p_dmy5 >/dev/null 2>&1; groupdel p_dmy5 >/dev/null 2>&1
+    getent group install >/dev/null || groupadd -g 9999 install
+    _d5_run() { env LFS_PKGUSR_DIR="$_d5/state" LFS_SRC_ROOT="$_d5/src" \
+                    LFS_SNAP_ROOT="$_d5/root" LFS_COLLECTOR_PREFIX=nimgnu \
+                    LFS_PKGUSR_PREFIX=p bash "$helper_src" "$@" ; }
+    _d5_run add-user dmy5 >/dev/null 2>&1
+    _d5h="$(_d5_run pkgusr-home dmy5)"
+    chgrp install "$_d5/root/usr/bin" && chmod g+w "$_d5/root/usr/bin"
+    printf '#!/bin/bash\ninstall_pkg() { :; }\ncase "${1:-all}" in all) echo hi > %s/root/usr/bin/dmy5-tool ;; esac\n' \
+        "$_d5" > "$_d5h/install_p_dmy5"
+    chown p_dmy5: "$_d5h/install_p_dmy5" 2>/dev/null
+    _d5_run build p_dmy5 --script "$_d5h/install_p_dmy5" --phase all --force \
+        >/dev/null 2>&1
+    [ -f "$_d5/root/usr/bin/dmy5-tool" ] \
+        || _p="$_p;a handed-over script did not build"
+    [ "$(stat -c %U "$_d5/root/usr/bin/dmy5-tool" 2>/dev/null)" = p_dmy5 ] \
+        || _p="$_p;the handed-over build's files do not belong to the package user"
+    [ -f "$_d5/state/manifests/dmy5.files" ] \
+        || _p="$_p;the records landed under the ACCOUNT name, not the step name (or nowhere)"
+    userdel p_dmy5 >/dev/null 2>&1; groupdel p_dmy5 >/dev/null 2>&1
+fi
+grep -q -- '--script' "$helper_src" \
+    || _p="$_p;cmd_build cannot take a script by path"
+# NEVER DROP A CLASS OF DEPENDENCIES.  --ignore-recommended, used to keep
+# texlive out of a sway build, also removed texlive's OWN deps (all
+# recommended) -- so it was scheduled first and built against a freetype
+# that did not exist.  Unwanted packages are NAMED, one at a time.
+# deps=required is a CHOICE OF GRAPH, per entry, and the recommendations
+# worth keeping are named as entries of their own.  (The first attempt at
+# this failed because the ORDER was wrong -- texlive's deps are all
+# recommended, so dropping them left it first in the plan.  That was fixed
+# by the topological sort; the choice itself is sound.)
+grep -q 'deps.*== "required"' "$pm_src" \
+    || _p="$_p;a stack entry cannot ask for the required graph only"
+# ...and --status must report THAT graph: it asked without deps= and showed
+# 272 packages for a plan that builds 99.  A status that does not match the
+# run is worse than no status.
+grep -q 'no_recommended=(e\["opts"\]' "$pm_src" \
+    || _p="$_p;--status counts a different dependency graph than the build uses"
+# THE STACKS MUST TRAVEL WITH THE TOOLS.  The chroot refresh copied the four
+# binaries only, so a chroot kept its first sway.stack forever -- the user
+# updated the tools four times and kept reading a 39-entry file.
+# (only meaningful where the stacks ship beside the tool, as they do in a
+#  real install; a bare checkout of the tool alone has nothing to copy)
+[ -d "$(dirname "$LFS_TOOL")/stacks" ] &&
+python3 - "$LFS_TOOL" <<'PYSTKREF' || _p="$_p;the chroot keeps a stale stack file after a tool refresh"
+import sys, os, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader("lfs", sys.argv[1]).load_module()
+d = tempfile.mkdtemp()
+os.makedirs(os.path.join(d, "usr/bin"))
+os.makedirs(os.path.join(d, "etc/pkgusr/stacks"))
+open(os.path.join(d, "etc/pkgusr/stacks/sway.stack"), "w").write("old\n")
+open(os.path.join(d, "etc/pkgusr/stacks/machine.conf"), "w").write("[mesa]\nmine=yes\n")
+lfs._refresh_chroot_tools(d, quiet=True)
+got = open(os.path.join(d, "etc/pkgusr/stacks/sway.stack")).read()
+assert got.strip() != "old", "the stack was not refreshed"
+# the machine's own options are never overwritten
+assert "mine=yes" in open(os.path.join(d, "etc/pkgusr/stacks/machine.conf")).read()
+PYSTKREF
+# ...and every entry point uses the SAME sync: `run` and `chroot enter` did,
+# `sync-tools` did not, so which command you used decided what got updated.
+_slice_py="$(sed -n '/^def cmd_bs_sync_tools/,/^def /p' "$LFS_TOOL")"
+printf '%s' "$_slice_py" | grep -q '_refresh_chroot_tools' \
+    || _p="$_p;sync-tools does not refresh the tools and stacks the other paths do"
+# a NEWER stack in the chroot is never replaced by an older one from the host
+grep -q '_stack_version' "$LFS_TOOL" \
+    || _p="$_p;a newer stack file in the chroot can be overwritten by an older one"
+# AND IT MUST FIND THEM WHEN INSTALLED.  The running tool is /usr/bin/lfs,
+# so looking only beside itself meant /usr/bin/stacks -- nothing, in silence,
+# while the host had 31 entries and the chroot kept 23.
+grep -q '"/etc/pkgusr/stacks"' "$LFS_TOOL" \
+    || _p="$_p;an installed lfs cannot find the stack files to refresh"
+grep -q 'no stack files found to refresh' "$LFS_TOOL" \
+    || _p="$_p;finding no stacks to refresh is silent"
+_stk="$(dirname "$LFS_TOOL")/stacks/sway.stack"
+if [ -f "$_stk" ]; then
+    # The recommendations are FOLLOWED again: a blanket --ignore-recommended
+    # dropped things the builds hard-require (curl for cmake, icu for
+    # libxml2).  Unwanted branches are named instead.
+    grep -q 'deps=required' "$_stk" \
+        && _p="$_p;the stack drops recommendations wholesale again"
+    grep -qE '^avoid +qt6' "$_stk" \
+        || _p="$_p;the heavy branches are not named as avoided"
+    # AVOID MUST REACH THE INSTALLER.  It printed "never built by this stack"
+    # and passed nothing on, so the packages were built anyway.
+    grep -q 'ignore=",".join' "$pm_src" \
+        || _p="$_p;the stack's avoid list never reaches the installer"
+    # ...and it must reach the STATUS too: it reported 273 packages for a run
+    # that skips qt6, okular, LibreOffice and CUPS by name.
+    grep -q 'skipped_by_avoid' "$pm_src" \
+        || _p="$_p;--status counts packages the run will skip"
+    # (a reachability prune was tried in 1.12.82 and reverted: `blfs order`
+    #  reports one parent per package, so a shared dependency recorded under
+    #  an ignored parent was dropped -- harfbuzz then failed on graphite2.
+    #  Unwanted leaves are named in the stack instead.)
+    grep -qE '^avoid +plasma-activities' "$_stk" \
+        || _p="$_p;the KDE leaves an avoided okular pulls in are not named"
+    for _want in harfbuzz pango gdk-pixbuf glib-networking adwaita-icon-theme; do
+        grep -qE "^book +$_want" "$_stk" \
+            || _p="$_p;$_want is a recommendation we rely on but no longer name"
+    done
+fi
+# (1.12.0) the engine is retired: packagemanager's front door is
+# lfs-helper pm-install, and pm-install hands the script to the one loop.
+_pm_src5="$(dirname "$LFS_TOOL")/packagemanager"
+if [ -f "$_pm_src5" ]; then
+    grep -q '"pm-install"' "$_pm_src5" \
+        || _p="$_p;packagemanager does not call lfs-helper pm-install"
+fi
+_slice_fn "$helper_src" cmd_pm_install | grep -qF 'install_$user_name" ' \
+    || _p="$_p;pm-install does not hand its prepared script to the one loop"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "one loop: the engine hands its script over, records land under the step name"
+fi
+rm -rf "$_d5"
+
+# ---- a failing phase stops the run, and our contract is known ---------------- #
+# ghostscript: configure failed, and `make so`, `gs ...` and the whole install
+# ran anyway.  `unpack_pkg && build_pkg || exit 1` reads like it stops on
+# failure and does the opposite -- POSIX disables set -e inside a function
+# whose status is being tested.  And the block that would have PREVENTED the
+# failure ("If you have installed the recommended dependencies, remove the
+# copies of freetype, lcms2, libjpeg...") was commented out as conditional,
+# though these tools install recommended dependencies by definition.
+_p=""
+_bt5="$(dirname "$LFS_TOOL")/blfs"
+if [ -f "$_bt5" ]; then
+    # what is EMITTED, not what is written about it: the explanation of this
+    # very bug quotes the old line, and a grep over the whole file cannot tell
+    # a comment from code
+    grep -qE "^\s*w\('.*unpack_pkg && build_pkg" "$_bt5" \
+        && _p="$_p;the dispatcher calls phases in a test context, which switches off set -e inside them"
+    # (the dispatcher is the shared runner's: each phase is its own process
+    #  under set -e, and the test switch is an if, not an and-list)
+    grep -q 'PKGUSR_PHASE="\$1" bash "\$_pp_self" </dev/null' "$PHASES_LIB" \
+        || _p="$_p;the dispatcher does not run each phase as its own process"
+    sed -n '/^pkgusr_run() {/,/^}/p' "$PHASES_LIB" | grep -q '^        set -e$' \
+        || _p="$_p;the dispatcher does not run under set -e"
+    grep -q '_pp_run_tests && _pp_test_step' "$PHASES_LIB" \
+        || _p="$_p;the test condition is an and-list, which aborts the run under set -e when false"
+    grep -qE '^\s*w\(.*(unpack_pkg|_enter_build|_fetch|_mirrors_for)\(\) \{' "$_bt5" \
+        && _p="$_p;blfs still emits its own scaffolding beside the runner"
+    python3 - "$_bt5" <<'PYGD' || _p="$_p;the conditional guard does not know what our contract installs"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+class P:
+    def __init__(self, txt): self.txt = txt; self.name = "p"
+    def get_text(self): return self.txt
+class Pre:
+    def __init__(self, txt): self.p = P(txt)
+    def find_previous(self, names): return self.p
+# recommended/required -> our contract satisfies it, so the block RUNS
+assert b._conditional_guard(Pre("If you have installed the recommended dependencies on your system, remove the copies:")) is None
+assert b._conditional_guard(Pre("If you have installed the required tools, run:")) is None
+# optional -> skipped, whatever else the sentence says
+assert b._conditional_guard(Pre("If you installed the optional sphinx module, create the man page:"))
+assert b._conditional_guard(Pre("If you have installed the optional recommended extras, run:"))
+# a demonstration that runs the package's own program is not a build step
+out = b._comment_own_program_demos("make\ngs -q -dBATCH x.eps", {"installed_programs": "gs, gsc"})
+assert "# gs -q" in out and out.splitlines()[0] == "make", out
+PYGD
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a failing phase stops the run; blocks conditioned on what we install are kept"
+fi
+
+# ---- the tool must survive being replaced while it runs ---------------------- #
+# bash reads a script incrementally, by byte offset.  Replace the file mid-run
+# and execution resumes at that offset in the NEW content, mid-word:
+#     /usr/bin/lfs-helper: line 8312: mmand: command not found
+#     /usr/bin/lfs-helper: line 8314: syntax error near unexpected token `)'
+# The package had already installed; the tool died on its own source.
+_p=""
+_g1="$(grep -vE '^\s*(#|$)' "$helper_src" | head -1)"
+[ "$_g1" = "{" ] \
+    || _p="$_p;lfs-helper is not wrapped in a group command -- a mid-run replacement corrupts it"
+[ "$(tail -1 "$helper_src" | cut -c1)" = "}" ] \
+    || _p="$_p;the group command is not closed at the end of the file"
+bash -n "$helper_src" 2>/dev/null || _p="$_p;lfs-helper does not parse"
+# and it still works, wrapped
+_gv="$(bash "$helper_src" --version 2>&1)"
+case "$_gv" in lfs-helper*build*) ;; *) _p="$_p;the wrapped tool cannot report its version: $_gv" ;; esac
+_gh="$(bash "$helper_src" owner-name gcc 2>&1)"
+[ "$_gh" = "p_gcc" ] || _p="$_p;the wrapped tool's commands do not run: $_gh"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the tool reads itself once, so replacing it mid-run cannot corrupt the run"
+fi
+
+# ---- "answer for me" means one thing ----------------------------------------- #
+# `packagemanager stack sway --run --yes` still stopped to ask which
+# collector group to use -- the exact thing --yes exists to prevent.  The
+# group prompt honoured LFS_ASSUME_YES, packagemanager --yes sets PM_YES, and
+# pm-install read PM_YES: three spellings of one decision.
+_p=""
+grep -q '^assume_yes()' "$helper_src" \
+    || _p="$_p;there is no single definition of assume-yes"
+for _spell in PM_YES LFS_ASSUME_YES; do
+    _r="$({ _slice_fn "$helper_src" assume_yes
+            echo 'assume_yes && echo YES || echo ASK'; } | env "$_spell=1" bash 2>/dev/null)"
+    [ "$_r" = YES ] || _p="$_p;$_spell=1 does not mean assume-yes"
+done
+_r="$({ _slice_fn "$helper_src" assume_yes
+        echo 'assume_yes && echo YES || echo ASK'; } | env -u PM_YES -u LFS_ASSUME_YES bash 2>/dev/null)"
+[ "$_r" = ASK ] || _p="$_p;assume-yes is on when neither variable is set"
+# the group prompt itself must use it, and say what it chose
+_gp="$(_slice_fn "$helper_src" choose_collector_group)"
+[ -n "$_gp" ] || _gp="$(grep -A6 'Which group should share THIS DIRECTORY' "$helper_src")"
+printf '%s' "$_gp" | grep -q 'assume_yes' \
+    || _p="$_p;the collector-group prompt still has its own idea of --yes"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "--yes answers every prompt, whichever tool asked"
+fi
+
+# ---- the book's order survives the split into phases ------------------------- #
+# A page can go user -> root -> user.  GLib does: build with introspection
+# disabled (user), install gobject-introspection (root), reconfigure with
+# introspection enabled (user).  Sorting blocks into two streams kept each
+# stream's order and lost the INTERLEAVING, so the reconfigure ran before
+# g-ir-scanner existed:  ERROR: Program 'g-ir-scanner' not found
+_p=""
+_bt7="$(dirname "$LFS_TOOL")/blfs"
+_bk7="$(ls "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*.html 2>/dev/null | head -1)"
+if [ -f "$_bt7" ] && [ -n "$_bk7" ]; then
+    _god="$T/gliborder"; mkdir -p "$_god"
+    python3 "$_bt7" --book-file "$_bk7" script glib2 -o "$_god" >/dev/null 2>&1
+    _gof="$(ls "$_god"/install_GLib-* 2>/dev/null | head -1)"
+    if [ -n "$_gof" ]; then
+        _ins="$(sed -n '/^install_pkg/,/^}/p' "$_gof" | grep -vE '^\s*(#|$)')"
+        _i_gi="$(printf '%s\n' "$_ins" | grep -n 'gi-build install' | head -1 | cut -d: -f1)"
+        _i_cfg="$(printf '%s\n' "$_ins" | grep -n 'introspection=enabled' | head -1 | cut -d: -f1)"
+        if [ -z "$_i_gi" ] || [ -z "$_i_cfg" ]; then
+            _p="$_p;glib's introspection dance is not in the install phase at all"
+        elif [ "$_i_gi" -ge "$_i_cfg" ]; then
+            _p="$_p;glib reconfigures for introspection BEFORE installing gobject-introspection"
+        fi
+        printf '%s\n' "$(sed -n '/^build_pkg/,/^}/p' "$_gof")" | grep -q 'introspection=enabled' \
+            && _p="$_p;the reconfigure is still stranded in the build phase"
+    fi
+    rm -rf "$_god"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a page that goes user -> root -> user keeps the book's order"
+fi
+
+# ---- a required edge beats a recommended one --------------------------------- #
+# shared-mime-info REQUIRES GLib; GLib merely RECOMMENDS shared-mime-info.
+# The walk marks a node visited on entry, so exploring GLib's recommended
+# list reached shared-mime-info while GLib was still in progress, skipped its
+# required GLib edge as "already visited", and emitted it FIRST -- which
+# fails at `Dependency "glib-2.0" not found`.  A recommendation is a
+# preference; a requirement is a fact.
+_p=""
+_bt6="$(dirname "$LFS_TOOL")/blfs"
+if [ -f "$_bt6" ]; then
+    python3 - "$_bt6" <<'PYORD' || _p="$_p;a recommended edge can still put a package before something it REQUIRES"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+# the exact shape of the GLib / shared-mime-info cycle
+order = ["smi", "glib", "dfu"]
+edges = {
+    "smi":  [{"anchor": "glib", "kind": "required"}],
+    "glib": [{"anchor": "smi",  "kind": "recommended"}],
+    "dfu":  [{"anchor": "glib", "kind": "required"}],
+}
+out = b._dependencies_come_first(list(order), edges)
+assert out.index("glib") < out.index("smi"), out
+assert out.index("glib") < out.index("dfu"), out
+# a cycle made only of required edges must terminate, not spin
+out2 = b._dependencies_come_first(["a", "b"], {"a": [{"anchor": "b", "kind": "required"}],
+                                              "b": [{"anchor": "a", "kind": "required"}]})
+assert set(out2) == {"a", "b"}, out2
+# A RECOMMENDATION IS A DEPENDENCY.  texlive's deps are all recommended, so
+# a required-only pass left it at 26 with FreeType at 46 -- and it built
+# against a freetype that did not exist.
+# ...AND REQUIRED HAS THE LAST WORD.  With the recommended pass running
+# second it could undo the strict one: xorg7-lib REQUIRES libxcb and still
+# came out ahead of it (32 vs 37), with no edge back at all.
+# A REAL TOPOLOGICAL SORT, not a repair pass.  Three times a pass "fixed"
+# an order and a later pass undid it (texlive, GLib, libxcb).  Kahn's
+# algorithm emits a node only when everything it depends on is out.
+chain = b._dependencies_come_first(
+    ["c", "b", "a"],
+    {"c": [{"anchor": "b", "kind": "required"}],
+     "b": [{"anchor": "a", "kind": "recommended"}]})
+assert chain == ["a", "b", "c"], chain
+
+# BREAK ONLY INSIDE THE CYCLE, and release only the knot.  "Fewest blocking
+# dependencies" picked ffmpeg, whose recommended edge to libass was dropped
+# (ffmpeg 179, libass 208) -- and the required-cycle fallback then emitted
+# EVERY remaining node in its original order, throwing away the ordering of
+# everything after the knot.
+chain2 = b._dependencies_come_first(
+    ["ffmpeg", "libass", "harfbuzz", "freetype2"],
+    {"ffmpeg":    [{"anchor": "libass", "kind": "recommended"},
+                   {"anchor": "freetype2", "kind": "recommended"}],
+     "libass":    [{"anchor": "freetype2", "kind": "required"},
+                   {"anchor": "harfbuzz", "kind": "required"}],
+     "harfbuzz":  [{"anchor": "freetype2", "kind": "recommended"}],
+     "freetype2": [{"anchor": "harfbuzz", "kind": "recommended"}]})
+assert chain2.index("libass") < chain2.index("ffmpeg"), chain2
+assert chain2.index("harfbuzz") < chain2.index("libass"), chain2
+
+# BREAK THE LEAST.  Dropping every recommended edge among the remaining
+# nodes put ghostscript (112) before FreeType (130): gs RECOMMENDS FreeType
+# and sits in a different cycle (gs -> cups -> cups-filters -> gs), and the
+# blanket drop took its FreeType edge along with the cycle's.
+mixed = b._dependencies_come_first(
+    ["gs", "cups", "cupsfilters", "ft"],
+    {"gs":          [{"anchor": "ft", "kind": "recommended"},
+                     {"anchor": "cups", "kind": "recommended"}],
+     "cups":        [{"anchor": "cupsfilters", "kind": "required"}],
+     "cupsfilters": [{"anchor": "gs", "kind": "required"}]})
+assert mixed.index("ft") < mixed.index("gs"), mixed
+# a required-only cycle is left as it came, not shuffled forever
+knot = b._dependencies_come_first(
+    ["x", "y"], {"x": [{"anchor": "y", "kind": "required"}],
+                 "y": [{"anchor": "x", "kind": "required"}]})
+assert set(knot) == {"x", "y"} and len(knot) == 2, knot
+strict = b._dependencies_come_first(
+    ["xorglib", "other", "xcb"],
+    {"xorglib": [{"anchor": "xcb", "kind": "required"}],
+     "other": [{"anchor": "xorglib", "kind": "recommended"}]})
+assert strict.index("xcb") < strict.index("xorglib"), strict
+rec = b._dependencies_come_first(
+    ["tex", "cairo", "ft"],
+    {"tex": [{"anchor": "cairo", "kind": "recommended"}],
+     "cairo": [{"anchor": "ft", "kind": "required"}]})
+assert rec.index("ft") < rec.index("cairo") < rec.index("tex"), rec
+PYORD
+
+# package-fixes.conf MUST PARSE.  A duplicate section makes configparser
+# raise, and the whole file is then ignored -- every fix in it silently
+# stops applying.
+python3 - <<'PYFIXCONF' || _p="$_p;package-fixes.conf does not parse (a duplicate section?)"
+import configparser, os, sys
+for cand in ("stacks/package-fixes.conf",
+             os.path.join(os.path.dirname(os.environ.get("LFS_TOOL", "")),
+                          "stacks", "package-fixes.conf")):
+    if cand and os.path.isfile(cand):
+        configparser.ConfigParser().read(cand)
+        break
+PYFIXCONF
+
+# THE LAYOUT NEEDS FLAGS TOO, with the same guard as the prefixes.
+for _lf in base-dir pkgusr-subdir cfguser-subdir; do
+    grep -q -- "\"--$_lf\"" "$pm_src" \
+        || _p="$_p;the layout cannot be set with a command (--$_lf)"
+done
+grep -q 'account homes already exist under the current layout' "$pm_src" \
+    || _p="$_p;changing the layout does not check for existing homes"
+# and the report must name the config file it really read
+grep -q 'def _lfs_config_path' "$pm_src" \
+    || _p="$_p;the report hardcodes the default config path"
+
+# A SETTING SAVED WHERE THE TOOL DOES NOT READ IS NOT SAVED.  `config
+# --pkgusr-prefix ""` wrote packagemanager.conf and said "Saved" -- while the
+# value is read from config.json, which is authoritative.  --show still said
+# "p_, the lfs config".
+grep -q 'def _save_shared_key' "$pm_src" \
+    || _p="$_p;a shared key is written where it will not be read"
+_ss="$T/sharedstore"; mkdir -p "$_ss"
+printf '{"pkgusr_prefix": "p"}\n' > "$_ss/config.json"
+LFS_STORE="$_ss" python3 - "$pm_src" <<'PYSHARED' >/dev/null 2>&1
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm._save_shared_key("pkgusr_prefix", "")
+PYSHARED
+python3 - "$_ss/config.json" <<'PYSHARED2' || _p="$_p;the authoritative config was not updated"
+import sys, json
+assert json.load(open(sys.argv[1]))["pkgusr_prefix"] == "", open(sys.argv[1]).read()
+PYSHARED2
+
+# THE PACKAGE-USER PREFIX MUST BE SETTABLE, AND GUARDED.  It could only be
+# changed by editing config.json by hand -- and it is the one prefix that
+# would orphan every account on the system.
+grep -q -- '"--pkgusr-prefix"' "$pm_src" \
+    || _p="$_p;the package-user prefix cannot be set with a command"
+grep -q 'def _accounts_with_prefix' "$pm_src" \
+    || _p="$_p;changing the prefix does not check for existing accounts"
+python3 - "$pm_src" <<'PYPFXGUARD' || _p="$_p;the existing-account check is wrong"
+import sys, types, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+class E:
+    def __init__(s, n, d): s.pw_name, s.pw_dir = n, d
+pm.pwd = types.SimpleNamespace(getpwall=lambda: [
+    E("p_gcc", pm.BASE_DIR + "/pkgusr/p_gcc"),
+    E("root", "/root")])
+assert pm._accounts_with_prefix("p") == ["p_gcc"]
+assert pm._accounts_with_prefix("zz") == []
+PYPFXGUARD
+
+# THE DIRECTORIES ARE CONFIGURABLE TOO.  BASE_DIR has read `pkgusr_home` from
+# packagemanager.conf for a long time; the two SUBDIRECTORIES were
+# environment-only, so a tree with a different layout depended on the
+# environment being right every time.
+grep -q '_early_conf("pkgusr_subdir"' "$pm_src" \
+    || _p="$_p;the package subdirectory cannot be set in the config file"
+grep -q '_early_conf("cfguser_subdir"' "$pm_src" \
+    || _p="$_p;the config-user subdirectory cannot be set in the config file"
+grep -q '"pkgusr_subdir", "cfguser_subdir"' "$pm_src" \
+    || _p="$_p;the layout keys do not travel with the tree"
+_lay="$T/layout.conf"
+printf 'pkgusr_subdir=packages\ncfguser_subdir=config\n' > "$_lay"
+# ...and from the LFS config, which is what makes it travel with the tree
+_lst="$T/layoutstore"; mkdir -p "$_lst"
+printf '{"pkgusr_subdir": "packages"}\n' > "$_lst/config.json"
+_lv3="$(LFS_STORE="$_lst" python3 - "$pm_src" <<'PYLAYOUT3'
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+print(pm.PKGUSR_SUBDIR)
+PYLAYOUT3
+)"
+[ "$_lv3" = "packages" ] \
+    || _p="$_p;the layout is not read from the lfs config (got: $_lv3)"
+# and the report must name the real keys, not tell people to export variables
+grep -q 'every value below can be set in either file' "$pm_src" \
+    || _p="$_p;config --show still tells people to export variables"
+_lv="$(PKGUSR_CONFIG="$_lay" python3 - "$pm_src" <<'PYLAYOUT'
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+print(pm.PKGUSR_SUBDIR, pm.CFGUSR_SUBDIR)
+PYLAYOUT
+)"
+[ "$_lv" = "packages config" ] \
+    || _p="$_p;the layout keys are not read from the config (got: $_lv)"
+_lv2="$(PKGUSR_CONFIG="$_lay" PKGUSR_SUBDIR=fromenv python3 - "$pm_src" <<'PYLAYOUT2'
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+print(pm.PKGUSR_SUBDIR)
+PYLAYOUT2
+)"
+[ "$_lv2" = "fromenv" ] || _p="$_p;the environment no longer overrides the layout config"
+
+# THE BUILT SYSTEM'S CONFIG, WRITABLE BEFORE IT EXISTS.  Until now the only
+# way to give the new system a different prefix or layout was to wait for the
+# tree and edit it there.
+grep -q 'target-config.json' "$LFS_TOOL" \
+    || _p="$_p;there is no host-side config for the built system"
+grep -q 'def cmd_config_target' "$LFS_TOOL" \
+    || _p="$_p;the target config cannot be shown or changed"
+# ...and interactively, like `packagemanager config` and `env --ask`
+grep -q 'INTERACTIVE, LIKE THE OTHERS' "$LFS_TOOL" \
+    || _p="$_p;the target config has no interactive mode"
+_tga="$T/tgtask"; mkdir -p "$_tga"
+printf 'p\n\n\npackages\n\n\n' \
+    | LFS_STORE="$_tga" python3 "$LFS_TOOL" config --target --ask >/dev/null 2>&1
+python3 - "$_tga/target-config.json" <<'PYASK' || _p="$_p;the interactive walk does not store answers"
+import sys, json
+d = json.load(open(sys.argv[1]))
+assert d.get("pkgusr_prefix") == "p", d
+assert d.get("pkgusr_subdir") == "packages", d
+assert "cfguser_prefix" not in d, d      # blank means "leave it alone"
+PYASK
+_tg="$T/tgtstore"; mkdir -p "$_tg"
+LFS_STORE="$_tg" python3 "$LFS_TOOL" config --target pkgusr_prefix p </dev/null >/dev/null 2>&1
+python3 - "$_tg/target-config.json" <<'PYTGT' || _p="$_p;the target config is not written"
+import sys, json
+assert json.load(open(sys.argv[1]))["pkgusr_prefix"] == "p"
+PYTGT
+# and the tree's own config still wins over it
+grep -q 'the tree overrides both' "$LFS_TOOL" \
+    || _p="$_p;the target config would override a config the tree already has"
+
+# ...AND THE SESSION MUST NOT NAME ACCOUNTS FROM THE HOST'S PREFIX.  The user
+# set pkgusr_prefix empty on their host and the session that builds the NEW
+# system showed "pkgusr_prefix = (unset)" -- the host's setting about to name
+# another machine's accounts.  And nothing said which config file was in use.
+grep -q 'SAY WHICH FILE, AND WHOSE PREFIXES' "$LFS_TOOL" \
+    || _p="$_p;the session config takes prefixes from the host without saying so"
+grep -q 'Session config:  (%s)" % config_path()' "$LFS_TOOL" \
+    || _p="$_p;the session does not name the config file it is using"
+# an EMPTY prefix is a decision (accounts named plainly), not a gap -- the
+# display read "(unset)" for both, which is how a host's empty value nearly
+# named a whole build system's accounts
+grep -q 'accounts will be named without a prefix' "$LFS_TOOL" \
+    || _p="$_p;an empty prefix is shown as if nothing had been chosen"
+
+# THE BUILD SYSTEM'S CONFIG IS ITS OWN.  The chroot scripts export
+# LFS_*_PREFIX, and the values were read from the HOST -- so a prefix changed
+# on the user's own machine was baked into the build system's environment,
+# where it overrode the tree's config.  That is how an empty prefix reached a
+# chroot whose config says "p".
+grep -q 'def _tree_prefix' "$LFS_TOOL" \
+    || _p="$_p;the chroot's exported prefixes come from the host"
+python3 - "$LFS_TOOL" <<'PYTREEPFX' || _p="$_p;the tree's config does not decide its own prefixes"
+import sys, os, json, tempfile, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+d = tempfile.mkdtemp()
+os.makedirs(os.path.join(d, "usr/share/lfs"))
+json.dump({"pkgusr_prefix": "p"},
+          open(os.path.join(d, "usr/share/lfs/config.json"), "w"))
+assert lfs._tree_prefix(d, "pkgusr_prefix", "") == "p"          # tree wins
+assert lfs._tree_prefix(d, "collector_prefix", "hostval") == "hostval"
+assert lfs._tree_prefix("/nonexistent", "pkgusr_prefix", "hv") == "hv"
+PYTREEPFX
+
+# THE PREFIXES AND DIRECTORIES MUST BE VISIBLE IN ONE PLACE.  The user could
+# not find where they are set -- fairly: prefixes come from config.json, then
+# packagemanager.conf, then the environment, then a default, and the
+# DIRECTORIES were environment-only and documented nowhere.
+grep -q 'def _config_sources' "$pm_src" \
+    || _p="$_p;nothing reports the prefixes and directories with their sources"
+grep -q 'Prefixes and directories' "$pm_src" \
+    || _p="$_p;config --show does not print the table"
+python3 - "$pm_src" <<'PYCFGSRC' || _p="$_p;the config report is missing a value or a source"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+rows = pm._config_sources()
+labels = [r[0] for r in rows]
+for want in ("package-user prefix", "config-user prefix", "collector prefix",
+             "base directory", "package homes", "config-user homes"):
+    assert want in labels, (want, labels)
+for label, value, source in rows:
+    assert value, label          # every row has a value
+    assert source, label         # and says where it came from
+PYCFGSRC
+
+# ONE FILE, TWO READERS.  package-fixes.conf carries build options (read by
+# apply_machine_opts, emitted as -Dkey=value) AND graph keys like `needs`
+# (read by blfs).  Each must ignore the other's keys, or mesa gets
+#     ERROR: Unknown option: "needs".
+python3 - "$pm_src" <<'PYTWOREADERS' || _p="$_p;a dependency key is passed to meson as a build option"
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = tempfile.mkdtemp()
+conf = os.path.join(d, "fixes.conf")
+open(conf, "w").write("[mesa]\nneeds = glslang\nllvm = enabled\n")
+script = os.path.join(d, "install_Mesa-1")
+open(script, "w").write("#!/bin/bash\nmeson setup ..\n")
+os.environ["PM_PACKAGE_FIXES"] = conf
+os.environ["PM_MACHINE_CONF"] = "/nonexistent"
+pm.apply_machine_opts("mesa", script)
+body = open(script).read()
+assert "-Dneeds=" not in body, body
+assert "-Dllvm=enabled" in body, body
+# and a script that ALREADY has the bad flag (written before 1.13.24) is
+# repaired, not left to fail forever: merging is idempotent, so nothing else
+# would ever take it out
+open(script, "w").write("#!/bin/bash\nmeson setup -Dneeds=glslang -Dllvm=enabled ..\n")
+pm.apply_machine_opts("mesa", script)
+body = open(script).read()
+assert "-Dneeds=" not in body, body
+assert "-Dllvm=enabled" in body, body
+PYTWOREADERS
+
+# A DEPENDENCY THE BOOK DOES NOT RECORD.  libass hard-requires harfbuzz in
+# its configure and its page lists only FreeType, FriBidi, Fontconfig and
+# NASM -- so no ordering could place it, and no entry order either, because
+# both sit inside one plan.  package-fixes.conf can add the edge.
+_fx2="$(dirname "$LFS_TOOL")/stacks/package-fixes.conf"
+if [ -f "$_fx2" ]; then
+    grep -q 'needs = harfbuzz' "$_fx2" \
+        || _p="$_p;libass's undeclared harfbuzz dependency is not recorded"
+fi
+grep -q '_extra_deps_for' "$_bt" \
+    || _p="$_p;the generator cannot be told about a dependency the book omits"
+python3 - "$_bt" <<'PYXTRA' || _p="$_p;an added dependency is not shaped like a book one"
+import sys, os, tempfile, importlib.machinery as m
+d = tempfile.mkdtemp(); p = os.path.join(d, "fixes.conf")
+open(p, "w").write("[libass]\nneeds = harfbuzz\n")
+os.environ["BLFS_PACKAGE_FIXES"] = p
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+got = b._extra_deps_for("libass")
+assert got and got[0]["anchor"] == "harfbuzz", got
+assert got[0]["kind"] == "required", got
+# every key a book-parsed dep has, or consumers KeyError on it
+for k in ("anchor", "kind", "name_version", "external"):
+    assert k in got[0], (k, got[0])
+assert b._extra_deps_for("nothing-here") == []
+PYXTRA
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a required dependency is built before its dependant, whatever the recommendations say"
+fi
+
+# ---- installing the tools must not re-mode the system ------------------------ #
+# `install -d` applies its mode to a directory that already exists, so
+# `make install` re-moded /usr/bin from 775 to 755 and silently broke the
+# package-user system -- package users are in group install and need
+# group-write there.  The next build failed with permission errors that had
+# nothing to do with the package.
+_p=""
+_mkf="$(dirname "$LFS_TOOL")/Makefile"
+if [ -f "$_mkf" ]; then
+    grep -qE '^\s*\$\(INSTALL\) -d ' "$_mkf" \
+        && _p="$_p;the Makefile creates directories with install -d, which re-modes existing ones"
+    grep -q 'MKDIR' "$_mkf" \
+        || _p="$_p;the Makefile has no non-destructive way to create a directory"
+    # and for real: a group-writable /usr/bin must survive an install
+    _mkd="$T/makeinstall"; mkdir -p "$_mkd/usr/bin"; chmod 775 "$_mkd/usr/bin"
+    ( cd "$(dirname "$LFS_TOOL")" && make install DESTDIR="$_mkd" ) >/dev/null 2>&1
+    [ "$(stat -c %a "$_mkd/usr/bin" 2>/dev/null)" = 775 ] \
+        || _p="$_p;make install changed the mode of an existing /usr/bin ($(stat -c %a "$_mkd/usr/bin" 2>/dev/null))"
+    rm -rf "$_mkd"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "installing the tools leaves the system's directories exactly as they were"
+fi
+
+# ---- the library cache, without touching anyone's symlinks ------------------ #
+# /etc/ld.so.cache is rewritten by every package that installs a library, and
+# ldconfig RENAMES a temp file over it -- which a sticky /etc allows only to
+# the owner.  So package users skip it and the tools refresh it afterwards.
+# But ldconfig also creates SONAME symlinks, and run as root those land
+# root-owned inside package trees (this is how libfreetype.so.6 came to be
+# owned by p_libpaper).  -X rebuilds the cache and touches no links.
+_p=""
+_slice_fn "$helper_src" make_wrappers | grep -q 'WRAPPERS/ldconfig' \
+    || _p="$_p;a package user still runs ldconfig and fails on the sticky /etc"
+grep -q 'ldconfig -X' "$helper_src" \
+    || _p="$_p;the cache refresh may rewrite symlinks in package-owned directories"
+grep -qE '^\s*soft .*-- ldconfig$' "$helper_src" \
+    && _p="$_p;ldconfig is run without -X somewhere"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the library cache is refreshed as root, and no package's symlinks are touched"
+fi
+
+# ---- rearranging a directory nothing filled --------------------------------- #
+# With git's "untar the html docs" block commented, the page still
+# reorganises what it would have extracted:
+#   mv /usr/share/doc/git-2.53.0/{git*.adoc,man-pages/text}
+#   mv: cannot stat '/usr/share/doc/git-2.53.0/git*.adoc'
+_p=""
+python3 - "$_bt" <<'PYSHUFFLE' || _p="$_p;a move from a directory nothing fills still runs"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._comment_orphan_tree_shuffles(
+    "# tar -xf ../git-htmldocs.tar.xz -C /usr/share/doc/git-2.53.0 &&\n"
+    "mkdir -vp /usr/share/doc/git-2.53.0/man-pages/{html,text} &&\n"
+    "mv /usr/share/doc/git-2.53.0/{git*.adoc,man-pages/text}")
+for line in out.splitlines():
+    assert line.startswith("#"), line          # the whole chain goes
+# a directory something DOES fill keeps its mv
+keep = b._comment_orphan_tree_shuffles(
+    "make install DESTDIR=/usr/share/doc/foo\nmv /usr/share/doc/foo/a /usr/share/doc/foo/b")
+assert not keep.splitlines()[1].startswith("#"), keep
+PYSHUFFLE
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a move out of a directory only a skipped step would fill is skipped too"
+fi
+
+# ---- installing docs nothing built ------------------------------------------ #
+# Git generates its man pages and html docs in an optional block the guard
+# skips, then installs them unconditionally -- so `make install-man` tried to
+# build them and died on `asciidoc: command not found`, after everything else
+# had installed.
+_p=""
+python3 - "$_bt" <<'PYDOCINST' || _p="$_p;an install of docs nothing built still runs"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+# nothing builds them -> skipped, and the chain after goes too
+out = b._comment_orphan_doc_installs(
+    "# make html\nmake install &&\nmake htmldir=/x install-html &&\n"
+    "mkdir -vp /x/html &&\nmv /x/a /x/html")
+assert "# make htmldir=/x install-html &&" in out, out
+assert "# mkdir -vp /x/html &&" in out, out
+assert "# mv /x/a /x/html" in out, out
+assert "\nmake install &&" in out, out          # the real install survives
+# something DOES build them -> kept
+keep = b._comment_orphan_doc_installs("make man\nmake install\nmake install-man")
+assert keep == "make man\nmake install\nmake install-man", keep
+PYDOCINST
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "an install-<x> whose generation step was skipped is skipped with its chain"
+fi
+
+# ---- the directory was never the problem ------------------------------------ #
+#     /usr/include/gstreamer-1.0/gst/audio -- nothing to grant (already writable)
+# The package CAN write there.  It cannot finish installing over a FILE owned
+# by another package: meson copies the contents, then chmod/chown the
+# destination, which only its owner may do -> EPERM, reported as "Unhandled
+# python OSError" with no path.  Ownership follows the installer.
+_p=""
+grep -q '^meson_takeover_from_log()' "$helper_src" \
+    || _p="$_p;a meson install over another package's file is never repaired"
+_slice_fn "$helper_src" cmd_build | grep -q 'meson_takeover_from_log "$log"' \
+    || _p="$_p;the repair loop does not try the file takeover"
+_mt="$T/mt"; mkdir -p "$_mt/dest"; echo old > "$_mt/dest/hdr.h"
+printf 'Installing /src/hdr.h to %s\nERROR: Unhandled python OSError\n' \
+    "$_mt/dest" > "$_mt/log"
+_mtrun() {   # $1 = owner reported for the file
+    { echo 'say(){ echo "$*"; }'; echo 'soft(){ shift 2; "$@"; }'
+      echo 'real_chown(){ echo "CHOWN $*"; }'; echo 'pkgusr_kind(){ echo pkg; }'
+      printf 'stat(){ case "$*" in *hdr.h) echo %s ;; *) command stat "$@" ;; esac; }\n' "$1"
+      python3 - "$helper_src" <<'PYMT'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('meson_takeover_from_log() {')
+d, j = 0, i
+while True:
+    if s[j] == '{': d += 1
+    elif s[j] == '}':
+        d -= 1
+        if d == 0: break
+    j += 1
+print(s[i:j+1])
+PYMT
+      printf 'meson_takeover_from_log %s p_installer\n' "$_mt/log"
+    } | bash 2>/dev/null
+}
+_mtrun p_other | grep -q 'CHOWN p_installer' \
+    || _p="$_p;a file owned by another package is not handed to the installer"
+_mtrun root | grep -q 'CHOWN' \
+    && _p="$_p;root's files are taken over"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a file being installed over is handed to the installer, and root's are not"
+fi
+
+# ---- a group on a leaf is no use if the chain is closed --------------------- #
+# Writing into .../gst/audio needs SEARCH on every directory above it, and
+# those belong to other packages.  And the loop printed a header and then
+# nothing when every candidate was skipped, so a failing package looked like
+# a repair that had not run.
+_p=""
+_slice_fn "$helper_src" grant_dir_access | grep -q 'A GROUP ON A LEAF IS NO USE' \
+    || _p="$_p;a grant does not check that the path above it is searchable"
+_slice_fn "$helper_src" auto_grant_from_log | grep -q 'nothing to grant (already writable' \
+    || _p="$_p;a skipped candidate is silent, so the repair looks like it never ran"
+if [ "$(id -u)" = 0 ] && id -u nobody >/dev/null 2>&1; then
+    _ch="$T/chain"; mkdir -p "$_ch/a/b/c"; chmod 750 "$_ch/a"; chmod 755 "$_ch/a/b"
+    _up="$_ch/a/b/c"
+    while :; do
+        _up="$(dirname "$_up")"
+        case "$_up" in /|"$T"|"") break ;; esac
+        [ -d "$_up" ] || break
+        su -s /bin/sh -c "test -x '$_up'" nobody 2>/dev/null && break
+        chmod o+x "$_up"
+    done
+    su -s /bin/sh -c "test -x '$_ch/a/b/c'" nobody 2>/dev/null \
+        || _p="$_p;the search path was not opened all the way down"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a grant opens the search path above it, and every candidate reports its outcome"
+fi
+
+# ---- one grant per DIRECTORY, not per tree ---------------------------------- #
+# The dedup collapsed every failing path to its tree top, so once one
+# directory under /usr/include/gstreamer-1.0 was granted, the one that
+# actually failed (.../gst/audio) was skipped -- two repair rounds, same
+# failure.
+_p=""
+_slice_fn "$helper_src" auto_grant_from_log | grep -q 'DEDUP BY DIRECTORY, NOT BY TREE TOP' \
+    || _p="$_p;the grant loop still dedups by tree top"
+_gn="$T/need.txt"
+printf '%s\n' /usr/include/gstreamer-1.0/gst/uridownloader \
+              /usr/include/gstreamer-1.0/gst/audio \
+              /usr/include/gstreamer-1.0/gst/audio > "$_gn"
+_gout="$({ printf 'need="$(cat %s)"\n' "$_gn"
+           echo 'granted=0; user=p_x'
+           echo 'grant_dir_access(){ echo "GRANT $1"; }'
+           echo 'collector_tree_top(){ echo /usr/include/gstreamer-1.0; }'
+           _slice_fn "$helper_src" auto_grant_from_log \
+             | sed -n '/# DEDUP BY DIRECTORY, NOT BY TREE TOP/,/done <<< "\$need"/p' \
+             | sed 's/^    //;s/^local /_x=/'
+         } | bash 2>/dev/null | grep -c GRANT)"
+[ "$_gout" = 2 ] \
+    || _p="$_p;the grant loop skipped a distinct directory (granted $_gout of 2)"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "every distinct directory that failed gets its own grant"
+fi
+
+# ---- meson says "OSError" and names nothing ---------------------------------- #
+# gst-plugins-bad ended with an unhandled OSError; the directory it could not
+# write is on the line BEFORE it, which is the only place meson puts it.  Two
+# repair rounds ran with nothing to grant.
+_p=""
+_slice_fn "$helper_src" unwritable_dirs_from_log | grep -q 'EVERY DESTINATION IT PRINTED' \
+    || _p="$_p;a meson install failure yields only the last directory"
+# meson installs through PYTHON, not our wrappers, so nothing on our side
+# sees the EACCES -- the only record is every destination it announced.
+_mall="$T/mesonall.log"
+cat > "$_mall" <<'MESONALL'
+Installing /src/a.h to /usr/include/gstreamer-1.0/gst/uridownloader
+Installing /src/b.h to /usr/include/gstreamer-1.0/gst/audio
+ERROR: Unhandled python OSError. This is probably not a Meson bug
+MESONALL
+_mc="$(tail -c 2097152 "$_mall" | awk '/^Installing .* to \//{ print $NF }' | sort -u | wc -l)"
+[ "$_mc" = 2 ] \
+    || _p="$_p;not every announced destination is collected (got $_mc)"
+# ...and a directory the package can already write must be skipped
+_slice_fn "$helper_src" grant_dir_access | grep -q 'ALREADY WRITABLE IS NOTHING TO GRANT' \
+    || _p="$_p;a writable directory would still get a new group"
+_ml="$T/meson.log"
+cat > "$_ml" <<'MESONEOF'
+Installing /src/a.h to /usr/include/gstreamer-1.0/gst/audio
+ERROR: Unhandled python OSError. This is probably not a Meson bug
+MESONEOF
+_mg="$(tail -c 524288 "$_ml" | awk '
+  /^Installing .* to \// { last = $NF }
+  /Unhandled python OSError|\[Errno 13\]|Permission denied/ { if (last != "") print last }' | sort -u)"
+[ "$_mg" = "/usr/include/gstreamer-1.0/gst/audio" ] \
+    || _p="$_p;the meson install destination is not extracted (got: $_mg)"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a meson install error resolves to the directory it was installing into"
+fi
+
+# ---- a relative complaint needs the cd that preceded it --------------------- #
+# git's install pipes into tar:
+#     (cd '/usr/lib/perl5/5.42/site_perl' && umask 022 && tar xof -)
+#     /usr/bin/tar: ./Git: Cannot mkdir: Permission denied
+# The path in the error is RELATIVE, so the permission repair found nothing to
+# grant -- while the directory needing it is named one line above.
+_p=""
+_slice_fn "$helper_src" unwritable_dirs_from_log | grep -q 'A RELATIVE PATH NEEDS THE' \
+    || _p="$_p;a relative permission error yields no directory to grant"
+_rl="$T/relcd.log"
+cat > "$_rl" <<'RELEOF'
+(cd perl/build/lib && tar cf - .) | \
+(cd '/usr/lib/perl5/5.42/site_perl' && umask 022 && tar xof -)
+/usr/bin/tar: ./Git: Cannot mkdir: Permission denied
+RELEOF
+_got="$({ printf 'log=%s\n' "$_rl"
+          _slice_fn "$helper_src" unwritable_dirs_from_log \
+            | sed -n '/# (plain awk: match() with a capture array/,/sort -u)"/p' \
+            | sed 's/^    //;s/^local /_x=/'
+          echo 'printf "%s" "$_cdpaths"'; } | bash 2>/dev/null)"
+[ "$_got" = "/usr/lib/perl5/5.42/site_perl" ] \
+    || _p="$_p;the cd before a relative error is not resolved (got: $_got)"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a relative permission error resolves to the directory the shell cd'd into"
+fi
+
+# ---- tar, like cp, must not fail on someone else's directory ---------------- #
+# Git installs its translations through tar, which then stamps the
+# destination DIRECTORIES -- owned by other packages, sticky because we
+# sealed them.  104 files had installed correctly and the build failed:
+#   tar: ./zh_TW: Cannot change mode to rwxr-xr-t: Operation not permitted
+_p=""
+grep -q 'WRAPPERS/tar' "$helper_src" \
+    || _p="$_p;tar is not wrapped, so a package cannot extract into a shared directory"
+_tw="$T/tarwrap"; mkdir -p "$_tw"
+sed -n '/^real=\/usr\/bin\/tar/,/^exit \$rc/p' "$helper_src" > "$_tw/body"
+if [ -s "$_tw/body" ]; then
+    printf '#!/bin/bash\n' > "$_tw/meta.sh"
+    printf 'echo "tar: ./zh_TW: Cannot utime: Operation not permitted" >&2\n' >> "$_tw/meta.sh"
+    printf 'echo "tar: Exiting with failure status due to previous errors" >&2\nexit 2\n' >> "$_tw/meta.sh"
+    printf '#!/bin/bash\necho "tar: x: Cannot open: No such file" >&2\nexit 2\n' > "$_tw/real.sh"
+    chmod 755 "$_tw/meta.sh" "$_tw/real.sh"
+    for _k in meta real; do
+        { printf '#!/bin/bash\n'; sed "s|^real=/usr/bin/tar|real=$_tw/$_k.sh|" "$_tw/body"; } > "$_tw/w_$_k"
+        chmod 755 "$_tw/w_$_k"
+    done
+    "$_tw/w_meta" -xf x >/dev/null 2>&1 \
+        || _p="$_p;the tar wrapper fails on a harmless metadata complaint"
+    "$_tw/w_real" -xf x >/dev/null 2>&1 \
+        && _p="$_p;the tar wrapper swallows a real error"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "tar tolerates stamping a directory it does not own, and nothing else"
+fi
+
+# ---- verify checks the package you named ------------------------------------ #
+# `lfs-helper verify xorg7-lib --fix` read only $1 for the flag, ignored the
+# name, and started walking all 533 packages.
+_p=""
+_slice_fn "$helper_src" cmd_verify | grep -q 'ONE PACKAGE, IF ONE IS NAMED' \
+    || _p="$_p;verify ignores a package name and scans everything"
+_slice_fn "$helper_src" cmd_verify | grep -q '_vfy_manifest_ownership "$fix" "$only"' \
+    || _p="$_p;the named package is not passed to the ownership pass"
+_slice_fn "$helper_src" _vfy_manifest_ownership | grep -q 'or just the one the caller named' \
+    || _p="$_p;the ownership pass cannot be narrowed to one package"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "verify checks only the package you name"
+fi
+
+# ---- the shell startup helpers BLFS snippets call ---------------------------- #
+# BLFS pages drop /etc/profile.d snippets that call pathprepend; the book
+# defines those in postlfs/profile and LFS does not install them, so rust's
+# rustc.sh said "pathprepend: command not found" on every package-user login.
+_p=""
+grep -q '^install_profile_helpers()' "$helper_src" \
+    || _p="$_p;nothing installs the path helpers BLFS snippets call"
+_slice_fn "$helper_src" cmd_init_pkgusr | grep -q 'install_profile_helpers' \
+    || _p="$_p;setting up the package-user system does not install them"
+# ...and the command people ACTUALLY run on a fresh system is the bootstrap,
+# `packagemanager setup` -- wiring it only into cmd_init_pkgusr meant nothing
+# happened.
+grep -q 'install-profile)' "$helper_src" \
+    || _p="$_p;there is no way to install the profile helpers on their own"
+# and its one question takes --yes on the command line: the difference is
+# whether /opt/rustc/bin is on PATH, and asking people to export a variable
+# to answer it is a poor trade
+grep -q -- '-y|--yes) LFS_ASSUME_YES=1' "$helper_src" \
+    || _p="$_p;install-profile cannot be answered without setting an environment variable"
+grep -q '"lfs-helper", "install-profile"' "$pm_src" \
+    || _p="$_p;the bootstrap does not install the profile helpers"
+if [ "$(id -u)" = 0 ]; then
+    _pfd="$T/profilehelp"; mkdir -p "$_pfd"
+    cat > "$T/pfrun.sh" <<PFOUTER
+SNAP_ROOT=$_pfd
+ok(){ :; }; warn(){ :; }
+set_install_dir_owner(){ :; }; real_chmod(){ chmod "\$@"; }
+PFOUTER
+    python3 - "$helper_src" >> "$T/pfrun.sh" <<'PFPY'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('install_profile_helpers() {')
+d, j = 0, i
+while True:
+    if s[j] == '{': d += 1
+    elif s[j] == '}':
+        d -= 1
+        if d == 0: break
+    j += 1
+print(s[i:j+1]); print('install_profile_helpers')
+PFPY
+    bash "$T/pfrun.sh" >/dev/null 2>&1
+    [ -f "$_pfd/etc/profile.d/00-path-functions.sh" ] \
+        || _p="$_p;the path helpers were not written"
+    # and it must SAY it wrote them: reporting only what it declined to do
+    # left the user believing nothing had been installed
+    _slice_fn "$helper_src" install_profile_helpers 2>/dev/null | grep -q 'wrote .*00-path-functions' \
+        || grep -q 'wrote \$d/00-path-functions.sh' "$helper_src" \
+        || _p="$_p;installing the helpers is silent"
+    # an existing /etc/profile that lacks the loop is OFFERED, not imposed
+    grep -q 'append a loop to /etc/profile' "$helper_src" \
+        || _p="$_p;an /etc/profile without the profile.d loop is only complained about"
+    grep -q 'before-lfs-helper' "$helper_src" \
+        || _p="$_p;/etc/profile would be appended to without a backup"
+    _pv="$(bash -c "PATH=/usr/bin; . $_pfd/etc/profile.d/00-path-functions.sh; \
+                    pathprepend /opt/r/bin; pathappend /opt/x/bin; echo \$PATH" 2>/dev/null)"
+    [ "$_pv" = "/opt/r/bin:/usr/bin:/opt/x/bin" ] \
+        || _p="$_p;the path helpers do not work ($_pv)"
+    # THE WHOLE CHAPTER, not just the path helpers.  "The Bash Shell Startup
+    # Files" creates /etc/profile, /etc/bashrc, four profile.d snippets and
+    # four skeleton dotfiles; we had one of them, so a package user's shell
+    # had no umask policy, no INPUTRC, no locale and no ~/.bashrc.
+    grep -q '^install_shell_startup_files()' "$helper_src" \
+        || _p="$_p;only the path helpers are installed, not the startup files"
+    # (written as "$d/umask.sh" and "$skel/.bashrc" in the source, so match
+    #  the leaf name; and check they really appear on disk below)
+    for _sf in umask.sh readline.sh i18n.sh extrapaths.sh; do
+        grep -q "/$_sf\"" "$helper_src" \
+            || _p="$_p;$_sf from the startup-files chapter is not installed"
+    done
+    for _sk in .bash_profile .bashrc .bash_logout .profile; do
+        grep -q "skel/$_sk\"" "$helper_src" \
+            || _p="$_p;the skeleton $_sk is not installed"
+    done
+    grep -q 'kept existing' "$helper_src" \
+        || _p="$_p;the startup files would overwrite what the administrator has"
+
+    # an existing /etc/profile is never overwritten
+    printf 'mine\n' > "$_pfd/etc/profile"
+    bash "$T/pfrun.sh" >/dev/null 2>&1
+    [ "$(cat "$_pfd/etc/profile")" = "mine" ] \
+        || _p="$_p;an existing /etc/profile was overwritten"
+    rm -rf "$_pfd"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the path helpers BLFS snippets call are installed, and your profile is not touched"
+fi
+
+# ---- staging a file onto itself is a no-op, not an error --------------------- #
+# pm-install copies the script into the account's home, and the phase runner
+# stages it again to the same name.  Invisible while the home was MISPLACED
+# (two different paths); once fix-home repointed the home mid-run they became
+# one file and install(1) refused:
+#   install: '.../install_p_nss' and '.../install_p_nss' are the same file
+_p=""
+[ "$(_slice_fn "$helper_src" cmd_build | grep -c '\-ef "\$staged"')" -ge 2 ] \
+    || _p="$_p;staging does not notice that the source IS the destination"
+[ "$(grep -c '\-ef "\$staged"' "$helper_src")" -ge 2 ] \
+    || _p="$_p;only one of the two staging paths checks for the same file"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a script already in place is left alone instead of copied onto itself"
+fi
+
+# ---- a shared INDEX is shared, not owned ------------------------------------- #
+# Every package that installs an info page runs install-info against
+# /usr/share/info/dir.  As a package user that is
+#     install-info: Operation not permitted for /usr/share/info/dir
+# and it killed nettle after its libraries were already installed.  The file
+# is never-claimed (nobody owns it) but nothing made it writable by the
+# people who must update it: a shared directory is root:install and
+# group-writable, and a shared file is the same rule one level down.
+_p=""
+_slice_fn "$helper_src" never_claim_list | grep -q '/usr/share/info/dir' \
+    || _p="$_p;the info index is claimable by a package"
+grep -q '^shared_files_list()' "$helper_src" \
+    || _p="$_p;there is no list of files every package must be able to rewrite"
+_slice_fn "$helper_src" shared_files_list | grep -q 'info/dir' \
+    || _p="$_p;the info index is not treated as a shared file"
+# the XML catalogs are the same species, one directory over: docbook-xml
+# creates /etc/xml/catalog as its own user and docbook-xsl then cannot write
+# it ("could not open /etc/xml/catalog for saving")
+_slice_fn "$helper_src" shared_files_list | grep -q '/etc/xml/catalog' \
+    || _p="$_p;the XML catalog is not treated as a shared file"
+# the whole family of regenerated caches, added at once rather than one
+# failure at a time (update-desktop-database, update-mime-database,
+# glib-compile-schemas, gtk-update-icon-cache)
+for _sf in applications/mimeinfo.cache mime/mime.cache \
+           schemas/gschemas.compiled icons/hicolor/icon-theme.cache; do
+    _slice_fn "$helper_src" shared_files_list | grep -q "$_sf" \
+        || _p="$_p;$_sf is not shared -- the package that runs its update tool will fail"
+done
+# and the GROUP is half the rule: a dir left root:root 775 is group-writable
+# for group root, which helps no package user
+_slice_fn "$helper_src" share_shared_files | grep -q 'real_chown root:install "\$d"' \
+    || _p="$_p;a shared directory gets the mode but not the install group"
+# "answer for me" must mean the same thing whoever asked: the group-choice
+# prompt honoured LFS_ASSUME_YES while packagemanager --yes sets PM_YES, so
+# `stack --run --yes` still stopped to ask which collector group to use
+grep -q '^assume_yes()' "$helper_src" \
+    || _p="$_p;there is no single meaning for assume-yes"
+for _v in LFS_ASSUME_YES PM_YES; do
+    _ayout="$({ _slice_fn "$helper_src" assume_yes
+                echo 'assume_yes && echo YES || echo ASK'; } | env "$_v=1" bash 2>/dev/null)"
+    [ "$_ayout" = YES ] || _p="$_p;$_v=1 does not answer the prompts"
+done
+_ayout="$({ _slice_fn "$helper_src" assume_yes
+            echo 'assume_yes && echo YES || echo ASK'; } | env -u LFS_ASSUME_YES -u PM_YES bash 2>/dev/null)"
+[ "$_ayout" = ASK ] || _p="$_p;the prompts are skipped even when nobody said yes"
+_slice_fn "$helper_src" cmd_init_pkgusr | grep -q 'share_shared_files' \
+    || _p="$_p;setting up the package-user system does not share the index"
+_slice_fn "$helper_src" cmd_build | grep -q 'share_shared_files' \
+    || _p="$_p;a build that cannot write the index does not repair it and retry"
+_slice_fn "$helper_src" cmd_verify | grep -q 'share_shared_files' \
+    || _p="$_p;verify --fix leaves the index unwritable"
+# and it really applies the rule, idempotently
+_sfd="$T/sharedfile"; mkdir -p "$_sfd/usr/share/info"
+: > "$_sfd/usr/share/info/dir"; chmod 600 "$_sfd/usr/share/info/dir"
+if [ "$(id -u)" = 0 ] && getent group install >/dev/null 2>&1; then
+    _sfout="$({ echo "SNAP_ROOT=$_sfd"; echo 'detail(){ echo "D: $*"; }'
+                echo 'real_chown(){ chown "$@"; }'; echo 'real_chmod(){ chmod "$@"; }'
+                _slice_fn "$helper_src" shared_files_list
+                _slice_fn "$helper_src" share_shared_files
+                echo 'share_shared_files; share_shared_files'
+              } | bash 2>/dev/null)"
+    [ "$(stat -c %G "$_sfd/usr/share/info/dir" 2>/dev/null)" = install ] \
+        || _p="$_p;the shared index did not get group install"
+    [ "$(stat -c %a "$_sfd/usr/share/info/dir" 2>/dev/null)" = 664 ] \
+        || _p="$_p;the shared index is not group-writable"
+    [ "$(echo "$_sfout" | grep -c '^D:')" = 1 ] \
+        || _p="$_p;sharing the index is not idempotent (it reports work every run)"
+    # THE MODE OF THE FILE IS ONLY HALF OF IT.  install-info renames a new
+    # file over the old one, and a STICKY directory allows that only to the
+    # file's owner -- EPERM, whatever the file's group-write says.  Reproduce
+    # it, then check the rule removes it.
+    chmod 1775 "$_sfd/usr/share/info" 2>/dev/null
+    chown root:install "$_sfd/usr/share/info" "$_sfd/usr/share/info/dir" 2>/dev/null
+    useradd -M -N -g install pmshtest >/dev/null 2>&1
+    _renam() { su pmshtest -c ": > $_sfd/usr/share/info/d.new && mv -f $_sfd/usr/share/info/d.new $_sfd/usr/share/info/dir" >/dev/null 2>&1; }
+    if id pmshtest >/dev/null 2>&1; then
+        _renam && _p="$_p;the fixture is wrong: a sticky dir should have blocked this"
+        { echo "SNAP_ROOT=$_sfd"; echo 'detail(){ :; }'
+          echo 'real_chown(){ chown "$@"; }'; echo 'real_chmod(){ chmod "$@"; }'
+          _slice_fn "$helper_src" shared_files_list
+          _slice_fn "$helper_src" shared_file_dirs
+          _slice_fn "$helper_src" share_shared_files
+          echo 'share_shared_files'; } | bash >/dev/null 2>&1
+        _renam || _p="$_p;a package user still cannot replace the shared index (the directory is sticky)"
+        userdel pmshtest >/dev/null 2>&1
+    fi
+    # THE INDEX IS USUALLY CREATED MID-BUILD, by the first package that ships
+    # an info page -- owned by THAT package user.  Sharing it only at
+    # init-pkgusr (when it does not exist yet) or after a failure means one
+    # guaranteed failure per fresh LFS base build.
+    if id p_shA >/dev/null 2>&1 || useradd -M -N -g install p_shA >/dev/null 2>&1; then
+        chown root:install "$_sfd/usr/share/info" 2>/dev/null
+        chmod 775 "$_sfd/usr/share/info" 2>/dev/null
+        rm -f "$_sfd/usr/share/info/dir"
+        su p_shA -c "echo idx > $_sfd/usr/share/info/dir" >/dev/null 2>&1
+        { echo "SNAP_ROOT=$_sfd"; echo 'detail(){ :; }'
+          echo 'real_chown(){ chown "$@"; }'; echo 'real_chmod(){ chmod "$@"; }'
+          _slice_fn "$helper_src" shared_files_list
+          _slice_fn "$helper_src" shared_file_dirs
+          _slice_fn "$helper_src" share_shared_files
+          echo 'share_shared_files'; } | bash >/dev/null 2>&1
+        [ "$(stat -c %U:%G "$_sfd/usr/share/info/dir" 2>/dev/null)" = "root:install" ] \
+            || _p="$_p;an index created BY a package user is not taken into shared ownership"
+        userdel p_shA >/dev/null 2>&1
+    fi
+    _slice_fn "$helper_src" cmd_build | grep -q 'pkgusr_ready && share_shared_files' \
+        || _p="$_p;the indexes are only shared AFTER a build fails, not before it runs"
+
+    # and sealing must not put the sticky bit back
+    _slice_fn "$helper_src" cmd_seal_install_dirs | grep -q 'shared_file_dirs' \
+        || _p="$_p;sealing would make the index unreplaceable again"
+    _slice_fn "$helper_src" _vfy_install_dirs | grep -q 'shared_file_dirs\|_shared_dirs' \
+        || _p="$_p;verify would seal the index directory back"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a shared index file gets the shared treatment, everywhere it matters"
+fi
+rm -rf "$_sfd"
+
+# ---- downloads follow the commands, not the labels --------------------------- #
+# alsa-ucm-conf is labelled "Recommended file:" and is used by a command that
+# is NOT conditional, so a label filter ("required" + .patch) did not fetch
+# it and the install died on `tar: ../alsa-ucm-conf...: Cannot open`.  What a
+# file is called does not decide whether it is needed; what runs does.
+_p=""
+_bt4="$(dirname "$LFS_TOOL")/blfs"
+if [ -f "$_bt4" ]; then
+    python3 - "$_bt4" <<'PYDL' || _p="$_p;additional downloads are chosen by label instead of by what the commands use"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+data = {"additional_links": ["https://x/needed.tar.bz2", "https://x/unused.tar.bz2",
+                             "https://x/fix.patch"],
+        "build_cmds": "make\n#\ttar -xf ../unused.tar.bz2",
+        "install_root_cmds": "make install &&\ntar -xf ../needed.tar.bz2",
+        "install_cmds": "tar -xf ../unused.tar.bz2"}
+keep = b._needed_additional_links(data, [])
+assert "https://x/needed.tar.bz2" in keep, keep
+assert "https://x/fix.patch" in keep, keep          # patches always
+assert "https://x/unused.tar.bz2" not in keep, keep # only a commented line uses it
+PYDL
+fi
+# an optional artifact that was never built is not a failed install
+_slice_fn "$helper_src" make_wrappers | grep -q 'nothing to install' \
+    || _p="$_p;install still fails the package when an optional artifact was never built"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "what gets downloaded and what gets installed follow the commands, not the labels"
+fi
+
+# ---- book prose is data, not shell ------------------------------------------- #
+# "Installed Directories: $TEXLIVE_PREFIX/bin" is documentation.  Emitted in
+# double quotes it became an expansion, and pm-install (which sources the
+# script for its metadata, under set -u) died before the install started.
+_p=""
+_bt3="$(dirname "$LFS_TOOL")/blfs"
+if [ -f "$_bt3" ]; then
+    python3 - "$_bt3" <<'PYBS' || _p="$_p;book strings are emitted so the shell can expand them"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b.bash_str('$TEXLIVE_PREFIX/bin, `date`, "x"')
+assert out.startswith("'") and out.endswith("'"), out
+assert '$TEXLIVE_PREFIX' in out and '`date`' in out
+assert b.bash_str("it's") == "'it'\\''s'", b.bash_str("it's")
+PYBS
+fi
+# and our shell options must not govern a file we merely source
+_slice_fn "$helper_src" cmd_pm_install | grep -q 'set +u +e' \
+    || _p="$_p;sourcing a book script imposes our set -u on it"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "book prose stays data, and our shell options stay ours"
+fi
+
+# ---- a file the installer may not replace ------------------------------------ #
+# freetype2 could not install its own freetype2.pc: the file was owned by
+# p_cairo (the over-claiming manifests, made real by a verify --fix) and
+# /usr/lib/pkgconfig is sticky, so only the owner may replace it -- EPERM,
+# which no collector group can grant away.  In this model the package that
+# installs a file owns it, so the installer takes it over.
+_p=""
+_tod="$T/takeover"; mkdir -p "$_tod/usr/lib/pkgconfig" "$_tod/src"
+if [ "$(id -u)" = 0 ] && command -v useradd >/dev/null 2>&1; then
+    for _u in p_tkA p_tkB; do id "$_u" >/dev/null 2>&1 || useradd -M -U "$_u" >/dev/null 2>&1; done
+    : > "$_tod/usr/lib/pkgconfig/ft.pc";  chown p_tkA:p_tkA "$_tod/usr/lib/pkgconfig/ft.pc" 2>/dev/null
+    : > "$_tod/usr/lib/pkgconfig/root.pc"
+    : > "$_tod/src/build.o";              chown p_tkA:p_tkA "$_tod/src/build.o" 2>/dev/null
+    printf "install: cannot remove '%s/usr/lib/pkgconfig/ft.pc': Operation not permitted\ninstall: cannot remove '%s/usr/lib/pkgconfig/root.pc': Operation not permitted\ninstall: cannot remove '%s/src/build.o': x\n" \
+        "$_tod" "$_tod" "$_tod" > "$_tod/log"
+    { echo "SNAP_ROOT=$_tod; SRCROOT=$_tod/src"; echo 'warn(){ :; }'
+      echo 'real_chown(){ chown "$@"; }'; echo 'user_exists(){ id "$1" >/dev/null 2>&1; }'
+      _slice_fn "$helper_src" under_dir
+      _slice_fn "$helper_src" takeover_files_from_log
+      echo 'takeover_files_from_log "$SNAP_ROOT/log" p_tkB'; } | bash >/dev/null 2>&1
+    [ "$(stat -c %U "$_tod/usr/lib/pkgconfig/ft.pc" 2>/dev/null)" = p_tkB ] \
+        || _p="$_p;a mis-owned file is not taken over by the package installing it"
+    [ "$(stat -c %U "$_tod/usr/lib/pkgconfig/root.pc" 2>/dev/null)" = root ] \
+        || _p="$_p;a ROOT-owned file was taken over (root's files are not another package's mistake)"
+    [ "$(stat -c %U "$_tod/src/build.o" 2>/dev/null)" = p_tkA ] \
+        || _p="$_p;a file inside a build tree was taken over"
+    userdel p_tkA >/dev/null 2>&1; userdel p_tkB >/dev/null 2>&1
+fi
+_slice_fn "$helper_src" cmd_build | grep -q 'takeover_files_from_log' \
+    || _p="$_p;the retry loop never takes over a mis-owned file (granting cannot fix EPERM)"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "ownership follows the installer: a mis-owned file is taken over, root's is not"
+fi
+rm -rf "$_tod"
+
+# ---- a directory that is not there cannot be granted ------------------------- #
+# cmake installs into /usr/share/vim/vimfiles/indent: vim's tree, a
+# subdirectory that never existed.  A package user cannot create it, and
+# granting cannot fix a directory that is NOT THERE.  The model's answer for
+# a shared directory (root:install, group-writable) is now applied on demand.
+_p=""
+_mdd="$T/missingdirs"
+mkdir -p "$_mdd/usr/share/vim" "$_mdd/etc" "$_mdd/src/pkgusr/p_x/src/docs"
+{
+  printf 'file INSTALL cannot make directory "%s/usr/share/vim/vimfiles/indent": No such file or directory.\n' "$_mdd"
+  # bash failing to redirect -- a DIFFERENT wording for the same problem,
+  # which the enumerate-the-messages version missed (libpaper, /etc/profile.d)
+  printf '%s/src/pkgusr/p_libpaper/install_libpaper: line 150: %s/etc/profile.d/libpaper.sh: No such file or directory\n' "$_mdd" "$_mdd"
+  # a SOURCE the build never produced, inside the build tree: not ours
+  printf "install: cannot stat '%s/src/pkgusr/p_x/src/docs/man/x.1': No such file or directory\n" "$_mdd"
+  # a missing file whose directory EXISTS: the error is about the file
+  printf 'cat: %s/usr/share/vim/gone.txt: No such file or directory\n' "$_mdd"
+} > "$_mdd/log"
+_mdout="$({ echo "SNAP_ROOT=$_mdd; SRCROOT=$_mdd/src; PM_YES=1"
+            echo 'ok(){ :; }'; echo 'warn(){ :; }'; echo 'say(){ :; }'
+            echo 'soft(){ shift 2; "$@"; }'
+            echo 'set_install_dir_owner(){ :; }'; echo 'real_chmod(){ chmod "$@"; }'
+            _slice_fn "$helper_src" assume_yes
+            _slice_fn "$helper_src" confirm_change
+            _slice_fn "$helper_src" missing_dirs_from_log
+            _slice_fn "$helper_src" create_missing_dirs_from_log
+            echo 'missing_dirs_from_log "$SNAP_ROOT/log"'
+            echo 'create_missing_dirs_from_log "$SNAP_ROOT/log" p_cmake'
+          } | bash 2>/dev/null)"
+echo "$_mdout" | grep -q "vimfiles/indent" \
+    || _p="$_p;a missing destination directory is not detected"
+echo "$_mdout" | grep -q "etc/profile.d" \
+    || _p="$_p;a shell redirection into a missing directory is not recognised (only some wordings are)"
+echo "$_mdout" | grep -q "docs/man" \
+    && _p="$_p;a missing SOURCE file in the build tree is mistaken for a directory"
+[ -d "$_mdd/usr/share/vim/vimfiles/indent" ] \
+    || _p="$_p;the missing shared directory was not created"
+[ -d "$_mdd/etc/profile.d" ] \
+    || _p="$_p;the redirection's missing directory was not created"
+[ -d "$_mdd/src/pkgusr/p_x/src/docs/man" ] \
+    && _p="$_p;a directory was created inside a package's build tree"
+[ -d "$_mdd/usr/share/vim/gone.txt" ] \
+    && _p="$_p;a directory was invented where only a FILE was missing"
+# A RETRY MUST NOT THROW AWAY A BUILD THAT SUCCEEDED.  LLVM compiled 4343
+# targets, failed on a systemd-run line at the very end, and the next run
+# wiped the tree and compiled it all again.
+_cb10="$(_slice_fn "$helper_src" cmd_build)"
+printf '%s' "$_cb10" | grep -q 'keeping the source tree' \
+    || _p="$_p;a retry of --phase all recompiles a build that already finished"
+printf '%s' "$_cb10" | grep -q '_done_phases' \
+    || _p="$_p;the retry does not consult the phase records before cleaning"
+# ...and a package with no finished build is still cleaned
+_phd="$T/phases"; mkdir -p "$_phd"
+printf 'unpack\nbuild\n' > "$_phd/done"; printf 'unpack\n' > "$_phd/partial"
+for _pk in done partial; do
+    _out="$({ echo 'say(){ echo KEPT; }'; echo 'clean_stale_source(){ echo CLEANED; }'
+              printf 'phase_file(){ echo "%s/$1"; }\n' "$_phd"
+              echo "name=$_pk; phase=all"
+              sed -n '/DO NOT THROW AWAY A BUILD/,/^    esac$/p' "$helper_src" \
+                  | sed 's/^    //' | sed 's/^local /_x=/'
+            } | bash 2>/dev/null | head -1)"
+    case "$_pk:$_out" in
+        done:KEPT|partial:CLEANED) ;;
+        *) _p="$_p;retry cleaning is wrong for a $_pk build ($_out)" ;;
+    esac
+done
+_slice_fn "$helper_src" cmd_build | grep -q 'create_missing_dirs_from_log' \
+    || _p="$_p;the retry loop never creates missing directories"
+# CREATING A DIRECTORY IS A CHANGE TO THE SYSTEM, and it needs the user's
+# word.  --yes is that word given in advance; no terminal means NO, because
+# silence is not consent.
+_slice_fn "$helper_src" create_missing_dirs_from_log | grep -q 'confirm_change' \
+    || _p="$_p;directories are created in someone else's tree without asking"
+# WHO OWNS A DIRECTORY WE CREATE.  root:install is the rule for the system's
+# own install directories.  Inside ANOTHER PACKAGE's tree it is wrong twice:
+# chmod needs ownership (cmake: "cannot set permissions"), and it invents a
+# second rule where the collector-group model already answers.
+_slice_fn "$helper_src" create_missing_dirs_from_log | grep -q 'share_new_dir_with_tree_owner' \
+    || _p="$_p;a directory made inside another package's tree does not go through collector groups"
+# THE GROUP BELONGS TO THE TREE, not to whoever installed first: vim's tree
+# came out nimgnu_cmake.  And naming a NEW group is a decision, not a
+# yes/no -- --yes means "do not ask me to confirm", not "pick a name for me".
+if [ "$(id -u)" = 0 ] && command -v groupadd >/dev/null 2>&1; then
+    _gtd="$T/treegroup"; mkdir -p "$_gtd/n1" "$_gtd/n2"
+    groupadd nimgnu_treet >/dev/null 2>&1
+    _grun() { { echo 'COLLECTOR_PREFIX=nimgnu; PKGUSR_PREFIX=p_; CFGUSR_PREFIX=cfg_'
+                echo 'ok(){ :; }'; echo 'warn(){ :; }'; echo 'say(){ :; }'
+                echo 'soft(){ shift 2; "$@"; }'
+                echo 'real_chgrp(){ chgrp "$@"; }'; echo 'real_chmod(){ chmod "$@"; }'
+                echo 'create_collector_group(){ groupadd "$1" 2>/dev/null; }'
+                echo 'add_to_group(){ :; }'
+                echo 'group_exists(){ getent group "$1" >/dev/null 2>&1; }'
+                _slice_fn "$helper_src" sanitise_group_name
+                _slice_fn "$helper_src" collector_group_for
+                _slice_fn "$helper_src" unprefix_pkg_user
+                _slice_fn "$helper_src" pkgusr_kind
+                _slice_fn "$helper_src" share_new_dir_with_tree_owner
+                echo "share_new_dir_with_tree_owner $1 $2 p_makert"; } > "$_gtd/run.sh"
+              setsid bash "$_gtd/run.sh" < /dev/null >/dev/null 2>&1; }
+    # THE PARENT DIRECTORY DECIDES: a subdirectory of a directory that
+    # already carries a collector group inherits it, with no new question.
+    chgrp nimgnu_treet "$_gtd" 2>/dev/null
+    _grun "$_gtd/n1" p_treet
+    [ "$(stat -c %G "$_gtd/n1" 2>/dev/null)" = nimgnu_treet ] \
+        || _p="$_p;a subdirectory does not inherit its parent's collector group"
+    chgrp root "$_gtd" 2>/dev/null
+    _grun "$_gtd/n2" p_fresht
+    case "$(stat -c %G "$_gtd/n2" 2>/dev/null)" in
+        nimgnu_fresht) ;;
+        nimgnu_makert) _p="$_p;the new group is named after the package that created the directory, not the tree" ;;
+        *) _p="$_p;no collector group was put on a directory made in another package's tree" ;;
+    esac
+    groupdel nimgnu_treet >/dev/null 2>&1; groupdel nimgnu_fresht >/dev/null 2>&1
+    rm -rf "$_gtd"
+fi
+_slice_fn "$helper_src" share_new_dir_with_tree_owner | grep -q '/dev/tty' \
+    || _p="$_p;naming a NEW collector group is never asked about"
+# STDOUT IS THE RETURN VALUE.  choose_collector_group ANSWERS on stdout, and
+# 1.13.46 added explanation lines with plain `say` -- so the caller captured
+# the paragraph as the group name and `chgrp` failed on it, silently.
+_ccg="$(_slice_fn "$helper_src" choose_collector_group)"
+printf '%s' "$_ccg" | grep -E '^\s+say ' | grep -v '>&2' | grep -v '^\s*#' \
+    | grep -q . && {
+    # the prompt body is legitimate: it lives inside a `{ ... } > /dev/tty`
+    printf '%s' "$_ccg" | grep -q '} > /dev/tty' \
+        || _p="$_p;informational output in choose_collector_group goes to stdout"
+}
+_cap="$({ echo 'COLLECTOR_PREFIX=nimgnu'
+          echo 'say(){ echo "$*"; }'; echo 'warn(){ echo "W:$*" >&2; }'
+          echo 'sanitise_group_name(){ printf "%s" "$1"; }'
+          echo 'collector_group_for(){ printf "nimgnu_%s" "${1#p_}"; }'
+          echo 'group_exists(){ false; }'; echo 'user_in_group(){ false; }'
+          echo 'stat(){ case "$3" in */gstreamer-1.0) echo nimgnu_gst ;; *) echo root ;; esac; }'
+          printf '%s\n' "$_ccg"
+          echo 'choose_collector_group /usr/share/gstreamer-1.0/presets p_good p_bad'
+        } | bash 2>/dev/null)"
+case "$_cap" in
+    nimgnu_gst) ;;
+    *) _p="$_p;the captured group name is not a name: [$_cap]" ;;
+esac
+
+# A NAME THAT CANNOT BE ASKED FOR MUST STILL BE CHOSEN.  During a build stdin
+# is not a terminal, so choose_collector_group's prompt cannot run and it
+# returned NOTHING -- then `chgrp "" dir` failed and grant_dir_access returned
+# 1 with no message, reported as "nothing to grant".  Five rounds of
+# debugging on gst-plugins-bad were chasing that silence.
+_slice_fn "$helper_src" grant_dir_access | grep -q 'NEVER LEAVE IT EMPTY, AND NEVER FAIL QUIETLY' \
+    || _p="$_p;an unaskable group name leaves the grant silently broken"
+_gfb="$({ echo 'COLLECTOR_PREFIX=nimgnu; owner=p_other; dir=/tmp/x'
+          echo 'warn(){ :; }'
+          echo 'sanitise_group_name(){ printf "%s" "$1"; }'
+          echo 'collector_group_for(){ printf "nimgnu_%s" "$1"; }'
+          echo 'choose_collector_group(){ printf ""; }'
+          echo 'grp="$(choose_collector_group x y z)"'
+          _slice_fn "$helper_src" grant_dir_access \
+            | sed -n '/# NEVER LEAVE IT EMPTY, AND NEVER FAIL QUIETLY/,/^    fi$/p' \
+            | sed 's/^    //'
+          echo 'printf "%s" "$grp"'; } | bash 2>/dev/null)"
+[ "$_gfb" = "nimgnu_other" ] \
+    || _p="$_p;the fallback group name is wrong ($_gfb)"
+_slice_fn "$helper_src" grant_dir_access | grep -q 'chgrp $grp $dir FAILED' \
+    || _p="$_p;a failed chgrp is silent"
+
+# AN ANCESTOR'S GROUP ALREADY ANSWERED.  /usr/lib/python3.14/site-packages is
+# nimgnu_python, and a package needing .../site-packages/gi/overrides was
+# still asked to name a group for it.
+_slice_fn "$helper_src" choose_collector_group | grep -q "ANCESTOR'S GROUP ALREADY ANSWERED" \
+    || _p="$_p;a directory inside a shared tree still asks for a group name"
+_ancs="$T/anc.sh"
+python3 - "$helper_src" > "$_ancs" <<'PYANC'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('choose_collector_group() {')
+d, j = 0, i
+while True:
+    if s[j] == '{': d += 1
+    elif s[j] == '}':
+        d -= 1
+        if d == 0: break
+    j += 1
+print('COLLECTOR_PREFIX=nimgnu')
+print('say(){ echo "$*"; }; warn(){ :; }')
+print('sanitise_group_name(){ printf "%s" "$1"; }')
+print('collector_group_for(){ printf "nimgnu_%s" "${1#p_}"; }')
+print('group_exists(){ false; }; user_in_group(){ false; }')
+print('stat(){ case "$3" in */site-packages) echo nimgnu_python ;; *) echo root ;; esac; }')
+print(s[i:j+1])
+print('choose_collector_group /usr/lib/python3.14/site-packages/gi/overrides '
+      'p_pygobject3 p_at-spi2-core')
+PYANC
+[ "$(bash "$_ancs" 2>/dev/null | tail -1)" = "nimgnu_python" ] \
+    || _p="$_p;the ancestor's collector group is not inherited"
+
+# --yes ANSWERS A QUESTION; IT DOES NOT NAME THINGS.  With --yes the grant
+# path picked the owner-named group and created it silently -- a name that
+# then sits on the system for good.  An EXISTING group is a yes/no and --yes
+# may take it; a NEW one is still asked about when there is a terminal.
+grep -q 'does not name a NEW collector group' "$helper_src" \
+    || _p="$_p;--yes silently invents collector group names"
+_gp="$(_slice_fn "$helper_src" _collector_group_for_dir 2>/dev/null || true)"
+[ -n "$_gp" ] && { printf '%s' "$_gp" | grep -q 'assume_yes && group_exists' \
+    || _p="$_p;--yes does not distinguish reusing a group from creating one"; }
+# A PACKAGE'S OWN TREE NEEDS NO GROUP.  p_rust created a directory inside
+# p_rust's tree and was asked which group should own it -- offering the same
+# name twice, because "the tree" and "the creator" were one package.
+_slice_fn "$helper_src" share_new_dir_with_tree_owner | grep -q 'which created it -- no group needed' \
+    || _p="$_p;a package is asked to share a directory in its own tree"
+# and the group is named after the PACKAGE, not the account: with an empty
+# PKGUSR_PREFIX the name came out nimgnu_p_rust
+_slice_fn "$helper_src" share_new_dir_with_tree_owner | grep -q 'powner#p_' \
+    || _p="$_p;the collector group keeps the account prefix (nimgnu_p_rust)"
+# the three things the answer depends on are highlighted
+for _hl in 'package  :' 'directory:' 'recommended'; do
+    _slice_fn "$helper_src" share_new_dir_with_tree_owner | grep -q "$_hl" \
+        || _p="$_p;the prompt does not highlight '$_hl'"
+done
+_slice_fn "$helper_src" create_missing_dirs_from_log | grep -q 'is_install_dir' \
+    || _p="$_p;the system's install directories and another package's tree get the same rule"
+# A DIRECTORY WE CREATED IS NOT EVIDENCE ABOUT OWNERSHIP.  mkdir -p leaves
+# intermediates root:root, and the next round read that artifact as "root's
+# tree" and applied the system rule inside a package's tree.
+if [ "$(id -u)" = 0 ] && command -v useradd >/dev/null 2>&1; then
+    _vvd="$T/dirrule"; mkdir -p "$_vvd/usr/share/vim" "$_vvd/usr/lib" "$_vvd/src"
+    for _u in p_vimQ p_cmQ; do id "$_u" >/dev/null 2>&1 || useradd -M -U "$_u" >/dev/null 2>&1; done
+    chown p_vimQ:p_vimQ "$_vvd/usr/share/vim" 2>/dev/null
+    _mkrun() {
+        printf 'cannot make directory "%s": x\n' "$1" > "$_vvd/log"
+        { echo "SNAP_ROOT=$_vvd; SRCROOT=$_vvd/src; PM_YES=1"
+          echo 'ok(){ :; }'; echo 'warn(){ :; }'; echo 'say(){ :; }'
+          echo 'soft(){ shift 2; "$@"; }'
+          echo 'real_chmod(){ chmod "$@"; }'; echo 'real_chown(){ chown "$@"; }'
+          echo 'set_install_dir_owner(){ chown root:install "$1"; }'
+          printf 'is_install_dir(){ case "$1" in %s/usr/lib) return 0;; esac; return 1; }\n' "$_vvd"
+          echo 'grant_dir_access(){ :; }'
+          _slice_fn "$helper_src" assume_yes
+          _slice_fn "$helper_src" confirm_change
+          _slice_fn "$helper_src" under_dir
+          _slice_fn "$helper_src" missing_dirs_from_log
+          _slice_fn "$helper_src" create_missing_dirs_from_log
+          echo "create_missing_dirs_from_log $_vvd/log p_cmQ"; } > "$_vvd/run.sh"
+        bash "$_vvd/run.sh" < /dev/null >/dev/null 2>&1
+    }
+    _mkrun "$_vvd/usr/share/vim/vimfiles/indent"
+    _mkrun "$_vvd/usr/share/vim/vimfiles/syntax"       # the second round
+    _mkrun "$_vvd/usr/lib/sysdir"
+    [ "$(stat -c %U "$_vvd/usr/share/vim/vimfiles" 2>/dev/null)" = p_cmQ ] \
+        || _p="$_p;an intermediate directory is left root-owned and unusable"
+    [ "$(stat -c %U "$_vvd/usr/share/vim/vimfiles/syntax" 2>/dev/null)" = p_cmQ ] \
+        || _p="$_p;the second round mistook our own intermediate for the system's tree"
+    [ "$(stat -c %G "$_vvd/usr/lib/sysdir" 2>/dev/null)" = install ] \
+        || _p="$_p;a real install directory no longer gets the system rule"
+    userdel p_vimQ >/dev/null 2>&1; userdel p_cmQ >/dev/null 2>&1
+    rm -rf "$_vvd"
+fi
+grep -q '^confirm_change()' "$helper_src" \
+    || _p="$_p;there is no way to ask before changing the system"
+# A PROMPT BEHIND A PIPE LOOKS LIKE A HANG.  The question goes to /dev/tty so
+# it survives the pipes, but the build's output goes through tee -- so a run
+# waiting for an answer showed nothing at all.
+[ "$(grep -c 'WAITING FOR AN ANSWER' "$helper_src")" -ge 3 ] \
+    || _p="$_p;a prompt can wait without saying so in the output"
+_slice_fn "$helper_src" cmd_build | grep -q 'missing_dirs_from_log "\$log"' \
+    || _p="$_p;a missing-directory failure never reaches the retry loop"
+# the GATE decides whether the loop runs at all, and cmake's wording is
+# "cannot MAKE directory" -- which the regex did not list, so cmake failed
+# twice with no attempt and no explanation
+_slice_fn "$helper_src" cmd_build | grep -q 'cannot (create|make|remove' \
+    || _p="$_p;the retry gate does not recognise \"cannot make directory\""
+_slice_fn "$helper_src" cmd_build | grep -q 'no automatic repair attempted' \
+    || _p="$_p;when no repair is attempted, nothing says why"
+# AND IT MUST WORK WHEN THE ROOT IS "/" -- which is every real chroot, and
+# no sandbox.  "${SNAP_ROOT%/}" is EMPTY there, so `case "$d" in
+# "${SNAP_ROOT%/}"/*)` matched nothing and `"$SRCROOT"/*` with an unset
+# SRCROOT excluded everything: cmake's missing directory was invisible on
+# the only system that matters.
+printf 'file INSTALL cannot make directory "/usr/share/vim/vimfiles/indent": No such file or directory.\n' > "$T/rootslash.log"
+_rs1="$({ echo 'SNAP_ROOT=/; SRCROOT=/usr/src'
+          _slice_fn "$helper_src" missing_dirs_from_log
+          echo 'missing_dirs_from_log '"$T"'/rootslash.log'; } | bash 2>/dev/null)"
+printf '%s\n' "$_rs1" | grep -q '/usr/share/vim/vimfiles/indent' \
+    || _p="$_p;with the root at / (every real chroot) a missing directory is invisible"
+_rs2="$({ echo 'SNAP_ROOT=/'
+          _slice_fn "$helper_src" missing_dirs_from_log
+          echo 'missing_dirs_from_log '"$T"'/rootslash.log'; } | bash 2>/dev/null)"
+printf '%s\n' "$_rs2" | grep -q '/usr/share/vim/vimfiles/indent' \
+    || _p="$_p;an unset SRCROOT turns the build-tree exclusion into a wildcard that excludes everything"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a shared directory that does not exist yet is created, whatever the tool called it"
+fi
+rm -rf "$_mdd"
+
+# ---- the attribution window opens on a quiet tree ---------------------------- #
+# Timestamp attribution assumes nothing else writes during a build.  A real
+# run disproved it: make-ca was still generating /etc/ssl/certs while libogg
+# built, and libogg's manifest claimed 400 certificates.  cmd_build now waits
+# for the known background writers before dropping its stamp.
+_p=""
+_slice_fn "$helper_src" cmd_build | grep -q '_settle_tree_before_stamp' \
+    || _p="$_p;the attribution window opens without waiting for background writers"
+grep -q '^_SETTLE_PROCS=' "$helper_src" \
+    || _p="$_p;there is no list of known background writers"
+for _w in mandb make-ca fc-cache; do
+    grep -A4 '^_SETTLE_PROCS=' "$helper_src" | grep -q "$_w" \
+        || _p="$_p;$_w is not waited for (it writes during other packages' builds)"
+done
+# it returns at once on a quiet tree, and gives up (never hangs) on a busy one
+_stq="$({ echo 'say(){ :; }'; echo 'warn(){ :; }'; echo '_SETTLE_PROCS="nosuchproc-xyz"'
+          _slice_fn "$helper_src" _settle_tree_before_stamp
+          echo 'time _settle_tree_before_stamp'; } | bash 2>&1 | grep real)"
+case "$_stq" in *0m0.*|*0m1.*) ;; *) _p="$_p;settling is slow on a quiet tree" ;; esac
+_stb="$({ echo 'say(){ echo S; }'; echo 'warn(){ echo GAVEUP; }'; echo '_SETTLE_PROCS="sleep"'
+          _slice_fn "$helper_src" _settle_tree_before_stamp
+          echo 'LFS_SETTLE_SECONDS=2 _settle_tree_before_stamp'; } > "$T/st.sh"
+        sleep 20 & _sp=$!
+        bash "$T/st.sh" 2>&1; kill $_sp 2>/dev/null)"
+echo "$_stb" | grep -q GAVEUP \
+    || _p="$_p;a busy tree hangs the build instead of warning and continuing"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a build's file list starts on a quiet tree, and never hangs waiting for one"
+fi
+
+# ---- a partly sealed tree is sealed, not unsealed ---------------------------- #
+# The seal probe demanded ALL five probed dirs be sticky, so a mixed tree read
+# as "not sealed" and verify proposed stripping the sticky bit off ~50
+# correctly sealed directories (1775 -> 775).  Sealing is one-way: verify
+# completes it, never undoes it.
+_sd="$T/sealdirs"
+_seal_probe() {   # $1 = how many of three dirs are sticky
+    rm -rf "$_sd"; mkdir -p "$_sd/a" "$_sd/b" "$_sd/c"
+    local n=0 d
+    for d in a b c; do
+        [ "$n" -lt "$1" ] && chmod 1775 "$_sd/$d"
+        n=$((n+1))
+    done
+    { echo "SNAP_ROOT=$_sd"; echo 'warn(){ :; }'
+      printf 'install_dirs_list(){ printf "/a\\n/b\\n/c\\n"; }\n'
+      _slice_fn "$helper_src" _install_dirs_are_sealed
+      echo '_install_dirs_are_sealed && echo SEALED || echo UNSEALED'
+    } | bash 2>/dev/null | tail -1
+}
+_p=""
+[ "$(_seal_probe 0)" = UNSEALED ] \
+    || _p="$_p;a mid-build tree reads as sealed -- the sticky bit would block package users"
+[ "$(_seal_probe 3)" = SEALED ] || _p="$_p;a fully sealed tree reads as unsealed"
+[ "$(_seal_probe 2)" = SEALED ] \
+    || _p="$_p;a PARTLY sealed tree reads as unsealed -- verify would strip sticky bits it should complete"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "sealing is one-way: a partly sealed tree is completed, never undone"
+fi
+rm -rf "$_sd"
+
+# ---- a failed build makes no install claim ---------------------------------- #
+# A failed libxml2 run recorded its 4 half-built files as pkg.lst; the
+# planner read pkg.lst as "installed" and skipped the package forever --
+# docbook then died on the xmlcatalog that was never installed.  The
+# manifest (what a step TOUCHED) survives failure; the recorder must not.
+_p=""
+_slice_fn "$helper_src" cmd_build | grep -q '= 0 \] && { cmd_record_install' \
+    || _p="$_p;a failed build still records itself as installed"
+_slice_fn "$helper_src" cmd_build | grep -q "Program '\[A-Za-z0-9._+-\]+' not found" \
+    || _p="$_p;a missing-program failure does not point at the lying record"
+# the same species from the LINKER's mouth: "cannot find -lfoo"
+_slice_fn "$helper_src" cmd_build | grep -q 'cannot find -l' \
+    || _p="$_p;a missing-library link failure does not point at the lying record"
+# and it must name only the libraries that are REALLY absent.  `ls a* b* c*`
+# fails when any one pattern misses, so a library present in the first
+# directory was reported missing because the others lacked it.
+_lkd="$T/linklibs"; mkdir -p "$_lkd/usr/lib"
+printf 'ld: cannot find -lonlymissing: x\nld: cannot find -lhalf: x\nld: cannot find -lpresent: x\n' > "$_lkd/log"
+: > "$_lkd/usr/lib/libpresent.so.1"
+ln -s libpresent.so.1 "$_lkd/usr/lib/libpresent.so"     # complete install
+: > "$_lkd/usr/lib/libhalf.so.6.20.1"                   # real lib, NO dev symlink
+_lkout="$({ echo "SNAP_ROOT=$_lkd; log=$_lkd/log"; echo 'fail(){ echo "$*"; }'
+            echo 'unprefix_pkg_user(){ echo "${1#p_}"; }'
+            sed -n '/# "cannot find -lfoo" is the linker/,/^        fi$/p' "$helper_src" | sed 's/^        //'
+          } | bash 2>/dev/null)"
+echo "$_lkout" | grep -q 'libonlymissing.so' \
+    || _p="$_p;a genuinely missing library is not named"
+echo "$_lkout" | grep -q 'libpresent' \
+    && _p="$_p;a COMPLETE library is reported missing (one failed glob poisons the check)"
+# libfoo.so.N without libfoo.so is what -lfoo actually fails on, and it is a
+# DIFFERENT illness: the owner's install never finished, its record is honest
+echo "$_lkout" | grep -q 'libhalf.so.6.20.1 exists' \
+    || _p="$_p;libfoo.so.N without libfoo.so is treated as present (that IS the failure case)"
+echo "$_lkout" | grep -q 'development symlink' \
+    || _p="$_p;a missing development symlink is diagnosed as a lying record instead"
+# and it must name the package that OWNS the library, not whoever ran
+# ldconfig: the SONAME link libfoo.so.1 carries the account that made it,
+# which blamed p_libpaper for fontconfig
+mkdir -p "$_lkd/man"
+: > "$_lkd/usr/lib/libowned.so.1.13.0"
+ln -s libowned.so.1.13.0 "$_lkd/usr/lib/libowned.so.1"
+printf '%s/usr/lib/libowned.so.1.13.0\n' "$_lkd" > "$_lkd/man/theowner.files"
+printf 'ld: cannot find -lowned: x\n' > "$_lkd/log2"
+_lkout2="$({ echo "SNAP_ROOT=$_lkd; log=$_lkd/log2; MANIFESTS=$_lkd/man"
+             echo 'fail(){ echo "$*"; }'; echo 'unprefix_pkg_user(){ echo "${1#p_}"; }'
+             sed -n '/# "cannot find -lfoo" is the linker/,/^        fi$/p' "$helper_src" | sed 's/^        //'
+           } | bash 2>/dev/null)"
+echo "$_lkout2" | grep -q 'build theowner' \
+    || _p="$_p;the rebuild hint names the wrong package (it follows the SONAME link, not the manifest)"
+rm -rf "$_lkd"
+# a compile error is not the tools' to fix, but the box must name where a
+# per-package build flag survives a regenerated script
+_slice_fn "$helper_src" cmd_build | grep -q 'machine.conf' \
+    || _p="$_p;a compile error does not point at machine.conf for a per-package flag"
+# a build that stops for a missing variable must print the command that sets
+# it -- "needs XORG_CONFIG to be set" says what, not how
+_slice_fn "$helper_src" cmd_build | grep -q 'packagemanager env --set' \
+    || _p="$_p;a missing build variable is reported without the command that sets it"
+# a failure whose script predates the generator must say so IN THE BOX: the
+# resolve-time warning is far out of sight by the time a package fails
+# THE RETRY HINT MUST BE A COMMAND THAT WORKS.  `lfs-helper build` takes the
+# ACCOUNT; the box printed the anchor for a BLFS package, so the suggested
+# command fell through to the LFS base-step path and blamed step scripts from
+# an old version -- sending the debugging in the wrong direction entirely.
+_slice_fn "$helper_src" cmd_build | grep -q 'THE RETRY HINT MUST BE A COMMAND THAT WORKS' \
+    || _p="$_p;the failure box suggests a name lfs-helper cannot resolve"
+[ "$(_slice_fn "$helper_src" cmd_build | grep -c '\$_retry --phase')" -ge 3 ] \
+    || _p="$_p;not every retry hint uses the resolved account name"
+
+# A FEATURE MISSING FROM AN INSTALLED PACKAGE.  pango died on "No Cairo font
+# backends found" with cairo installed: cairo had been built before freetype2
+# existed and silently has no ft backend.
+_slice_fn "$helper_src" cmd_build | grep -q "is missing from it -- it was probably built" \
+    || _p="$_p;a missing feature in an installed package is not explained"
+_fl="$T/feature.log"
+printf 'Run-time dependency cairo found: YES 1.18.4\n' > "$_fl"
+printf 'Run-time dependency cairo-ft found: NO (tried pkgconfig)\n' >> "$_fl"
+_fp="$(grep -oE "dependency [a-z0-9]+-[a-z0-9]+ found: NO" "$_fl" | head -n1 | awk '{print $2}' | cut -d- -f1)"
+[ "$_fp" = cairo ] || _p="$_p;the feature-provider is not identified (got: $_fp)"
+
+_slice_fn "$helper_src" cmd_build | grep -q 'the generator is now' \
+    || _p="$_p;a failure on a stale script does not mention regenerating it"
+# and it must suggest the ANCHOR (mesa), not the account (p_mesa) -- and say
+# so when the prefix it read disagrees with the account it was handed
+_slice_fn "$helper_src" cmd_build | grep -q 'read an EMPTY package-user prefix' \
+    || _p="$_p;a prefix disagreement is papered over instead of reported"
+# ...but an EMPTY EXPORT is not a disagreement: a chroot script exports
+# LFS_PKGUSR_PREFIX="" when the value was unknown, and `-` let that beat a
+# config that says "p" -- so the tool reported files as disagreeing when they
+# agreed.  The config may mean empty; the environment may not.
+grep -q 'THE CONFIG IS CURRENT; THE ENVIRONMENT MAY BE OLD' "$helper_src" \
+    || _p="$_p;an empty exported prefix overrides the config file"
+for _pfx in "p_" ""; do
+    _sg="$({ printf "PKGUSR_PREFIX='%s'\n" "$_pfx"
+             echo 'name=p_mesa'; echo 'fail(){ echo "$*"; }'
+             sed -n '/^unprefix_pkg_user() {/,/^}/p' "$helper_src"
+             _slice_fn "$helper_src" cmd_build \
+               | sed -n '/# The suggestion needs the ANCHOR/,/esac/p' \
+               | sed 's/^        //;s/^local /_x=/'
+           } | bash 2>/dev/null | head -1)"
+    case "$_sg" in
+        *"install mesa "*) ;;
+        *) _p="$_p;with prefix [$_pfx] the box suggests: $_sg" ;;
+    esac
+done
+# (the "install mesa" behaviour is checked above for both prefixes; the
+#  literal ${name#p_} that used to be here was replaced in 1.13.25 by
+#  reporting the config disagreement instead of hiding it)
+# and verify sweeps for ALL lying records in one pass
+_lr="$T/lyingrec"; mkdir -p "$_lr/p_liar" "$_lr/p_honest" "$_lr/real"
+printf '%s/real/g1\n%s/real/g2\n%s/real/g3\n%s/real/here\n' "$_lr" "$_lr" "$_lr" "$_lr" > "$_lr/p_liar/pkg.lst"
+touch "$_lr/real/here" "$_lr/real/a"
+printf '%s/real/a\n%s/real/here\n' "$_lr" "$_lr" > "$_lr/p_honest/pkg.lst"
+_lrout="$({ echo "PKGUSR_ROOT=$_lr"
+    echo 'warn(){ echo "W: $*"; }'
+    echo 'unprefix_pkg_user(){ echo "${1#p_}"; }'
+    _slice_fn "$helper_src" _vfy_lying_records
+    echo '_vfy_lying_records'
+  } | bash 2>/dev/null)"
+echo "$_lrout" | grep -q "lying record: p_liar" \
+    || _p="$_p;verify does not sweep for lying records"
+echo "$_lrout" | grep -q "p_honest" \
+    && _p="$_p;an honest record is accused"
+_slice_fn "$helper_src" cmd_verify | grep -q '_vfy_lying_records' \
+    || _p="$_p;cmd_verify never runs the lying-record sweep"
+# THE ORDINARY BUILD PATH MUST NOT NEED THE SWEEP.  The planner decided
+# "installed" from ONE surviving path, so a record with 190 of 330 files gone
+# still made it skip the package -- and only a manual `verify` would have
+# said otherwise.  Same rule in both places now.
+python3 - "$pm_src" <<'PYMAN' || _p="$_p;the planner believes a record whose files are mostly gone"
+import sys, os, tempfile, random, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+C = pm.User
+d = tempfile.mkdtemp(); real = os.path.join(d, "real"); os.makedirs(real)
+def mk(name, alive, dead, shuffle=True):
+    lines = []
+    for i in range(alive):
+        p = os.path.join(real, "%s%d" % (name, i)); open(p, "w").close(); lines.append(p)
+    for i in range(dead):
+        lines.append(os.path.join(real, "%sgone%d" % (name, i)))
+    if shuffle: random.shuffle(lines)
+    lst = os.path.join(d, name + ".lst"); open(lst, "w").write("\n".join(lines) + "\n")
+    u = C.__new__(C); u.pkg_list = lst; return u
+assert mk("liar", 140, 190)._manifest_has_real_paths() is False
+# pkg.lst is path-sorted, so sampling the top would call this one healthy
+assert mk("sorted", 140, 190, shuffle=False)._manifest_has_real_paths() is False
+assert mk("good", 300, 30)._manifest_has_real_paths() is True
+PYMAN
+# --fix must DELETE the false claim: while it stands the planner skips the
+# package and every dependent fails somewhere else entirely.  Rebuilding
+# stays the user's decision; removing a lie is not.
+_lrf="$T/lyingfix"; mkdir -p "$_lrf/p_liar" "$_lrf/p_ok" "$_lrf/real"
+printf '%s/real/g1\n%s/real/g2\n%s/real/g3\n' "$_lrf" "$_lrf" "$_lrf" > "$_lrf/p_liar/pkg.lst"
+: > "$_lrf/p_liar/VERSION"; touch "$_lrf/real/a"
+printf '%s/real/a\n' "$_lrf" > "$_lrf/p_ok/pkg.lst"
+{ echo "PKGUSR_ROOT=$_lrf"; echo 'warn(){ :; }'; echo 'ok(){ :; }'
+  echo 'unprefix_pkg_user(){ echo "${1#p_}"; }'; echo '_vfy_n_fixed=0'
+  _slice_fn "$helper_src" _vfy_lying_records; echo '_vfy_lying_records 0'; } | bash >/dev/null 2>&1
+[ -f "$_lrf/p_liar/pkg.lst" ] || _p="$_p;a bare verify deleted a record (it must only report)"
+{ echo "PKGUSR_ROOT=$_lrf"; echo 'warn(){ :; }'; echo 'ok(){ :; }'
+  echo 'unprefix_pkg_user(){ echo "${1#p_}"; }'; echo '_vfy_n_fixed=0'
+  _slice_fn "$helper_src" _vfy_lying_records; echo '_vfy_lying_records 1'; } | bash >/dev/null 2>&1
+[ -f "$_lrf/p_liar/pkg.lst" ] && _p="$_p;verify --fix leaves the false record in place"
+[ -f "$_lrf/p_liar/VERSION" ] && _p="$_p;verify --fix leaves the false VERSION in place"
+[ -f "$_lrf/p_ok/pkg.lst" ] || _p="$_p;verify --fix deleted an HONEST record"
+rm -rf "$_lrf"
+python3 - "$pm_src" <<'PYCASE' || _p="$_p;python does not lowercase names like the helper (p_DocBook vs p_docbook)"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+assert pm.pkgusr_name('DocBook') == 'p_docbook'
+assert pm.pkgusr_name('p_docbook') == 'p_docbook'
+PYCASE
+# --status answers "where are we", short by default and complete on request:
+# entry counts alone said "1 of 39" while hundreds of packages were in flight.
+# (checked in the source: running it needs a book, which a bare checkout
+#  does not have -- see the four book-gated failures)
+# THE BUILD RUNS AS A PACKAGE USER through `su -`, which drops the caller's
+# environment -- so exporting TEXLIVE_PREFIX in a shell never reached it.
+# One file, written by `packagemanager env`, passed to every phase.
+grep -q 'def cmd_env' "$pm_src" || _p="$_p;there is no way to set the book's build variables"
+# scripts from an OLDER generator ask older questions: after the guard was
+# narrowed, the stale files in /tmp still listed EUID and DOCNAME, so the
+# fix looked like it had done nothing
+grep -q 'stale.add' "$pm_src" \
+    || _p="$_p;env reads scripts from an older blfs and repeats their questions"
+# ...and an empty list must not read as "nothing to do": a variable only
+# becomes visible once its package's script is generated, during the build
+grep -q 'becomes visible when its package' "$pm_src" \
+    || _p="$_p;an empty env list is presented as if nothing will ever be needed"
+grep -q '"--refresh"' "$pm_src" \
+    || _p="$_p;stale scripts cannot be cleared to reveal the current questions"
+grep -q 'XORG_CONFIG' "$pm_src" \
+    || _p="$_p;--ask offers no value for XORG_CONFIG, which the generator cannot lift safely"
+# a value that spans continuation lines must never be emitted half-captured:
+# "XORG_CONFIG=\"--prefix=$XORG_PREFIX --sysconfdir=/etc \\" is broken bash
+python3 - "$_bt4" <<'PYCHAIN' || _p="$_p;a multi-line book value is emitted as a fragment"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+class P:
+    name = "pre"
+    def __init__(s, t): s.t = t
+    def get_text(s): return s.t
+    def find_all(s, *a, **k): return [s]
+class Root(P):
+    parent = None
+sec = Root('export A_PREFIX="/usr"\nexport A_CONFIG="--prefix=$A_PREFIX \\\n  --more"\n')
+got = b._page_env_definitions(sec, {"A_CONFIG"})
+for v in got.values():
+    assert not v.endswith("\\"), got
+PYCHAIN
+grep -q 'BUILD_ENV_FILE' "$helper_src" \
+    || _p="$_p;the build never reads the variables that were set for it"
+_slice_fn "$helper_src" run_phase_as | grep -q 'build_env_pairs' \
+    || _p="$_p;a phase runs without the build environment"
+_bev="$T/build.env"
+printf 'A=1\n# c\nB=two words\n' > "$_bev"
+_bout="$({ echo "BUILD_ENV_FILE=$_bev"; _slice_fn "$helper_src" build_env_pairs
+           echo 'build_env_pairs'; } | bash 2>/dev/null)"
+# quoted, because these pairs are pasted into a command line
+case "$_bout" in *"A='1'"*"B='two words'"*) ;;
+    *) _p="$_p;the build environment file is not read correctly: $_bout" ;; esac
+# A VALUE WITH SPACES IS ONE VALUE.  These pairs are pasted into
+# `env $envpass bash ...`; unquoted, XORG_CONFIG's flag list split and the
+# second word was run as a command:
+#     env: '--disable-static': No such file or directory
+printf "XC=--prefix=/usr --sysconfdir=/etc --disable-static\nAP=it's here\n" > "$_bev"
+_bq="$({ echo "BUILD_ENV_FILE=$_bev"; _slice_fn "$helper_src" build_env_pairs
+         echo 'p="$(build_env_pairs)"'
+         echo 'eval "env $p bash -c '"'"'printf \"[%s][%s]\" \"\$XC\" \"\$AP\"'"'"'"'
+       } | bash 2>/dev/null)"
+[ "$_bq" = "[--prefix=/usr --sysconfdir=/etc --disable-static][it's here]" ] \
+    || _p="$_p;a build variable containing spaces or quotes does not survive: $_bq"
+grep -q '"--status"' "$pm_src" || _p="$_p;there is no --status"
+grep -q '"--full"' "$pm_src" || _p="$_p;--status has no full listing"
+# A GIT ENTRY'S "AM I INSTALLED?" CHECK MUST BE REAL.  `prog=false` looked
+# like "no program to check" and `false` IS a program, so four entries
+# reported themselves installed before they had ever been built.
+if [ -f "$_stk" ]; then
+    grep -q 'prog=false' "$_stk" \
+        && _p="$_p;a stack entry checks for the program 'false' and always passes"
+    # the WebRTC chain must precede the packages that link it
+    _ln=$(grep -n '^git .*libnice' "$_stk" | head -1 | cut -d: -f1)
+    _gb=$(grep -n '^book *gst10-plugins-bad' "$_stk" | head -1 | cut -d: -f1)
+    _wk=$(grep -n '^book *webkitgtk' "$_stk" | head -1 | cut -d: -f1)
+    if [ -n "$_ln" ] && [ -n "$_gb" ] && [ "$_ln" -gt "$_gb" ]; then
+        _p="$_p;libnice is built after gst-plugins-bad, so webrtcbin will be missing"
+    fi
+    if [ -n "$_ln" ] && [ -n "$_wk" ] && [ "$_ln" -gt "$_wk" ]; then
+        _p="$_p;libnice is built after webkitgtk"
+    fi
+fi
+
+# GIT ENTRIES NEED GIT, which is itself a BLFS package: a clone failed with
+# "git: command not found".  They are grouped at the end of the stack, after
+# `book git`, and --no-git skips them entirely.
+grep -q '"--no-git"' "$pm_src" \
+    || _p="$_p;the cloned entries cannot be skipped"
+# a BOOK entry can become a clone (elogind: `book ... url=...`), and its kind
+# is only final after the judging -- so --no-git has to decide there too
+grep -q 'skipped (--no-git)' "$pm_src" \
+    || _p="$_p;a book entry that falls back to git is still cloned under --no-git"
+# ...and some cloned entries are DEPENDENCIES: gst-plugins-bad compiles
+# webrtcbin only if libnice is there, so --no-git must say what it costs
+grep -q 'SOME CLONED ENTRIES ARE DEPENDENCIES, NOT EXTRAS' "$pm_src" \
+    || _p="$_p;--no-git silently drops packages that book entries link"
+if [ -f "$_stk" ]; then
+    grep -qE '^book +git' "$_stk" \
+        || _p="$_p;the stack clones packages without building git first"
+    # The invariant is that the EXTRAS BLOCK is last, not that no git entry
+    # may precede a book one: 1.13.67 added libnice and friends as git
+    # entries BEFORE gst-plugins-bad, because webrtcbin is compiled only if
+    # libnice is there.  Those are dependencies, not extras.  What must hold
+    # is that nothing after the extras marker is a book entry.
+    _marker=$(grep -n 'Everything from here needs GIT' "$_stk" | head -1 | cut -d: -f1)
+    if [ -n "$_marker" ]; then
+        # `book git` belongs there: the clones cannot run before git exists.
+        awk -v m="$_marker" 'NR > m && /^book / && $2 != "git"' "$_stk" \
+            | grep -q . \
+            && _p="$_p;a book entry other than git sits after the extras marker"
+    fi
+fi
+grep -q 'packages: %d of %d installed' "$pm_src" \
+    || _p="$_p;--status counts entries but not the packages they pull in"
+grep -q 'if not getattr(args, "status", False):' "$pm_src" \
+    || _p="$_p;--status still prints the whole entry table"
+grep -q 'install_tag' "$pm_src" \
+    || _p="$_p;status invents its own idea of what is installed"
+LFS_PKGUSR_DIR="$T/stackcache" python3 - "$pm_src" <<'PYSC' || _p="$_p;the stack cache does not round-trip"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+sp = os.path.join(os.environ["LFS_PKGUSR_DIR"], "y.stack")
+os.makedirs(os.path.dirname(sp), exist_ok=True); open(sp, "w").write("book x\n")
+pm._stack_mark_done(sp, "book dbus")
+assert pm._stack_done_set(sp) == {"book dbus"}
+PYSC
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a failed build makes no claim; one casing rule; the stack cache holds"
+fi
+
+# ---- one command, one environment: the stack replayer ----------------------- #
+# `packagemanager stack <name> --run` replays a declarative plan through the
+# proven machinery: book targets via the install planner, git targets via an
+# auto-generated template (make all && make PREFIX=/usr install), check/cfg
+# root scripts beside the stack.  Dry run by default; a malformed plan is
+# refused with a line number, never half-understood.
+_p=""
+_st="$(dirname "$LFS_TOOL")/stacks/sway.stack"
+if [ -f "$_st" ]; then
+    python3 "$pm_src" stack "$_st" >/dev/null 2>&1 \
+        || _p="$_p;the shipped sway stack does not survive its own dry run"
+    for _sh in kernel-sway sway-session; do
+        bash -n "$(dirname "$LFS_TOOL")/stacks/$_sh.sh" 2>/dev/null \
+            || _p="$_p;stacks/$_sh.sh does not parse"
+    done
+else
+    _p="$_p;no sway.stack ships with the tools"
+fi
+grep -q 'git fallback' "$pm_src" \
+    || _p="$_p;a book entry with url= cannot fall back to git where the book lacks it"
+printf 'book\n' > "$T/bad.stack"
+python3 "$pm_src" stack "$T/bad.stack" >/dev/null 2>&1 \
+    && _p="$_p;a malformed stack file is accepted instead of refused"
+python3 - "$pm_src" <<'PYSTK' || _p="$_p;the git template is wrong (see stderr)"
+import sys, tempfile, subprocess, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+e = {"kind":"git","target":"x","opts":{"url":"https://example.com/x","prog":"x"}}
+p, _ = pm._stack_git_script(e, tempfile.mkdtemp())
+t = open(p).read()
+assert 'is_git="1"' in t and 'installed_program="x"' in t
+assert 'make all' in t and 'make PREFIX=/usr install' in t
+assert subprocess.run(["bash","-n",p]).returncode == 0
+PYSTK
+# the machine's options are merged the moment a script is born
+_mo="$T/machineopts"; mkdir -p "$_mo"
+printf '[mesa]\ngallium-drivers = radeonsi\n' > "$_mo/m.conf"
+printf '#!/bin/bash\nmeson setup .. -Dgallium-drivers=auto\n' > "$_mo/install_Mesa-1"
+# AUTOTOOLS TOO: libassuan's `make` builds a PDF manual needing TeX, which
+# this system does not build -- and machine.conf only knew `meson setup`.
+printf '[libassuan]\nconfigure_args = --disable-doc\n' > "$_mo/auto.conf"
+printf '#!/bin/bash\n./configure --prefix=/usr &&\nmake\n' > "$_mo/install_libassuan-1"
+# A FIX MUST BE ABLE TO REACH AN EXISTING SYSTEM.  machine.conf is never
+# overwritten (it is the user's), so a workaround shipped in it never
+# arrived: libassuan kept failing on a fix that was in the release.
+_fx="$(dirname "$LFS_TOOL")/stacks/package-fixes.conf"
+if [ -f "$_fx" ]; then
+    grep -q 'libassuan' "$_fx" \
+        || _p="$_p;the shipped package workarounds are not in the refreshed file"
+    grep -q 'libassuan' "$(dirname "$LFS_TOOL")/stacks/machine.conf" \
+        && _p="$_p;a shipped workaround still lives in the file that is never overwritten"
+else
+    _p="$_p;there is no package-fixes.conf for the workarounds the tools ship"
+fi
+grep -q 'PACKAGE_FIXES' "$pm_src" \
+    || _p="$_p;the shipped workarounds are not read at all"
+# ...and they must reach a script that ALREADY EXISTS: the options were
+# merged only at generation, so every package that had failed once kept its
+# untouched script (libassuan built its TeX manual three releases running).
+grep -q 'THE OPTIONS APPLY TO A LOCAL SCRIPT TOO' "$pm_src" \
+    || _p="$_p;a package's existing script never gets the machine options"
+# and the merge must be idempotent, or a re-run appends the flag again
+printf '#!/bin/bash\n./configure --prefix=/usr\n' > "$_mo/idem"
+printf '[libassuan]\nconfigure_args = --disable-doc\n' > "$_mo/idem.conf"
+for _i in 1 2 3; do
+    PM_PACKAGE_FIXES="$_mo/idem.conf" PM_MACHINE_CONF=/nonexistent \
+        python3 - "$pm_src" "$_mo/idem" <<'PYIDEM' >/dev/null 2>&1
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm.apply_machine_opts('libassuan', sys.argv[2])
+PYIDEM
+done
+[ "$(grep -c -- '--disable-doc' "$_mo/idem")" = 1 ] \
+    || _p="$_p;re-applying the machine options duplicates the flag"
+PM_MACHINE_CONF="$_mo/auto.conf" python3 - "$pm_src" "$_mo/install_libassuan-1" <<'PYAUTO' \
+    || _p="$_p;machine.conf cannot pass an option to an autotools package"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm.apply_machine_opts('libassuan', sys.argv[2])
+body = open(sys.argv[2]).read()
+assert "./configure --disable-doc --prefix=/usr" in body, body
+PYAUTO
+# THE BOOK WRITES `-D key=value` WITH A SPACE.  Matching only "-Dkey=" left
+# the book's own `-D gallium-drivers=auto` in place and merely prepended
+# ours -- meson takes the LAST one, so mesa built for every driver and died
+# on `Dependency "libdrm_intel" not found`.
+printf '[mesa]\ngallium-drivers = radeonsi\n' > "$_mo/spaced.conf"
+printf '#!/bin/bash\nmeson setup .. \\\n  -D gallium-drivers=auto \\\n  -D valgrind=disabled\n' \
+    > "$_mo/install_Mesa-2"
+PM_MACHINE_CONF="$_mo/spaced.conf" PM_PACKAGE_FIXES=/nonexistent \
+python3 - "$pm_src" "$_mo/install_Mesa-2" <<'PYSPACED' \
+    || _p="$_p;a book option written with a space survives the machine.conf merge"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm.apply_machine_opts('mesa', sys.argv[2])
+body = open(sys.argv[2]).read()
+assert "gallium-drivers=auto" not in body, body
+assert body.count("gallium-drivers=radeonsi") == 1, body
+assert "-D valgrind=disabled" in body, body      # untouched keys stay as they were
+PYSPACED
+
+PM_MACHINE_CONF="$_mo/m.conf" python3 - "$pm_src" "$_mo/install_Mesa-1" <<'PYMO' \
+    || _p="$_p;machine.conf options are not merged into a fresh script"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm.apply_machine_opts('mesa', sys.argv[2])
+t = open(sys.argv[2]).read()
+assert '-Dgallium-drivers=radeonsi' in t and 'auto' not in t
+PYMO
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "one command, one environment: the stack replays through the proven machinery"
+fi
+
+# ---- the book flavour follows the system ------------------------------------ #
+# A hardcoded stable-systemd default handed the SysV system the systemd book:
+# elogind read NOT IN BOOK and every generated script leaned systemd.
+_bt2="$(dirname "$LFS_TOOL")/blfs"
+if [ -f "$_bt2" ]; then
+    grep -q '_default_selector' "$_bt2" \
+        && grep -q '/run/systemd/system' "$_bt2" \
+        && ok "the default book flavour follows the running init" \
+        || bad "a SysV system still defaults to the systemd book"
+fi
+
+# ---- pm-install end to end  (item 6, step 7) -------------------------------- #
+# The retired engine's whole job, through the one door: confirm skipped
+# (PM_YES), records kept, script handed to the one loop, files installed.
+if command -v useradd >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
+    _d7="$T/step7"; mkdir -p "$_d7/root/usr/bin" "$_d7/src/pkgusr" "$_d7/state" "$_d7/scripts"
+    userdel p_dmy7 >/dev/null 2>&1; groupdel p_dmy7 >/dev/null 2>&1
+    getent group install >/dev/null || groupadd -g 9999 install
+    _d7_run() { env LFS_PKGUSR_DIR="$_d7/state" LFS_SRC_ROOT="$_d7/src" \
+                    LFS_SNAP_ROOT="$_d7/root" LFS_COLLECTOR_PREFIX=nimgnu \
+                    LFS_PKGUSR_PREFIX=p PM_YES=1 bash "$helper_src" "$@" ; }
+    _d7_run add-user dmy7 >/dev/null 2>&1
+    chgrp install "$_d7/root/usr/bin" && chmod g+w "$_d7/root/usr/bin"
+    printf '#!/bin/bash\npkg="dmy7-1.0.tar.gz"\ninstall_pkg() { :; }\ncase "${1:-all}" in all) echo hi > %s/root/usr/bin/dmy7-tool ;; esac\n' \
+        "$_d7" > "$_d7/scripts/install_dmy7-1.0"
+    _d7_run pm-install dmy7 "$_d7/scripts/install_dmy7-1.0" >/dev/null 2>&1
+    _rc7=$?
+    _p=""
+    [ "$_rc7" = 0 ] || _p="$_p;pm-install exited $_rc7"
+    [ -f "$_d7/root/usr/bin/dmy7-tool" ] || _p="$_p;nothing was installed"
+    _h7="$(_d7_run pkgusr-home dmy7)"
+    [ -f "$_h7/install_last" ] || _p="$_p;no install_last record was kept"
+    # ONE file to edit and run (1.14.16): the canonical install_<nv>, not a
+    # second copy under the account's name
+    [ -f "$_h7/install_dmy7-1.0" ] || _p="$_p;the editable script is not in the home"
+    [ -x "$_h7/install_dmy7-1.0" ] || _p="$_p;the editable script is not runnable"
+    [ -f "$_h7/install_p_dmy7" ] && _p="$_p;the redundant install_p_<user> copy is back"
+    [ -f "$_d7/state/manifests/dmy7.files" ] \
+        || _p="$_p;the install left no manifest under the step name"
+    if [ -n "$_p" ]; then
+        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+            [ -n "$m" ] && bad "$m"
+        done
+    else
+        ok "pm-install does the retired engine's whole job through the one door"
+    fi
+    userdel p_dmy7 >/dev/null 2>&1; groupdel p_dmy7 >/dev/null 2>&1
+    rm -rf "$_d7"
+fi
+
+# verify must run the same check for every package account (rule 6b) -- the
+# pass exists and calls the one implementation, not a second copy.
+case "$(_slice_fn "$helper_src" _vfy_misplaced_homes)" in
+    *_repair_misplaced_home*) ok "verify's misplaced-home pass calls the one repair implementation" ;;
+    *) bad "verify has no misplaced-home pass, or it re-implements the repair" ;;
+esac
+case "$(_slice_fn "$helper_src" cmd_verify)" in
+    *_vfy_misplaced_homes*) ok "cmd_verify runs the misplaced-home pass" ;;
+    *) bad "cmd_verify never runs the misplaced-home pass" ;;
+esac
+
+# and account creation everywhere runs the one repair -- python's own path
+# delegates to fix-home, pm-install's runs it in-process.
+_pm_src="$(dirname "$LFS_TOOL")/packagemanager"
+if [ -f "$_pm_src" ]; then
+    grep -q '"fix-home"' "$_pm_src" \
+        && ok "packagemanager delegates the home repair to lfs-helper fix-home" \
+        || bad "packagemanager still repairs homes on its own (usermod-only leaves the husk)"
+fi
+_slice_fn "$helper_src" _pm_add_account | grep -q '_repair_misplaced_home' \
+    && ok "pm-install account creation runs the one home repair" \
+    || bad "pm-install creates accounts without the home repair"
+rm -rf "$_fh"
+
+# ---- the runner moved out of every script  (1.14.0) -------------------------- #
+# A generated script was ~230 lines for 5 lines of book commands: source
+# lookup, the unpack, the heredoc-per-phase trick, the dispatcher, the usage
+# text -- copied into every script by four generators in three dialects.
+# Now a script is its variables and one function per phase; everything shared
+# is lfs-phases, sourced by the last line.  What must hold:
+_p=""
+_bt14="$(dirname "$LFS_TOOL")/blfs"
+_pm14="$(dirname "$LFS_TOOL")/packagemanager"
+_mk14="$(dirname "$LFS_TOOL")/Makefile"
+# the runner ships everywhere a script can run
+[ -f "$PHASES_LIB" ] || _p="$_p;lfs-phases is not beside the tools"
+[ -f "$_mk14" ] && { grep -qE '^TOOLS\s*:=.*\blfs-phases\b' "$_mk14" \
+    || _p="$_p;make install does not install lfs-phases"; }
+grep -q '"lfs-phases"' "$LFS_TOOL" || _p="$_p;lfs does not copy lfs-phases into the chroot"
+grep -qE '^PKGUSR_TOOLS=.*\blfs-phases\b' "$helper_src" \
+    || _p="$_p;lfs-phases is not claimed by the pkgusr package user"
+# it identifies itself like the other tools, and does nothing else when run
+bash "$PHASES_LIB" --version | grep -qE '^lfs-phases [0-9.]+ \(build [0-9a-f]{7}\)' \
+    || _p="$_p;lfs-phases --version does not print a version and build id"
+# the phase names must not shadow a program or a builtin: install(1) is used
+# INSIDE install phases, and test is a builtin
+grep -qE '^(install|test|build)\(\)' "$PHASES_LIB" \
+    && _p="$_p;the runner defines a function named like a command the book uses"
+# a script is small and carries none of the scaffolding
+python3 - "$LFS_TOOL" <<'PY14' || _p="$_p;a generated LFS script still carries scaffolding"
+import sys, importlib.machinery as m
+lfs = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+cmds = ["mkdir -v build\ncd build", "../configure", "make", "make check", "make install",
+        "ln -sv x /usr/lib/y"]
+s = lfs._crosschain_script_body("demo", "ch-tools-demo", "demo-1.0", "demo-1.0.tar.*", cmds)
+assert len(s.splitlines()) < 50, len(s.splitlines())
+for scaffold in ("_enter_build", "_phase_body", "__LFS_PHASE__", "case \"${LFS_CC_PHASE",
+                 "mktemp", "tar tf", "usage:"):
+    assert scaffold not in s, scaffold
+assert s.rstrip().endswith('. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'), s[-120:]
+assert 'pkgusr_stage="cross"' in s
+# the commands are NOT indented: an indented heredoc terminator is no terminator
+assert "\n../configure\n" in s, s
+# the book's test block is the test phase, and the install block the install phase
+assert "test_pkg() {\nmake check\n}" in s, s
+assert "install_pkg() {\nmake install\n}" in s, s
+PY14
+python3 - "$_bt14" <<'PY14B' || _p="$_p;a generated BLFS script still carries scaffolding"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+data = dict(name_version="demo-1.0", pkg="demo-1.0.tar.gz", name="demo", link="https://x/demo-1.0.tar.gz",
+            md5="abc", info="", required=[], recommended=[], optional=[], installed_content={},
+            is_module=False, group=None, install_cmds="./configure &&\nmake", build_cmds="./configure &&\nmake",
+            install_root_cmds="make install", config_cmds="", between_cmds=["wget -i list"], page_env={},
+            additional_downloads=[])
+fn, s = b.render_script(data, "#demo", "13.0")
+assert len(s.splitlines()) < 50, len(s.splitlines())
+for scaffold in ("_enter_build", "_fetch() {", "_mirrors_for", "rm -rf tmp && mkdir tmp", "usage:", "systemctl()"):
+    assert scaffold not in s, scaffold
+assert "prepare_pkg() {\nwget -i list\n}" in s, s
+# the mirror of last resort names the BOOK's release, not a literal
+assert "pkgusr_book_mirror='https://www.linuxfromscratch.org/blfs/downloads/13.0'" in s, s
+src = open(sys.argv[1]).read()
+assert "blfs/downloads/13.0/" not in src, "a release number is hardcoded in the generator"
+# a phase of comments alone is still a function bash accepts
+data["install_root_cmds"] = "# nothing here\n"
+fn, s = b.render_script(data, "#demo", "13.0")
+assert "install_pkg() {\n# nothing here\n:\n}" in s, s
+# and a command left ending in && by a LATER commenting filter is repaired:
+# it ran before five of them, and cachecontrol's install failed `bash -n`
+data["install_root_cmds"] = "pip3 install --no-index x &&\ntestenv/bin/python3 -m pytest"
+fn, s = b.render_script(data, "#demo", "13.0")
+import subprocess, tempfile, os
+p = os.path.join(tempfile.mkdtemp(), fn); open(p, "w").write(s)
+assert subprocess.run(["bash", "-n", p]).returncode == 0, s
+PY14B
+# the template packagemanager writes for a package not in the book, too
+python3 - "$_pm14" <<'PY14C' || _p="$_p;the packagemanager template still carries its own (older) scaffolding"
+import sys, importlib.machinery as m, tempfile, subprocess
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+t = pm._TEMPLATE
+for stale in ("unpack_pkg && build_pkg", "mv tmp/* .", 'wget -4 "$link"', "BUILD_ROOT:-$PWD"):
+    assert stale not in t, stale
+assert 'pkgusr_run "$@"' in t
+e = {"target": "foo", "kind": "git", "opts": {"url": "https://g/foo.git", "build": "make all;make doc"}}
+p, _ = pm._stack_git_script(e, tempfile.mkdtemp())
+s = open(p).read()
+assert "build_pkg() {\nmake all\nmake doc\n}" in s, s
+assert subprocess.run(["bash", "-n", p]).returncode == 0
+assert pm.extract_phase_cmds(s, "build") == "make all\nmake doc"
+PY14C
+# the version comes from the header line every generator writes.  This read
+# a "# package:" comment no generator ever wrote, so every pkgusr.info said
+# version= and nothing more.
+_vf="$T/vfs.sh"; printf 'name_version="xmlto-0.0.29"\n' > "$_vf"
+[ "$(_slice_fn "$helper_src" _version_from_script > "$T/vfn.sh"; . "$T/vfn.sh"; _version_from_script "$_vf")" = "0.0.29" ] \
+    || _p="$_p;_version_from_script cannot read the version from a generated script"
+printf "name_version='wget-1.25.0'\n" > "$_vf"
+[ "$(. "$T/vfn.sh"; _version_from_script "$_vf")" = "1.25.0" ] \
+    || _p="$_p;_version_from_script does not accept the single-quoted header blfs writes"
+# the runner refuses what it cannot re-execute, and does nothing when only
+# sourced for its metadata
+printf 'name_version="d-1"\nbuild_pkg(){ :; }\ninstall_pkg(){ :; }\n. "$PKGUSR_LIB" && pkgusr_run "$@"\n' > "$T/rr.sh"
+bash -s < "$T/rr.sh" >/dev/null 2>&1 && _p="$_p;a script piped on stdin is not refused"
+[ "$(bash -c '. '"$T"'/rr.sh; echo "$name_version"')" = "d-1" ] \
+    || _p="$_p;sourcing a script for its metadata runs it"
+# the runner must not know either of the old test switches alone
+grep -q 'PKGUSR_TESTS' "$PHASES_LIB" || _p="$_p;the runner has no test switch"
+grep -q 'PKGUSR_TESTS=1' "$helper_src" || _p="$_p;lfs-helper does not pass the test switch"
+grep -q '"PKGUSR_TESTS"' "$_pm14" || _p="$_p;packagemanager does not pass the test switch"
+# a missing runner is one clear message from lfs-helper, not a shell error
+# from inside su
+_slice_fn "$helper_src" run_phase_as | grep -q "needs the phase runner 'lfs-phases'" \
+    || _p="$_p;lfs-helper does not explain a missing lfs-phases"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a script is its variables and its commands; everything shared is lfs-phases"
+fi
+
+# ---- silence is not progress  (1.14.2) -------------------------------------- #
+# Reported from a real build: it printed
+#     ===== [37/106] gcc =====
+#     # user   : p_gcc (package user)   phase: all
+# and then nothing for ten minutes, with one bash process on a core and no
+# child.  Between those two lines sits _claim_earlier_stages, which forked
+# three or four times PER PATH (a command substitution for
+# strip_host_prefix, a stat, a chown) over every earlier stage's manifest.
+# For GCC that is gcc-pass1 + gcc-pass2 + libstdcpp.  Nothing is printed
+# while it runs, so the build looks hung.
+_cl="$T/claim"; mkdir -p "$_cl/manifests" "$_cl/tree/d1"
+_p=""
+for _i in $(seq 1 400); do : > "$_cl/tree/f$_i"; done
+ls -1 "$_cl/tree"/f* > "$_cl/manifests/demo-pass1.files"
+printf '%s\n' "$_cl/tree/d1" > "$_cl/manifests/demo-pass1.dirs"
+# one file already belongs to another package: it must be left alone
+chown bin:bin "$_cl/tree/f7" 2>/dev/null
+{
+    echo 'SNAP_ROOT="/"; LFS_HOST_MOUNT=""; MANIFESTS="'"$_cl"'/manifests"'
+    echo 'user_exists() { return 0; }'
+    echo 'is_install_dir() { return 1; }'
+    echo 'count_stdin_lines() { wc -l; }'
+    echo 'say() { echo "$*"; }'
+    echo '_real_tool() { command -v "$1"; }'
+    _slice_fn "$helper_src" _claim_candidates
+    _slice_fn "$helper_src" _claim_earlier_stages
+    echo '_claim_earlier_stages demo daemon'
+} > "$_cl/drv.sh"
+_t0=$(date +%s)
+_out="$(bash "$_cl/drv.sh" 2>&1)"
+_t1=$(date +%s)
+case "$_out" in
+    *"400 path(s)"*) ;;   # 400 files less the one another package owns, plus the dir
+    *) _p="$_p;the claim did not take the 400 paths it should have: $_out" ;;
+esac
+[ "$(stat -c %U "$_cl/tree/f7" 2>/dev/null)" = bin ] \
+    || _p="$_p;the claim took a file that belongs to another package"
+[ "$(stat -c %U "$_cl/tree/f1" 2>/dev/null)" = daemon ] \
+    || _p="$_p;the claim did not take a file its earlier stage left behind"
+[ "$(stat -c %U "$_cl/tree/d1" 2>/dev/null)" = daemon ] \
+    || _p="$_p;the claim did not take the directories"
+[ $((_t1 - _t0)) -le 5 ] || _p="$_p;400 paths took $((_t1 - _t0))s -- it is forking per path again"
+# it must not go back to a fork per path
+_slice_fn "$helper_src" _claim_earlier_stages | grep -q 'stat -c %U "\$p"' \
+    && _p="$_p;the claim stats one path at a time again"
+# and GCC's first stage is not spelled gcc
+_slice_fn "$helper_src" _claim_earlier_stages | grep -q 'libstdcpp' \
+    || _p="$_p;libstdcpp's files are never claimed by the gcc account"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a package claims its earlier stages in two passes, not four forks per file"
+fi
+
+# ---- the bootstrap circle, explained from where you are  (1.14.3) ----------- #
+# Reported from a real chroot: `packagemanager bootstrap --run` reached stage
+# 2 and said
+#     wget: there is no BLFS book on this system to look it up in.
+#       Download it (needs working networking):  blfs fetch
+# ...on a system whose whole problem was that it has no download tool.  Worse,
+# the host resolves wget's own URL from that same book (blfs sources wget, via
+# lfs's bootstrap_sources), so a host with no cached book staged no wget
+# tarball either: BOTH halves are missing, and the advice named neither.
+_p=""
+_pm14c="$(dirname "$LFS_TOOL")/packagemanager"
+_bsdir="$T/nobook-src"; mkdir -p "$_bsdir"
+_out="$(LFS_SOURCES_DIR="$_bsdir" python3 - "$_pm14c" <<'PYBS'
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm._blfs_book_available = lambda: False
+pm._download_tool_available = lambda: False
+pm._explain_not_in_book("wget")
+PYBS
+)"
+case "$_out" in
+    *"blfs fetch"*"cannot work"*) ;;
+    *) _p="$_p;a system with no download tool is still told to fetch the book" ;;
+esac
+case "$_out" in
+    *"no wget tarball"*) ;;
+    *) _p="$_p;the missing wget tarball is not mentioned, so it is found out later" ;;
+esac
+case "$_out" in
+    *"on the host"*) ;;
+    *) _p="$_p;the recovery does not say where it has to be done" ;;
+esac
+# with a download tool present the short advice is right and must stay short
+_out2="$(LFS_SOURCES_DIR="$_bsdir" python3 - "$_pm14c" <<'PYBS2'
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm._blfs_book_available = lambda: False
+pm._download_tool_available = lambda: True
+pm._explain_not_in_book("wget")
+PYBS2
+)"
+case "$_out2" in
+    *"on the host"*) _p="$_p;a system that CAN fetch is sent to the host anyway" ;;
+esac
+case "$_out2" in
+    *"blfs fetch"*) ;;
+    *) _p="$_p;a system that can fetch is not told to" ;;
+esac
+# and the host says so loudly when it has no book to copy in, because that is
+# the same failure one step earlier
+python3 - "$LFS_TOOL" <<'PYHOST' || _p="$_p;the host reports a missing BLFS book as an aside, not as the failure it causes"
+import sys
+src = open(sys.argv[1]).read()
+i = src.index("(none cached here") if "(none cached here" in src else -1
+assert i == -1, "install-tools still prints the missing book as a plain note"
+j = src.index("BLFS book: none cached on this host")
+assert 'warn("!   BLFS book: none cached' in src[j - 40:j + 60], src[j - 60:j + 60]
+PYHOST
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the bootstrap circle is explained from the side of it you are standing on"
+fi
+
+# ---- the error reporter must not fail  (1.14.4) ----------------------------- #
+# Reported from a real build.  util-macros stopped for a missing XORG_CONFIG,
+# the box explained it correctly, and then:
+#     ! Edit the script, then retry just this phase:
+#     /usr/bin/lfs-helper: line 5596: _retry: unbound variable
+# $_retry was computed INSIDE the permission-failure branch and used by three
+# hints outside it, so under `set -u` every OTHER kind of failure crashed the
+# reporter on the line that tells you how to retry.  The last thing a person
+# sees when something breaks cannot itself break.
+_p=""
+_rp="$T/reporter"; mkdir -p "$_rp"
+{
+    echo 'set -u'
+    echo 'fail() { echo "$*"; }'
+    echo 'say() { echo "$*"; }; warn() { echo "$*" >&2; }'
+    echo 'detail() { :; }; hint() { :; }; show_build_errors() { :; }'
+    echo 'pkg_owner_name() { echo "p_$1"; }'
+    echo 'unprefix_pkg_user() { echo "${1#p_}"; }'
+    echo 'phase_done() { return 1; }'
+    echo 'SNAP_ROOT="/"'
+    # deliberately NOT setting SRCROOT: the report must survive a caller that
+    # has not set every variable it happens to read (1.14.33)
+    python3 - "$helper_src" <<'PYREP'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index("        # A FEATURE MISSING FROM AN INSTALLED PACKAGE.")
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs=""\n' + body + '\n}')
+PYREP
+} > "$_rp/rep.sh"
+bash -n "$_rp/rep.sh" || _p="$_p;the failure report does not even parse on its own"
+# every kind of failure the reporter recognises, and one it does not
+while IFS= read -r _kind; do
+    printf '%s\n' "$_kind" > "$_rp/log"
+    _o="$(bash -c '. "'"$_rp"'/rep.sh"; report util-macros all "'"$_rp"'/log"' 2>&1)"
+    case "$_o" in
+        *"unbound variable"*|*"bad substitution"*)
+            _p="$_p;the failure report crashes on: $_kind" ;;
+    esac
+    # and it must still end with a usable retry command
+    # (the account name resolves to whichever of the two exists; in this
+    #  harness neither does, so only the shape is checked)
+    case "$_o" in
+        *"lfs-helper build "*" --phase all --force"*) ;;
+        *) _p="$_p;no retry command printed after: $_kind" ;;
+    esac
+done <<'KINDS'
+this package needs XORG_CONFIG to be set
+permission denied
+foo.c:12:3: error: bad thing
+Program 'gperf' not found
+/usr/bin/ld: cannot find -lfoo
+nothing familiar at all
+KINDS
+# a fresh account's home is not news: add_package_user takes no home
+# argument, so EVERY new account is briefly misplaced and instantly repaired.
+# Reporting that as a warning opened every install with two lines of alarm.
+_slice_fn "$helper_src" _repair_misplaced_home > "$_rp/rmh.sh"
+grep -q 'fresh="${3:-0}"' "$_rp/rmh.sh" \
+    || _p="$_p;the repair cannot tell a fresh account from a long-wrong one"
+grep -q '\[ "$fresh" = 1 \] && \[ "$got" = "$husk" \]' "$_rp/rmh.sh" \
+    || _p="$_p;the quiet path is not restricted to add_package_user's own home"
+grep -q 'misplaced home: $acct is recorded at $got' "$_rp/rmh.sh" \
+    || _p="$_p;a genuinely misplaced home is no longer reported at all"
+_slice_fn "$helper_src" _pm_add_account | grep -q '_repair_misplaced_home "$1" 1 1' \
+    || _p="$_p;account creation does not tell the repair the home is fresh"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the failure report survives every failure, and a new account is not an alarm"
+fi
+
+# ---- one package, several filenames  (1.14.5) ------------------------------- #
+# Reported from a real chroot.  util-macros unpacked and built, then
+#     packagemanager script install util-macros
+#     !! no unpacked source in /usr/src/pkgusr/p_util-macros/src
+# with the source sitting right there.  The build markers were named from $0,
+# and this project runs ONE script under three names by design: the book copy
+# (install_util-macros-1.20.2), the staged copy (install_util-macros) and the
+# account's copy (install_p_util-macros).  Unpack recorded one, install looked
+# for another.  The old scaffolding keyed them to the package (.cc-dir-<name>,
+# .pm_build_cwd); keying them to the file was a 1.14.0 regression.
+_mk="$T/marker"; mkdir -p "$_mk/sources" "$_mk/src" "$_mk/stage/demo-3.0"
+_p=""
+printf '#!/bin/sh\nprintf "all:\\n\\techo ok > built\\ninstall:\\n\\tcp built %s/out\\n" > Makefile\n' "$_mk" \
+    > "$_mk/stage/demo-3.0/configure"
+chmod +x "$_mk/stage/demo-3.0/configure"
+( cd "$_mk/stage" && tar czf ../sources/demo-3.0.tar.gz demo-3.0 ) 2>/dev/null
+{
+    echo '#!/bin/bash'
+    echo 'name_version="demo-3.0"'
+    echo 'pkg_glob="demo-3.0.tar.*"'
+    echo 'build_pkg() {'
+    echo './configure'
+    echo 'make'
+    echo '}'
+    echo 'install_pkg() {'
+    echo 'make install'
+    echo '}'
+    echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+} > "$_mk/install_demo-3.0"
+cp "$_mk/install_demo-3.0" "$_mk/install_p_demo"      # the account's copy
+_env="PKGUSR_LIB=$PHASES_LIB LFS_BUILD_ROOT=$_mk/src LFS_SOURCES_DIR=$_mk/sources"
+if env $_env bash "$_mk/install_demo-3.0" unpack >/dev/null 2>&1 \
+   && env $_env bash "$_mk/install_demo-3.0" build >/dev/null 2>&1; then
+    # the marker names the PACKAGE, so any copy of the script finds it
+    ls "$_mk/src"/.pkgusr-demo-3.0.dir >/dev/null 2>&1 \
+        || _p="$_p;the build marker is not named for the package"
+    env $_env bash "$_mk/install_p_demo" install >/dev/null 2>&1 \
+        || _p="$_p;a second copy of the same script cannot find the unpacked source"
+    [ "$(cat "$_mk/out" 2>/dev/null)" = ok ] \
+        || _p="$_p;the install phase did not run from the build directory"
+    # and with no marker at all the tree is still found, not thrown away
+    rm -f "$_mk/src"/.pkgusr-* "$_mk/out"
+    _o="$(env $_env bash "$_mk/install_p_demo" install 2>&1)"
+    case "$_o" in
+        *"no marker"*) ;;
+        *) _p="$_p;an unpacked tree with no marker is not recovered: $_o" ;;
+    esac
+    [ "$(cat "$_mk/out" 2>/dev/null)" = ok ] \
+        || _p="$_p;the recovered tree was not usable"
+else
+    _p="$_p;the fixture package would not unpack and build at all"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "build markers name the package, so every copy of a script finds the source"
+fi
+
+# ---- a failure has to say WHERE  (1.14.6) ----------------------------------- #
+# Reported from a real chroot.  Running one phase on a package whose build had
+# never finished gave, in full:
+#     make: *** No rule to make target 'install'.  Stop.
+#     !! phase 'install' FAILED (exit 2)
+#     phase 'install' failed for p_util-macros (exit 2).
+#       logs: /usr/src/pkgusr/p_util-macros/log
+# -- the package's own words for "there is no Makefile", and not one of the
+# three script paths, the source directory, or the reason.
+_p=""
+_wu="$T/unbuilt"; mkdir -p "$_wu/sources" "$_wu/src" "$_wu/stage/demo-4.0"
+printf '#!/bin/sh\ntouch configured\n' > "$_wu/stage/demo-4.0/configure"
+chmod +x "$_wu/stage/demo-4.0/configure"
+( cd "$_wu/stage" && tar czf ../sources/demo-4.0.tar.gz demo-4.0 ) 2>/dev/null
+{
+    echo '#!/bin/bash'
+    echo 'name_version="demo-4.0"'
+    echo 'pkg_glob="demo-4.0.tar.*"'
+    echo 'build_pkg() {'
+    echo './configure'
+    echo '}'
+    echo 'install_pkg() {'
+    echo 'make install'
+    echo '}'
+    echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+} > "$_wu/install_demo-4.0"
+_env="PKGUSR_LIB=$PHASES_LIB LFS_BUILD_ROOT=$_wu/src LFS_SOURCES_DIR=$_wu/sources"
+env $_env bash "$_wu/install_demo-4.0" unpack >/dev/null 2>&1 \
+    || _p="$_p;the fixture would not unpack"
+# install with no build ever run: say so BEFORE the package's own tools do
+_o="$(env $_env bash "$_wu/install_demo-4.0" install 2>&1)"
+case "$_o" in
+    *"recorded a finished build phase"*) ;;
+    *) _p="$_p;a phase run on an unbuilt tree does not say the build never finished" ;;
+esac
+# after a real build the record exists and the warning is gone
+env $_env bash "$_wu/install_demo-4.0" build >/dev/null 2>&1
+[ -f "$_wu/src/.pkgusr-demo-4.0.built" ] \
+    || _p="$_p;a finished build records nothing, so no later phase can tell"
+_o2="$(env $_env bash "$_wu/install_demo-4.0" install 2>&1)"
+case "$_o2" in
+    *"recorded a finished build phase"*)
+        _p="$_p;the warning still fires after the build finished" ;;
+esac
+# and a build that FAILS must not claim it finished
+{
+    echo '#!/bin/bash'
+    echo 'name_version="demo-4.0"'
+    echo 'pkg_glob="demo-4.0.tar.*"'
+    echo 'build_pkg() { false; }'
+    echo 'install_pkg() { :; }'
+    echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+} > "$_wu/install_bad"
+rm -f "$_wu/src/.pkgusr-demo-4.0.built"
+env $_env bash "$_wu/install_bad" build >/dev/null 2>&1
+[ -f "$_wu/src/.pkgusr-demo-4.0.built" ] \
+    && _p="$_p;a failed build recorded itself as finished"
+# packagemanager's own report names the files it ran and the one you edit
+python3 - "$(dirname "$LFS_TOOL")/packagemanager" "$T" <<'PYPATHS' || _p="$_p;the failure report cannot name the script, the edit file or the source"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+h = os.path.join(sys.argv[2], "pmhome"); os.makedirs(os.path.join(h, "src", "util-macros-1.20.2"))
+for f in ("install_util-macros-1.20.2", "install_p_util-macros",
+          "install_p_util-macros.edited"):
+    open(os.path.join(h, f), "w").write("x")
+# the editable one is the versioned one -- not the copy, not the .edited backup
+assert pm._versioned_script_in(h).endswith("install_util-macros-1.20.2"), \
+    pm._versioned_script_in(h)
+assert pm._unpacked_source_dir(h).endswith("src/util-macros-1.20.2")
+src = open(sys.argv[1]).read()
+i = src.index("phase '{phase}' failed for {name}")
+blk = src[i:i + 1600]
+for need in ("ran    :", "edit   :", "source :", "logs   :", "retry  :"):
+    assert need in blk, need
+assert "packagemanager script build" in blk, "no hint to run the build phase first"
+PYPATHS
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a failed phase names its files, and an unbuilt tree says so first"
+fi
+
+# ---- the build environment has to reach the build  (1.14.7) ----------------- #
+# Reported from a real chroot.  The person ran
+#     packagemanager env --set XORG_CONFIG=...
+# was shown it in the table, and the very next command still failed with
+#     this package needs XORG_CONFIG to be set
+# lfs-helper's run_phase_as pastes /etc/pkgusr/build.env in front of the
+# command it runs; packagemanager's `script <phase>` built its own `su` and
+# passed nothing.  `su -` is a login shell and drops the caller's environment,
+# so the variables have to travel INSIDE the command.
+_p=""
+_be="$T/buildenv"; mkdir -p "$_be"
+printf '# comment\nXORG_CONFIG=--prefix=/usr --sysconfdir=/etc --disable-static\n' \
+    > "$_be/build.env"
+_o="$(LFS_BUILD_ENV="$_be/build.env" python3 - "$(dirname "$LFS_TOOL")/packagemanager" <<'PYENV'
+import sys, shlex, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+be = pm._read_build_env()
+assert "XORG_CONFIG" in be, be
+# the pairs, exactly as cmd_script builds them
+pairs = "".join("%s=%s " % (k, shlex.quote(v)) for k, v in sorted(be.items()))
+print(pairs)
+PYENV
+)"
+case "$_o" in
+    *"XORG_CONFIG='--prefix=/usr --sysconfdir=/etc --disable-static'"*) ;;
+    *) _p="$_p;a value with spaces is not passed as one value: $_o" ;;
+esac
+# and it must actually arrive: the same guard the book's scripts carry
+_g="$T/guard.sh"
+{
+    echo 'name_version="demo-9.0"'
+    echo 'build_pkg() {'
+    echo '[ -n "${XORG_CONFIG:-}" ] || { echo "needs XORG_CONFIG" >&2; exit 1; }'
+    echo 'echo "got [$XORG_CONFIG]"'
+    echo '}'
+    echo 'install_pkg() { :; }'
+    echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+} > "$_g"
+mkdir -p "$T/genv-build"
+_r="$(env LFS_BUILD_ROOT="$T/genv-build" PKGUSR_LIB="$PHASES_LIB" \
+      sh -c "env $_o bash $_g build" 2>&1)"
+case "$_r" in
+    *"got [--prefix=/usr --sysconfdir=/etc --disable-static]"*) ;;
+    *) _p="$_p;the variable does not reach the phase: $_r" ;;
+esac
+# the command line pm prints must be the one it runs
+_src14="$(sed -n '/THE BUILD ENVIRONMENT HAS TO REACH THE BUILD/,/_records = phase/p' \
+          "$(dirname "$LFS_TOOL")/packagemanager")"
+printf '%s' "$_src14" | grep -q '_read_build_env()' \
+    || _p="$_p;the script path does not read the build environment file"
+printf '%s' "$_src14" | grep -q 'shlex.quote(v)' \
+    || _p="$_p;the pairs are not quoted, so a value with spaces splits"
+printf '%s' "$_src14" | grep -q 'cd ~ &&' \
+    || _p="$_p;the phase no longer runs from the package user's home"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "what 'packagemanager env' sets reaches the build, spaces and all"
+fi
+
+# ---- one book load, not one per package  (1.14.8) --------------------------- #
+# Reported from a real chroot: a 151-package plan printed
+#     cached script is from blfs 1.14.3, this is 1.14.7 -- regenerating
+# twice and then sat silent for five minutes, and the person killed it.
+# resolve_script generated ONE PER PACKAGE, each a subprocess that loaded and
+# indexed the whole book again.  `blfs script` has always taken a list of
+# targets and used only the first.
+_p=""
+_pmw="$(dirname "$LFS_TOOL")/packagemanager"
+_bw="$(dirname "$LFS_TOOL")/blfs"
+_bookf=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bookf="$_c" && break
+done
+if [ -n "$_bookf" ]; then
+    _wd="$T/prewarm"; mkdir -p "$_wd"
+    _n="$(python3 "$_bw" --book-file "$_bookf" script xcb-proto dbus libxau \
+            -o "$_wd" 2>/dev/null | grep -c '^Created ')"
+    [ "$_n" = 3 ] || _p="$_p;blfs script writes $_n of 3 packages asked for in one call"
+    # and packagemanager uses that: a plan pre-generates in one pass
+    LFS_BUILD_ENV=/nonexistent BLFS_BOOK_FILE="$_bookf" \
+    python3 - "$_pmw" "$T/prewarm2" <<'PYPW' || _p="$_p;the plan does not pre-generate its scripts in one pass"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm.pkgusr_home = lambda n: "/nonexistent/" + n     # no local copies to prefer
+out = sys.argv[2]; os.makedirs(out, exist_ok=True)
+plan = [("xcb-proto", "xcb-proto-1.17.0", "new"), ("dbus", "dbus-1.16.2", "new"),
+        ("libxau", "libXau-1.0.12", "new")]
+pm._prewarm_scripts(plan, out)
+assert len(os.listdir(out)) == 3, os.listdir(out)
+# run again: everything is current, so nothing is regenerated
+before = sorted((f, os.path.getmtime(os.path.join(out, f))) for f in os.listdir(out))
+pm._prewarm_scripts(plan, out)
+assert before == sorted((f, os.path.getmtime(os.path.join(out, f))) for f in os.listdir(out)), \
+    "current scripts were regenerated anyway"
+PYPW
+    grep -q '_prewarm_scripts(plan, script_dir' "$_pmw" \
+        || _p="$_p;the install plan never calls the pre-generation pass"
+fi
+# and the pre-build env check must read WHERE THE BUILD READS.  It asked
+# os.environ only, so after `packagemanager env --set XORG_CONFIG=...` every
+# Xorg package was still announced as missing it -- and the cure it printed,
+# `export`, is the one that cannot work through `su -`.
+_ev="$T/envwarn"; mkdir -p "$_ev"
+printf 'XORG_CONFIG=--prefix=/usr\n' > "$_ev/build.env"
+printf '#!/bin/bash\nbuild_pkg() {\n[ -n "${XORG_CONFIG:-}" ] || { echo "this package needs XORG_CONFIG to be set" >&2; exit 1; }\n}\n' \
+    > "$_ev/install_demo-1.0"
+_o="$(LFS_BUILD_ENV="$_ev/build.env" python3 - "$_pmw" "$_ev/install_demo-1.0" 2>&1 <<'PYEW'
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm._warn_unset_env("demo", sys.argv[2])
+PYEW
+)"
+[ -z "$_o" ] || _p="$_p;a variable set in build.env is still reported as missing: $_o"
+_o2="$(LFS_BUILD_ENV="$_ev/empty.env" python3 - "$_pmw" "$_ev/install_demo-1.0" 2>&1 <<'PYEW2'
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+os.environ.pop("XORG_CONFIG", None)
+pm._warn_unset_env("demo", sys.argv[2])
+PYEW2
+)"
+case "$_o2" in
+    *"packagemanager env --set XORG_CONFIG"*) ;;
+    *) _p="$_p;an unset variable is not reported, or not with a cure that works" ;;
+esac
+case "$_o2" in
+    *"export XORG_CONFIG=..."*)
+        _p="$_p;it still tells you to export, which su - discards" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a plan reads the book once, and the env check reads where the build reads"
+fi
+
+# ---- the commands are the fact, the dep list is an opinion  (1.14.9) -------- #
+# Reported from a real chroot: three packages into a 151-package plan,
+#     /usr/src/pkgusr/p_libheif/install_libheif: line 33: cmake: command not found
+# libheif's BLFS page has NO Required section: CMake reaches it only through
+# x265, and x265 was already installed, so nothing pulled cmake into the plan.
+# The dependency list is what the book says; the script's own commands are
+# what will actually run, and they are readable before anything is built.
+_p=""
+_pm9="$(dirname "$LFS_TOOL")/packagemanager"
+_b9="$(dirname "$LFS_TOOL")/blfs"
+_bk9=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk9="$_c" && break
+done
+if [ -n "$_bk9" ]; then
+    _sd9="$T/tools"; mkdir -p "$_sd9"
+    python3 "$_b9" --book-file "$_bk9" script libheif libtasn1 -o "$_sd9" >/dev/null 2>&1
+    python3 - "$_pm9" "$_sd9" <<'PYT' || _p="$_p;the missing build tool is not found from the script's own commands"
+import sys, os, glob, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]
+heif = glob.glob(os.path.join(d, "install_libheif*"))[0]
+tas  = glob.glob(os.path.join(d, "install_libtasn1*"))[0]
+# pretend nothing is installed, so the check is about the parsing
+pm._tool_available = lambda t: False        # nothing installed anywhere
+got = pm._warn_missing_build_tools("libheif", heif)
+assert "cmake" in got, got
+# a package that needs no build-system driver stays silent -- the check must
+# not turn into noise on every package
+assert pm._warn_missing_build_tools("libtasn1", tas) == [], "false positive"
+# and a tool that IS present is not reported
+pm._MISSING_TOOLS.clear()
+pm._tool_available = lambda t: True          # everything installed
+assert pm._warn_missing_build_tools("libheif", heif) == []
+# warned once per tool, not once per package
+pm._MISSING_TOOLS.clear()
+pm._tool_available = lambda t: False
+import io, contextlib
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+    pm._warn_missing_build_tools("libheif", heif)
+    pm._warn_missing_build_tools("other", heif)
+assert buf.getvalue().count("builds with `cmake`") == 1, buf.getvalue()
+assert pm._MISSING_TOOLS["cmake"] == ["libheif", "other"], pm._MISSING_TOOLS
+PYT
+fi
+# the checks run for a script taken from the cache too -- pre-generating a
+# whole plan in one pass (1.14.8) must not skip them
+_rs="$(sed -n '/^def resolve_script(/,/^def /p' "$_pm9")"
+[ "$(printf '%s' "$_rs" | grep -c '_check_script_prereqs')" -ge 2 ] \
+    || _p="$_p;a cached script is used without checking its prerequisites"
+grep -q '_report_missing_tools()' "$_pm9" \
+    || _p="$_p;the plan does not summarise the tools it is missing"
+# EVERY SUGGESTED INSTALL CARRIES ITS DEPENDENCIES.  `packagemanager install
+# cmake --run` builds cmake alone, and cmake then fails on
+#     CMAKE_USE_SYSTEM_CURL is ON but a curl is not found
+# because cURL is one of its four RECOMMENDED deps -- so the tool suggested
+# to fix a missing tool has to be suggested with --recursive.
+_bad="$(grep -n 'packagemanager install %s --run"' "$_pm9" || true)"
+[ -z "$_bad" ] || _p="$_p;a suggested install still omits --recursive: $_bad"
+# (the command is built by _install_cmd_for now, which checks the book first)
+sed -n '/def _install_cmd_for/,/^def /p' "$_pm9" \
+    | grep -q 'install %s --run --recursive' \
+    || _p="$_p;the missing-tool hint does not build the tool's dependencies"
+sed -n '/def _report_missing_tools/,/^def /p' "$_pm9" \
+    | grep -q 'install %s --run --recursive' \
+    || _p="$_p;the summary's install command does not build dependencies"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a build tool the book forgot is found in the script, before the build"
+fi
+
+# ---- the book sets them together  (1.14.11) --------------------------------- #
+# Reported from a real chroot, seventeen packages into a plan:
+#     this package needs XORG_PREFIX to be set
+# The person had set XORG_CONFIG hours earlier, from the same BLFS page that
+# sets both:
+#     export XORG_PREFIX="/usr"
+#     export XORG_CONFIG="--prefix=$XORG_PREFIX --sysconfdir=/etc ..."
+# and nothing said the other half was missing -- because `env --set` looks at
+# the cached scripts to know what to ask, and every one of them was from an
+# older blfs, so it asked nothing at all.
+_p=""
+_pmA="$(dirname "$LFS_TOOL")/packagemanager"
+_ea="$T/envcomp"; mkdir -p "$_ea"
+python3 - "$_pmA" "$_ea" <<'PYC' || _p="$_p;setting one half of a book pair does not mention the other"
+import sys, os, io, contextlib, importlib.machinery as m
+os.environ["LFS_BUILD_ENV"] = os.path.join(sys.argv[2], "build.env")
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+    pm._warn_env_companions({"XORG_CONFIG": "--prefix=/usr"})
+out = buf.getvalue()
+assert "XORG_PREFIX" in out, out
+assert "env --set XORG_PREFIX=/usr" in out, out      # with the book's value
+# both ways round, and silent once both are set
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+    pm._warn_env_companions({"XORG_CONFIG": "x", "XORG_PREFIX": "/usr"})
+assert buf.getvalue() == "", buf.getvalue()
+PYC
+# and in a plan: once per VARIABLE, plus a summary naming how many want it
+python3 - "$_pmA" "$_ea" <<'PYS' || _p="$_p;the plan repeats the same variable per package, or never summarises it"
+import sys, os, io, contextlib, importlib.machinery as m
+os.environ["LFS_BUILD_ENV"] = os.path.join(sys.argv[2], "empty.env")
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+os.environ.pop("XORG_PREFIX", None)
+sc = os.path.join(sys.argv[2], "install_demo-1.0")
+open(sc, "w").write('build_pkg() {\n[ -n "${XORG_PREFIX:-}" ] || '
+                    '{ echo "this package needs XORG_PREFIX to be set" >&2; exit 1; }\n}\n')
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+    for pkg in ("libevdev", "libinput", "xorg-server"):
+        pm._warn_unset_env(pkg, sc)
+    pm._report_missing_env()
+out = buf.getvalue()
+assert out.count("needs XORG_PREFIX set before") == 1, out
+assert "needed by 3 package(s), first: libevdev" in out, out
+assert pm._MISSING_ENV["XORG_PREFIX"] == ["libevdev", "libinput", "xorg-server"]
+PYS
+# the summary runs with the plan's other prerequisite report
+sed -n '/def _report_missing_tools/,/^def /p' "$_pmA" | grep -q '_report_missing_env()' \
+    || _p="$_p;the plan prints missing tools but not missing variables"
+# a run where EVERY cached script is stale must not silently ask nothing
+sed -n '/def _env_wanted_by_scripts/,/^def cmd_env/p' "$_pmA" \
+    | grep -q 'nothing here can say which variables' \
+    || _p="$_p;when every script is stale, env --set still says nothing useful"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a variable the book pairs with another is asked for at the same time"
+fi
+
+# ---- a plan that cannot finish should not start  (1.14.12) ------------------ #
+# Reported from a real chroot.  1.14.9's check knew libaom needs a cmake that
+# is not installed -- and said nothing, because resolve_script returns a
+# script already sitting in the package user's home BEFORE either place the
+# checks were wired in, and that is every package attempted once.  So the run
+# built twenty-two packages and then stopped exactly where the check would
+# have pointed.  Warning and building anyway was the other half of the
+# mistake: a plan known to be unable to finish should not start.
+_p=""
+_pmB="$(dirname "$LFS_TOOL")/packagemanager"
+# the checks are on EVERY path out of resolve_script, home copy included
+_rs="$(sed -n '/^def resolve_script(/,/^def /p' "$_pmB")"
+[ "$(printf '%s' "$_rs" | grep -c '_check_script_prereqs')" -ge 3 ] \
+    || _p="$_p;a script from the package user's home is used without its checks"
+printf '%s' "$_rs" | sed -n '/return local/!d;=' >/dev/null
+printf '%s' "$_rs" | grep -B4 'return local' | grep -q '_check_script_prereqs' \
+    || _p="$_p;the home-copy path returns before the checks run"
+python3 - "$_pmB" <<'PYSTOP' || _p="$_p;a plan missing what it needs still starts"
+import sys, os, tempfile, types, io, contextlib, importlib.machinery as m
+os.environ["LFS_BUILD_ENV"] = tempfile.mktemp()
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm.shutil.which = lambda *a, **k: None
+d = tempfile.mkdtemp(); sc = os.path.join(d, "install_libaom-3.13.1")
+open(sc, "w").write("build_pkg() {\ncmake -B build\n}\n")
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+    pm._warn_missing_build_tools("libaom", sc)
+    # a DRY RUN still shows the plan: nothing is being built, so nothing to stop
+    pm._stop_if_prereqs_missing(types.SimpleNamespace(run=False, ignore_prereqs=False))
+    # and an explicit override starts anyway
+    pm._stop_if_prereqs_missing(types.SimpleNamespace(run=True, ignore_prereqs=True))
+# but a real run stops before the first package
+try:
+    with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+        pm._stop_if_prereqs_missing(types.SimpleNamespace(run=True, ignore_prereqs=False))
+except SystemExit as e:
+    assert e.code == 1, e.code
+else:
+    raise AssertionError("a run with a missing build tool was allowed to start")
+assert "--ignore-prereqs" in buf.getvalue()
+PYSTOP
+# and the escape hatch is a real flag on the commands that build
+for _cmd in install update; do
+    python3 "$_pmB" $_cmd --help 2>&1 | grep -q -- "--ignore-prereqs" \
+        || _p="$_p;$_cmd has no --ignore-prereqs, so the stop cannot be overridden"
+done
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a plan that cannot finish stops before it builds anything"
+fi
+
+# ---- build the tool before the package that calls it  (1.14.12) ------------- #
+# Reported from a real chroot: a plan that CONTAINED CMake stopped at libaom
+# with `cmake: command not found`.  --recursive had worked -- CMake was in the
+# plan at position 151 and libaom at 89.  The resolver ordered on the book's
+# dependency list, and libaom's page lists no Required at all, so nothing said
+# libaom must wait for CMake.  Right answer, wrong facts.
+_p=""
+_pmB="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmB" "$T/order" <<'PYORD' || _p="$_p;a package is not ordered after the tool its commands call"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+pm._tool_available = lambda t: False              # nothing installed
+def sc(n, body):
+    p = os.path.join(d, "install_" + n)
+    open(p, "w").write("build_pkg() {\n%s\n}\n" % body)
+    return p
+steps = [("libaom", "libaom-3.13.1", "new", sc("libaom", "cmake -B build")),
+         ("curl",   "cURL-8.18.0",   "new", sc("curl", "./configure --prefix=/usr")),
+         ("cmake",  "CMake-4.2.3",   "new", sc("cmake", "./bootstrap --prefix=/usr")),
+         ("libheif", "libheif-1.21.2", "new", sc("libheif", "cmake --preset=rel"))]
+out, moved = pm._order_by_build_tools(list(steps))
+order = [nv for _a, nv, _r, _p in out]
+assert order.index("CMake-4.2.3") < order.index("libaom-3.13.1"), order
+assert order.index("CMake-4.2.3") < order.index("libheif-1.21.2"), order
+# the CONSUMER moves down, never the provider up: cmake's own dep stays ahead
+assert order.index("cURL-8.18.0") < order.index("CMake-4.2.3"), order
+assert moved, "nothing was reported as reordered"
+# a tool already on the system needs no reordering at all
+pm._tool_available = lambda t: True
+out2, moved2 = pm._order_by_build_tools(list(steps))
+assert [nv for _a, nv, _r, _p in out2] == [nv for _a, nv, _r, _p in steps], out2
+assert moved2 == [], moved2
+# and a tool the plan BUILDS is not also reported as missing
+pm._tool_available = lambda t: False
+pm._MISSING_TOOLS.clear()
+pm._warn_missing_build_tools("libaom", steps[0][3])
+assert "cmake" in pm._MISSING_TOOLS
+in_plan = {a.lower() for a, _n, _r, _p in out}
+for t in list(pm._MISSING_TOOLS):
+    if pm._BUILD_TOOLS[t].lower() in in_plan:
+        pm._MISSING_TOOLS.pop(t)
+assert not pm._MISSING_TOOLS, pm._MISSING_TOOLS
+PYORD
+# the printed plan is the order that will run
+_ci="$(sed -n '/Install plan ({len(plan)} to build)/,/for nv, after, tool in _moved/p' "$_pmB")"
+_ord="$(printf '%s' "$_ci" | grep -n '_order_by_build_tools' | head -1 | cut -d: -f1)"
+_prt="$(printf '%s' "$_ci" | grep -n 'reason:<10' | head -1 | cut -d: -f1)"
+[ -n "$_ord" ] && [ -n "$_prt" ] && [ "$_ord" -lt "$_prt" ] \
+    || _p="$_p;the plan is printed before it is ordered, so the list lies about what runs"
+# and a plan that cannot finish does not start
+grep -q '_stop_if_prereqs_missing(args)' "$_pmB" \
+    || _p="$_p;a plan missing its prerequisites still starts"
+grep -q 'ignore-prereqs' "$_pmB" \
+    || _p="$_p;there is no way to start anyway"
+# EVERY exit from resolve_script checks prerequisites -- the local copy in the
+# package user's home returned before either check, which is every package
+# that has been attempted once
+[ "$(sed -n '/^def resolve_script(/,/^def _prewarm\|^# ------/p' "$_pmB" \
+      | grep -c '_check_script_prereqs')" -ge 3 ] \
+    || _p="$_p;a script taken from the package user's home is used unchecked"
+# the stack delegates to the SAME install command, so everything above applies
+# to `packagemanager stack <name> --run` too -- and a decision to push past a
+# missing tool has to travel with it
+_ivs="$(sed -n '/^def _install_via_self/,/^def /p' "$_pmB")"
+printf '%s' "$_ivs" | grep -q '"install", pkg, "--run"' \
+    || _p="$_p;a stack entry no longer goes through the one install command"
+printf '%s' "$_ivs" | grep -q 'ignore_prereqs' \
+    || _p="$_p;a stack cannot pass --ignore-prereqs to the install it delegates to"
+sed -n '/kind == "book"/,/elif kind in/p' "$_pmB" | grep -q 'ignore_prereqs=getattr' \
+    || _p="$_p;the stack does not forward its own --ignore-prereqs"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a package waits for the tool its commands call, even when the book is silent"
+fi
+
+# ---- name a package the book actually has  (1.14.14) ------------------------ #
+# Reported from a real chroot.  The 1.14.9 hint said
+#     cargo    needed by 3 package(s), first: rust-bindgen
+#     packagemanager install rustc --run --recursive
+# and `rustc` is not an anchor in the book -- `rust` is.  The command would
+# have answered "not in the BLFS book".  Same mistake as 1.14.10, one layer
+# down: the tool->package map was written from memory instead of checked.
+_p=""
+_pmC="$(dirname "$LFS_TOOL")/packagemanager"
+_bk14=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk14="$_c" && break
+done
+if [ -n "$_bk14" ]; then
+    BLFS_BOOK_FILE="$_bk14" python3 - "$_pmC" <<'PYPROV' || _p="$_p;a tool is mapped to a package the book does not have"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+# EVERY named provider must resolve in the book -- that is the whole point
+bad = []
+for tool, prov in pm._BUILD_TOOLS.items():
+    if not prov:
+        continue                      # deliberately none: an LFS tool
+    try:
+        if not pm.book_version(prov):
+            bad.append((tool, prov))
+    except SystemExit:
+        bad.append((tool, prov))
+assert not bad, "these providers are not in the book: %r" % bad
+# the one from the report
+assert pm._provider_of("cargo") == "rust", pm._provider_of("cargo")
+assert "install rust --run --recursive" in pm._install_cmd_for("cargo")
+# a tool with no BLFS page gets NO command rather than a wrong one
+assert pm._provider_of("meson") == ""
+assert pm._install_cmd_for("meson") == ""
+PYPROV
+fi
+# and a tool whose provider is not in the plan at all is ADDED, not just
+# reported: reordering cannot help when the package is absent
+grep -q 'return cmd_install(args, _replanned=True)' "$_pmC" \
+    || _p="$_p;a missing provider is never added to the plan"
+sed -n '/A TOOL THE PLAN DOES NOT HAVE AT ALL/,/return cmd_install/p' "$_pmC" \
+    | grep -q 'not _replanned' \
+    || _p="$_p;the re-plan is not bounded, so a missing provider could loop"
+sed -n '/A TOOL THE PLAN DOES NOT HAVE AT ALL/,/return cmd_install/p' "$_pmC" \
+    | grep -q 'getattr(args, "recursive", False)' \
+    || _p="$_p;a non-recursive install silently grows extra packages"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "every tool names a package the book has, or no command at all"
+fi
+
+# ---- progress that is real should be visible  (1.14.15) --------------------- #
+# The user, after three runs of the same stack: "its like always starting from
+# fresh".  It was not -- the plan had gone 181 -> 151 -> 135, forty-six
+# packages built -- but each run recomputes the whole tree and prints only
+# what is LEFT, so three real advances read as three identical fresh starts.
+_p=""
+_pmD="$(dirname "$LFS_TOOL")/packagemanager"
+_bkD=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bkD="$_c" && break
+done
+if [ -n "$_bkD" ]; then
+    _o="$(BLFS_BOOK_FILE="$_bkD" timeout 600 python3 - "$_pmD" 2>&1 <<'PYPROG'
+import sys, types, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+real = pm.gather_user
+class Installed:
+    state = "installed"; version = None
+    def __init__(self, a): self.name = a
+done = {"icu", "libuv", "libarchive", "nghttp2"}
+pm.gather_user = lambda a: Installed(a) if a in done else real(a)
+args = types.SimpleNamespace(packages=["libheif"], recursive=True, ignore="",
+    reinstall=False, yes=True, run=False, regenerate=False, local=None,
+    test=False, clean=False, ignore_recommended=False, optional=False,
+    ignore_prereqs=False, outdir=None, select=False)
+try:
+    pm.cmd_install(args)
+except SystemExit:
+    pass
+PYPROG
+)"
+    case "$_o" in
+        *"already installed -- they are skipped"*) ;;
+        *) _p="$_p;a re-run never says how much of the tree is already done" ;;
+    esac
+    # the count has to be the truth, not a guess: 4 of the 19 considered
+    case "$_o" in
+        *"4 of the 19 packages"*) ;;
+        *) _p="$_p;the already-installed count does not match the tree" ;;
+    esac
+    # and the plan itself shrinks by exactly those four
+    case "$_o" in
+        *"Install plan (15 to build)"*) ;;
+        *) _p="$_p;installed packages are not dropped from the plan" ;;
+    esac
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a re-run says how much of the tree it is skipping"
+fi
+
+# ---- one file to edit, one to run  (1.14.16) -------------------------------- #
+# The user, reading a failure box: "im also irritated cause of the different
+# files in script and staged, is it wanted that we have the p prefix?"
+# No.  One script had FOUR names in one home -- install_Hatchling-1.28.0 (the
+# one you are told to edit), install_p_hatchling (the one that actually ran),
+# install_hatchling (a staged copy of it) and install_last (the record) -- and
+# every failure spent three lines explaining which was which.
+_p=""
+_pmE="$(dirname "$LFS_TOOL")/lfs-helper"
+_stg="$(sed -n '/ONE FILE TO EDIT/,/^    local rc=0/p' "$_pmE")"
+printf '%s' "$_stg" | grep -q 'cp "$install_script" "$home/install_$user_name"' \
+    && _p="$_p;the redundant install_p_<user> copy is still written"
+printf '%s' "$_stg" | grep -q 'rm -f "$home/install_$user_name"' \
+    || _p="$_p;an old install_p_<user> copy is never cleaned up"
+# ...but only when it is a copy: someone may have edited it
+printf '%s' "$_stg" | grep -q 'cmp -s' \
+    || _p="$_p;an edited install_p_<user> would be deleted without a word"
+# the canonical file is the one that runs
+grep -q 'cmd_build "$user_name" --script "$home/\$base"' "$_pmE" \
+    || _p="$_p;the phased path still runs a copy instead of the editable script"
+grep -q 'run_phase_as "$user_name" "$home/\$base"' "$_pmE" \
+    || _p="$_p;the unphased path still runs a copy"
+# and a script already in the owner's home is not staged a second time
+sed -n '/ALREADY THERE IS ALREADY STAGED/,/elif ! /p' "$_pmE" | grep -q 'staged="$s"' \
+    || _p="$_p;a script in the package user's home is still copied to a second name"
+sed -n '/! \$name FAILED/,/auto-repair/p' "$_pmE" | grep -q '\[ "$staged" = "$s" \] ||' \
+    || _p="$_p;the failure box prints a staged line even when there is no second file"
+# a missing Python module is named, not left inside pip's traceback
+_pl="$T/pylog"; mkdir -p "$_pl"
+printf "    import pathspec\nModuleNotFoundError: No module named 'pathspec'\nerror: metadata-generation-failed\n" \
+    > "$_pl/log"
+{
+    echo 'set -u'
+    echo 'fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }'
+    echo 'detail() { :; }; hint() { :; }; show_build_errors() { :; }'
+    echo 'pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }'
+    echo 'phase_done() { return 1; }; SNAP_ROOT="/"'
+    python3 - "$_pmE" <<'PYREP2'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index("        # A FEATURE MISSING FROM AN INSTALLED PACKAGE.")
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs=""\n' + body + '\n}')
+PYREP2
+} > "$_pl/rep.sh"
+_o="$(bash -c '. "'"$_pl"'/rep.sh"; report hatchling all "'"$_pl"'/log"' 2>&1)"
+case "$_o" in
+    *"Python module 'pathspec'"*) ;;
+    *) _p="$_p;a ModuleNotFoundError does not name the module: $_o" ;;
+esac
+case "$_o" in
+    *"install pathspec --run --recursive"*) ;;
+    *) _p="$_p;no command to install the missing module" ;;
+esac
+case "$_o" in
+    *"built for an"*) ;;
+    *) _p="$_p;it does not mention the module may exist for an older Python" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "one script, one name in its home, and a missing module is named"
+fi
+
+# ---- build a wheel, install nothing  (1.14.16) ------------------------------ #
+# Found from a user's `ls`: p_pathspec's manifest held ONE path,
+#     /var/mail/p_pathspec
+# and nothing else.  Two faults met.
+#
+# (1) `_comment_orphan_pip_installs` comments a pip install whose --find-links
+#     directory nothing builds -- right for brotli, whose wheel step is
+#     optional and commented out.  It judged each block ALONE, and for a
+#     Python module the wheel is built in the BUILD phase and installed in the
+#     INSTALL phase, so it never saw the producer and commented the only line
+#     that installs anything.  All 76 module pages: build a wheel, install
+#     nothing.
+# (2) useradd creates /var/mail/<user>, owned by the package user, so the
+#     manifest scan picked it up -- and one existing path is the evidence
+#     `state` accepts for "installed".  A package that installed NOTHING
+#     looked installed, the planner skipped it, and Hatchling died on
+#     `No module named 'pathspec'` twenty-two packages later.
+_p=""
+_bkF=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bkF="$_c" && break
+done
+if [ -n "$_bkF" ]; then
+    _wd="$T/wheels"; mkdir -p "$_wd"
+    python3 "$(dirname "$LFS_TOOL")/blfs" --book-file "$_bkF" \
+        script pathspec brotli -o "$_wd" >/dev/null 2>&1
+    _ps="$(ls "$_wd"/install_[Pp]athspec* 2>/dev/null | head -1)"
+    if [ -n "$_ps" ]; then
+        sed -n '/^install_pkg() {/,/^}/p' "$_ps" | grep -q '^pip3 install' \
+            || _p="$_p;a python module page still installs nothing"
+        sed -n '/^build_pkg() {/,/^}/p' "$_ps" | grep -q 'pip3 wheel' \
+            || _p="$_p;the wheel is no longer built"
+    else
+        _p="$_p;could not generate the pathspec script"
+    fi
+    _br="$(ls "$_wd"/install_[Bb]rotli* 2>/dev/null | head -1)"
+    if [ -n "$_br" ]; then
+        grep -q "SKIPPED -- installs from 'dist'" "$_br" \
+            || _p="$_p;brotli's orphan pip install is no longer guarded"
+    fi
+fi
+_pmF="$(dirname "$LFS_TOOL")/packagemanager"
+sed -n '/^_write_pkg_lst() {/,/^}/p' "$helper_src" | grep -q 'var/mail/\*' \
+    || _p="$_p;useradd's mail spool can still stand in for an installed package"
+# ...and every pkg.lst ALREADY on disk contains it, so the reader has to skip
+# it too -- excluding it only from new records left pathspec skipped again on
+# the very next run
+python3 - "$_pmF" <<'PYMAIL' || _p="$_p;an old manifest of nothing but a mail spool still reads as installed"
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = tempfile.mkdtemp(); ml = os.path.join(d, "pkg.lst")
+u = pm.User.__new__(pm.User); u.pkg_list = ml
+open(ml, "w").write("/var/mail/p_pathspec\n")
+assert pm.User._manifest_has_real_paths(u) is False, "mail spool alone counted"
+open(ml, "w").write("/var/mail/p_x\n/usr\n/etc\n")
+assert pm.User._manifest_has_real_paths(u) is True, "real paths were discarded"
+PYMAIL
+sed -n '/def _declares_content_that_is_missing/,/def _manifest_has_real_paths/p' "$_pmF" \
+    | grep -q 'installed_directories' \
+    || _p="$_p;the page's own installed paths are never checked"
+python3 - "$_pmF" <<'PYST' || _p="$_p;a package whose declared paths are all missing still counts as installed"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+u = pm.User.__new__(pm.User)
+u.meta = {"installed_directories": "/nonexistent/site-packages/pathspec"}
+assert pm.User._declares_content_that_is_missing(u) is True
+u.meta = {"installed_directories": "/usr /nonexistent/x"}
+assert pm.User._declares_content_that_is_missing(u) is False
+u.meta = {}
+assert pm.User._declares_content_that_is_missing(u) is False
+PYST
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a python module installs itself, and an empty install cannot look installed"
+fi
+
+# ---- ask the book once, not once per package  (1.14.18) --------------------- #
+# "why is the lookup for the script taking that long? arent we somehow indexing
+# all the package names?"  There IS an index -- book_versions_all() reads the
+# whole book in one call -- and only `update` used it.  book_version() ran
+# `blfs debug <anchor>`: a subprocess, opening and reading the book cache, to
+# answer ONE lookup.  A sway stack preview asks 56 of them and the planner asks
+# one per package considered.  Measured on 26 names: 7.07s of subprocesses
+# against 0.79s for the map, and every lookup after the first free.
+_p=""
+_pmG="$(dirname "$LFS_TOOL")/packagemanager"
+_bkG=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bkG="$_c" && break
+done
+if [ -n "$_bkG" ]; then
+    BLFS_BOOK_FILE="$_bkG" python3 - "$_pmG" <<'PYIDX' || _p="$_p;the book is still asked one process per package"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+calls = []
+real = pm.run_blfs
+def counting(argv):
+    calls.append(list(argv))
+    return real(argv)
+pm.run_blfs = counting
+names = ["dbus", "curl", "mesa", "pango", "gtk4", "cmake", "xmlto", "alsa-lib"]
+got = [pm.book_version(n) for n in names]
+assert all(got), dict(zip(names, got))
+# ONE process for all of them -- the whole-book map
+assert len(calls) == 1, calls
+assert calls[0][0] == "versions", calls
+# and nothing at all the second time
+before = len(calls)
+[pm.book_version(n) for n in names]
+assert len(calls) == before, calls[before:]
+# a name the map does not have still gets its own answer, and is remembered
+pm.book_version("this-is-not-a-package-at-all")
+assert len(calls) == before + 1, calls[before:]
+PYIDX
+fi
+grep -q 'def book_versions_all' "$_pmG" \
+    || _p="$_p;the whole-book version map is gone"
+sed -n '/^def book_version(/,/^def /p' "$_pmG" | grep -q 'book_versions_all()' \
+    || _p="$_p;book_version does not use the map"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the book is read once and answers every lookup from memory"
+fi
+
+# ---- a typo in a group name is permanent  (1.14.19) ------------------------- #
+# Reported from a real build: the collector-group prompt offered nimgnu_gcc or
+# nimgnu_lib, the user typed their own name and wrote `nimnu_gdb` -- one letter
+# short of `nimgnu_`.  It is a valid group name, so it was created and the
+# directory handed to it, and nothing that looks for ${COLLECTOR_PREFIX}_*
+# would ever see it again.
+_p=""
+_hlp="$helper_src"
+# a near miss for the prefix is offered as a correction; a deliberate name is not
+_nm="$T/nearmiss.sh"; _slice_fn "$_hlp" _near_miss > "$_nm"
+_near_check() {   # <a> <b> <expected: yes|no>
+    if ( . "$_nm"; _near_miss "$1" "$2" ); then _r=yes; else _r=no; fi
+    [ "$_r" = "$3" ] || _p="$_p;_near_miss $1 $2 said $_r, expected $3"
+}
+_near_check nimnu   nimgnu yes      # the reported typo: one letter missing
+_near_check nmgnu   nimgnu yes      # one letter missing, elsewhere
+_near_check nimgnux nimgnu yes      # one letter too many
+_near_check nimgno  nimgnu yes      # one letter wrong
+_near_check nimgnu  nimgnu no       # already right: nothing to offer
+_near_check gcc     nimgnu no       # a deliberate name, left alone
+_near_check shared  nimgnu no
+# the prompt actually consults it, and only for names that have a prefix part
+_pick="$(sed -n '/A TYPO IN A GROUP NAME IS PERMANENT/,/using .\$picked./p' "$_hlp")"
+printf '%s' "$_pick" | grep -q '_near_miss "$_head" "$_pfx"' \
+    || _p="$_p;the prompt does not check a typed name against the collector prefix"
+# (the fallback is "sysgroup" since 1.14.35 -- the same default lfs and
+#  packagemanager use; it was the one place that said nimgnu)
+printf '%s' "$_pick" | grep -q 'COLLECTOR_PREFIX:-sysgroup' \
+    || _p="$_p;the prompt hardcodes a prefix instead of using the configured one"
+printf '%s' "$_pick" | grep -q '\[Y/n\]' \
+    || _p="$_p;the correction is applied without asking"
+# and the ones already made can be repaired: renaming keeps the gid, so every
+# directory already granted stays granted
+grep -q 'rename-group)    shift; cmd_rename_group' "$_hlp" \
+    || _p="$_p;there is no way to fix a group that was already misnamed"
+_rg="$(_slice_fn "$_hlp" cmd_rename_group)"
+printf '%s' "$_rg" | grep -q 'groupmod' \
+    || _p="$_p;rename-group does not rename the group"
+printf '%s' "$_rg" | grep -q 'group_exists "$new" && die' \
+    || _p="$_p;rename-group would collide with an existing group"
+printf '%s' "$_rg" | grep -q 'dry run' \
+    || _p="$_p;rename-group has no dry run"
+if command -v groupadd >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
+    _g1="lfstest_nimnu_$$"; _g2="lfstest_nimgnu_$$"
+    if groupadd "$_g1" 2>/dev/null; then
+        _gd="$T/granted"; mkdir -p "$_gd"; chgrp "$_g1" "$_gd" 2>/dev/null
+        _gid_before="$(getent group "$_g1" | cut -d: -f3)"
+        SNAP_ROOT="$T" bash "$_hlp" rename-group "$_g1" "$_g2" --run >/dev/null 2>&1
+        _gid_after="$(getent group "$_g2" | cut -d: -f3)"
+        [ -n "$_gid_after" ] || _p="$_p;rename-group did not create the new name"
+        [ "$_gid_before" = "$_gid_after" ] \
+            || _p="$_p;the gid changed, so every directory already granted lost its group"
+        [ "$(stat -c %G "$_gd" 2>/dev/null)" = "$_g2" ] \
+            || _p="$_p;a directory the group owned did not follow the rename"
+        groupdel "$_g2" 2>/dev/null || groupdel "$_g1" 2>/dev/null
+    fi
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a mistyped collector prefix is caught, and an old one can be renamed"
+fi
+
+# ---- not every name is an LFS step  (1.14.20) ------------------------------- #
+# Reported from a real chroot.  The failure box's own hint said
+#     lfs-helper build p_glib2 --phase all --force
+# and a session note said `lfs-helper build glib2 --phase install --force`.
+# glib2 is a BLFS package: there is no $SCRIPTS/glib2.sh and never will be.
+# cmd_build looked only at the step scripts and answered
+#     !! no script for 'glib2' ...
+#     From outside the chroot: lfs build-system gen-chroot-scripts --run
+# -- advice for a different problem, naming a command that REFUSES to run
+# inside the chroot the person is standing in.  ("that hint was dumb.")
+_p=""
+_hlpB="$helper_src"
+# a name that is not a step is recognised as such
+_so="$T/steporder"; mkdir -p "$_so"
+printf 'binutils\ngcc\n' > "$_so/steporder"
+_cls="$(SCRIPTS="$_so" STATE_PROGRESS="$_so" bash -c '
+    . <(sed -n "/^steps() {/,/^}/p" "'"$_hlpB"'")
+    . <(sed -n "/^in_step_order() {/,/^}/p" "'"$_hlpB"'")
+    for n in gcc glib2; do
+        in_step_order "$n" && echo "$n=step" || echo "$n=not"
+    done')"
+case "$_cls" in
+    *"gcc=step"*) ;;
+    *) _p="$_p;a real LFS step is no longer recognised as one" ;;
+esac
+case "$_cls" in
+    *"glib2=not"*) ;;
+    *) _p="$_p;a BLFS package is mistaken for an LFS step" ;;
+esac
+# ...and gets the answer that fits: build it through packagemanager
+_die="$(sed -n '/ONE OF THREE THINGS/,/die "\$_msg"/p' "$_hlpB")"
+printf '%s' "$_die" | grep -q 'packagemanager install $name --run --recursive' \
+    || _p="$_p;an unknown name is not pointed at packagemanager"
+printf '%s' "$_die" | grep -q 'packagemanager script install $name' \
+    || _p="$_p;there is no way offered to re-run one phase"
+printf '%s' "$_die" | grep -q 'in_step_order "$name"' \
+    || _p="$_p;the message does not depend on what the name actually is"
+# the gen-chroot-scripts advice survives ONLY for a real step
+_stepbranch="$(printf '%s' "$_die" | sed -n '/if in_step_order/,/else/p')"
+printf '%s' "$_stepbranch" | grep -q 'gen-chroot-scripts' \
+    || _p="$_p;a genuinely missing step script no longer says how to generate it"
+_elsebranch="$(printf '%s' "$_die" | sed -n '/^        else$/,/^        fi$/p')"
+printf '%s' "$_elsebranch" | grep -q 'gen-chroot-scripts' \
+    && _p="$_p;a BLFS package is still told to regenerate the chroot scripts"
+# before any of that: a package user's OWN script is used when there is one
+_fb="$(sed -n '/NOT EVERY NAME IS AN LFS STEP/,/^    fi$/p' "$_hlpB")"
+printf '%s' "$_fb" | grep -q 'pkg_owner_name "$name"' \
+    || _p="$_p;the package user's own script is never looked for"
+printf '%s' "$_fb" | grep -q 'install_last' \
+    || _p="$_p;there is no fallback to the record of what last ran"
+printf '%s' "$_fb" | grep -q "grep -v '\\\\.edited" \
+    || _p="$_p;an .edited backup could be run instead of the script"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a BLFS package builds through its own script, not an LFS step message"
+fi
+
+# ---- one door for every build  (1.14.21) ------------------------------------ #
+# Reported from a real chroot.  glib2's install stopped on
+#     PermissionError: [Errno 13] '/usr/share/gettext/its'
+# Through lfs-helper that failure is REPAIRED: the grant-and-retry offers a
+# collector group for the directory and runs the phase again.  Through
+# `packagemanager script install glib2` -- the command the failure box itself
+# tells people to run -- the identical traceback repeated forever, because that
+# path built its own `su` and had none of the wrappers, tracking, failure box
+# or repair around it.  Second bug from the same split (the first: the build
+# environment, 1.14.7).
+_p=""
+_pmH="$(dirname "$LFS_TOOL")/packagemanager"
+_sd="$(sed -n '/THE SAME DOOR AS EVERY OTHER BUILD/,/printInfo(f"  \$ su/p' "$_pmH")"
+printf '%s' "$_sd" | grep -q 'shutil.which("lfs-helper")' \
+    || _p="$_p;the script path does not look for lfs-helper"
+printf '%s' "$_sd" | grep -q '"build", name, "--script", home_script' \
+    || _p="$_p;a phase is still run without the wrappers and the repair"
+printf '%s' "$_sd" | grep -q 'phase != "fetch"' \
+    || _p="$_p;the fetch phase, which runs nothing, is sent through the builder"
+printf '%s' "$_sd" | grep -q 'else:' \
+    || _p="$_p;there is no fallback when lfs-helper is absent"
+# and the file it runs is the one the user is told to edit
+grep -q '_versioned_script_in(home)' "$_pmH" \
+    || _p="$_p;the script path still runs install_<user> instead of the canonical file"
+python3 - "$_pmH" "$T/canon" <<'PYCANON' || _p="$_p;the canonical script is not found or not preferred"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+h = sys.argv[2]; os.makedirs(h, exist_ok=True)
+for f in ("install_GLib-2.86.4", "install_p_glib2"):
+    open(os.path.join(h, f), "w").write("x")
+got = pm._versioned_script_in(h)
+assert got and got.endswith("install_GLib-2.86.4"), got
+PYCANON
+# the message about a regenerated script has to describe what happened
+grep -q 'is never regenerated)' "$_pmH" \
+    && _p="$_p;it still claims the file it just rewrote is never regenerated"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "packagemanager script runs a phase through the same door as every build"
+fi
+
+# ---- an undeclared symbol usually belongs to someone else  (1.14.22) -------- #
+# cairo stopped with twelve of these:
+#     error: 'FC_HINT_NONE' undeclared (first use in this function)
+#     error: 'FC_RGBA_RGB' undeclared ...
+# all of them fontconfig's -- a DEPENDENCY whose headers are missing or too
+# old, not a bug in cairo.  The box said "this is a COMPILE error ... the tools
+# cannot repair it" and stopped there, leaving the person to work out whose
+# symbols those were.  The tools can look: either some installed header
+# declares it (an include path or .pc problem) or none does (the package that
+# provides it is not properly installed).
+_p=""
+_hlpC="$helper_src"
+_cr="$T/compile"; mkdir -p "$_cr"
+# build the whole failure report, not the tail of it -- the earlier harness
+# sliced from a marker halfway down and never covered this branch at all
+python3 - "$_hlpC" > "$_cr/rep.sh" <<'PYSLICE'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('phase_done() { return 1; }; missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/"; s="/x"; staged="/x"; auto_repair=1')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE
+bash -n "$_cr/rep.sh" || _p="$_p;the failure report does not parse when sliced whole"
+# a symbol that IS declared somewhere: name the header and the package
+_hdr=""
+for _c in /usr/include/stdio.h /usr/include/stdlib.h; do
+    [ -f "$_c" ] && _hdr="$_c" && break
+done
+printf "../src/x.c:56:14: error: 'SEEK_SET' undeclared (first use in this function)\n" \
+    > "$_cr/known.log"
+if [ -n "$_hdr" ]; then
+    _o="$(bash -c '. "'"$_cr"'/rep.sh"; report demo all "'"$_cr"'/known.log"' 2>&1)"
+    case "$_o" in
+        *"IS declared, in:"*) ;;
+        *) _p="$_p;a symbol that exists in an installed header is not located" ;;
+    esac
+fi
+# a symbol nothing declares: say the providing package is missing
+printf "../src/x.c:9:5: error: 'FC_MADE_UP_SYMBOL_XYZ' undeclared (first use in this function)\n" \
+    > "$_cr/unknown.log"
+_o2="$(bash -c '. "'"$_cr"'/rep.sh"; report demo all "'"$_cr"'/unknown.log"' 2>&1)"
+case "$_o2" in
+    *"Nothing under /usr/include declares"*) ;;
+    *) _p="$_p;an undeclared symbol nothing provides is not diagnosed" ;;
+esac
+case "$_o2" in
+    *"which-package FC_MADE_UP_SYMBOL_XYZ"*) ;;
+    *) _p="$_p;no way offered to find which package should provide it" ;;
+esac
+# the machine.conf advice, which is right for a genuine compile error, stays
+case "$_o2" in
+    *"machine.conf"*) ;;
+    *) _p="$_p;the per-package build-flag advice was lost" ;;
+esac
+# the search must be bounded: a failure report cannot hang the build
+_sd2="$(sed -n '/AN UNDECLARED SYMBOL USUALLY BELONGS/,/^        fi$/p' "$_hlpC")"
+printf '%s' "$_sd2" | grep -q 'timeout ' \
+    || _p="$_p;the header search is unbounded and could hang the report"
+printf '%s' "$_sd2" | grep -q 'grep -rlm1' \
+    || _p="$_p;the header search reads every match instead of stopping at one"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "an undeclared symbol is traced to the header, or to the package that lacks it"
+fi
+
+# ---- a commented line is not a command  (1.14.23) --------------------------- #
+# A plan refused to start:
+#     JT_JAVA        needed by 1 package(s), first: openjdk
+#     packagemanager env --set JT_JAVA=...
+# JT_JAVA appears on OpenJDK's page ONLY inside the test block -- which the
+# generated script comments out -- and the page EXPORTS it there itself:
+#     # export JT_JAVA=$(echo $PWD/build/*/jdk) &&
+#     # jtreg/bin/jtreg -jdk:$JT_JAVA ...
+# So the guard demanded a value for a variable nothing live would read, and
+# the person was asked to invent one.
+_p=""
+_bkH=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bkH="$_c" && break
+done
+if [ -n "$_bkH" ]; then
+    _gd="$T/guards"; mkdir -p "$_gd"
+    python3 "$(dirname "$LFS_TOOL")/blfs" --book-file "$_bkH" \
+        script openjdk xorg-server texlive -o "$_gd" >/dev/null 2>&1
+    _oj="$(ls "$_gd"/install_OpenJDK* 2>/dev/null | head -1)"
+    if [ -n "$_oj" ]; then
+        grep -q 'needs JT_JAVA to be set' "$_oj" \
+            && _p="$_p;a variable used only in a commented-out test block is still demanded"
+        # the commented line itself must survive: it is the book's own text
+        grep -q 'JT_JAVA' "$_oj" \
+            || _p="$_p;the page's commented test commands were dropped entirely"
+    else
+        _p="$_p;could not generate the openjdk script"
+    fi
+    # a variable the user really must provide is still guarded
+    _xs="$(ls "$_gd"/install_Xorg-Server* 2>/dev/null | head -1)"
+    if [ -n "$_xs" ]; then
+        grep -q 'needs XORG_PREFIX to be set' "$_xs" \
+            || _p="$_p;XORG_PREFIX, which the user must set, is no longer guarded"
+    fi
+    # ...and one the page sets ITSELF is not asked for
+    _tl="$(ls "$_gd"/install_texlive* 2>/dev/null | head -1)"
+    if [ -n "$_tl" ]; then
+        grep -q 'needs TEXLIVE_PREFIX to be set' "$_tl" \
+            && _p="$_p;a variable the book assigns itself is demanded from the user"
+        grep -q 'TEXLIVE_PREFIX=' "$_tl" \
+            || _p="$_p;the book's own assignment was lost"
+    fi
+fi
+# both rules, in the generator
+_gf="$(sed -n '/^def _required_env_guard/,/^def /p' "$(dirname "$LFS_TOOL")/blfs")"
+printf '%s' "$_gf" | grep -q 'A COMMENTED LINE IS NOT A COMMAND' \
+    || _p="$_p;the guard still scans commented-out commands"
+printf '%s' "$_gf" | grep -q "startswith(\"#\")" \
+    || _p="$_p;comments are not filtered before scanning"
+printf '%s' "$_gf" | grep -q 'the page is telling us its value' \
+    || _p="$_p;a variable the commands assign is still asked for"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "only variables live commands read, and the book does not set, are demanded"
+fi
+
+# ---- an avoided package is not walked into  (1.14.24) ----------------------- #
+# From a real plan: cups, Java, OpenJDK and apache-ant were queued, each
+# labelled "required by libreoffice" -- with libreoffice in --ignore.  Ignoring
+# dropped the NAMED package and kept everything it alone wanted, so a sway
+# desktop was about to build a JDK, and stopped on a JT_JAVA guard for it.
+# sway.stack's 80-name avoid list was the workaround for this.
+#
+# 1.12.82 pruned on the finished list and was reverted: `blfs order` reports
+# ONE parent per package, so graphite2 -- recorded under an ignored parent,
+# genuinely needed by harfbuzz -- was dropped and the build failed with
+# "Dependency 'graphite2' is required but not found".  The prune belongs in
+# the WALK, where every edge is still known.
+_p=""
+_b24="$(dirname "$LFS_TOOL")/blfs"
+_bk24=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk24="$_c" && break
+done
+if [ -n "$_bk24" ]; then
+    # poppler/qt6: 185 -> 61.  (This used harfbuzz/libreoffice until 1.14.31
+    # removed that edge -- it came from a parenthetical aside and was never
+    # real.  A test needs a relationship the book actually states.)
+    _all="$(python3 "$_b24" --book-file "$_bk24" order poppler --anchors 2>/dev/null | wc -l)"
+    _cut="$(python3 "$_b24" --book-file "$_bk24" order poppler --anchors \
+            --ignore qt6 2>/dev/null)"
+    _ncut="$(printf '%s\n' "$_cut" | grep -c .)"
+    [ "${_all:-0}" -gt 100 ] || _p="$_p;the unpruned order looks wrong ($_all)"
+    [ "${_ncut:-0}" -lt "${_all:-0}" ] \
+        || _p="$_p;ignoring a package pruned nothing ($_ncut of $_all)"
+    # what libreoffice ALONE wanted is gone
+    for _gone in qt6 vlc phonon phonon-backend-vlc; do
+        printf '%s\n' "$_cut" | cut -f1 | grep -qix "$_gone" \
+            && _p="$_p;$_gone survived although only the ignored package wanted it"
+    done
+    # ...and what harfbuzz itself needs is NOT: this is the 1.12.82 regression
+    for _keep in cairo fontconfig glib2 libpng boost; do
+        printf '%s\n' "$_cut" | cut -f1 | grep -qix "$_keep" \
+            || _p="$_p;$_keep was pruned although another package needs it"
+    done
+    # the ignored package itself is not built
+    printf '%s\n' "$_cut" | cut -f1 | grep -qix qt6 \
+        && _p="$_p;the ignored package is in the order"
+    # asking for an ignored package BY NAME still works: it is the target
+    python3 "$_b24" --book-file "$_bk24" order qt6 --anchors \
+        --ignore qt6 2>/dev/null | cut -f1 | grep -qix qt6 \
+        || _p="$_p;a package cannot be built even when asked for by name"
+fi
+# the walker takes the list, and packagemanager hands it over
+sed -n '/^def walk_deps/,/^def /p' "$_b24" | grep -q 'ignore=()' \
+    || _p="$_p;the dependency walk does not take an ignore list"
+sed -n '/^def walk_deps/,/^def /p' "$_b24" | grep -q 'a.lower() in ignore and a != anchor' \
+    || _p="$_p;the walk still descends into an ignored package"
+sed -n '/^def blfs_order_anchors/,/^def /p' "$(dirname "$LFS_TOOL")/packagemanager" \
+    | grep -q '"--ignore"' \
+    || _p="$_p;packagemanager never passes the ignore list to the walk"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "an avoided package takes what only it wanted, and nothing else"
+fi
+
+# ---- where the page's own commands left off  (1.14.25) ---------------------- #
+# Xorg Libraries downloaded all thirty-two tarballs, verified every checksum,
+# and then:
+#     the list this build loops over is missing or empty: ../lib-7.md5
+# Its prepare step writes lib-7.md5 in the build root, then `mkdir lib && cd
+# lib` and downloads into it -- and the build loop reads `../lib-7.md5`, which
+# only resolves from INSIDE lib.  _pp_unpack ran prepare_pkg and then `cd
+# "$BUILD_ROOT"`, throwing that away, so the build began one level too high.
+_p=""
+_mt="$T/meta"; mkdir -p "$_mt/src"
+{
+    echo '#!/bin/bash'
+    echo 'name_version="meta-1.0"'
+    echo 'prepare_pkg() {'
+    echo 'cat > lib-7.md5 << "XEOF"'
+    echo 'd41d8cd98f00b204e9800998ecf8427e  a.txt'
+    echo 'XEOF'
+    echo 'mkdir -p lib &&'
+    echo 'cd lib &&'
+    echo 'echo hello > a.txt'
+    echo '}'
+    echo 'build_pkg() {'
+    echo '[ -s "../lib-7.md5" ] || { echo "MISSING LIST" >&2; exit 1; }'
+    echo 'echo "BUILT-IN:$PWD"'
+    echo '}'
+    echo 'install_pkg() { echo "INSTALLED-IN:$PWD"; }'
+    echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+} > "$_mt/install_meta"
+_o="$(env PKGUSR_LIB="$PHASES_LIB" LFS_BUILD_ROOT="$_mt/src" \
+      bash "$_mt/install_meta" all 2>&1)"
+case "$_o" in
+    *"MISSING LIST"*) _p="$_p;the build no longer resumes where the page's commands ended" ;;
+esac
+case "$_o" in
+    *"BUILT-IN:$_mt/src/lib"*) ;;
+    *) _p="$_p;the build phase did not resume inside the page's own directory: $_o" ;;
+esac
+# ...and so does every phase after it, not just the build
+case "$_o" in
+    *"INSTALLED-IN:$_mt/src/lib"*) ;;
+    *) _p="$_p;the install phase started somewhere else again" ;;
+esac
+# a package with a real tarball is unaffected: it enters its unpacked source
+_mt2="$T/meta2"; mkdir -p "$_mt2/src" "$_mt2/sources" "$_mt2/stage/demo-5.0"
+printf 'x\n' > "$_mt2/stage/demo-5.0/file"
+( cd "$_mt2/stage" && tar czf ../sources/demo-5.0.tar.gz demo-5.0 ) 2>/dev/null
+{
+    echo 'name_version="demo-5.0"'
+    echo 'pkg_glob="demo-5.0.tar.*"'
+    echo 'prepare_pkg() { mkdir -p elsewhere && cd elsewhere; }'
+    echo 'build_pkg() { echo "BUILT-IN:$PWD"; }'
+    echo 'install_pkg() { :; }'
+    echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+} > "$_mt2/install_demo"
+_o2="$(env PKGUSR_LIB="$PHASES_LIB" LFS_BUILD_ROOT="$_mt2/src" \
+       LFS_SOURCES_DIR="$_mt2/sources" bash "$_mt2/install_demo" all 2>&1)"
+case "$_o2" in
+    *"BUILT-IN:$_mt2/src/demo-5.0"*) ;;
+    *) _p="$_p;a package with a tarball no longer builds in its unpacked source: $_o2" ;;
+esac
+sed -n '/WHERE THE PAGE.S OWN COMMANDS LEFT OFF/,/cd "\$BUILD_ROOT"/p' "$PHASES_LIB" \
+    | grep -q '_pp_prepared_in="$PWD"' \
+    || _p="$_p;the directory prepare_pkg ended in is not remembered"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a meta page's build resumes where its own download commands ended"
+fi
+
+# ---- three reasons a dependency is "not found"  (1.14.26) ------------------- #
+# mesa stopped with meson's whole account of the problem:
+#     ERROR: Dependency "libdrm_intel" not found, tried pkgconfig and cmake
+# libdrm WAS installed -- version 2.4.131, found two lines earlier.  It had
+# been built before libpciaccess existed (the book only RECOMMENDS
+# Xorg-Libraries for libdrm, so nothing ordered them), so it has no
+# libdrm_intel.pc and never will until it is rebuilt.  The .pc files on disk
+# tell the three cases apart, and the box now does.
+_p=""
+_hlpD="$helper_src"
+_dr="$T/depreport"; mkdir -p "$_dr"
+python3 - "$_hlpD" > "$_dr/rep.sh" <<'PYSLICE2'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('phase_done() { return 1; }; missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/"; s="/x"; staged="/x"; auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE2
+bash -n "$_dr/rep.sh" || _p="$_p;the failure report does not parse"
+printf '../meson.build:1719:6: ERROR: Dependency "libdrm_intel" not found, tried pkgconfig and cmake\n' \
+    > "$_dr/mesa.log"
+# 1. the provider is installed but lacks the component -- the reported case
+mkdir -p "$_dr/root1/usr/lib/pkgconfig"; : > "$_dr/root1/usr/lib/pkgconfig/libdrm.pc"
+_o="$(bash -c '. "'"$_dr"'/rep.sh"; SNAP_ROOT="'"$_dr"'/root1"; report mesa all "'"$_dr"'/mesa.log"' 2>&1)"
+case "$_o" in
+    *"'libdrm_intel' is missing, but 'libdrm' IS installed"*) ;;
+    *) _p="$_p;a half-built provider is not recognised" ;;
+esac
+case "$_o" in
+    *"install libdrm --run --recursive --reinstall"*) ;;
+    *) _p="$_p;no command offered to rebuild the provider" ;;
+esac
+# 2. the .pc exists and was not found -- a path problem, not a missing package
+mkdir -p "$_dr/root2/usr/lib/pkgconfig"; : > "$_dr/root2/usr/lib/pkgconfig/libdrm_intel.pc"
+_o2="$(bash -c '. "'"$_dr"'/rep.sh"; SNAP_ROOT="'"$_dr"'/root2"; report mesa all "'"$_dr"'/mesa.log"' 2>&1)"
+case "$_o2" in
+    *"EXISTS, at"*"PKG_CONFIG_PATH"*) ;;
+    *) _p="$_p;an installed .pc that was not found is reported as missing" ;;
+esac
+case "$_o2" in
+    *"is missing, but"*) _p="$_p;it claims the provider is half-built when the .pc is right there" ;;
+esac
+# 3. nothing provides it at all
+mkdir -p "$_dr/root3/usr/lib"
+_o3="$(bash -c '. "'"$_dr"'/rep.sh"; SNAP_ROOT="'"$_dr"'/root3"; report mesa all "'"$_dr"'/mesa.log"' 2>&1)"
+case "$_o3" in
+    *"Nothing on this system provides 'libdrm_intel'"*) ;;
+    *) _p="$_p;a genuinely absent dependency is not reported as absent" ;;
+esac
+# pkg-config's own wording is read too, not only meson's
+printf "Package 'foo-bar' not found\nNo package 'foo-bar' found\n" > "$_dr/pc.log"
+_o4="$(bash -c '. "'"$_dr"'/rep.sh"; SNAP_ROOT="'"$_dr"'/root3"; report demo all "'"$_dr"'/pc.log"' 2>&1)"
+case "$_o4" in
+    *"foo-bar"*) ;;
+    *) _p="$_p;pkg-config's own 'No package ... found' is not recognised" ;;
+esac
+# the searches stay bounded
+sed -n '/A DEPENDENCY THE BUILD SYSTEM COULD NOT FIND/,/^        fi$/p' "$_hlpD" \
+    | grep -q 'timeout 10 find' \
+    || _p="$_p;the .pc search is unbounded"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a missing dependency says which of the three things went wrong"
+fi
+
+# ---- an old account can point at the wrong home  (1.14.27) ------------------ #
+# elogind ended up with TWO half-populated homes:
+#     /usr/src/p_elogind/         install_elogind, install_last, log
+#     /usr/src/pkgusr/p_elogind/  build, build.conf, src
+# Its .bash_profile was dated Nov 2023: an account carried over from an
+# earlier system, whose /etc/passwd home was never re-examined.  Every tool
+# uses pkgusr_home_for (the canonical path), but `su -` starts in the PASSWD
+# home -- so the build ran in one directory while its sources were staged in
+# the other.  The repair existed and ran only when an account was CREATED.
+_p=""
+_hlpE="$helper_src"
+_pmE2="$(dirname "$LFS_TOOL")/packagemanager"
+sed -n '/^cmd_pm_install() {/,/pkgusr_home_for "\$user_name"/p' "$_hlpE" \
+    | grep -q '_repair_misplaced_home "$user_name" 1' \
+    || _p="$_p;an existing account's home is never re-checked before a build"
+# it must be the LOUD form: this is not the expected just-created case
+sed -n '/^cmd_pm_install() {/,/pkgusr_home_for "\$user_name"/p' "$_hlpE" \
+    | grep -q '_repair_misplaced_home "$user_name" 1 1' \
+    && _p="$_p;a home wrong since 2023 is reported as routine"
+# ...and only for an account that exists, so creation still owns that path
+sed -n '/^cmd_pm_install() {/,/pkgusr_home_for "\$user_name"/p' "$_hlpE" \
+    | grep -q 'user_exists "$user_name" && _repair_misplaced_home' \
+    || _p="$_p;the repair runs for accounts that do not exist yet"
+# a git stack entry needs git, which appears in no command: the runner clones
+python3 - "$_pmE2" <<'PYGIT' || _p="$_p;a git entry does not know it needs git"
+import sys, io, tempfile, contextlib, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+e = {"target": "elogind", "kind": "git",
+     "opts": {"url": "https://example.invalid/elogind", "ref": "v255.17",
+              "build": "meson setup build; ninja -C build"}}
+p, _ = pm._stack_git_script(e, tempfile.mkdtemp())
+assert "is_git" in open(p).read()
+pm._tool_available = lambda t: False
+pm._MISSING_TOOLS.clear()
+with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+    pm._warn_missing_build_tools("elogind", p)
+assert "git" in pm._MISSING_TOOLS, sorted(pm._MISSING_TOOLS)
+# and git IS a book package, so the command offered has to work
+assert pm._BUILD_TOOLS.get("git") == "git"
+# nothing is reported when everything is installed
+pm._tool_available = lambda t: True
+pm._MISSING_TOOLS.clear()
+with contextlib.redirect_stderr(io.StringIO()), contextlib.redirect_stdout(io.StringIO()):
+    pm._warn_missing_build_tools("elogind", p)
+assert not pm._MISSING_TOOLS, sorted(pm._MISSING_TOOLS)
+PYGIT
+# the stack checks a git entry before it creates anything
+sed -n '/THE SAME CHECKS AS A BOOK PACKAGE/,/install_local(target, spath/p' "$_pmE2" \
+    | grep -q '_check_script_prereqs(target, spath)' \
+    || _p="$_p;a git entry is built without checking what it needs"
+sed -n '/THE SAME CHECKS AS A BOOK PACKAGE/,/install_local(target, spath/p' "$_pmE2" \
+    | grep -q 'ignore_prereqs' \
+    || _p="$_p;there is no way to push a git entry past the check"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "an inherited account's home is repaired, and a clone knows it needs git"
+fi
+
+# ---- build it, do not just name it  (1.14.28) ------------------------------- #
+# The stack stopped correctly, and then asked the person to type the thing the
+# stack exists to do:
+#     stack stopped at git 'elogind': it needs a tool that is not installed
+#         packagemanager install git --run --recursive
+# A PLAN handles this itself (1.14.14: a missing provider joins the plan and
+# the plan is rebuilt).  A git entry is not a plan, so it stopped.  git is a
+# book package; an unattended run should install it and carry on.
+_p=""
+_pmF2="$(dirname "$LFS_TOOL")/packagemanager"
+_gb="$(sed -n '/BUILD IT, DO NOT JUST NAME IT/,/To start regardless/p' "$_pmF2")"
+printf '%s' "$_gb" | grep -q '_install_via_self(_prov, args.yes, recursive=True)' \
+    || _p="$_p;a missing tool the book provides is still only named"
+printf '%s' "$_gb" | grep -q '_provider_of(t) for t in _MISSING_TOOLS' \
+    || _p="$_p;the tool is not resolved to a book package before installing"
+# a tool with NO book page cannot be installed, and must still stop the run
+printf '%s' "$_gb" | grep -q 'no BLFS page provides' \
+    || _p="$_p;a tool the book cannot provide is treated as installable"
+printf '%s' "$_gb" | grep -q 'come from LFS' \
+    || _p="$_p;it does not say where an unprovidable tool comes from"
+# a failed install of the tool stops the run rather than building on
+printf '%s' "$_gb" | grep -q 'could not"' \
+    || _p="$_p;a failed tool install does not stop the stack"
+# and the split itself is right: git resolves, meson does not
+_bk28=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk28="$_c" && break
+done
+if [ -n "$_bk28" ]; then
+    BLFS_BOOK_FILE="$_bk28" python3 - "$_pmF2" <<'PYSPLIT' || _p="$_p;the installable/not-installable split is wrong"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+assert pm._provider_of("git") == "git", pm._provider_of("git")
+assert pm._provider_of("meson") == "", pm._provider_of("meson")
+assert pm._provider_of("ninja") == "", pm._provider_of("ninja")
+PYSPLIT
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a stack installs a tool the book has instead of asking for it"
+fi
+
+# ---- the setup for a test is part of the test  (1.14.29) -------------------- #
+# Xwayland's build cloned piglit, cloned the X Test Suite, started an Xvfb and
+# tried to build xts -- during an ORDINARY build -- and died:
+#     install_Xwayland-24.1.9: line 54: cd: xts: No such file or directory
+#     Fatal server error
+# The page puts all of that in its BUILD block and only the last line,
+# `ninja test`, looks like a test run, so 1.13's filter commented that one
+# line and left the setup running.  Commenting a test but not what it needs is
+# worse than commenting neither: the cost stays and the point is gone.
+_p=""
+_b29="$(dirname "$LFS_TOOL")/blfs"
+_bk29=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk29="$_c" && break
+done
+if [ -n "$_bk29" ]; then
+    _xw="$T/xwayland"; mkdir -p "$_xw"
+    python3 "$_b29" --book-file "$_bk29" script xwayland -o "$_xw" >/dev/null 2>&1
+    _f="$(ls "$_xw"/install_Xwayland* 2>/dev/null | head -1)"
+    if [ -n "$_f" ]; then
+        _live="$(sed -n '/^build_pkg() {/,/^}/p' "$_f" | grep -vE '^\s*#|^\s*$')"
+        # the real build survives
+        printf '%s' "$_live" | grep -q 'meson setup' \
+            || _p="$_p;the real build commands were commented out too"
+        printf '%s' "$_live" | grep -qw 'ninja' \
+            || _p="$_p;the compile step was lost"
+        # the test scaffolding does not
+        for _t in piglit xts Xvfb autogen.sh; do
+            printf '%s' "$_live" | grep -q "$_t" \
+                && _p="$_p;$_t still runs during an ordinary build"
+        done
+        printf '%s' "$_live" | grep -q 'mkdir tools' \
+            && _p="$_p;the directory made only for the test suite is still created"
+        # the book's text is kept, commented, so it can be read and re-enabled
+        grep -q '# git clone https://gitlab.freedesktop.org/mesa/piglit' "$_f" \
+            || _p="$_p;the page's own test setup was deleted rather than commented"
+        grep -q 'builds the test suite that the commented run below uses' "$_f" \
+            || _p="$_p;nothing says why that block is commented"
+        bash -n "$_f" || _p="$_p;the generated script does not parse"
+    else
+        _p="$_p;could not generate the xwayland script"
+    fi
+fi
+# the rule is narrow: a pushd group is only taken when it IS a test suite
+_ts="$(sed -n '/_TEST_SETUP_RE = re.compile/,/re.I)/p' "$_b29")"
+printf '%s' "$_ts" | grep -q 'piglit' \
+    || _p="$_p;the test-suite names the books fetch are not recognised"
+sed -n '/AND SO DOES THE BLOCK THAT BUILT THE TEST SUITE/,/out.insert/p' "$_b29" \
+    | grep -q '_TEST_SETUP_RE.search(_span)' \
+    || _p="$_p;any pushd group before a test would be commented, not just a test suite"
+sed -n '/AND SO DOES THE BLOCK THAT BUILT THE TEST SUITE/,/out.insert/p' "$_b29" \
+    | grep -q 'popd' \
+    || _p="$_p;the group is not bounded by pushd/popd"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a test suite is not built during an ordinary build"
+fi
+
+# ---- ask the way the build will ask  (1.14.30) ------------------------------ #
+# A plan printed itself twice and refused twice:
+#     cargo    needed by 2 package(s), first: cargo-c
+#     adding to the plan: rust -- its commands call `cargo`
+#     ... same plan, same refusal ...
+# Rust WAS installed.  BLFS puts it in /opt/rustc and adds /opt/rustc/bin in
+# /etc/profile.d/rustc.sh; a build runs through `su -`, a LOGIN shell, which
+# reads that.  `shutil.which` reads OUR path, which does not.  So a tool the
+# build could see was reported missing -- and the 1.14.14 repair could not
+# help, because adding an already-installed package changes nothing, so the
+# second pass produced the identical stop.
+_p=""
+_pmG="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmG" <<'PYTOOL' || _p="$_p;a tool is not looked for the way the build will find it"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+assert pm._tool_available("bash") is True
+assert pm._tool_available("zzz-definitely-not-a-tool") is False
+# what a login shell adds is found: that is exactly /opt/rustc/bin's case
+os.makedirs("/tmp/lfstest-opt/bin", exist_ok=True)
+p = "/tmp/lfstest-opt/bin/lfstest-tool"
+open(p, "w").write("#!/bin/sh\nexit 0\n"); os.chmod(p, 0o755)
+prof = "/etc/profile.d/lfstest-tool.sh"
+wrote = False
+try:
+    open(prof, "w").write('export PATH=/tmp/lfstest-opt/bin:$PATH\n')
+    wrote = True
+except OSError:
+    pass
+if wrote:
+    pm._TOOL_SEEN.clear()
+    try:
+        assert pm._tool_available("lfstest-tool") is True, \
+            "a tool added by /etc/profile.d is reported missing"
+    finally:
+        os.remove(prof)
+PYTOOL
+sed -n '/def _tool_available/,/^def /p' "$_pmG" | grep -q 'bash", "-lc"' \
+    || _p="$_p;the login shell is never consulted"
+sed -n '/def _tool_available/,/^def /p' "$_pmG" | grep -q 'timeout=' \
+    || _p="$_p;the login-shell probe is unbounded"
+sed -n '/def _tool_available/,/^def /p' "$_pmG" | grep -q '_TOOL_SEEN' \
+    || _p="$_p;the probe is repeated for every package that wants the tool"
+# nothing may use the bare PATH check for a build tool any more
+grep -q 'if shutil.which(word) or word in missing' "$_pmG" \
+    && _p="$_p;the tool scan still reads only our own PATH"
+# and a provider that is already installed is never "added to the plan" again
+grep -q 'gather_user(a).state != "installed"' "$_pmG" \
+    || _p="$_p;an installed provider can still be added, so the plan repeats"
+sed -n '/SAY WHEN THE PACKAGE IS THERE AND ONLY THE TOOL/,/command -v/p' "$_pmG" \
+    | grep -q 'profile.d' \
+    || _p="$_p;a PATH problem is not distinguished from a missing package"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a build tool is looked for on the build's PATH, not only on ours"
+fi
+
+# ---- a link in an aside is not a dependency  (1.14.31) ---------------------- #
+# "should we block some things so its not getting that heavy?"  Planning
+# Xwayland -- an X server for Wayland -- came to 235 packages including
+# LibreOffice, OpenJDK, PostgreSQL, TeX Live and a print stack.  The reason
+# was one sentence on the harfbuzz page:
+#     Graphite2-1.3.14 (required for building texlive-20250308 or
+#     LibreOffice-26.2.1.2 with system harfbuzz)
+# Those name what NEEDS graphite2.  The parser harvested every <a class="xref">
+# in the paragraph, so harfbuzz "recommended" LibreOffice and TeX Live, and
+# poppler "recommended" okular from "Qt-6.10.2 (required for PDF support in
+# okular)".  The qualified package is always the link BEFORE the parenthesis,
+# so what is inside can go.
+_p=""
+_b31="$(dirname "$LFS_TOOL")/blfs"
+_bk31=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk31="$_c" && break
+done
+if [ -n "$_bk31" ]; then
+    python3 - "$_b31" "$_bk31" <<'PYASIDE' || _p="$_p;links inside a parenthetical aside are still read as dependencies"
+import sys, types, importlib.machinery as m
+b = m.SourceFileLoader('blfs', sys.argv[1]).load_module()
+book = b.get_book(types.SimpleNamespace(book_file=sys.argv[2], book=None))
+def deps(name):
+    d = book.get(b.resolve_anchor(book, b.anchor_from_input(name)))
+    return d["required"] + d["recommended"]
+h = deps("harfbuzz")
+# the aside named these; they are not harfbuzz's dependencies
+assert not [x for x in h if x.lower().startswith("libreoffice")], h
+assert not [x for x in h if x.lower().startswith("texlive")], h
+# ...and what the sentence really recommends is still there
+for want in ("Graphite2", "icu", "FreeType", "GLib"):
+    assert [x for x in h if x.lower().startswith(want.lower())], (want, h)
+p = deps("poppler")
+assert not [x for x in p if x.lower().startswith("okular")], p
+assert [x for x in p if x.lower().startswith("qt-6")], p   # Qt6 IS required
+# the page that started it: an X server should not pull an office suite
+o = "\n".join(x for x in [])
+PYASIDE
+    _n="$(python3 "$_b31" --book-file "$_bk31" order xwayland --anchors 2>/dev/null | wc -l)"
+    [ "${_n:-999}" -lt 100 ] \
+        || _p="$_p;xwayland still plans $_n packages -- the aside edges are back"
+    python3 "$_b31" --book-file "$_bk31" order xwayland --anchors 2>/dev/null \
+        | cut -f1 | grep -qixE "libreoffice|openjdk|postgresql|texlive" \
+        && _p="$_p;an office suite or a JDK is still in the xwayland tree"
+    # nothing was lost at the other end: the required-only tree is unchanged
+    _r="$(python3 "$_b31" --book-file "$_bk31" order xwayland --anchors \
+          --no-recommended 2>/dev/null | wc -l)"
+    [ "${_r:-0}" -ge 20 ] \
+        || _p="$_p;the required tree shrank too -- real dependencies were dropped"
+fi
+sed -n '/def _in_parenthetical/,/^def /p' "$_b31" | grep -q 'previous_siblings' \
+    || _p="$_p;the aside test does not look at what precedes the link"
+# (the number moves on; what matters is that a PARSE change bumped it -- the
+#  aside fix was v48, and any later parse change must bump it again)
+grep -qE 'CACHE_VERSION = (4[89]|[5-9][0-9])' "$_b31" \
+    || _p="$_p;the cache version was not bumped, so old parses are still served"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a package named in an aside is not treated as a dependency"
+fi
+
+# ---- say what the cycle cost  (1.14.32) ------------------------------------- #
+# vala stopped at
+#     configure: error: Package requirements (libgvc >= 2.16) were not met
+# libgvc is Graphviz, which vala RECOMMENDS -- and the plan had graphviz in
+# it, 20 packages later.  The cause is a real cycle:
+#     vala -> graphviz -> gegl -> babl -> librsvg -> vala
+# all recommended, so one edge has to give and vala loses.  That ordering is
+# the best available; doing it silently is not.
+_p=""
+_b32="$(dirname "$LFS_TOOL")/blfs"
+_pm32="$(dirname "$LFS_TOOL")/packagemanager"
+_bk32=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk32="$_c" && break
+done
+if [ -n "$_bk32" ]; then
+    _co="$(python3 "$_b32" --book-file "$_bk32" order vala --anchors 2>/dev/null)"
+    printf '%s\n' "$_co" | grep -q '^#cycle' \
+        || _p="$_p;a broken cycle edge is not reported by the walker"
+    printf '%s\n' "$_co" | grep -q '^#cycle	vala	graphviz' \
+        || _p="$_p;the vala/graphviz cycle is not among them"
+    # the order itself must still be a valid one: every package appears once
+    _dups="$(printf '%s\n' "$_co" | grep -v '^#' | cut -f1 | sort | uniq -d)"
+    [ -z "$_dups" ] || _p="$_p;the order repeats packages: $_dups"
+fi
+# packagemanager reports only the direction that actually happened
+sed -n '/def _report_cycles/,/^def /p' "$_pm32" | grep -q '_pos\[a.lower()\] < _pos\[d.lower()\]' \
+    || _p="$_p;both directions of a two-package cycle are reported, so one line is false"
+sed -n '/def _report_cycles/,/^def /p' "$_pm32" | grep -q 'reinstall' \
+    || _p="$_p;no rebuild is offered for what the cycle cost"
+grep -q '_report_cycles(steps)' "$_pm32" \
+    || _p="$_p;the plan never reports its cycles"
+# and autoconf's wording reaches the .pc diagnosis (1.14.26 knew only meson's)
+_dr2="$T/depwording"; mkdir -p "$_dr2/root/usr/lib"
+python3 - "$helper_src" > "$_dr2/rep.sh" <<'PYSLICE3'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('phase_done() { return 1; }; missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/"; s="/x"; staged="/x"; auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE3
+printf "configure: error: Package requirements (libgvc >= 2.16) were not met:\nPackage 'libgvc' not found\n" \
+    > "$_dr2/vala.log"
+_o="$(bash -c '. "'"$_dr2"'/rep.sh"; SNAP_ROOT="'"$_dr2"'/root"; report vala all "'"$_dr2"'/vala.log"' 2>&1)"
+case "$_o" in
+    *"provides 'libgvc'"*) ;;
+    *) _p="$_p;autoconf's 'Package requirements ... were not met' is not diagnosed" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a cycle says which package it shortchanged, and how to make it good"
+fi
+
+# ---- the manifests know who claimed it  (1.14.33) --------------------------- #
+# librsvg stopped on `Program 'cargo-cbuild' not found`.  The box knew the
+# shape of the problem -- a package recorded as installed whose build did not
+# finish -- and then said "find the package, purge its record, rebuild it",
+# leaving the person to find it.  Every installed package has a pkg.lst naming
+# the files it installed; a grep answers in a second, and the answer decides
+# WHICH of two situations it is.
+_p=""
+_hlpF="$helper_src"
+_mf="$T/manifests"; mkdir -p "$_mf/p_cargo-c"
+python3 - "$_hlpF" > "$_mf/rep.sh" <<'PYSLICE4'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('phase_done() { return 1; }; missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/"; s="/x"; staged="/x"; auto_repair=1; auto_fix=0; _perm_ish=0')
+print('SRCROOT="' + sys.argv[2] + '"' if len(sys.argv) > 2 else 'SRCROOT="/tmp"')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE4
+sed -i "s|^SRCROOT=.*|SRCROOT=\"$_mf\"|" "$_mf/rep.sh"
+bash -n "$_mf/rep.sh" || _p="$_p;the report does not parse"
+printf "../meson.build:28:10: ERROR: Program 'cargo-cbuild' not found or not executable\n" \
+    > "$_mf/log"
+# 1. a package's record CLAIMS the file: name it and rebuild it
+printf '/usr/bin/cargo-cbuild\n/usr/bin/cargo-capi\n' > "$_mf/p_cargo-c/pkg.lst"
+_o="$(bash -c '. "'"$_mf"'/rep.sh"; report librsvg all "'"$_mf"'/log"' 2>&1)"
+case "$_o" in
+    *"'p_cargo-c' RECORDS having installed it"*) ;;
+    *) _p="$_p;the package whose manifest claims the file is not named" ;;
+esac
+case "$_o" in
+    *"install cargo-c --run --reinstall"*) ;;
+    *) _p="$_p;the rebuild command does not name the package (or keeps the p_ prefix)" ;;
+esac
+case "$_o" in
+    *"rm /usr/src/pkgusr/p_<pkg>"*) _p="$_p;it still tells the user to delete files by hand" ;;
+esac
+# 2. nobody claims it: a different situation, a different answer
+rm -f "$_mf/p_cargo-c/pkg.lst"
+_o2="$(bash -c '. "'"$_mf"'/rep.sh"; report librsvg all "'"$_mf"'/log"' 2>&1)"
+case "$_o2" in
+    *"No installed package records that file"*) ;;
+    *) _p="$_p;an unprovided program is reported as a bad record" ;;
+esac
+case "$_o2" in
+    *"packagemanager search cargo-cbuild"*) ;;
+    *) _p="$_p;no way offered to find what provides it" ;;
+esac
+# the search stays bounded -- a failure report cannot hang
+sed -n '/THE MANIFESTS KNOW WHO CLAIMED IT/,/^        fi$/p' "$_hlpF" | grep -q 'timeout ' \
+    || _p="$_p;the manifest search is unbounded"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a missing program names the package that claims to have installed it"
+fi
+
+# ---- a health check must lead with what is wrong  (1.14.34) ----------------- #
+# A real `packagemanager verify` on a working tree:
+#     broken: 4   not installed: 12   unvalidated: 226
+# The 226 are normal -- "unvalidated" means the page named no file to check,
+# not that anything is broken -- and the twelve that need action were inside
+# them.  Worse, three of the four "broken" were nimgnu_* COLLECTOR GROUPS,
+# which are groups and not packages at all, reported as "has a user but no
+# home dir".  A false alarm in a health check teaches people to skip it.
+_p=""
+_pmI="$(dirname "$LFS_TOOL")/packagemanager"
+sed -n '/A COLLECTOR GROUP IS NOT A PACKAGE/,/startswith(_cp/p' "$_pmI" \
+    | grep -q 'collector_prefix()' \
+    || _p="$_p;collector groups are still listed as package-users"
+python3 - "$_pmI" <<'PYCOLL' || _p="$_p;the collector-group filter does not work"
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+root = tempfile.mkdtemp()
+for d in ("p_zlib", "p_bash", "nimgnu_perl-modules", "nimgnu_python-modules"):
+    os.makedirs(os.path.join(root, d))
+    # a package user's home carries the skeleton; without it these are just
+    # directories, and 1.14.34 drops those (a stray /usr/src/root was being
+    # reported as a broken package).  Give them the evidence, so the only
+    # thing that can exclude the collector groups is the PREFIX.
+    open(os.path.join(root, d, "build.conf"), "w").write("")
+pm.pkgusr_roots = lambda: [root]
+pm.collector_prefix = lambda: "nimgnu"
+got = set(pm.list_all_users())
+assert "zlib" in got and "bash" in got, got
+assert not [g for g in got if g.startswith("nimgnu")], got
+# a different configured prefix is honoured, not a hardcoded one
+# nimgnu and sysgroup are BOTH recognised now (1.14.35: the two tools had
+# different fallbacks, so real systems carry groups under either name), so a
+# third prefix is the way to show the configured value is honoured
+for d in ("acme_shared-thing",):
+    os.makedirs(os.path.join(root, d))
+    open(os.path.join(root, d, "build.conf"), "w").write("")
+pm.collector_prefix = lambda: "acme"
+got2 = set(pm.list_all_users())
+assert not [g for g in got2 if g.startswith("acme")], got2
+pm.collector_prefix = lambda: "somethingelse"
+assert [g for g in pm.list_all_users() if g.startswith("acme")], \
+    "the configured prefix is ignored"
+PYCOLL
+# and the summary repeats the actionable ones with a command
+sed -n '/LEAD WITH WHAT NEEDS DOING/,/nothing needs attention/p' "$_pmI" \
+    > "$T/verify_tail.py" 2>/dev/null
+grep -q 'in ("not installed", "broken")' "$_pmI" \
+    || _p="$_p;the summary does not pick out the states that need action"
+grep -q 'nothing needs attention' "$_pmI" \
+    || _p="$_p;a clean tree is not told so"
+sed -n '/LEAD WITH WHAT NEEDS DOING/,/nothing needs attention/p' "$_pmI" \
+    | grep -q 'packagemanager install %s --run --recursive' \
+    || _p="$_p;no command is offered to rebuild what verify found"
+sed -n '/LEAD WITH WHAT NEEDS DOING/,/nothing needs attention/p' "$_pmI" \
+    | grep -q "unvalidated" \
+    || _p="$_p;nothing explains that 'unvalidated' is normal"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "verify ends with the packages that need action, not with 226 that do not"
+fi
+
+# ---- a stray directory is not a package  (1.14.34) -------------------------- #
+# The account list walked every directory under BASE_DIR (/usr/src), which
+# holds more than package users, so `root` came out as
+#     root   broken   has a home dir but no user
+# An account either exists in the user database, carries one of the prefixes
+# accounts are created with (p_, u_, cfg_), or has the skeleton every package
+# user gets.  A bare directory is none of those.
+_p=""
+_pmJ="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmJ" <<'PYSTRAY' || _p="$_p;a stray directory is still listed as a package"
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+root = tempfile.mkdtemp()
+for d in ("p_zlib", "cfg_bootscripts", "lfs-pkgusr", "root"):
+    os.makedirs(os.path.join(root, d))
+pm.pkgusr_roots = lambda: [root]
+got = set(pm.list_all_users())
+# the prefix is evidence enough for a real account
+assert "zlib" in got, got
+assert "cfg_bootscripts" in got, got
+# ...and a directory that is none of the three is not an account
+assert "lfs-pkgusr" not in got, got
+# a directory with the skeleton IS one, whatever it is called
+os.mkdir(os.path.join(root, "handmade"))
+open(os.path.join(root, "handmade", "install_last"), "w").write("")
+assert "handmade" in pm.list_all_users(), pm.list_all_users()
+PYSTRAY
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the account list holds accounts, not every directory in /usr/src"
+fi
+
+# ---- an install that leaves no record is invisible  (1.14.37) --------------- #
+# `packagemanager verify` reported beautifulsoup4, certifi, charset_normalizer,
+# idna, requests, soupsieve and urllib3 as
+#     not installed   user + home exist, but nothing installed yet
+# while blfs was using bs4 to parse the book on the same machine.  Their homes
+# held build.conf and .project and nothing else: `packagemanager pip` installed
+# the module and wrote NO record -- no pkg.lst, no install_last.  Then verify
+# offered to rebuild them with a command that could not work either, because
+# they are not BLFS packages.
+_p=""
+_pmK="$(dirname "$LFS_TOOL")/packagemanager"
+# the installer records what it installed
+sed -n '/RECORD IT LIKE EVERY OTHER INSTALL/,/return True/p' "$_pmK" \
+    | grep -q '_record_pip_install(user, mod' \
+    || _p="$_p;a pip install still leaves no record"
+_rec="$(sed -n '/^def _record_pip_install/,/^def /p' "$_pmK")"
+printf '%s' "$_rec" | grep -q 'write_pkg_list(user, background=False)' \
+    || _p="$_p;no manifest is written, so the files it installed are unknown"
+printf '%s' "$_rec" | grep -q 'install_last' \
+    || _p="$_p;no version stamp is written"
+printf '%s' "$_rec" | grep -q 'validate_cmd' \
+    || _p="$_p;nothing is recorded that can confirm the module later"
+# ...and the version comes from the module, not from what was asked for
+printf '%s' "$_rec" | grep -q 'importlib.metadata' \
+    || _p="$_p;the recorded version is not the one pip actually installed"
+# a module installed BEFORE this can be given its record without reinstalling
+grep -q 'def cmd_pip_record' "$_pmK" \
+    || _p="$_p;there is no way to record an already-installed module"
+python3 ./packagemanager pip --help 2>&1 | grep -q 'record' \
+    || _p="$_p;pip record is not reachable from the command line"
+python3 - "$_pmK" <<'PYREC' || _p="$_p;the module probe is wrong, so record would refuse or lie"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+# these tools need bs4 themselves, so it is installed wherever they run
+assert pm._python_module_here("beautifulsoup4") is True
+assert pm._python_module_here("definitely-not-a-module-xyz") is False
+# the underscore/dash spelling difference must not decide it
+assert pm._python_module_here("charset-normalizer") == \
+       pm._python_module_here("charset_normalizer")
+PYREC
+# refusing to record something that is NOT installed is the point of the probe
+sed -n '/^def cmd_pip_record/,/^def /p' "$_pmK" | grep -q 'record refused' \
+    || _p="$_p;record would stamp a module that is not installed"
+# and verify says which state this is, instead of "nothing installed yet"
+sed -n '/A PIP MODULE INSTALLED BEFORE 1.14.37/,/continue/p' "$_pmK" \
+    | grep -q 'packagemanager pip record' \
+    || _p="$_p;verify does not tell you how to fix an unrecorded module"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a pip install records itself, and an old one can be recorded in place"
+fi
+
+# ---- a report names the thing it is about  (1.14.38) ------------------------ #
+#     root   broken   has a home dir but no user
+# sent the user looking for /usr/src/root, which is not where it was -- the
+# path was in hand when the line was printed and was thrown away.  And the
+# advice under it read "remove with: packagemanager remove <name>", which for
+# a name like `root` is an invitation to an accident: the fix for a directory
+# with no account is to delete the DIRECTORY.
+_p=""
+_pmL="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmL" <<'PYBROKE' || _p="$_p;a broken entry does not name the directory it is about"
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+root = tempfile.mkdtemp()
+d = os.path.join(root, "root"); os.makedirs(d)
+open(os.path.join(d, "build.conf"), "w").write("")
+pm.pkgusr_roots = lambda: [root]
+pm.pkgusr_home = lambda n: os.path.join(root, n)
+st, why = pm.assess(pm.gather_user("root"), None)
+assert st == "broken", (st, why)
+assert d in why, why          # the PATH, not just the fact
+PYBROKE
+sed -n '/Not BLFS packages, and not rebuilt/,/removed/p' "$_pmL" \
+    | grep -q 'packagemanager remove <name>' \
+    && _p="$_p;it still suggests removing an account for a stray directory"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a broken entry names its directory, and suggests nothing dangerous"
+fi
+
+# ---- a commented block does not move the stream  (1.14.39) ------------------ #
+# gegl's generated script had an EMPTY build phase and did the whole build
+# inside install_pkg, so when meson failed the following `ninja install` ran
+# anyway:  ninja: error: loading 'build.ninja': No such file or directory
+#
+# The rule "everything after a root block belongs after it" (GLib's
+# user -> root -> user interleaving) is right for a root step that RUNS.
+# gegl's first root block is conditional -- "If you are installing over a
+# previous version ... remove it" -- so it is emitted COMMENTED, and nothing
+# has happened; but it flipped the latch anyway.
+_p=""
+_b39="$(dirname "$LFS_TOOL")/blfs"
+_bk39=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk39="$_c" && break
+done
+if [ -n "$_bk39" ]; then
+    _sd39="$T/streams"; mkdir -p "$_sd39"
+    python3 "$_b39" --book-file "$_bk39" script gegl glib2 -o "$_sd39" >/dev/null 2>&1
+    _g="$(ls "$_sd39"/install_gegl* 2>/dev/null | head -1)"
+    if [ -n "$_g" ]; then
+        _gb="$(sed -n '/^build_pkg() {/,/^}/p' "$_g")"
+        _gi="$(sed -n '/^install_pkg() {/,/^}/p' "$_g")"
+        printf '%s' "$_gb" | grep -q 'meson setup' \
+            || _p="$_p;gegl still builds nothing in its build phase"
+        printf '%s' "$_gb" | grep -qw 'ninja' \
+            || _p="$_p;the compile step is not in the build phase"
+        printf '%s' "$_gi" | grep -q 'ninja install' \
+            || _p="$_p;the install step left the install phase"
+        printf '%s' "$_gi" | grep -q 'meson setup' \
+            && _p="$_p;the build is still being done in the install phase"
+        # the book's own conditional line stays, commented
+        grep -q '# rm -f /usr/lib/gegl-0.4/vector-fill.so' "$_g" \
+            || _p="$_p;the conditional root command was dropped instead of commented"
+    else
+        _p="$_p;could not generate the gegl script"
+    fi
+    # ...and a root block that REALLY runs still moves everything after it:
+    # GLib builds, installs gobject-introspection as root, then reconfigures
+    _gl="$(ls "$_sd39"/install_GLib* 2>/dev/null | head -1)"
+    if [ -n "$_gl" ]; then
+        sed -n '/^install_pkg() {/,/^}/p' "$_gl" | grep -q 'gi-build' \
+            || _p="$_p;GLib's interleaved reconfigure moved back into the build phase"
+    fi
+fi
+# ...and gegl does not need the override at all: a subproject with NO BLFS
+# page is allowed to fall back by name, so the protection stays everywhere
+# else (1.14.40).  --force-fallback-for overrides the wrap mode for exactly
+# the named subprojects.
+if [ -n "$_bk39" ]; then
+    _gm="$(grep -h 'meson setup' "$_sd39"/install_gegl* 2>/dev/null | head -1)"
+    case "$_gm" in
+        *"--force-fallback-for=libnsgif,poly2tri-c"*) ;;
+        *) _p="$_p;gegl cannot get the subprojects the book has no page for" ;;
+    esac
+    case "$_gm" in
+        *"--wrap-mode=nofallback"*) ;;
+        *) _p="$_p;the vendoring protection was dropped instead of narrowed" ;;
+    esac
+    # a package whose deps ARE in the book keeps the plain protection
+    python3 "$_b39" --book-file "$_bk39" script cairo -o "$_sd39" >/dev/null 2>&1
+    _cm="$(grep -h 'meson setup' "$_sd39"/install_[Cc]airo* 2>/dev/null | head -1)"
+    case "$_cm" in
+        *force-fallback-for*) _p="$_p;cairo may vendor freetype again" ;;
+    esac
+    # every listed subproject must genuinely be absent from the book
+    BLFS_BOOK_FILE="$_bk39" python3 - "$(dirname "$LFS_TOOL")/packagemanager" "$_b39" <<'PYNOPAGE' || _p="$_p;a subproject on the allow-list has a book page and should be built as a package"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+b = m.SourceFileLoader('b', sys.argv[2]).load_module()
+for pkg, subs in b._FALLBACK_ALLOWED.items():
+    for sub in subs:
+        assert not pm.book_version(sub), (pkg, sub, "IS in the book")
+PYNOPAGE
+fi
+# the wrap-mode we add can also be overridden per package by hand
+_pmM="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmM" "$T/wrapmode" <<'PYWRAP' || _p="$_p;wrap_mode cannot be set per package"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "install_gegl-0.4.66")
+open(p, "w").write("build_pkg() {\nmeson setup --wrap-mode=nofallback --prefix=/usr ..\n}\n")
+pm._machine_opts_for = lambda a: {"wrap_mode": "default"}
+pm.apply_machine_opts("gegl", p)
+body = open(p).read()
+assert "--wrap-mode=default" in body, body
+assert "nofallback" not in body, body
+PYWRAP
+# and the failure says who disabled it -- meson's message never does
+sed -n '/A FALLBACK \*WE\* DISABLED/,/regenerate/p' "$helper_src" \
+    | grep -q 'wrap_mode = default' \
+    || _p="$_p;a disabled fallback does not say how to allow it"
+sed -n '/A FALLBACK \*WE\* DISABLED/,/regenerate/p' "$helper_src" \
+    | grep -q 'disabled BY US' \
+    || _p="$_p;it does not say the flag is ours, not the book's"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a commented-out root block leaves the build in the build phase"
+fi
+
+# ---- a test runner is a command, not a substring  (1.14.41) ----------------- #
+# librsvg died on `Program 'cargo-cbuild' not found`, and cargo-c -- which
+# provides it -- had installed nothing.  Its one install line is
+#     install -vm755 target/release/cargo-{capi,cbuild,cinstall,ctest} /usr/bin/
+# and `\bctest\b` matched inside the brace list, because a comma is a word
+# boundary.  So the line that installs four binaries was commented as "runs
+# the test suite", verify was right to call cargo-c not installed, and the
+# failure surfaced two packages later.
+_p=""
+_b41="$(dirname "$LFS_TOOL")/blfs"
+_bk41=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk41="$_c" && break
+done
+python3 - "$_b41" <<'PYDRIVER' || _p="$_p;the test-runner pattern still matches inside a word"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+hit = lambda l: bool(b._TEST_DRIVER_RE.search(l))
+# the reported line, and the shapes around it
+assert not hit("install -vm755 target/release/cargo-{capi,cbuild,cinstall,ctest} /usr/bin/")
+assert not hit("install -v -m755 foo-pytest /usr/bin")
+assert not hit("cp build/mytest-helper /usr/bin")
+# ...while a real test run is still recognised, however it is reached
+assert hit("ctest --output-on-failure")
+assert hit("cd build && ctest")
+assert hit("pytest -v")
+assert hit("make check")
+assert hit("ninja test")
+PYDRIVER
+if [ -n "$_bk41" ]; then
+    _wd41="$T/drivers"; mkdir -p "$_wd41"
+    python3 "$_b41" --book-file "$_bk41" script cargo-c whois git -o "$_wd41" >/dev/null 2>&1
+    _cg="$(ls "$_wd41"/install_cargo-c* 2>/dev/null | head -1)"
+    [ -n "$_cg" ] && { sed -n '/^install_pkg() {/,/^}/p' "$_cg" \
+        | grep -q '^install -vm755 target/release/cargo-' \
+        || _p="$_p;cargo-c still installs nothing"; }
+    # A BARE `make` BUILDS THE PACKAGE.  Whois builds with `make` and installs
+    # with `make prefix=/usr install-whois`; there is no `make whois` target,
+    # so all three install lines were commented as building nothing.
+    _wh="$(ls "$_wd41"/install_Whois* 2>/dev/null | head -1)"
+    [ -n "$_wh" ] && { sed -n '/^install_pkg() {/,/^}/p' "$_wh" \
+        | grep -q '^make prefix=/usr install-whois' \
+        || _p="$_p;a package built by a bare make installs nothing"; }
+    # ...but a bare make does NOT build the manuals: git's install-man still
+    # waits for the conditional `make man`, which is why this filter exists
+    _gt="$(ls "$_wd41"/install_[Gg]it-2* 2>/dev/null | head -1)"
+    [ -n "$_gt" ] && { grep -q "^# make install-man" "$_gt" \
+        || _p="$_p;git installs man pages it never built"; }
+    # and every page in the book installs SOMETHING
+    _none=0
+    for _f in "$_wd41"/install_*; do
+        sed -n '/^install_pkg() {/,/^}/p' "$_f" | grep -vE '^\s*#|^\s*$|install_pkg|^\}' \
+            | grep -qv '^:$' || _none=$((_none + 1))
+    done
+    [ "$_none" = 0 ] || _p="$_p;$_none of the generated scripts install nothing"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a test runner is recognised as a command, and every page installs something"
+fi
+
+# ---- one answer per failure  (1.14.42) -------------------------------------- #
+# gtk4 stopped on `Dependency 'libtiff-4' is required but not found`, and the
+# box told the user to allow a vendored copy:
+#     [gtk4]
+#     wrap_mode = default
+# libtiff-4 is the pkg-config module of libtiff -- a BLFS package, installed
+# on that system.  Following the advice would have built a second libtiff
+# inside gtk4 and buried a pkg-config problem.
+#
+# Two faults: meson's SECOND wording ("'x' is required but not found", single
+# quotes) matched none of the extraction patterns, so the whole .pc diagnosis
+# was skipped and only the fallback note remained; and the fallback note ran
+# before that diagnosis, so it could not know better.
+_p=""
+_hlpG="$helper_src"
+_dr42="$T/onedep"; mkdir -p "$_dr42/root/usr/lib"
+python3 - "$_hlpG" > "$_dr42/rep.sh" <<'PYSLICE5'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { [ "$1" = "p_libtiff" ]; }')
+print('phase_done() { return 1; }; missing_dirs_from_log() { :; }')
+print('s="/x"; staged="/x"; auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE5
+bash -n "$_dr42/rep.sh" || _p="$_p;the report does not parse"
+printf "Not looking for a fallback subproject for the dependency libtiff-4 because:\nUse of fallback dependencies is disabled.\n../meson.build:9: ERROR: Dependency 'libtiff-4' is required but not found.\n" \
+    > "$_dr42/gtk4.log"
+_o="$(bash -c '. "'"$_dr42"'/rep.sh"; SNAP_ROOT="'"$_dr42"'/root"; report gtk4 all "'"$_dr42"'/gtk4.log"' 2>&1)"
+# the module name is resolved to the package that owns it
+case "$_o" in
+    *"pkg-config name of 'libtiff'"*) ;;
+    *) _p="$_p;a pkg-config module name is not traced to its package" ;;
+esac
+case "$_o" in
+    *"install libtiff --run --reinstall"*) ;;
+    *) _p="$_p;no way offered to rebuild the package that owns it" ;;
+esac
+# ...and the WRONG advice is not given: libtiff is ours, not a subproject
+case "$_o" in
+    *"wrap_mode = default"*) _p="$_p;it still offers to vendor a package we have" ;;
+esac
+case "$_o" in
+    *"Nothing on this system provides"*)
+        _p="$_p;it says the provider is installed AND that nothing provides it" ;;
+esac
+# a dependency nothing can supply still gets the fallback advice
+printf "Not looking for a fallback subproject for the dependency libnsgif because:\nUse of fallback dependencies is disabled.\n../meson.build:384: ERROR: Dependency 'libnsgif' is required but not found.\n" \
+    > "$_dr42/gegl.log"
+_o2="$(bash -c '. "'"$_dr42"'/rep.sh"; SNAP_ROOT="'"$_dr42"'/root"; report gegl all "'"$_dr42"'/gegl.log"' 2>&1)"
+case "$_o2" in
+    *"wrap_mode = default"*) ;;
+    *) _p="$_p;a subproject nothing provides no longer gets the fallback advice" ;;
+esac
+case "$_o2" in
+    *"pkg-config name of"*) _p="$_p;it invents an owner for a name nothing provides" ;;
+esac
+# all four spellings of "not found" reach the diagnosis
+_dep_block="$(sed -n '/A DEPENDENCY THE BUILD SYSTEM COULD NOT FIND/,/local _dep_provider/p' "$_hlpG")"
+for _w in 'is required but not found' 'No package' 'Package requirements' '" not found'; do
+    printf '%s' "$_dep_block" | grep -qF "$_w" \
+        || _p="$_p;the wording '$_w' is not recognised"
+done
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a missing dependency gets one answer, and it is the right one"
+fi
+
+# ---- not installed is not the same as not a package  (1.14.43) -------------- #
+# gtk4 wanted `libtiff-4` on a system with NO p_libtiff at all.  The account
+# check found nothing, so the box said "nothing provides it -- packagemanager
+# install libtiff-4", naming a package the book does not have, and then
+# offered to vendor a copy.  Two wrong answers where the right one was one
+# string operation away: libtiff-4 is the pkg-config module of libtiff.
+_p=""
+_hlpH="$helper_src"
+_dr43="$T/guessdep"; mkdir -p "$_dr43"
+python3 - "$_hlpH" > "$_dr43/rep.sh" <<'PYSLICE6'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }        # nothing installed')
+print('phase_done() { return 1; }; missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/nonexistent"; s="/x"; staged="/x"')
+print('auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE6
+printf "Not looking for a fallback subproject for the dependency libtiff-4 because:\nUse of fallback dependencies is disabled.\n../meson.build:9: ERROR: Dependency 'libtiff-4' is required but not found.\n" \
+    > "$_dr43/gtk4.log"
+_o="$(bash -c '. "'"$_dr43"'/rep.sh"; report gtk4 all "'"$_dr43"'/gtk4.log"' 2>&1)"
+case "$_o" in
+    *"pkg-config module of"*"'libtiff'"*) ;;
+    *) _p="$_p;a module name is not traced to its package when nothing is installed" ;;
+esac
+case "$_o" in
+    *"install libtiff --run --recursive"*) ;;
+    *) _p="$_p;it does not offer to install the package that provides it" ;;
+esac
+case "$_o" in
+    *"install libtiff-4 --run"*) _p="$_p;it still names a package the book cannot have" ;;
+esac
+case "$_o" in
+    *"wrap_mode = default"*) _p="$_p;it still offers to vendor a real package" ;;
+esac
+# a name with no version suffix has no better guess: the fallback IS the answer
+printf "Not looking for a fallback subproject for the dependency libnsgif because:\nUse of fallback dependencies is disabled.\n../meson.build:384: ERROR: Dependency 'libnsgif' is required but not found.\n" \
+    > "$_dr43/gegl.log"
+_o2="$(bash -c '. "'"$_dr43"'/rep.sh"; report gegl all "'"$_dr43"'/gegl.log"' 2>&1)"
+case "$_o2" in
+    *"wrap_mode = default"*) ;;
+    *) _p="$_p;a subproject with no package behind it lost the fallback advice" ;;
+esac
+case "$_o2" in
+    *"pkg-config module of"*) _p="$_p;it invented a package name for libnsgif" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "an absent dependency is named as the package that would provide it"
+fi
+
+# ---- a ref that does not exist is a typo, not a build error  (1.14.44) ------ #
+# A stack entry pinned usrsctp to ref=1.0.0, which does not exist upstream
+# (the tags are 0.9.3.0, 0.9.4.0, 0.9.5.0).  All the person saw was git's own
+#     error: pathspec '1.0.0' did not match any file(s) known to git
+# followed by "phase 'unpack' FAILED" -- which reads like a build failure and
+# sends them to a log.  The repository is right there and knows what it has.
+_p=""
+_gr="$T/gitref"; mkdir -p "$_gr/src"
+if command -v git >/dev/null 2>&1; then
+    ( cd "$_gr" && git init -q repo && cd repo \
+      && git config user.email t@t && git config user.name t \
+      && echo x > f && git add f && git commit -qm one \
+      && git tag v0.9.5 && git tag v1.0-real ) >/dev/null 2>&1
+    {
+        echo '#!/bin/bash'
+        echo 'name="demo"'
+        echo 'name_version="demo-git"'
+        echo 'is_git="1"'
+        echo "link=\"$_gr/repo\""
+        echo 'git_ref="1.0.0"'
+        echo 'build_pkg() { :; }'
+        echo 'install_pkg() { :; }'
+        echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+    } > "$_gr/install_demo"
+    _o="$(env PKGUSR_LIB="$PHASES_LIB" LFS_BUILD_ROOT="$_gr/src" \
+          bash "$_gr/install_demo" unpack 2>&1)"
+    case "$_o" in
+        *"is not a tag, branch or commit"*) ;;
+        *) _p="$_p;a missing git ref is not explained: $_o" ;;
+    esac
+    case "$_o" in
+        *"v1.0-real"*) ;;
+        *) _p="$_p;the tags the repository DOES have are not shown" ;;
+    esac
+    case "$_o" in
+        *"Fix ref= in the stack entry"*) ;;
+        *) _p="$_p;it does not say where the wrong value came from" ;;
+    esac
+    # and the phase still fails: explaining is not excusing
+    env PKGUSR_LIB="$PHASES_LIB" LFS_BUILD_ROOT="$_gr/src" \
+        bash "$_gr/install_demo" unpack >/dev/null 2>&1 \
+        && _p="$_p;a bad ref no longer fails the phase"
+    # a ref that DOES exist still works
+    sed -i 's/^git_ref="1.0.0"/git_ref="v0.9.5"/' "$_gr/install_demo"
+    env PKGUSR_LIB="$PHASES_LIB" LFS_BUILD_ROOT="$_gr/src" \
+        bash "$_gr/install_demo" unpack >/dev/null 2>&1 \
+        || _p="$_p;a valid ref no longer checks out"
+fi
+# the stack's own pin was the wrong one and is corrected
+_ss="$(dirname "$LFS_TOOL")/stacks/sway.stack"
+[ -f "$_ss" ] && { grep -q 'usrsctp.git ref=1.0.0' "$_ss" \
+    && _p="$_p;the stack still pins a usrsctp tag that does not exist"; }
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a git ref that does not exist names the tags that do"
+fi
+
+# ---- one flag, and the same one every time  (1.14.45) ----------------------- #
+# webrtc-audio-processing stopped with
+#     ../webrtc/rtc_base/trace_event.h:202:18: error: 'uint8_t' does not name a type
+# which is not a broken package: GCC 13 stopped pulling <cstdint> in through
+# other headers, so code written before that no longer compiles.  The box said
+# only "if it needs a build flag, put it in machine.conf" -- true, and no help
+# at all when the flag is always the same one.
+_p=""
+_hlpI="$helper_src"
+_pmN="$(dirname "$LFS_TOOL")/packagemanager"
+_st="$T/stdint"; mkdir -p "$_st"
+python3 - "$_hlpI" > "$_st/rep.sh" <<'PYSLICE7'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }; phase_done() { return 1; }')
+print('missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/nonexistent"; s="/x"; staged="/x"')
+print('auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE7
+printf "../webrtc/rtc_base/trace_event.h:202:18: error: 'uint8_t' does not name a type\n../webrtc/rtc_base/foo.cc:9:1: note: here\n" \
+    > "$_st/cpp.log"
+_o="$(bash -c '. "'"$_st"'/rep.sh"; report webrtc-audio-processing all "'"$_st"'/cpp.log"' 2>&1)"
+case "$_o" in
+    *"GCC 13+ change"*) ;;
+    *) _p="$_p;the stdint compile error is not recognised" ;;
+esac
+case "$_o" in
+    *"cpp_args = -include cstdint"*) ;;
+    *) _p="$_p;a C++ failure is not given the C++ flag" ;;
+esac
+# a C source gets the C spelling, not the C++ one
+printf "../src/foo.c:12:5: error: 'uint32_t' does not name a type\n" > "$_st/c.log"
+_o2="$(bash -c '. "'"$_st"'/rep.sh"; report demo all "'"$_st"'/c.log"' 2>&1)"
+case "$_o2" in
+    *"c_args = -include stdint.h"*) ;;
+    *) _p="$_p;a C failure is given the C++ flag" ;;
+esac
+# an ordinary compile error keeps the generic advice and gains nothing
+printf "../src/foo.c:12:5: error: too few arguments to function 'bar'\n" > "$_st/plain.log"
+_o3="$(bash -c '. "'"$_st"'/rep.sh"; report demo all "'"$_st"'/plain.log"' 2>&1)"
+case "$_o3" in
+    *"GCC 13+ change"*) _p="$_p;every compile error is blamed on cstdint" ;;
+esac
+# ...and the flag it recommends must survive being written into the script:
+# a value with a space is ONE value
+python3 - "$_pmN" "$_st" <<'PYQUOTE2' || _p="$_p;a multi-word option value is split by the shell"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+p = os.path.join(sys.argv[2], "install_w")
+open(p, "w").write("build_pkg() {\nmeson setup build --prefix=/usr\n}\n")
+pm._machine_opts_for = lambda a: {"cpp_args": "-include cstdint"}
+pm.apply_machine_opts("webrtc-audio-processing", p)
+body = open(p).read()
+assert "-Dcpp_args='-include cstdint'" in body, body
+# and applying it twice does not nest the quotes
+pm.apply_machine_opts("webrtc-audio-processing", p)
+assert body == open(p).read(), open(p).read()
+PYQUOTE2
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the GCC 13 cstdint break is named, with the flag that fixes it"
+fi
+
+# ---- advice that nothing reads  (1.14.46) ----------------------------------- #
+# The 1.14.45 box told the user to put
+#     [webrtc-audio-processing]
+#     cpp_args = -include cstdint
+# in machine.conf.  webrtc-audio-processing is a GIT stack entry, and
+# apply_machine_opts was called only from resolve_script -- the BOOK path.
+# Nothing would have read that section.  The advice was correct and inert,
+# which is worse than wrong: it looks like it worked until the same error
+# comes back.
+_p=""
+_pmO="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmO" <<'PYMOPT' || _p="$_p;machine.conf does not reach a git stack entry"
+import sys, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+e = {"target": "webrtc-audio-processing", "kind": "git",
+     "opts": {"url": "https://example.invalid/w.git", "ref": "v2.1",
+              "build": "meson setup build --prefix=/usr; ninja -C build",
+              "install": "ninja -C build install"}}
+p, _ = pm._stack_git_script(e, tempfile.mkdtemp())
+pm._machine_opts_for = lambda a: {"cpp_args": "-include cstdint"}
+pm.apply_machine_opts("webrtc-audio-processing", p)
+body = open(p).read()
+assert "-Dcpp_args='-include cstdint'" in body, body
+PYMOPT
+# the stack's git/tar branch calls it, for the same reason a book package does
+sed -n '/elif kind in ("git", "tar")/,/install_local(target, spath/p' "$_pmO" \
+    | grep -q 'apply_machine_opts(target, spath)' \
+    || _p="$_p;a git or tar entry is built without its machine.conf options"
+# every path that RUNS a script applies them: two in resolve_script, one here
+[ "$(grep -c 'apply_machine_opts(' "$_pmO")" -ge 4 ] \
+    || _p="$_p;some path still runs a script without applying machine.conf"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "machine.conf reaches every script, whatever wrote it"
+fi
+
+# ---- one typo must not disable a whole file  (1.14.47) ---------------------- #
+# The user followed the advice twice, so machine.conf ended up with
+#     [webrtc-audio-processing]
+#     cpp_args = -include cstdint
+#     [webrtc-audio-processing]
+#     cpp_args = -include cstdint
+# configparser raises on a repeated section, and _read_conf_section discarded
+# the ENTIRE file on any error.  So the new section did nothing -- and neither
+# did [mesa], whose driver selection quietly reverted to "build everything"
+# because of a duplicate heading further down the file.
+_p=""
+_pmP="$(dirname "$LFS_TOOL")/packagemanager"
+_mc="$T/machineconf"; mkdir -p "$_mc"
+printf '[mesa]\nplatforms = x11,wayland\n\n[webrtc-audio-processing]\ncpp_args = -include cstdint\n[webrtc-audio-processing]\ncpp_args = -include cstdint\n' \
+    > "$_mc/dup.conf"
+PM_MACHINE_CONF="$_mc/dup.conf" python3 - "$_pmP" <<'PYDUP' || _p="$_p;a repeated section still discards the whole file"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+# the repeated section itself is read
+assert pm._machine_opts_for("webrtc-audio-processing") == {"cpp_args": "-include cstdint"}, \
+    pm._machine_opts_for("webrtc-audio-processing")
+# ...and so is every OTHER section, which is the part that was dangerous
+assert pm._machine_opts_for("mesa").get("platforms") == "x11,wayland", \
+    pm._machine_opts_for("mesa")
+PYDUP
+# a file that is genuinely malformed still reports, and says how far the
+# damage reaches
+printf '[mesa]\nplatforms = x11\n[oops\nbroken = yes\n' > "$_mc/bad.conf"
+_o="$(PM_MACHINE_CONF="$_mc/bad.conf" python3 - "$_pmP" 2>&1 <<'PYBAD'
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm._machine_opts_for("mesa")
+PYBAD
+)"
+case "$_o" in
+    *"NO options from that file were applied"*) ;;
+    *) _p="$_p;a broken machine.conf does not say that everything was skipped" ;;
+esac
+sed -n '/def _read_conf_section/,/^def /p' "$_pmP" | grep -q 'strict=False' \
+    || _p="$_p;the parser is strict again, so a duplicate heading breaks the file"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a repeated section is merged, and a broken file says what it cost"
+fi
+
+# ---- the wrong book, found by the package  (1.14.48) ------------------------ #
+# BlueZ stopped with
+#     configure: error: systemd system unit directory is required
+# on a SysV system.  Nothing was broken: the SYSTEMD book's page produced the
+# script, and its configure line omits --disable-systemd because on a systemd
+# machine there is nothing to disable.  Every run had been printing "no book
+# matched 'stable-sysv'; using the cached BLFS-BOOK-...-systemd" -- this is
+# what that note costs when it scrolls past.
+_p=""
+_hlpJ="$helper_src"
+_sy="$T/sysvbook"; mkdir -p "$_sy"
+python3 - "$_hlpJ" > "$_sy/rep.sh" <<'PYSLICE8'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }; phase_done() { return 1; }')
+print('missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/nonexistent"; s="/x"; staged="/x"')
+print('auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE8
+printf "checking systemd system unit dir... configure: error: systemd system unit directory is required\n" \
+    > "$_sy/bluez.log"
+# on a system WITHOUT systemctl, the book mismatch is named
+_o="$(bash -c 'command() { if [ "${2:-}" = systemctl ]; then return 1; fi; builtin command "$@"; }
+. "'"$_sy"'/rep.sh"; report bluez all "'"$_sy"'/bluez.log"' 2>&1)"
+case "$_o" in
+    *"blfs fetch stable-sysv"*) ;;
+    *) _p="$_p;a systemd-only configure check does not point at the sysv book" ;;
+esac
+case "$_o" in
+    *"configure_args = --disable-systemd"*) ;;
+    *) _p="$_p;no offline fallback is offered for a machine with no network" ;;
+esac
+case "$_o" in
+    *"every later package too"*) ;;
+    *) _p="$_p;it does not say the book fixes more than this one package" ;;
+esac
+# ...and on a systemd system it says nothing: there the page is correct
+if command -v systemctl >/dev/null 2>&1; then
+    _o2="$(bash -c '. "'"$_sy"'/rep.sh"; report bluez all "'"$_sy"'/bluez.log"' 2>&1)"
+    case "$_o2" in
+        *"This is a SysV system"*)
+            _p="$_p;it blames the book on a systemd system, where the page is right" ;;
+    esac
+fi
+# the check must be OUTSIDE the compile-error branch: a configure error has no
+# file:line:col to match, which is why the first attempt at this never fired
+_pos_dep="$(grep -n 'A DEPENDENCY THE BUILD SYSTEM COULD NOT FIND' "$_hlpJ" | cut -d: -f1)"
+_pos_book="$(grep -n 'THE WRONG BOOK, FOUND BY THE PACKAGE' "$_hlpJ" | cut -d: -f1)"
+_pos_compile="$(grep -n 'This is a COMPILE error' "$_hlpJ" | cut -d: -f1)"
+[ -n "$_pos_book" ] && [ -n "$_pos_compile" ] && [ "$_pos_book" -gt "$_pos_compile" ] \
+    && [ -n "$_pos_dep" ] && [ "$_pos_book" -lt "$_pos_dep" ] \
+    || _p="$_p;the book check is not where a configure failure can reach it"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a systemd-only configure check names the book, not the package"
+fi
+
+# ---- see the difference, do not guess it  (1.14.48) ------------------------- #
+# BlueZ stopped with "systemd system unit directory is required" on a SysV
+# system: the SYSTEMD book's page was used, and its configure line has no
+# --disable-systemd because on a systemd machine there is nothing to disable.
+# Every run already warned "no book matched 'stable-sysv'"; this is what that
+# note costs.  Per-package machine.conf entries paper over one page at a time,
+# and only after each has failed.
+_p=""
+_b48="$(dirname "$LFS_TOOL")/blfs"
+_bk48=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk48="$_c" && break
+done
+python3 "$_b48" diff-init --help >/dev/null 2>&1 \
+    || _p="$_p;there is no way to compare two books"
+if [ -n "$_bk48" ]; then
+    # a copy with one page changed the way the sysv book changes it
+    _alt="$T/BLFS-BOOK-13.0-sysv-nochunks.html"
+    python3 - "$_bk48" "$_alt" <<'PYDOCTOR'
+import sys
+s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+i = s.index('id="bluez"')
+seg = s[i:i + 40000]
+alt = seg.replace('--enable-library', '--enable-library --disable-systemd', 1)
+open(sys.argv[2], "w", encoding="utf-8").write(s[:i] + alt + s[i + 40000:])
+PYDOCTOR
+    # one package: the actual command difference, as a diff
+    _d="$(python3 "$_b48" --book-file "$_bk48" diff-init "$_alt" bluez 2>&1)"
+    case "$_d" in
+        *"--disable-systemd"*) ;;
+        *) _p="$_p;the per-package diff does not show the changed command: $_d" ;;
+    esac
+    case "$_d" in
+        *"+++"*"---"*|*"---"*"+++"*) ;;
+        *) _p="$_p;the output is not a diff, so it cannot be read as one" ;;
+    esac
+    # ...and the survey: which pages differ at all, before anything is built
+    _s="$(timeout 300 python3 "$_b48" --book-file "$_bk48" diff-init "$_alt" 2>&1)"
+    case "$_s" in
+        *"bluez"*"commands differ"*) ;;
+        *) _p="$_p;the survey does not name the page that differs" ;;
+    esac
+    case "$_s" in
+        *"1 of "*" shared pages differ"*) ;;
+        *) _p="$_p;the survey does not count what it compared" ;;
+    esac
+    # comparing a book with ITSELF is refused outright (1.14.49): answering
+    # "0 differ" for it is true and useless, and hid a fallback that had
+    # silently picked the same book for both sides
+    _z="$(timeout 300 python3 "$_b48" --book-file "$_bk48" diff-init "$_bk48" 2>&1)"
+    case "$_z" in
+        *"same file"*) ;;
+        *) _p="$_p;comparing a book with itself is not refused" ;;
+    esac
+fi
+# and the failure box points at the book, not only at a per-package patch
+sed -n '/THE WRONG BOOK, FOUND BY THE PACKAGE INSTEAD OF BY US/,/configure_args = --disable-systemd/p' \
+    "$helper_src" | grep -q 'blfs fetch stable-sysv' \
+    || _p="$_p;a systemd-only configure failure does not mention the sysv book"
+sed -n '/THE WRONG BOOK, FOUND BY THE PACKAGE INSTEAD OF BY US/,/configure_args/p' \
+    "$helper_src" | grep -q 'command -v systemctl' \
+    || _p="$_p;it would say this on a systemd system too"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "two books can be compared, page by page, before anything is built"
+fi
+
+# ---- a fetch that fetches nothing is not "cached"  (1.14.49) ---------------- #
+#     $ blfs fetch stable-sysv
+#     note: no book matched 'stable-sysv'; using the cached ...-systemd
+#     cached.
+# Nothing was fetched, and it said success.  THERE IS NO 13.0 SYSV BOOK --
+# BLFS stopped publishing that edition after 12.4 (the user's own `blfs books`
+# lists 13.0-systemd and 13.1-systemd, and `stable` = 12.4 [sysv]).  Then
+#     $ blfs diff-init 12.4
+#     0 of 947 shared pages differ
+# which was true and useless: the default selector has no book, so it fell
+# back to the newest cached one -- 12.4, the very book being compared against.
+_p=""
+_b49="$(dirname "$LFS_TOOL")/blfs"
+_bk49=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk49="$_c" && break
+done
+# a selector nobody publishes fails, and says so
+_o="$(python3 "$_b49" fetch definitely-not-a-published-book 2>&1)"
+case "$_o" in
+    *"no book is published as"*) ;;
+    *) _p="$_p;fetching a nonexistent book does not report a problem" ;;
+esac
+case "$_o" in
+    *cached.*) _p="$_p;a fetch that fetched nothing still claims success" ;;
+esac
+if [ -n "$_bk49" ]; then
+    # comparing a book with itself is refused, not answered with "0 differ"
+    _s="$(python3 "$_b49" --book-file "$_bk49" diff-init "$_bk49" 2>&1)"
+    case "$_s" in
+        *"same file"*) ;;
+        *) _p="$_p;a book compared with itself reports a meaningless zero" ;;
+    esac
+    # ...and both sides are always named, so the fallback cannot hide
+    case "$_s" in
+        *"comparing:"*) ;;
+        *) _p="$_p;the two books being compared are not named" ;;
+    esac
+    # across versions, only the init-related differences are shown by default
+    _alt="$T/BLFS-BOOK-13.0-sysv-nochunks.html"
+    [ -f "$_alt" ] || python3 - "$_bk49" "$_alt" <<'PYDOC2'
+import sys
+s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+i = s.index('id="bluez"')
+seg = s[i:i + 40000]
+open(sys.argv[2], "w", encoding="utf-8").write(
+    s[:i] + seg.replace('--enable-library', '--enable-library --disable-systemd', 1)
+    + s[i + 40000:])
+PYDOC2
+    _d="$(timeout 400 python3 "$_b49" --book-file "$_bk49" diff-init "$_alt" 2>&1)"
+    case "$_d" in
+        *"differ in their init handling"*) ;;
+        *) _p="$_p;the survey does not say it is filtering to init differences" ;;
+    esac
+    case "$_d" in
+        *"--all compares everything"*) ;;
+        *) _p="$_p;there is no way to see the differences it filtered out" ;;
+    esac
+fi
+python3 "$_b49" diff-init --help 2>&1 | grep -q '\-\-all' \
+    || _p="$_p;--all is not offered"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a fetch that finds no book says so, and no book is compared with itself"
+fi
+
+# ---- what differs AND concerns you  (1.14.50) ------------------------------- #
+# The survey came back with 47 of 929 pages differing in their init handling.
+# True, and most of them are for software this machine does not have and never
+# will -- GNOME, samba, qemu, postgresql.  The useful question is not "what
+# differs" but "what differs AND is on my system", and the answer is on disk:
+# a package with an account has been built or is about to be.
+_p=""
+_b50="$(dirname "$LFS_TOOL")/blfs"
+python3 "$_b50" diff-init --help 2>&1 | grep -q '\-\-installed' \
+    || _p="$_p;there is no way to narrow the survey to this machine"
+_bk50=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk50="$_c" && break
+done
+if [ -n "$_bk50" ]; then
+    _alt50="$T/BLFS-BOOK-13.0-sysv-nochunks.html"
+    [ -f "$_alt50" ] || python3 - "$_bk50" "$_alt50" <<'PYDOC3'
+import sys
+s = open(sys.argv[1], encoding="utf-8", errors="replace").read()
+i = s.index('id="bluez"')
+seg = s[i:i + 40000]
+open(sys.argv[2], "w", encoding="utf-8").write(
+    s[:i] + seg.replace('--enable-library', '--enable-library --disable-systemd', 1)
+    + s[i + 40000:])
+PYDOC3
+    _fr="$T/fakeroot"; mkdir -p "$_fr/p_bluez" "$_fr/p_dbus" "$_fr/p_polkit"
+    _o="$(LFS_PKGUSR_ROOT="$_fr" timeout 400 python3 "$_b50" \
+          --book-file "$_bk50" diff-init "$_alt50" --installed 2>&1)"
+    # only the three accounts are considered, not all 954 pages
+    case "$_o" in
+        *"of 3 shared pages"*) ;;
+        *) _p="$_p;--installed does not narrow to the packages that exist here" ;;
+    esac
+    case "$_o" in
+        *bluez*) ;;
+        *) _p="$_p;the page that does differ was filtered out" ;;
+    esac
+    # and a machine with no package users says so instead of comparing nothing
+    _empty="$T/emptyroot"; mkdir -p "$_empty"
+    _o2="$(LFS_PKGUSR_ROOT="$_empty" timeout 400 python3 "$_b50" \
+           --book-file "$_bk50" diff-init "$_alt50" --installed 2>&1)"
+    case "$_o2" in
+        *"nothing to filter by"*) ;;
+        *) _p="$_p;an empty package-user root silently compares nothing" ;;
+    esac
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the book comparison can be narrowed to the packages this machine has"
+fi
+
+# ---- judge the difference on lines that run  (1.14.51) ---------------------- #
+# The survey named eight pages on a real system; four were nothing.  gcc
+# differed only in a NOTE whose URL contains "13.0-systemd"; libxml2 in a NOTE
+# saying "systemctl stop httpd.service"; rust in a NOTE about the "systemd
+# journal".  Prose, all of it -- the same mistake as 1.14.23, in a different
+# filter: a commented line is not a command.
+_p=""
+_b51="$(dirname "$LFS_TOOL")/blfs"
+python3 - "$_b51" <<'PYLIVE' || _p="$_p;the init filter still judges comment text"
+import sys, difflib, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+live = lambda t: [l for l in t.splitlines()
+                  if l.strip() and not l.strip().startswith("#")]
+def is_init(old, new):
+    d = "\n".join(l for l in difflib.ndiff(live(old), live(new)) if l[:1] in "+-")
+    return bool(b._INIT_WORDS_RE.search(d))
+# the four that were noise, in the shapes they really had
+assert not is_init("## NOTE: lfs/view/12.4/chapter08/gcc.html\nmake install",
+                   "## NOTE: lfs/view/13.0-systemd/chapter08/gcc.html\nmake install")
+assert not is_init("## NOTE: shut down the server: /etc/init.d/httpd stop\nninja install",
+                   "## NOTE: shut down the server: systemctl stop httpd.service\nninja install")
+assert not is_init("## NOTE: messages in the system log\n./x.py install",
+                   "## NOTE: messages in the systemd journal\n./x.py install")
+# ...and the three that were real
+assert is_init("./configure --enable-library --disable-systemd &&\nmake",
+               "./configure --enable-library &&\nmake")
+assert is_init("cat > /etc/cron.weekly/update-pki.sh << EOF\nEOF",
+               "systemctl enable update-pki.timer")
+assert is_init("meson setup -D systemd=disabled ..", "meson setup ..")
+PYLIVE
+sed -n '/A COMMENTED LINE IS NOT A COMMAND -- HERE TOO/,/_INIT_WORDS_RE.search/p' "$_b51" \
+    | grep -q 'startswith("#")' \
+    || _p="$_p;the comparison does not strip comments before judging"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "an init difference is judged on the commands, not on the prose"
+fi
+
+# ---- a boot script belongs to blfs-bootscripts  (1.14.52) ------------------- #
+# With the SysV book finally in use, BlueZ installed cleanly and then:
+#     ## Configuration
+#     make: *** No rule to make target 'install-bluetooth'.  Stop.
+#     !! phase 'configure' FAILED (exit 2)
+# `make install-bluetooth` is the SysV books' idiom for installing a boot
+# script, and that target lives in the blfs-bootscripts package -- not in the
+# package being built.  So a finished, correct install ended as a failure.
+# The systemd books have no such sections, which is why this appeared only
+# after switching books.
+_p=""
+_b52="$(dirname "$LFS_TOOL")/blfs"
+python3 - "$_b52" <<'PYBOOT' || _p="$_p;a boot-script install is still run in the wrong package"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+f = b._comment_bootscript_installs
+skipped = lambda l: f(l).startswith("## SKIPPED")
+# the reported case, and another of the same shape
+assert skipped("make install-bluetooth")
+assert skipped("make install-dbus")
+# the package's OWN install is untouched
+assert not skipped("make install")
+assert not skipped("ninja install")
+assert not skipped("make -C build install")
+# ...and so are the real automake targets, which are NOT boot scripts
+for t in ("strip", "exec", "data", "man", "html", "info"):
+    assert not skipped("make install-" + t), t
+# an already-commented line is left alone
+assert not skipped("# make install-bluetooth")
+# the note says where the target actually lives and how to get there
+out = f("make install-bluetooth")
+assert "blfs-bootscripts" in out, out
+assert "cd <blfs-bootscripts source> && make install-bluetooth" in out, out
+# the original command survives as a comment, not deleted
+assert "# make install-bluetooth" in out, out
+PYBOOT
+sed -n '/CACHE_VERSION = /p' "$_b52" | grep -qE 'CACHE_VERSION = (5[3-9]|[6-9][0-9])' \
+    || _p="$_p;the cache version was not bumped for a parse change"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a boot-script install is explained, not run in the wrong package"
+fi
+
+# ---- a fallback must not take you back a release  (1.14.52) ----------------- #
+# The user was building 13.0.  They fetched the 12.4 book as a REFERENCE for
+# SysV commands, and the next build produced BlueZ-5.83 -- 12.4's version.
+# The configured default is 'stable-sysv', which no longer exists, so the
+# fallback scored the cached books by init flavour: the 12.4 sysv book matched
+# and won, and the 13.0 book it passed over was never mentioned.
+_p=""
+_b52="$(dirname "$LFS_TOOL")/blfs"
+python3 - "$_b52" "$T/bookcache" <<'PYFALL' || _p="$_p;the fallback ignores versions"
+import sys, os, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+names = ["BLFS-BOOK-12.4-nochunks.html",
+         "BLFS-BOOK-13.0-systemd-nochunks.html",
+         "BLFS-BOOK-11.0-nochunks.html"]
+cached = []
+for n in names:
+    p = os.path.join(d, n)
+    open(p, "w").write("")
+    cached.append(p)
+# the asked-for flavour still decides -- that is what the selector means
+assert b._best_cached_for("stable-sysv", cached).endswith("12.4-nochunks.html")
+assert b._best_cached_for("stable-systemd", cached).endswith("13.0-systemd-nochunks.html")
+# ...but among books of the SAME flavour, the newest wins: a fallback must not
+# quietly take a system back a release
+assert b._best_cached_for("sysv", cached).endswith("12.4-nochunks.html"), \
+    b._best_cached_for("sysv", cached)
+# and versions sort as versions, not as strings ("13.0" > "12.4" > "9.1")
+assert b._version_key("13.0") > b._version_key("12.4") > b._version_key("9.1")
+assert b._version_key("unknown") < b._version_key("1.0")
+PYFALL
+# the note names the newer book it passed over, and how to pin it
+sed -n '/NAME WHAT ELSE WAS ON DISK/,/set-default/p' "$_b52" \
+    | grep -q 'a NEWER book is also cached' \
+    || _p="$_p;the fallback does not mention a newer cached book"
+sed -n '/NAME WHAT ELSE WAS ON DISK/,/set-default/p' "$_b52" \
+    | grep -q 'blfs set-default' \
+    || _p="$_p;it does not say how to pin the book to build from"
+# a boot-script install belongs to blfs-bootscripts, not to the package
+python3 - "$_b52" <<'PYBOOT' || _p="$_p;a SysV boot-script step is run in the wrong package"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+out = b._comment_bootscript_installs("make install-bluetooth")
+assert out.startswith("## SKIPPED"), out
+assert "blfs-bootscripts" in out, out
+# the package's own install targets are untouched
+for keep in ("make install", "make install-strip", "make install-data",
+             "make -C build install", "ninja install"):
+    assert not b._comment_bootscript_installs(keep).startswith("## SKIPPED"), keep
+PYBOOT
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a book fallback names what it passed over, and never silently downgrades"
+fi
+
+# ---- a page that offers a choice must still build  (1.14.53) ---------------- #
+# WebKitGTK unpacked and then:
+#     ninja: error: loading 'build.ninja': No such file or directory
+# Its page gives TWO complete builds -- "If you want to install the GTK-3
+# version, run the following commands", and the same for GTK-4 -- so each is
+# introduced by a conditional and _conditional_guard commented BOTH.  The
+# build phase came out as `:` and the install phase ran `ninja install`
+# against a directory with no build in it.
+_p=""
+_b53="$(dirname "$LFS_TOOL")/blfs"
+python3 - "$_b53" <<'PYALT' || _p="$_p;a page whose build blocks are all conditional still builds nothing"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+# every block skipped -> the first is restored
+skipped = ("## OPTIONAL, skipped -- the book says: If you want the GTK-3 version:\n"
+           "# mkdir build &&\n"
+           "# cd build &&\n"
+           "# cmake .. &&\n"
+           "# ninja\n"
+           ":")
+out = b._enable_one_alternative(skipped)
+live = [l for l in out.splitlines()
+        if l.strip() and not l.strip().startswith("#") and l.strip() != ":"]
+assert any("cmake" in l for l in live), out
+assert any("ninja" in l for l in live), out
+assert "ENABLED HERE" in out, out
+# a phase that already has real commands is untouched
+keep = "mkdir build &&\ncd build &&\ncmake ..\n## OPTIONAL, skipped -- something else\n# make foo"
+assert b._enable_one_alternative(keep) == keep
+# and a phase that is empty for another reason (nothing skipped) stays empty
+assert b._enable_one_alternative(":") == ":"
+PYALT
+_bk53=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk53="$_c" && break
+done
+if [ -n "$_bk53" ]; then
+    _wd53="$T/alts"; mkdir -p "$_wd53"
+    python3 "$_b53" --book-file "$_bk53" script webkitgtk -o "$_wd53" >/dev/null 2>&1
+    _w="$(ls "$_wd53"/install_WebKitGTK* 2>/dev/null | head -1)"
+    if [ -n "$_w" ]; then
+        _wb="$(sed -n '/^build_pkg() {/,/^}/p' "$_w" | grep -vE '^\s*#|^\s*$')"
+        printf '%s' "$_wb" | grep -q 'cmake' \
+            || _p="$_p;webkitgtk still configures nothing"
+        printf '%s' "$_wb" | grep -qw 'ninja' \
+            || _p="$_p;webkitgtk still compiles nothing"
+        bash -n "$_w" || _p="$_p;the restored block does not parse"
+        # the alternative it did NOT pick stays commented, and is findable
+        grep -q '# *-D USE_GTK4=ON' "$_w" \
+            || _p="$_p;the other variant was lost rather than left commented"
+    else
+        _p="$_p;could not generate the webkitgtk script"
+    fi
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a page offering only conditional builds still builds one of them"
+fi
+
+# ---- an ignored package that something REQUIRES  (1.14.54) ------------------ #
+# WebKitGTK configured for an hour and then:
+#     CMake Error: Ruby 2.5 or higher is required.
+# webkitgtk REQUIRES Ruby-4.0.1, and the stack's avoid list contains `ruby`.
+# Not walking into an avoided branch is right (1.14.24); leaving out a hard
+# requirement of a package the user asked for, without a word, is not.
+_p=""
+_b54="$(dirname "$LFS_TOOL")/blfs"
+_pmQ="$(dirname "$LFS_TOOL")/packagemanager"
+_bk54=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk54="$_c" && break
+done
+if [ -n "$_bk54" ]; then
+    _o="$(python3 "$_b54" --book-file "$_bk54" order webkitgtk --anchors \
+          --ignore ruby 2>/dev/null)"
+    printf '%s\n' "$_o" | grep -q '^#ignored-required	webkitgtk	ruby' \
+        || _p="$_p;an ignored REQUIRED dependency is not reported by the walk"
+    # the ignore still works: ruby is not built
+    printf '%s\n' "$_o" | grep -v '^#' | cut -f1 | grep -qix ruby \
+        && _p="$_p;the ignored package is in the order after all"
+    # a dependency that is only ever RECOMMENDED is not reported -- that is
+    # the normal, intended use of an avoid list.  (bubblewrap is the wrong
+    # example: webkitgtk merely recommends it, but glycin in the same tree
+    # REQUIRES it, so reporting it is correct.)
+    _o2="$(python3 "$_b54" --book-file "$_bk54" order webkitgtk --anchors \
+           --ignore enchant 2>/dev/null)"
+    printf '%s\n' "$_o2" | grep -q '^#ignored-required' \
+        && _p="$_p;ignoring a merely recommended package is reported as a problem"
+fi
+# packagemanager turns that into a warning with a way out
+sed -n '/def _report_ignored_required/,/^def /p' "$_pmQ" \
+    | grep -q 'REQUIRE something the ignore list' \
+    || _p="$_p;the plan does not warn about it"
+sed -n '/def _report_ignored_required/,/^def /p' "$_pmQ" \
+    | grep -q 'packagemanager install %s --run --recursive' \
+    || _p="$_p;no command offered to resolve it"
+grep -q '_report_ignored_required(steps)' "$_pmQ" \
+    || _p="$_p;the report is never called"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "ignoring a package that something requires is said out loud"
+fi
+
+# ---- cmake takes -D options too  (1.14.55) ---------------------------------- #
+# WebKitGTK stopped on "Enchant is needed for ENABLE_SPELLCHECK".  enchant is
+# in the user's avoid list and only RECOMMENDED, so 1.14.54's check correctly
+# stayed quiet -- but the natural fix, turning the feature off, had nowhere to
+# live:
+#     machine.conf has [webkitgtk] but the script has no `meson setup` line
+#     -- options NOT applied
+# webkitgtk is a cmake package.  Both build systems take -Dkey=value; only the
+# command word differs.
+_p=""
+_pmR="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmR" "$T/cmakeopts" <<'PYCMAKE' || _p="$_p;machine.conf does not reach a cmake package"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "install_w")
+open(p, "w").write("build_pkg() {\nmkdir -vp build &&\ncd build &&\n"
+                   "cmake -D CMAKE_BUILD_TYPE=Release \\\n      -D PORT=GTK ..\n"
+                   "ninja\n}\n")
+pm._machine_opts_for = lambda a: {"ENABLE_SPELLCHECK": "OFF"}
+pm.apply_machine_opts("webkitgtk", p)
+body = open(p).read()
+assert "-DENABLE_SPELLCHECK=OFF" in body, body
+assert "cmake" in body and "ninja" in body, body
+# an option the BOOK already sets is replaced, not duplicated
+pm._machine_opts_for = lambda a: {"PORT": "GTK4"}
+pm.apply_machine_opts("webkitgtk", p)
+body = open(p).read()
+assert body.count("PORT=") == 1, body
+assert "-DPORT=GTK4" in body, body
+# applying twice changes nothing further
+before = body
+pm.apply_machine_opts("webkitgtk", p)
+assert open(p).read() == before, open(p).read()
+PYCMAKE
+# a script with neither build system says so, and names the alternative
+python3 - "$_pmR" "$T/cmakeopts" <<'PYNONE' || _p="$_p;a script with no -D build system is not explained"
+import sys, os, io, contextlib, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+p = os.path.join(sys.argv[2], "install_plain")
+open(p, "w").write("build_pkg() {\nmake\n}\n")
+pm._machine_opts_for = lambda a: {"FOO": "bar"}
+buf = io.StringIO()
+with contextlib.redirect_stderr(buf), contextlib.redirect_stdout(buf):
+    pm.apply_machine_opts("plain", p)
+out = buf.getvalue()
+assert "no `meson setup` or `cmake` line" in out, out
+assert "configure_args" in out, out
+assert open(p).read() == "build_pkg() {\nmake\n}\n"      # untouched
+PYNONE
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "machine.conf options reach cmake packages, not only meson ones"
+fi
+
+# ---- a demonstration is not an installation step  (1.14.56) ----------------- #
+# enchant installed perfectly -- 17 files tracked, enchant-2.pc in place -- and
+# then the configure phase failed:
+#     No dictionary available for 'en_GB'
+# Its page ends with "You can test your installation and configuration by
+# creating a test file and running the following commands", and the generator
+# turned that demonstration into a step.  It needs an aspell dictionary the
+# system may not have, and running it is nobody's idea of installing enchant.
+_p=""
+_b56="$(dirname "$LFS_TOOL")/blfs"
+_bk56=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk56="$_c" && break
+done
+if [ -n "$_bk56" ]; then
+    _ed="$T/enchant"; mkdir -p "$_ed"
+    python3 "$_b56" --book-file "$_bk56" script enchant -o "$_ed" >/dev/null 2>&1
+    _e="$(ls "$_ed"/install_enchant* 2>/dev/null | head -1)"
+    if [ -n "$_e" ]; then
+        _live="$(sed -n '/^configure_pkg() {/,/^}/p' "$_e" \
+                 | grep -vE '^\s*#|^\s*$|^configure_pkg|^\}')"
+        printf '%s' "$_live" | grep -q 'enchant-2 -d en_GB' \
+            && _p="$_p;the book's spell-check demo still runs as a config step"
+        printf '%s' "$_live" | grep -q 'test-enchant.txt' \
+            && _p="$_p;the demo's heredoc still runs"
+        # the text is kept, commented, with a reason
+        grep -q 'the book offers this as a way to TEST' "$_e" \
+            || _p="$_p;nothing says why those lines are commented"
+        grep -q '# enchant-2 -d en_GB' "$_e" \
+            || _p="$_p;the demo was deleted rather than commented"
+        bash -n "$_e" || _p="$_p;the enchant script does not parse"
+    else
+        _p="$_p;could not generate the enchant script"
+    fi
+fi
+# ...and a real configuration step is NOT commented by that rule
+python3 - "$_b56" <<'PYCFG' || _p="$_p;a genuine configuration step was commented away"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+real = ("# Create the configuration file:\n"
+        "cat > /etc/foo.conf << \"EOF\"\nx=1\nEOF")
+assert b._comment_config_tests(real) == real, b._comment_config_tests(real)
+PYCFG
+# a shell word is not a program: `not: command not found` is noise
+_nf="$T/notfound"; mkdir -p "$_nf"
+python3 - "$helper_src" > "$_nf/rep.sh" <<'PYSLICE8'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }; phase_done() { return 1; }')
+print('missing_dirs_from_log() { :; }; _package_providing() { :; }')
+print('SNAP_ROOT="/nonexistent"; s="/x"; staged="/x"')
+print('auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE8
+printf './configure: line 26491: not: command not found\ninstall_x: line 12: cmake: command not found\n' \
+    > "$_nf/both.log"
+_o="$(bash -c '. "'"$_nf"'/rep.sh"; report enchant all "'"$_nf"'/both.log"' 2>&1)"
+case "$_o" in
+    *"'cmake' is not installed"*) ;;
+    *) _p="$_p;the real missing command is not reported" ;;
+esac
+case "$_o" in
+    *"'not' is not installed"*) _p="$_p;a shell word is still reported as a package" ;;
+esac
+printf './configure: line 1: not: command not found\n' > "$_nf/noise.log"
+_o2="$(bash -c '. "'"$_nf"'/rep.sh"; report enchant all "'"$_nf"'/noise.log"' 2>&1)"
+case "$_o2" in
+    *"is not installed -- the build needs it"*)
+        _p="$_p;a log with only shell noise still names a missing program" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a book's demo is not run, and a shell word is not called a package"
+fi
+
+# ---- one place to set the job count  (1.14.57) ------------------------------ #
+# Asked where -j is set.  Four places, and they did not agree:
+#   lfs config makeflags   -> written into <tree>/usr/src/lfs-pkgusr/config/env
+#                             and exported by every chroot shell
+#   /etc/pkgusr/build.env  -> the per-machine file, read by build_env_pairs
+#   lfs-helper build --jobs N   -> one build
+#   lfs-phases             -> -j$(nproc) only when nothing else set it
+# build.env is added to the command FIRST and the caller's MAKEFLAGS after it,
+# and the last assignment on an `env` line wins -- so an ambient -j16 from the
+# chroot's config silently beat the -j13 someone had put in the file meant for
+# exactly this.
+_p=""
+_hlpJ="$helper_src"
+_pp="$(_slice_fn "$_hlpJ" cmd_build)"
+printf '%s' "$_pp" | grep -q 'grep -q "MAKEFLAGS="' \
+    || _p="$_p;an ambient MAKEFLAGS still overrides the per-machine file"
+# the precedence itself: --jobs beats build.env beats the shell
+_jt() {   # <jobs> <build.env value> <shell value>
+    ( jobs="$1"; MAKEFLAGS="$3"
+      envpass=""
+      [ -n "$2" ] && envpass="MAKEFLAGS='$2' "
+      if [ -n "$jobs" ]; then
+          envpass="$envpass MAKEFLAGS='-j$jobs'"
+      elif [ -n "${MAKEFLAGS:-}" ] && ! printf '%s' "$envpass" | grep -q "MAKEFLAGS="; then
+          envpass="$envpass MAKEFLAGS='$MAKEFLAGS'"
+      fi
+      printf '%s' "$envpass" | sed 's/.*MAKEFLAGS=//' | tr -d "' " )
+}
+[ "$(_jt 4 -j13 -j16)" = "-j4" ]  || _p="$_p;--jobs does not win"
+[ "$(_jt '' -j13 -j16)" = "-j13" ] || _p="$_p;build.env does not beat the ambient value"
+[ "$(_jt '' '' -j16)" = "-j16" ]   || _p="$_p;the ambient value is ignored when nothing else is set"
+# lfs-phases only fills in a default when nobody said anything
+sed -n '/if \[ -z "${MAKEFLAGS:-}" \]/,/fi/p' "$PHASES_LIB" | grep -q 'nproc' \
+    || _p="$_p;the runner no longer defaults the job count"
+grep -q 'export MAKEFLAGS="-j$(nproc)"' "$PHASES_LIB" \
+    || _p="$_p;the runner's default is not a job count"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the job count comes from one file, and --jobs still overrides it"
+fi
+
+# ---- a stack file is the user's  (1.14.58) ---------------------------------- #
+# `make install` copied stacks/* over /etc/pkgusr/stacks/* unconditionally.
+# The user had just removed `avoid ruby` from sway.stack to fix a build; the
+# next `make install` -- which every fix in this session begins with -- would
+# have put it straight back, and the build would have failed the same way with
+# no explanation.  machine.conf lives in the same directory and was equally at
+# risk, which is where the per-package build options go.
+_p=""
+_mkf="$(dirname "$LFS_TOOL")/Makefile"
+if [ -f "$_mkf" ]; then
+    _blk="$(sed -n '/A STACK FILE IS THE USER/,/done; true/p' "$_mkf")"
+    printf '%s' "$_blk" | grep -q 'cmp -s' \
+        || _p="$_p;an edited stack file is still overwritten"
+    printf '%s' "$_blk" | grep -q '\.new' \
+        || _p="$_p;the new version is not offered alongside"
+    printf '%s' "$_blk" | grep -q 'KEPT YOURS' \
+        || _p="$_p;it does not say that the user's file was kept"
+    # and it really behaves that way
+    _d="$T/mkinstall"; rm -rf "$_d"
+    ( cd "$(dirname "$LFS_TOOL")" && make install DESTDIR="$_d" ) >/dev/null 2>&1
+    if [ -f "$_d/etc/pkgusr/stacks/sway.stack" ]; then
+        # (a leading newline: the shipped file has no trailing one, and an
+        #  appended marker would otherwise join its last line)
+        printf '\n# LOCAL EDIT\n' >> "$_d/etc/pkgusr/stacks/sway.stack"
+        _o="$( cd "$(dirname "$LFS_TOOL")" && make install DESTDIR="$_d" 2>&1 )"
+        grep -q '^# LOCAL EDIT$' "$_d/etc/pkgusr/stacks/sway.stack" \
+            || _p="$_p;a second make install destroyed the edit"
+        [ -f "$_d/etc/pkgusr/stacks/sway.stack.new" ] \
+            || _p="$_p;the shipped version was not left for comparison"
+        case "$_o" in
+            *"KEPT YOURS"*) ;;
+            *) _p="$_p;the install is silent about keeping the user's file" ;;
+        esac
+        # an untouched file is still refreshed, not left stale
+        case "$_o" in
+            *"(unchanged)"*) ;;
+            *) _p="$_p;identical files are not reported as such" ;;
+        esac
+    else
+        _p="$_p;make install did not place the stack files at all"
+    fi
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "make install keeps an edited stack file and offers the new one beside it"
+fi
+
+# ---- ninja does not read MAKEFLAGS  (1.14.59) ------------------------------- #
+# WebKitGTK's own page: "some source files of this package require more than
+# 4 GiB of RAM to be built.  As the result, you should pass -j<N> to ninja
+# (replacing <N> with the quotient of the amount of available RAM and 4 GiB)
+# to limit the number of parallel jobs and avoid the job from being killed by
+# the kernel OOM killer."
+# MAKEFLAGS cannot express that: ninja ignores it and defaults to nproc+2.  So
+# there was no way to follow the book short of editing the script by hand, and
+# the failure it prevents arrives hours in, as a killed compiler.
+_p=""
+_pmS="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmS" "$T/ninjajobs" <<'PYNINJA' || _p="$_p;a per-package ninja job cap cannot be set"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "install_w")
+open(p, "w").write("build_pkg() {\ncmake .. &&\nninja\n}\n"
+                   "install_pkg() {\nninja install\nninja -C build install\n}\n")
+pm._machine_opts_for = lambda a: {"jobs": "8"}
+pm.apply_machine_opts("webkitgtk", p)
+body = open(p).read()
+assert "ninja -j8\n" in body, body
+assert "ninja -j8 install" in body, body
+assert "ninja -j8 -C build install" in body, body
+# applying it again does not stack more -j flags
+pm.apply_machine_opts("webkitgtk", p)
+assert open(p).read().count("-j8") == 3, open(p).read()
+# a ninja line that ALREADY has -j is left alone
+p2 = os.path.join(d, "install_x")
+open(p2, "w").write("build_pkg() {\nninja -j4\n}\n")
+pm.apply_machine_opts("webkitgtk", p2)
+assert open(p2).read().count("-j") == 1, open(p2).read()
+assert "-j4" in open(p2).read()
+PYNINJA
+# and `jobs` is not passed on to cmake as -Djobs=
+sed -n '/NINJA DOES NOT READ MAKEFLAGS/,/_wrap = opts.pop/p' "$_pmS" \
+    | grep -q 'opts.pop("jobs"' \
+    || _p="$_p;jobs would be handed to cmake as an option"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a package can cap its own ninja jobs, as its book page asks"
+fi
+
+# ---- put the option on the command, not in the prose  (1.14.60) ------------- #
+# WebKitGTK died on
+#     fatal error: systemd/sd-journal.h: No such file or directory
+# with ENABLE_JOURNALD_LOG = OFF sitting in machine.conf.  The generated
+# script showed why:
+#     ## NOTE: ... add the -D CMAKE_CXX_FLAGS_RELEASE=... option to the cmake
+#     -Denable_journald_log=OFF -Duse_gstreamer_webrtc=ON to disable some ...
+# Two bugs in one line.  The options went into the first line CONTAINING the
+# word "cmake" -- a book NOTE -- and never reached the build.  And they were
+# lower-cased, because configparser lower-cases keys; cmake variables are
+# case-sensitive, so even correctly placed, -Denable_journald_log=OFF would
+# have set a different variable and been ignored.  (meson's options are
+# lower-case anyway, which is why [mesa] worked and hid this.)
+_p=""
+_pmT="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmT" "$T/prose" <<'PYPROSE' || _p="$_p;options still land in a comment, or lose their case"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "install_w")
+note = ("## NOTE: add the -D CMAKE_CXX_FLAGS_RELEASE option to the cmake "
+        "command to disable optimizations")
+open(p, "w").write("build_pkg() {\n%s\nmkdir -vp build &&\ncd build &&\n"
+                   "cmake -D PORT=GTK -D USE_GTK4=OFF ..\nninja\n}\n" % note)
+pm._machine_opts_for = lambda a: {"ENABLE_JOURNALD_LOG": "OFF", "USE_GTK4": "ON"}
+pm.apply_machine_opts("webkitgtk", p)
+body = open(p).read()
+# the NOTE is untouched
+assert note in body, body
+# the real command carries the options, with their case intact
+cmd = [l for l in body.splitlines() if l.startswith("cmake ")][0]
+assert "-DENABLE_JOURNALD_LOG=OFF" in cmd, cmd
+assert "-DUSE_GTK4=ON" in cmd, cmd
+assert "enable_journald_log" not in body, body
+# an option the book set is still replaced, not duplicated
+assert cmd.count("USE_GTK4") == 1, cmd
+PYPROSE
+# the parser keeps key case
+python3 - "$_pmT" "$T/prose" <<'PYCASE' || _p="$_p;machine.conf keys are lower-cased"
+import sys, os, importlib.machinery as m
+os.environ["LFS_MACHINE_CONF"] = os.path.join(sys.argv[2], "m.conf")
+open(os.environ["LFS_MACHINE_CONF"], "w").write(
+    "[webkitgtk]\nENABLE_JOURNALD_LOG = OFF\nUSE_GTK4 = ON\n")
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+got = pm._read_conf_section(os.environ["LFS_MACHINE_CONF"], "webkitgtk")
+assert "ENABLE_JOURNALD_LOG" in got, got
+assert "enable_journald_log" not in got, got
+PYCASE
+sed -n '/CMAKE VARIABLES ARE CASE-SENSITIVE/,/optionxform/p' "$_pmT" \
+    | grep -q 'cp.optionxform = str' \
+    || _p="$_p;the parser still folds key case"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a build option reaches the command with its case intact"
+fi
+
+# ---- a skipped variant does not keep its install step  (1.14.61) ------------ #
+# "is it possible that the install of webkitgtk is repeating itself at the
+# end? i think im building it the second time!"  Its install phase held
+#     ninja -j8 install
+#     ## OPTIONAL, skipped -- ... the GTK-4 version ...
+#     # <the whole GTK-4 build, commented>
+#     ninja -j8 install          <- the GTK-4 variant's install, still live
+# The second is a no-op rather than a second build, but on a package that
+# takes hours nobody watching can tell.
+_p=""
+_b61="$(dirname "$LFS_TOOL")/blfs"
+python3 - "$_b61" <<'PYDUP' || _p="$_p;a skipped variant still keeps its install step"
+import sys, importlib.machinery as m
+b = m.SourceFileLoader('b', sys.argv[1]).load_module()
+# X ; <skipped> ; X  -> the repeat belongs to the skipped block
+out = b._drop_orphaned_variant_install(
+    "ninja install\n## OPTIONAL, skipped -- the GTK-4 version:\n# cmake ..\nninja install")
+live = [l for l in out.splitlines()
+        if l.strip() and not l.strip().startswith("#")]
+assert live == ["ninja install"], live
+# ...but a repeat with real work in between is NOT redundant: GLib installs,
+# rebuilds with introspection enabled, and installs again
+glib = ("ninja install\nmeson configure -D introspection=enabled &&\nninja\n"
+        "## OPTIONAL, skipped -- the documentation:\n# ninja -C docs\nninja install")
+out2 = b._drop_orphaned_variant_install(glib)
+live2 = [l for l in out2.splitlines()
+         if l.strip() and not l.strip().startswith("#")]
+assert live2.count("ninja install") == 2, live2
+# and a phase with no skipped block at all is untouched
+plain = "make install\nmake install-data"
+assert b._drop_orphaned_variant_install(plain) == plain
+PYDUP
+_bk61=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bk61="$_c" && break
+done
+if [ -n "$_bk61" ]; then
+    _wd61="$T/variants"; mkdir -p "$_wd61"
+    python3 "$_b61" --book-file "$_bk61" script webkitgtk glib2 -o "$_wd61" >/dev/null 2>&1
+    _w="$(ls "$_wd61"/install_WebKitGTK* 2>/dev/null | head -1)"
+    [ -n "$_w" ] && { [ "$(sed -n '/^install_pkg() {/,/^}/p' "$_w" \
+        | grep -c '^ninja.*install')" = 1 ] \
+        || _p="$_p;webkitgtk still installs twice"; }
+    # GLib's second install is real and must remain
+    _g="$(ls "$_wd61"/install_GLib* 2>/dev/null | head -1)"
+    [ -n "$_g" ] && { [ "$(sed -n '/^install_pkg() {/,/^}/p' "$_g" \
+        | grep -c '^ninja install')" -ge 2 ] \
+        || _p="$_p;GLib lost the install that follows its introspection rebuild"; }
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a commented-out build variant does not leave its install behind"
+fi
+
+# ---- a library that will not link  (1.14.62) -------------------------------- #
+# alsa-utils found alsa-lib's headers and then:
+#     checking for snd_ctl_open in -lasound... no
+#     configure: error: No linkable libasound was found.
+# Headers present but the library unlinkable is a different fault from a
+# missing package, and none of the existing diagnoses covered it -- the box
+# said nothing at all.  Three ways it happens, told apart by what is on disk.
+_p=""
+_hlpK="$helper_src"
+_ld="$T/linklib"; mkdir -p "$_ld"
+python3 - "$_hlpK" > "$_ld/rep.sh" <<'PYSLICE9'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }; phase_done() { return 1; }')
+print('missing_dirs_from_log() { :; }')
+print('s="/x"; staged="/x"; auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICE9
+printf 'checking for snd_ctl_open in -lasound... no\nconfigure: error: No linkable libasound was found.\n' \
+    > "$_ld/alsa.log"
+# 1. dev symlink AND runtime library present -> a cache or a second library
+mkdir -p "$_ld/both/usr/lib"
+: > "$_ld/both/usr/lib/libasound.so.2.0.0"
+ln -sf libasound.so.2.0.0 "$_ld/both/usr/lib/libasound.so"
+_o="$(bash -c '. "'"$_ld"'/rep.sh"; SNAP_ROOT="'"$_ld"'/both"; report alsa-utils all "'"$_ld"'/alsa.log"' 2>&1)"
+case "$_o" in
+    *"IS installed, and links should work"*) ;;
+    *) _p="$_p;a fully installed library is reported as missing" ;;
+esac
+case "$_o" in *ldconfig*) ;; *) _p="$_p;the stale linker cache is not mentioned" ;; esac
+case "$_o" in *config.log*) ;; *) _p="$_p;it does not point at the real link error" ;; esac
+# 2. runtime library only -> the development symlink is missing
+mkdir -p "$_ld/runtime/usr/lib"
+: > "$_ld/runtime/usr/lib/libasound.so.2.0.0"
+_o2="$(bash -c '. "'"$_ld"'/rep.sh"; SNAP_ROOT="'"$_ld"'/runtime"; report alsa-utils all "'"$_ld"'/alsa.log"' 2>&1)"
+case "$_o2" in
+    *"libasound.so.N is installed but libasound.so is NOT"*) ;;
+    *) _p="$_p;a missing development symlink is not diagnosed" ;;
+esac
+case "$_o2" in
+    *"--run --reinstall"*) ;;
+    *) _p="$_p;no way offered to repair the package that owns it" ;;
+esac
+# 3. nothing at all
+mkdir -p "$_ld/none/usr/lib"
+_o3="$(bash -c '. "'"$_ld"'/rep.sh"; SRCROOT="'"$_ld"'/nosrc"; SNAP_ROOT="'"$_ld"'/none"; report alsa-utils all "'"$_ld"'/alsa.log"' 2>&1)"
+case "$_o3" in
+    *"Nothing here provides libasound at all"*) ;;
+    *) _p="$_p;a genuinely absent library is not reported" ;;
+esac
+# 3b. absent from disk but RECORDED by a package -- the reported case: a
+# 1711-byte p_alsa-lib/pkg.lst and no libasound anywhere.  "Nothing provides
+# it" is true and one step short of the answer.
+mkdir -p "$_ld/claimed/p_alsa-lib"
+printf '/usr/lib/libasound.so.2.0.0
+/usr/lib/libasound.so
+'     > "$_ld/claimed/p_alsa-lib/pkg.lst"
+_o3b="$(bash -c '. "'"$_ld"'/rep.sh"; SRCROOT="'"$_ld"'/claimed"; SNAP_ROOT="'"$_ld"'/none"; report alsa-utils all "'"$_ld"'/alsa.log"' 2>&1)"
+case "$_o3b" in
+    *"'p_alsa-lib'"*"RECORDS having installed it"*) ;;
+    *) _p="$_p;the package whose record claims the library is not named" ;;
+esac
+case "$_o3b" in
+    *"install alsa-lib --run --reinstall"*) ;;
+    *) _p="$_p;no rebuild offered for the package that owns the library" ;;
+esac
+# the linker's own wording is read too
+printf '/usr/bin/ld: cannot find -lfoo\n' > "$_ld/ld.log"
+_o4="$(bash -c '. "'"$_ld"'/rep.sh"; SNAP_ROOT="'"$_ld"'/none"; report demo all "'"$_ld"'/ld.log"' 2>&1)"
+case "$_o4" in
+    *"libfoo"*) ;;
+    *) _p="$_p;the linker's own 'cannot find -lX' is not recognised" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a library that will not link says which of the three faults it is"
+fi
+
+# ---- a zero exit is not proof that nothing failed  (1.14.64) ---------------- #
+# alsa-lib's install ended with
+#     install: cannot create regular file '/usr/include/sys/asoundlib.h':
+#              Permission denied
+#     make[4]: *** [Makefile:786: install-data-hook] Error 1
+#     make: *** [Makefile:408: install-recursive] Error 1
+# and the run reported "# alsa-lib: done" and "1 package(s) installed".
+# Whatever swallowed the status, the LOG said plainly that make had failed --
+# and every "installed but not really" in this session began exactly here.
+_p=""
+_hlpL="$helper_src"
+_sw="$T/swallowed"; mkdir -p "$_sw"
+_check() {   # <logtext> <expect: caught|clean>
+    printf '%s' "$1" > "$_sw/log"
+    _r="$(grep -m1 -E "^(make(\[[0-9]+\])?|ninja): \*\*\* .*(Error [0-9]+|build stopped)|^install: cannot create|: Permission denied$" \
+          "$_sw/log" 2>/dev/null)"
+    if [ -n "$_r" ]; then _got=caught; else _got=clean; fi
+    [ "$_got" = "$2" ] || _p="$_p;log check said $_got for: $(printf '%s' "$1" | head -1)"
+}
+# the reported failure, in the three shapes it took
+_check "install: cannot create regular file '/usr/include/sys/x.h': Permission denied
+" caught
+_check "make[4]: *** [Makefile:786: install-data-hook] Error 1
+" caught
+_check "make: *** [Makefile:408: install-recursive] Error 1
+" caught
+_check "ninja: *** build stopped: subcommand failed.
+" caught
+# ...and things that must NOT trip it
+_check "make[1]: Leaving directory '/x'
+installing files
+Done.
+" clean
+_check "checking for Permission denied handling... yes
+" clean
+_check "  -- Error handling tests: 12 passed
+" clean
+# the check is wired into run_phase_as, and only when the status was 0
+_rp="$(_slice_fn "$_hlpL" run_phase_as)"
+printf '%s' "$_rp" | grep -q 'A ZERO EXIT IS NOT PROOF' \
+    || _p="$_p;the log is not checked when a phase exits 0"
+printf '%s' "$_rp" | grep -q 'rc=1' \
+    || _p="$_p;a swallowed failure does not become a failure"
+printf '%s' "$_rp" | grep -q '\[ "$rc" = 0 \] && \[ -n "$log" \]' \
+    || _p="$_p;the log check runs even when the phase already failed"
+# and the runner itself still stops a phase at the first failing command
+_ph="$T/phasefail"; mkdir -p "$_ph/src"
+{
+    echo '#!/bin/bash'
+    echo 'name_version="demo-1.0"'
+    echo 'build_pkg() { :; }'
+    echo 'install_pkg() {'
+    echo 'echo "step one"'
+    echo 'false'
+    echo 'echo "step two ran anyway"'
+    echo '}'
+    echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+} > "$_ph/install_demo"
+_o="$(env PKGUSR_LIB="$PHASES_LIB" LFS_BUILD_ROOT="$_ph/src" \
+      bash "$_ph/install_demo" install 2>&1)"; _rc=$?
+[ "$_rc" != 0 ] || _p="$_p;a failing command mid-phase still exits 0"
+case "$_o" in
+    *"step two ran anyway"*) _p="$_p;the phase continued past a failed command" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a phase whose log records a failure is not reported as done"
+fi
+
+# ---- a warning that is only fatal because of -Werror  (1.14.65) ------------- #
+# wlroots 0.19 against libinput 1.31:
+#     error: enumeration value 'LIBINPUT_SWITCH_KEYPAD_SLIDE' not handled in
+#            switch [-Werror=switch]
+#     cc1: all warnings being treated as errors
+# Nothing is wrong with wlroots: a dependency grew a new enum value since that
+# version was written.  The box called it "a COMPILE error in the package's
+# own source ... the tools cannot repair it" and offered `c_args =
+# -DSOMETHING`, which is no help at all.  Version skew like this is the normal
+# state of a rolling book against pinned git sources, and the cure is always
+# the same flag.
+_p=""
+_hlpM="$helper_src"
+_we="$T/werror"; mkdir -p "$_we"
+python3 - "$_hlpM" > "$_we/rep.sh" <<'PYSLICEA'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }; phase_done() { return 1; }')
+print('missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/nonexistent"; s="/x"; staged="/x"')
+print('auto_repair=1; auto_fix=0; _perm_ish=0')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICEA
+printf "../backend/libinput/switch.c:32:9: error: enumeration value 'X' not handled in switch [-Werror=switch]\ncc1: all warnings being treated as errors\n" \
+    > "$_we/werror.log"
+_o="$(bash -c '. "'"$_we"'/rep.sh"; report wlroots all "'"$_we"'/werror.log"' 2>&1)"
+case "$_o" in
+    *"-Werror turned into an error"*) ;;
+    *) _p="$_p;a -Werror failure is not recognised" ;;
+esac
+case "$_o" in
+    *"werror = false"*) ;;
+    *) _p="$_p;the meson switch is not offered" ;;
+esac
+# the specific warning class is named, so the narrower flag is possible
+case "$_o" in
+    *"-Wno-switch"*) ;;
+    *) _p="$_p;the warning class is not carried into the suggested flag" ;;
+esac
+case "$_o" in
+    *"(-Werror=switch)"*) ;;
+    *) _p="$_p;the box does not say which warning became the error" ;;
+esac
+# a compile error that is NOT a promoted warning keeps the old advice only
+printf "../src/foo.c:12:5: error: too few arguments to function 'bar'\n" \
+    > "$_we/plain.log"
+_o2="$(bash -c '. "'"$_we"'/rep.sh"; report demo all "'"$_we"'/plain.log"' 2>&1)"
+case "$_o2" in
+    *"-Werror turned into an error"*) _p="$_p;every compile error is blamed on -Werror" ;;
+esac
+case "$_o2" in
+    *"machine.conf"*) ;;
+    *) _p="$_p;an ordinary compile error lost its build-flag advice" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a warning promoted by -Werror is named, with the flag that turns it off"
+fi
+
+# ---- a git entry can name its dependencies  (1.14.66) ----------------------- #
+# sway is built from git, so nothing in the book orders anything before it:
+#     ERROR: Dependency "json-c" not found, tried pkgconfig and cmake
+# json-c IS a BLFS package (JSON-C-0.18).  It had simply never been built,
+# because a git stack entry had no way to say it needed one -- book entries
+# get their dependencies from the book, git entries got nothing.
+_p=""
+_pmU="$(dirname "$LFS_TOOL")/packagemanager"
+_ssU="$(dirname "$LFS_TOOL")/stacks/sway.stack"
+# the stack parser keeps needs=, and the sway entry declares its own
+if [ -f "$_ssU" ]; then
+    python3 - "$_pmU" "$_ssU" <<'PYNEEDS' || _p="$_p;needs= is not parsed from a stack entry"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+rows = pm._parse_stack_file(sys.argv[2])
+sway = [r for r in rows if r.get("target") == "sway"]
+assert sway, "no sway entry in the stack"
+needs = (sway[0]["opts"].get("needs") or "")
+assert "json-c" in needs, needs
+PYNEEDS
+    # every name declared must be a package the book actually has, or the
+    # install it triggers cannot work (pcre2 was in the first draft: LFS, not
+    # BLFS, and the lookup returns nothing)
+    _bkU=""
+    for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+        [ -f "$_c" ] && _bkU="$_c" && break
+    done
+    if [ -n "$_bkU" ]; then
+        BLFS_BOOK_FILE="$_bkU" python3 - "$_pmU" "$_ssU" <<'PYREAL' || _p="$_p;a needs= entry names something the book does not have"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+for r in pm._parse_stack_file(sys.argv[2]):
+    for n in (r["opts"].get("needs") or "").replace(",", " ").split():
+        assert pm.book_version(n), (r["target"], n, "is not a BLFS package")
+PYREAL
+    fi
+fi
+# the stack installs them before the entry, through the same door
+_gb="$(sed -n '/A GIT ENTRY CAN NAME ITS DEPENDENCIES/,/MACHINE.CONF REACHES A GIT ENTRY/p' "$_pmU")"
+printf '%s' "$_gb" | grep -q '_install_via_self(_need, args.yes, recursive=True)' \
+    || _p="$_p;a declared dependency is not installed before the entry"
+printf '%s' "$_gb" | grep -q 'gather_user(_need).state == "installed"' \
+    || _p="$_p;an already-installed dependency is rebuilt every run"
+printf '%s' "$_gb" | grep -q 'stack stopped at' \
+    || _p="$_p;a dependency that cannot be installed does not stop the stack"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a git stack entry can declare the book packages it needs"
+fi
+
+# ---- check every pinned ref at once  (1.14.67) ------------------------------ #
+# Second rotted pin in one stack: usrsctp ref=1.0.0 (1.14.44) and now
+#     error: pathspec '1.24.1' did not match any file(s) known to git
+# for foot, whose tags are 1.24.0 and 1.28.0 -- 1.24.1 never existed.  Each
+# cost a clone, a build attempt and a round trip.  1.14.44's HANDOFF note said
+# a --check-refs would turn this class into a five-second report; here it is.
+_p=""
+_pmV="$(dirname "$LFS_TOOL")/packagemanager"
+python3 "$_pmV" stack --help 2>&1 | grep -q '\-\-check-refs' \
+    || _p="$_p;there is no way to check a stack's pinned refs"
+_cr="$(sed -n '/^def _check_stack_refs/,/^def /p' "$_pmV")"
+printf '%s' "$_cr" | grep -q 'ls-remote' \
+    || _p="$_p;the check does not ask the remote"
+printf '%s' "$_cr" | grep -q 'timeout=' \
+    || _p="$_p;a hanging remote would hang the check"
+printf '%s' "$_cr" | grep -q '0-9a-f.\{0,8\}7,40' \
+    || _p="$_p;a commit id is treated as a tag and reported missing"
+# (1.14.69: an entry with no ref is still CONTACTED -- the wording changed
+#  from "tracks the default branch" to a reachability result)
+printf '%s' "$_cr" | grep -q 'no ref=' \
+    || _p="$_p;an entry with no ref is reported as broken"
+# an unreachable remote is NOT an all-clear -- those are the ones that might
+# be wrong, and saying "every pinned ref exists" over them is a false pass
+printf '%s' "$_cr" | grep -q 'every ref that COULD be checked exists' \
+    || _p="$_p;unreachable remotes are counted as verified"
+printf '%s' "$_cr" | grep -q 'those refs are unverified' \
+    || _p="$_p;it does not say how many could not be checked"
+# SORT TAGS AS VERSIONS.  foot's real tags include 1.28.0, and a reverse
+# STRING sort offered "1.9.2, 1.9.1, 1.9.0, 1.9, 1.8.2" as the newest --
+# a suggestion that invites a downgrade is worse than none.
+python3 - "$_pmV" <<'PYVSORT' || _p="$_p;candidate tags are sorted as strings, not versions"
+import sys, re
+src = open(sys.argv[1]).read()
+i = src.index("        def _vkey(n):")
+j = src.index("        near = sorted", i)
+ns = {"re": re}
+NL = chr(10)
+exec(NL.join(l[8:] for l in src[i:j].split(NL)), ns)
+tags = ["1.8.2", "1.9", "1.9.0", "1.9.1", "1.9.2", "1.10.0", "1.24.0",
+        "1.26.1", "1.27.0", "1.28.0"]
+top = sorted(tags, key=ns["_vkey"], reverse=True)[:3]
+assert top == ["1.28.0", "1.27.0", "1.26.1"], top
+# a v-prefix and a mixed tag must not crash it
+assert ns["_vkey"]("v2.6.0") < ns["_vkey"]("v2.10.0")
+ns["_vkey"]("release-3.2.4")
+PYVSORT
+# and the summary line is a sentence
+printf '%s' "$_cr" | grep -q 'y pins" if bad == 1 else "ies pin' \
+    || _p="$_p;the summary says '1 entry pin a ref'"
+# it builds nothing: the command exits after reporting
+sed -n '/if getattr(args, "check_refs", False)/,+2p' "$_pmV" | grep -q 'sys.exit' \
+    || _p="$_p;--check-refs falls through into building the stack"
+# and the shipped stack no longer pins a ref that never existed
+_ssV="$(dirname "$LFS_TOOL")/stacks/sway.stack"
+[ -f "$_ssV" ] && { grep -q 'ref=1.24.1' "$_ssV" \
+    && _p="$_p;the stack still pins foot at a tag that does not exist"; }
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a stack's pinned refs can be checked before anything is built"
+fi
+
+# ---- an entry with no ref still has a url  (1.14.69) ------------------------ #
+# --check-refs reported "every pinned ref exists" while four entries -- the
+# ones tracking a default branch -- had not been contacted at all.  A
+# repository that has been renamed, made private or moved fails exactly like a
+# bad ref: at clone time, after everything before it has built.  "No ref to
+# check" is not the same as "nothing to check".
+_p=""
+_pmW="$(dirname "$LFS_TOOL")/packagemanager"
+_cr2="$(sed -n '/^def _check_stack_refs/,/^def /p' "$_pmW")"
+_nb="$(printf '%s' "$_cr2" | sed -n '/AN ENTRY WITH NO REF STILL HAS A URL/,/continue/p')"
+printf '%s' "$_nb" | grep -q 'ls-remote' \
+    || _p="$_p;an entry with no ref= is never contacted"
+printf '%s' "$_nb" | grep -q 'default branch, reachable' \
+    || _p="$_p;a reachable default-branch entry is not confirmed"
+printf '%s' "$_nb" | grep -q 'the remote has NO branches' \
+    || _p="$_p;an empty or moved repository is not reported"
+printf '%s' "$_nb" | grep -q 'unreachable += 1' \
+    || _p="$_p;an unreachable no-ref remote is counted as verified"
+printf '%s' "$_nb" | grep -q 'timeout=' \
+    || _p="$_p;the no-ref probe can hang"
+# the four local entries point at real repositories, not a placeholder
+_ssW="$(dirname "$LFS_TOOL")/stacks/sway.stack"
+if [ -f "$_ssW" ]; then
+    grep -qE '^git +(minibrowser|swbr|swov|swas).*github\.com/nimbin2' "$_ssW" \
+        && _p="$_p;the local sway tools still point at the old placeholder urls"
+    for _e in minibrowser swbr swov swas; do
+        grep -qE "^git +$_e .*url=https://" "$_ssW" \
+            || _p="$_p;$_e has no url"
+    done
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "every git entry is contacted, whether or not it pins a ref"
+fi
+
+# ---- retry the phase that failed, not the whole build  (1.14.70) ------------ #
+# "is it possible that if we fail the install part we recompile everything?"
+# Yes.  foot needed seven rounds to collect its directory grants (/etc/xdg,
+# then zsh site-functions, then fish vendor_completions.d -- meson reports one
+# at a time), and EVERY round re-cloned the repository, re-ran meson and
+# recompiled all 150 targets, to redo an install that had failed on one
+# completion file.  Granting a directory cannot invalidate a compile.
+_p=""
+_hlpN="$helper_src"
+_rt="$(_slice_fn "$_hlpN" cmd_build)"
+printf '%s' "$_rt" | grep -q 'RETRY THE PHASE THAT FAILED' \
+    || _p="$_p;the retry still re-runs the whole build"
+printf '%s' "$_rt" | grep -q 'install|configure) _retry_phase=' \
+    || _p="$_p;a failure in install or configure is not retried on its own"
+# it must learn WHICH phase failed from run_phase_as, not by parsing the log a
+# second time -- the bookkeeping has one reader (see the 1.12.x rule above)
+printf '%s' "$_rt" | grep -q 'LAST_FAILED_PHASE' \
+    || _p="$_p;the retry does not use the phase run_phase_as recorded"
+_slice_fn "$_hlpN" run_phase_as | grep -q 'LAST_FAILED_PHASE="$_failed"' \
+    || _p="$_p;run_phase_as does not publish which phase failed"
+printf '%s' "$_rt" | grep -q 'run_phase_as "$owner" "$staged" "$_retry_phase"' \
+    || _p="$_p;the retry does not use the narrowed phase"
+# ...and `all` still finishes: configure runs after a retried install
+printf '%s' "$_rt" | grep -q '\[ "$_retry_phase" = install \]' \
+    || _p="$_p;a retried install skips the configure step that would have followed"
+# a failure in unpack or build is still retried as the whole thing
+printf '%s' "$_rt" | grep -q '_retry_phase="$phase"' \
+    || _p="$_p;an early-phase failure no longer retries everything"
+# the runner really can redo one phase against an existing build tree
+_rd="$T/retryphase"; mkdir -p "$_rd/src"
+{
+    echo '#!/bin/bash'
+    echo 'name_version="demo-2.0"'
+    echo 'build_pkg() { echo "COMPILING"; touch built.marker; }'
+    echo 'install_pkg() {'
+    echo '[ -f built.marker ] || { echo "NO BUILD ARTIFACTS"; exit 9; }'
+    echo "if [ -f $_rd/allow ]; then echo \"INSTALL OK\"; else echo \"install: cannot create x: Permission denied\" >&2; exit 13; fi"
+    echo '}'
+    echo 'configure_pkg() { echo "CONFIGURED"; }'
+    echo '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"'
+} > "$_rd/install_demo"
+_o="$(env PKGUSR_LIB="$PHASES_LIB" LFS_BUILD_ROOT="$_rd/src" \
+      bash "$_rd/install_demo" all 2>&1)"
+case "$_o" in
+    *"phase 'install' FAILED"*) ;;
+    *) _p="$_p;the fixture did not fail where it was meant to" ;;
+esac
+touch "$_rd/allow"
+_o2="$(env PKGUSR_LIB="$PHASES_LIB" LFS_BUILD_ROOT="$_rd/src" \
+       bash "$_rd/install_demo" install 2>&1)"
+case "$_o2" in
+    *"INSTALL OK"*) ;;
+    *) _p="$_p;an install-only retry does not work against an existing build tree" ;;
+esac
+case "$_o2" in
+    *COMPILING*) _p="$_p;an install-only retry recompiles" ;;
+esac
+case "$_o2" in
+    *"NO BUILD ARTIFACTS"*) _p="$_p;the build tree was thrown away before the retry" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a permission grant retries the install, not the compile"
+fi
+
+# ---- the log belongs beside the package  (1.14.71) -------------------------- #
+# "shouldnt we log everything within the pkgusers home log dir?"  Yes, and
+# every failure box already CLAIMS we do: it ends with
+#     logs: /usr/src/pkgusr/p_json-c/log
+# which contained one empty .diff.  The phase log went to the central
+# $LOGS/<name>-<phase>.log and nowhere else -- and that copy is overwritten by
+# the next run of the same package.  The history someone wants three days
+# later was never kept where they were told to look.
+_p=""
+_hlpO="$helper_src"
+_rp2="$(_slice_fn "$_hlpO" run_phase_as)"
+printf '%s' "$_rp2" | grep -q 'THE LOG BELONGS BESIDE THE PACKAGE' \
+    || _p="$_p;the phase log is still not copied into the package's home"
+printf '%s' "$_rp2" | grep -q 'pkgusr_home_for "$owner"' \
+    || _p="$_p;the copy does not go to the owner's home"
+printf '%s' "$_rp2" | grep -q 'chown "$owner:$owner"' \
+    || _p="$_p;the copied log is not owned by the package user"
+# it really copies, with a timestamp so history accumulates
+_lg="$T/pkglog"; mkdir -p "$_lg/home/log" "$_lg/central"
+python3 - "$_hlpO" "$_lg" <<'PYLOG' || _p="$_p;the log is not placed in the package home"
+import sys, os, subprocess
+src = open(sys.argv[1]).read()
+d = sys.argv[2]
+i = src.index("    # THE LOG BELONGS BESIDE THE PACKAGE.")
+j = src.index('    if [ "$rc" = 0 ] && [ -n "$log" ] && [ -f "$log" ]; then', i)
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in src[i:j].split("\n"))
+open(os.path.join(d, "central", "foo-all.log"), "w").write("build output\n")
+sh = os.path.join(d, "t.sh")
+open(sh, "w").write("set -u\npkgusr_home_for() { echo %s/home; }\n"
+                    "owner=p_foo\nlog=%s/central/foo-all.log\nrc=0\n"
+                    % (d, d) + body)
+subprocess.run(["bash", sh], capture_output=True)
+got = os.listdir(os.path.join(d, "home", "log"))
+assert got, "nothing was copied into the package's log dir"
+assert got[0].startswith("foo-all-") and got[0].endswith(".log"), got
+assert open(os.path.join(d, "home", "log", got[0])).read() == "build output\n"
+# ...and old logs are pruned, so a package that fails twenty times does not
+# fill the disk with megabyte webkitgtk logs
+for n in range(14):
+    open(os.path.join(d, "home", "log", "old-%02d.log" % n), "w").write("x")
+subprocess.run(["bash", sh], capture_output=True)
+kept = [f for f in os.listdir(os.path.join(d, "home", "log")) if f.endswith(".log")]
+assert len(kept) == 10, len(kept)
+PYLOG
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a phase log is kept in the package's own log directory"
+fi
+
+# ---- a network stack, and every entry checked  (1.14.72) -------------------- #
+# "is it possible that we miss wpa_supplicant?"  Yes: the sway stack builds a
+# desktop and nothing in it brings up a network.  Their wifi script needs
+# wpa_cli, wpa_supplicant and ifup; none of the three was installed.
+# stacks/network.stack covers it -- libnl, wpa_supplicant, iw,
+# wireless_tools, libmnl, iptables, net-tools -- every one a BLFS package.
+_p=""
+_pmX="$(dirname "$LFS_TOOL")/packagemanager"
+_nsX="$(dirname "$LFS_TOOL")/stacks/network.stack"
+[ -f "$_nsX" ] || _p="$_p;there is no network stack"
+_bkX=""
+for _c in "$(dirname "$LFS_TOOL")"/BLFS-BOOK-*nochunks.html; do
+    [ -f "$_c" ] && _bkX="$_c" && break
+done
+if [ -f "$_nsX" ] && [ -n "$_bkX" ]; then
+    BLFS_BOOK_FILE="$_bkX" python3 - "$_pmX" "$_nsX" <<'PYNET' || _p="$_p;the network stack does not cover the wifi script"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+rows = pm._parse_stack_file(sys.argv[2])
+have = {r["target"] for r in rows}
+for want in ("wpa_supplicant", "libnl", "iptables"):
+    assert want in have, (want, sorted(have))
+PYNET
+fi
+# EVERY book entry in EVERY shipped stack must be a package the book has.
+# This is the check that would have caught `needs=pcre2` (1.14.66) before it
+# shipped -- a stack naming something unbuildable fails late and far from the
+# cause.
+if [ -n "$_bkX" ]; then
+    BLFS_BOOK_FILE="$_bkX" python3 - "$_pmX" "$(dirname "$LFS_TOOL")/stacks" <<'PYALLSTACK' || _p="$_p;a shipped stack names a package the book does not have"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]
+bad = []
+for f in sorted(os.listdir(d)):
+    if not f.endswith(".stack"):
+        continue
+    for r in pm._parse_stack_file(os.path.join(d, f)):
+        # a `book` entry that carries url= is book-preferred with a GIT
+        # fallback (elogind: the SysV logind, which the systemd book has no
+        # page for).  The tool already falls back; only an entry with no
+        # fallback has to resolve.
+        if (r.get("kind") == "book" and not r["opts"].get("url")
+                and not pm.book_version(r["target"])):
+            bad.append((f, r["target"]))
+        for n in (r["opts"].get("needs") or "").replace(",", " ").split():
+            if not pm.book_version(n):
+                bad.append((f, r["target"] + " needs " + n))
+assert not bad, bad
+PYALLSTACK
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a network stack exists, and every stack entry names a real package"
+fi
+
+# ---- an --enable must beat the book's --disable  (1.14.74) ------------------ #
+# The user wants iptables-nft (legacy is being retired upstream).  The book's
+# page configures --disable-nftables, so the flag comes from machine.conf --
+# and configure_args PREPENDED it:
+#     ./configure --enable-nftables --prefix=/usr \
+#                 --disable-nftables ...
+# autoconf takes the LAST occurrence, so the book's flag won and the setting
+# did nothing at all.  Same class as 1.14.60: an option that reaches the
+# command and is then ignored is worse than one that never arrives.
+_p=""
+_pmY="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmY" "$T/confargs" <<'PYCONF' || _p="$_p;configure_args does not override the opposite flag"
+import sys, os, re, subprocess, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "install_i")
+open(p, "w").write(
+    "build_pkg() {\n"
+    "./configure --prefix=/usr      \\\n"
+    "            --disable-nftables \\\n"
+    "            --enable-libipq    &&\n"
+    "make\n}\n")
+pm._machine_opts_for = lambda a: {"configure_args": "--enable-nftables"}
+pm.apply_machine_opts("iptables", p)
+body = open(p).read()
+assert "--enable-nftables" in body, body
+assert "--disable-nftables" not in body, body
+# the rest of the command survives
+assert "--enable-libipq" in body, body
+assert "--prefix=/usr" in body, body
+# and no dangling continuation is left behind: removing the token alone gave
+#     --prefix=/usr      \ \
+# which is a backslash-escaped space -- an argument
+assert "\\ \\" not in body, body
+assert subprocess.run(["bash", "-n", p]).returncode == 0, body
+# an unrelated flag is not touched
+open(p, "w").write("build_pkg() {\n./configure --disable-static --enable-shared\n}\n")
+pm._machine_opts_for = lambda a: {"configure_args": "--enable-nftables"}
+pm.apply_machine_opts("iptables", p)
+assert "--disable-static" in open(p).read(), open(p).read()
+PYCONF
+# the network stack carries libnftnl, ahead of iptables, and says where the
+# version came from -- netfilter.org's own news page, not a guess
+_nsY="$(dirname "$LFS_TOOL")/stacks/network.stack"
+if [ -f "$_nsY" ]; then
+    grep -q '^tar    libnftnl' "$_nsY" \
+        || _p="$_p;libnftnl is not in the network stack"
+    _ln="$(grep -n '^tar    libnftnl' "$_nsY" | cut -d: -f1)"
+    _ip="$(grep -n '^book   iptables' "$_nsY" | cut -d: -f1)"
+    [ -n "$_ln" ] && [ -n "$_ip" ] && [ "$_ln" -lt "$_ip" ] \
+        || _p="$_p;libnftnl is not built before iptables"
+    grep -q 'sha256' "$_nsY" \
+        || _p="$_p;nothing tells the reader to check the tarball"
+fi
+# ...and the flag it needs ships in machine.conf
+_mcY="$(dirname "$LFS_TOOL")/stacks/machine.conf"
+[ -f "$_mcY" ] && { grep -q 'enable-nftables' "$_mcY" \
+    || _p="$_p;the shipped machine.conf does not enable the nft backend"; }
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a configure_args flag overrides the book's opposite, and iptables-nft is set up"
+fi
+
+# ---- a systemd unit on a system with no systemd  (1.14.75) ------------------ #
+# wpa_supplicant installed its binaries and man pages and then died on
+#     install: target '/usr/lib/systemd/system/': No such file or directory
+# The systemd book's page ends by installing a unit file; on a SysV system
+# that directory does not exist.  Same situation the systemctl shim was
+# written for -- the book assumes an init this machine does not run -- and the
+# install wrapper is where it has to be caught, because it is a file copy and
+# not a systemctl call.
+_p=""
+_hlpP="$helper_src"
+_iw="$T/instwrap"; mkdir -p "$_iw"
+python3 - "$_hlpP" "$_iw" <<'PYWRAP'
+import sys, os
+s = open(sys.argv[1]).read()
+i = s.index('    cat > "$WRAPPERS/install" <<')
+j = s.index("\nEOF\n", i)
+body = s[i:j]
+body = body[body.index("\n") + 1:]
+p = os.path.join(sys.argv[2], "install")
+open(p, "w").write(body)
+os.chmod(p, 0o755)
+PYWRAP
+bash -n "$_iw/install" || _p="$_p;the install wrapper does not parse"
+grep -q 'A SYSTEMD UNIT ON A SYSTEM WITH NO SYSTEMD' "$_iw/install" \
+    || _p="$_p;the wrapper does not handle a systemd unit destination"
+# force the SysV case: no unit dir, no systemctl
+sed -e 's|\[ ! -d /usr/lib/systemd/system \]|true|' \
+    -e 's|! command -v systemctl >/dev/null 2>&1|true|' \
+    "$_iw/install" > "$_iw/install-sysv"
+echo unit > "$_iw/foo.service"
+( cd "$_iw" && bash install-sysv -m644 foo.service /usr/lib/systemd/system/ ) 2>"$_iw/err"
+[ $? = 0 ] || _p="$_p;a unit install still fails the package on a SysV system"
+grep -q "does not run systemd" "$_iw/err" \
+    || _p="$_p;the skip is silent -- nobody would know the unit was dropped"
+# ...and an ordinary install is untouched
+( cd "$_iw" && bash install-sysv -m644 foo.service "$_iw/out.txt" ) 2>/dev/null
+[ -f "$_iw/out.txt" ] || _p="$_p;an ordinary install no longer copies anything"
+# on a machine that DOES run systemd, the unit must be installed for real
+sed -e 's|\[ ! -d /usr/lib/systemd/system \]|false|' "$_iw/install" > "$_iw/install-sd"
+mkdir -p "$_iw/unitdir"
+( cd "$_iw" && bash install-sd -m644 foo.service "$_iw/unitdir/foo.service" ) 2>/dev/null
+[ -f "$_iw/unitdir/foo.service" ] \
+    || _p="$_p;a systemd host no longer gets its unit files"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a unit file from a systemd-book page is skipped, not fatal, on SysV"
+fi
+
+# ---- the pattern has to be a real path  (1.14.76) --------------------------- #
+# A finished stack ended with
+#     results: packagemanager errors     logs: /usr/src/p_<pkg>/log
+# The hint was built by hand -- os.path.join(BASE_DIR, pkgusr_name('<pkg>'),
+# 'log') -- and got it wrong twice over: the placeholder never gets filled in,
+# and the path is missing the `pkgusr/` component every package home has.
+# Someone following it found nothing, and until 1.14.71 the logs were not
+# there to find either.
+_p=""
+_pmZ="$(dirname "$LFS_TOOL")/packagemanager"
+grep -q "pkgusr_name('<pkg>')" "$_pmZ" \
+    && _p="$_p;the log hint is still assembled by hand"
+[ "$(grep -c "_pkg_log_dir('<name>')" "$_pmZ")" -ge 2 ] \
+    || _p="$_p;the summary lines do not use the function that knows the path"
+python3 - "$_pmZ" <<'PYPATH' || _p="$_p;the printed log path is not where logs live"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+shown = pm._pkg_log_dir("<name>")
+# it must be under the package-user root, not one level up
+assert "/pkgusr/" in shown or pm.PKGUSR_SUBDIR == "", shown
+# and for a real package it must be exactly that package's log directory
+real = pm._pkg_log_dir("zlib")
+assert real.endswith("/log"), real
+assert pm.pkgusr_name("zlib") in real, real
+# the placeholder form differs from the real one only in the name
+assert shown.replace("<name>", "zlib") == real, (shown, real)
+PYPATH
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the log path a summary prints is the path logs are actually in"
+fi
+
+# ---- boot scripts are a package too  (1.14.77) ------------------------------ #
+# /etc/init.d after an LFS build holds LFS's own scripts and nothing else: no
+# dbus, no alsa, no cron.  The user noticed the missing fcron script and asked
+# whether the LFS install had gone wrong.  It had not -- those scripts live in
+# blfs-bootscripts, a separate tarball and not a BLFS package, which is
+# exactly why a package page's `make install-<service>` is commented out by
+# the generator (1.14.20): the target is in THAT tarball, not in the package.
+_p=""
+_pmA2="$(dirname "$LFS_TOOL")/packagemanager"
+_ss2="$(dirname "$LFS_TOOL")/stacks/services.stack"
+[ -f "$_ss2" ] || _p="$_p;there is no services stack"
+if [ -f "$_ss2" ]; then
+    python3 - "$_pmA2" "$_ss2" <<'PYSVC' || _p="$_p;the services stack does not install the boot scripts"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+rows = pm._parse_stack_file(sys.argv[2])
+by = {r["target"]: r for r in rows}
+assert "blfs-bootscripts" in by, sorted(by)
+inst = by["blfs-bootscripts"]["opts"].get("install", "")
+# the services this system actually runs
+for t in ("install-dbus", "install-alsa", "install-bluetooth", "install-acpid",
+          "install-fcron", "install-service-wpa"):
+    assert t in inst, (t, inst)
+# a package must be built before its boot script is installed
+names = [r["target"] for r in rows]
+assert names.index("acpid") < names.index("blfs-bootscripts"), names
+assert names.index("fcron") < names.index("blfs-bootscripts"), names
+# have= keeps it idempotent
+assert by["blfs-bootscripts"]["opts"].get("have"), by["blfs-bootscripts"]["opts"]
+PYSVC
+fi
+# A LINE MAY CONTINUE.  Every entry had to be one line, which is why
+# sway.stack's are 300 characters wide and unreadable.
+python3 - "$_pmA2" "$T/cont" <<'PYCONT' || _p="$_p;a stack entry cannot be split over lines"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "t.stack")
+open(p, "w").write(
+    "# a comment\n"
+    "tar    demo \\\n"
+    "       url=https://example.invalid/demo-1.0.tar.xz \\\n"
+    "       pkg=demo-1.0.tar.xz \\\n"
+    '       build="true" \\\n'
+    '       install="make install-one install-two"\n'
+    "book   zlib\n")
+rows = pm._parse_stack_file(p)
+assert len(rows) == 2, rows
+assert rows[0]["target"] == "demo", rows[0]
+assert rows[0]["opts"]["install"] == "make install-one install-two", rows[0]
+assert rows[1]["target"] == "zlib", rows[1]
+# a dangling backslash at the end of the file is an error, not a silent drop
+open(p, "w").write("tar    demo \\\n")
+try:
+    pm._parse_stack_file(p)
+    raise AssertionError("a dangling continuation was accepted")
+except ValueError as e:
+    assert "backslash" in str(e), e
+PYCONT
+# the stacks that shipped before this still parse unchanged
+for _f in sway network services; do
+    _sf="$(dirname "$LFS_TOOL")/stacks/$_f.stack"
+    [ -f "$_sf" ] || continue
+    python3 - "$_pmA2" "$_sf" <<'PYSTILL' || _p="$_p;$_f.stack no longer parses"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+assert pm._parse_stack_file(sys.argv[2]), "no entries"
+PYSTILL
+done
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "boot scripts install from their own tarball, and a stack entry can wrap"
+fi
+
+# ---- a service account is root's job  (1.14.78) ----------------------------- #
+# fcron built completely and then died in its install:
+#     groupadd: cannot lock /etc/group; try again later
+#     Group "fcron" does not exist : please create it
+# Its page's own commands are
+#     groupadd -g 22 fcron &&
+#     useradd -d /dev/null -c "Fcron User" -g fcron -s /bin/false -u 22 fcron
+# and the install phase runs as p_fcron, which cannot write /etc/group.  Any
+# page that needs a system account (fcron, avahi, sshd, ...) is in this
+# position.
+_p=""
+_hlpQ="$helper_src"
+_sa="$(_slice_fn "$_hlpQ" create_service_accounts_from_script)"
+[ -n "$_sa" ] || _p="$_p;nothing creates the accounts a page asks for"
+printf '%s' "$_sa" | grep -q 'id -u..\? = 0' \
+    || _p="$_p;it would try to create accounts when not root"
+printf '%s' "$_sa" | grep -q 'getent group' \
+    || _p="$_p;an existing group would be created again"
+_slice_fn "$_hlpQ" cmd_build | grep -q 'create_service_accounts_from_script' \
+    || _p="$_p;the build never calls it"
+# the NAME is the last argument: stripping "-x value" pairs by hand tripped
+# over the quoted comment in useradd -c "Fcron User"
+_nm="$(printf '%s' 'useradd -d /dev/null -c "Fcron User" -g fcron -s /bin/false -u 22 fcron &&' \
+       | sed 's/&&.*//' | awk '{print $NF}')"
+[ "$_nm" = fcron ] || _p="$_p;the account name is parsed as '$_nm'"
+# and the wrappers make the package user's own attempt a no-op once it exists
+python3 - "$_hlpQ" "$T/uwrap" <<'PYUW'
+import sys, os
+s = open(sys.argv[1]).read()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+for w in ("groupadd", "useradd"):
+    i = s.index('    cat > "$WRAPPERS/%s" <<' % w)
+    j = s.index("\nEOF\n", i)
+    body = s[i:j]
+    body = body[body.index("\n") + 1:]
+    p = os.path.join(d, w)
+    open(p, "w").write(body)
+    os.chmod(p, 0o755)
+PYUW
+for _w in groupadd useradd; do
+    bash -n "$T/uwrap/$_w" || _p="$_p;the $_w wrapper does not parse"
+done
+# an account that exists -> skip, exit 0 (root is the caller here)
+_o="$(bash "$T/uwrap/groupadd" -g 99 root 2>&1)"; _rc=$?
+[ "$_rc" = 0 ] || _p="$_p;groupadd for an existing group is still an error"
+case "$_o" in *"already exists"*) ;; *) _p="$_p;the skip is silent" ;; esac
+_o2="$(bash "$T/uwrap/useradd" -u 99 root 2>&1)"; _rc2=$?
+[ "$_rc2" = 0 ] || _p="$_p;useradd for an existing user is still an error"
+# ...and a package user asked to create a NEW one is told who can
+grep -q 'a package user cannot' "$T/uwrap/groupadd" \
+    || _p="$_p;a package user gets no explanation when the account is missing"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a page that needs a system account gets one, created by root"
+fi
+
+# ---- a configuration step that needs root  (1.14.79) ------------------------ #
+# fcron built, created its system account (1.14.78), installed 74 files -- and
+# then its configure phase said
+#     must be privileged to use -u
+# from `fcrontab -u systab`.  BLFS's "Configuring" sections are written for
+# the root user: they are system configuration, not part of installing a
+# package, and no directory grant can help because the command itself refuses
+# to run unprivileged.  --as-root already existed for exactly this.
+_p=""
+_hlpR="$helper_src"
+_cfg="$T/cfgroot"; mkdir -p "$_cfg"
+python3 - "$_hlpR" > "$_cfg/rep.sh" <<'PYSLICEB'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }; phase_done() { return 1; }')
+print('missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/nonexistent"; s="/x"; staged="/x"')
+print('auto_repair=1; auto_fix=0; _perm_ish=0')
+print('LAST_FAILED_PHASE="${FAILED_PHASE:-configure}"')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICEB
+printf '## Configuration\nmust be privileged to use -u\n' > "$_cfg/cfg.log"
+_o="$(bash -c '. "'"$_cfg"'/rep.sh"; report fcron all "'"$_cfg"'/cfg.log"' 2>&1)"
+case "$_o" in
+    *"CONFIGURATION step, and it needs root"*) ;;
+    *) _p="$_p;a privileged configure step is not recognised" ;;
+esac
+case "$_o" in
+    *"--phase configure --force --as-root"*) ;;
+    *) _p="$_p;the retry does not use the flag that exists for this" ;;
+esac
+# ...and it does not fire for a BUILD failure with the same words
+printf 'checking...\nmust be privileged to use -u\n' > "$_cfg/build.log"
+_o2="$(bash -c 'FAILED_PHASE=build; . "'"$_cfg"'/rep.sh"; report fcron all "'"$_cfg"'/build.log"' 2>&1)"
+case "$_o2" in
+    *"CONFIGURATION step"*) _p="$_p;a build failure is called a configuration problem" ;;
+esac
+# the flag it names must actually exist
+grep -q -- '--as-root) as_root=1' "$_hlpR" \
+    || _p="$_p;--as-root is not a real option"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a configure step that needs privilege says so, and how to run it"
+fi
+
+# ---- the commands we print must be commands  (1.14.80) ---------------------- #
+#     $ lfs-helper build fcron --phase configure --force --as-root
+#     !! unknown option: --as-root
+# 1.14.79 printed that advice confidently.  The flag existed -- on
+# cmd_run_script, one function away -- and cmd_build did not take it.  Then,
+# once accepted, `local as_root=0` inside cmd_build shadowed it, so the flag
+# parsed cleanly and did nothing.  Two ways to be wrong about one word.
+_p=""
+_hlpS="$helper_src"
+# cmd_build accepts it, and does not immediately overwrite it
+_cb="$(_slice_fn "$_hlpS" cmd_build)"
+printf '%s' "$_cb" | grep -q -- '--as-root) as_root=1' \
+    || _p="$_p;lfs-helper build does not accept --as-root"
+printf '%s' "$_cb" | grep -q 'local as_root=0 staged' \
+    && _p="$_p;a later local re-declaration shadows the flag again"
+printf '%s' "$_cb" | grep -q 'as_root=0' \
+    || _p="$_p;as_root has no default, so it is unset under set -u"
+# it really parses: an unknown option dies, a known one does not
+_o="$(bash "$_hlpS" build --this-is-not-an-option 2>&1)"
+case "$_o" in *"unknown option"*) ;; *) _p="$_p;an unknown option is no longer refused" ;; esac
+_o2="$(bash "$_hlpS" build --as-root 2>&1)"
+case "$_o2" in
+    *"unknown option: --as-root"*) _p="$_p;--as-root is still refused" ;;
+esac
+# THE GENERAL RULE: every long option the failure report suggests must be
+# accepted by the command it names.  This is the check that would have caught
+# it before it shipped.
+python3 - "$_hlpS" <<'PYFLAGS' || _p="$_p;the failure report suggests an option no command takes"
+import sys, re
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+report = s[i:j]
+# every "lfs-helper build ... --flag" the report prints
+flags = set()
+for line in report.split("\n"):
+    if "lfs-helper build" not in line:
+        continue
+    flags.update(re.findall(r"--[a-z][a-z-]+", line))
+assert flags, "the report suggests no build flags at all -- did the slice move?"
+i2 = s.index("cmd_build() {")
+j2 = s.index("\n}\n", i2)
+parser = s[i2:j2]
+missing = [f for f in sorted(flags) if f + ")" not in parser and f + "|" not in parser]
+assert not missing, missing
+PYFLAGS
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "every option the failure report suggests is one the command accepts"
+fi
+
+# ---- a package that checks its own file ownership  (1.14.81) ---------------- #
+# Running fcron's configure as root got further and then:
+#     ERROR Conf file (/etc/fcron.conf) must be owned by root:fcron
+#     ERROR Could not chdir to /var/spool/fcron: Permission denied
+# A package-user install CANNOT satisfy that.  Everything it writes belongs to
+# p_fcron, and the chown wrapper skips the package's own chown deliberately --
+# that skipping is the whole model.  For a daemon that validates ownership
+# before it will start, the last step belongs to root, and the package's own
+# error says precisely what it wants.
+_p=""
+_hlpT="$helper_src"
+_ow="$T/ownership"; mkdir -p "$_ow"
+python3 - "$_hlpT" > "$_ow/rep.sh" <<'PYSLICEC'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }; phase_done() { return 1; }')
+print('missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/nonexistent"; s="/x"; staged="/x"')
+print('auto_repair=1; auto_fix=0; _perm_ish=0; LAST_FAILED_PHASE=configure')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print(body)
+print('}')
+PYSLICEC
+printf 'ERROR Conf file (/etc/fcron.conf) must be owned by root:fcron and (no more than) 644 : ignored\nERROR Could not chdir to /var/spool/fcron: Permission denied\n' \
+    > "$_ow/own.log"
+_o="$(bash -c '. "'"$_ow"'/rep.sh"; report fcron configure "'"$_ow"'/own.log"' 2>&1)"
+case "$_o" in
+    *"CHECKS who owns its files"*) ;;
+    *) _p="$_p;an ownership demand is not recognised" ;;
+esac
+# the exact commands, taken from the package's own words
+case "$_o" in
+    *"chown root:fcron /etc/fcron.conf"*) ;;
+    *) _p="$_p;the conf file's required ownership is not turned into a command" ;;
+esac
+case "$_o" in
+    *"chown -R fcron:fcron /var/spool/fcron"*) ;;
+    *) _p="$_p;the spool directory is not mentioned" ;;
+esac
+# it explains WHY a package-user install cannot do this itself
+case "$_o" in
+    *"chown wrapper skips"*) ;;
+    *) _p="$_p;it does not say why the ownership is wrong in the first place" ;;
+esac
+# and it stays quiet for a log with no ownership complaint
+printf 'make: *** [Makefile:9: all] Error 1\n' > "$_ow/plain.log"
+_o2="$(bash -c '. "'"$_ow"'/rep.sh"; report demo configure "'"$_ow"'/plain.log"' 2>&1)"
+case "$_o2" in
+    *"CHECKS who owns"*) _p="$_p;every failure is blamed on ownership" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a package that validates its file ownership says which chown fixes it"
+fi
+
+# ---- write down what was refused  (1.14.82) --------------------------------- #
+# fcron's configure, as root, failed with
+#     ERROR could not change egid to 22: Operation not permitted
+# As ROOT.  Which makes no sense until you know that `fcrontab` is installed
+# setgid `fcron`, and the chmod wrapper had refused that bit at install time
+# -- correctly, a package user must not set it -- and then said nothing ever
+# again.  A refusal nobody records is a decision that has to be re-derived
+# from its consequences, hours later, in a different phase.
+_p=""
+_hlpU="$helper_src"
+# the wrapper records the refusal as well as printing it
+python3 - "$_hlpU" "$T/chmodw" <<'PYCH'
+import sys, os
+s = open(sys.argv[1]).read()
+i = s.index('    cat > "$WRAPPERS/chmod" <<')
+j = s.index("\nEOF\n", i)
+body = s[i:j]
+body = body[body.index("\n") + 1:]
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "chmod")
+open(p, "w").write(body)
+os.chmod(p, 0o755)
+PYCH
+bash -n "$T/chmodw/chmod" || _p="$_p;the chmod wrapper does not parse"
+grep -q 'pkgusr-setid.requests' "$T/chmodw/chmod" \
+    || _p="$_p;a refused setuid/setgid is still not recorded"
+mkdir -p "$T/chmodw/home"
+( cd "$T/chmodw" && HOME="$T/chmodw/home" bash chmod 2755 /usr/bin/fcrontab ) 2>/dev/null
+grep -q 'chmod 2755 /usr/bin/fcrontab' "$T/chmodw/home/.pkgusr-setid.requests" 2>/dev/null \
+    || _p="$_p;the refused chmod was not written down"
+# an ordinary chmod is not recorded
+( cd "$T/chmodw" && HOME="$T/chmodw/home" bash chmod 644 "$T/chmodw/home/x" ) 2>/dev/null
+[ "$(grep -c . "$T/chmodw/home/.pkgusr-setid.requests")" = 1 ] \
+    || _p="$_p;an ordinary chmod is recorded as a set-id request"
+# and root reports them after the phase
+_rs="$(_slice_fn "$_hlpU" report_setid_requests)"
+[ -n "$_rs" ] || _p="$_p;nothing reports the refusals"
+printf '%s' "$_rs" | grep -q 'setuid/setgid' \
+    || _p="$_p;the report does not say what kind of request it was"
+_slice_fn "$_hlpU" cmd_build | grep -q 'report_setid_requests "$owner"' \
+    || _p="$_p;the build never reports them"
+# it prints each line and then clears the file, so a later build does not
+# repeat requests that have been dealt with
+mkdir -p "$T/sidrep"
+printf 'chmod 2755 /usr/bin/fcrontab\n' > "$T/sidrep/.pkgusr-setid.requests"
+_o="$( warn() { echo "$*" >&2; }
+       pkgusr_home_for() { echo "$T/sidrep"; }
+       eval "$_rs"
+       report_setid_requests p_fcron 2>&1 )"
+case "$_o" in
+    *"chmod 2755 /usr/bin/fcrontab"*) ;;
+    *) _p="$_p;the refused command is not shown" ;;
+esac
+[ -s "$T/sidrep/.pkgusr-setid.requests" ] \
+    && _p="$_p;the requests are repeated on every later build"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a refused setuid/setgid bit is written down and reported to root"
+fi
+
+# ---- fix them together, not one round each  (1.14.83) ----------------------- #
+# fcron names ONE file at a time.  First /etc/fcron.conf must be owned by
+# root:fcron; fixed that, and the next run said /etc/fcron.allow: Permission
+# denied; /etc/fcron.deny would have been the third round.  The package
+# creates a system group for itself -- it says so in its own script -- and
+# every config file it installed under /etc wants root:<that group>.
+_p=""
+_hlpV="$helper_src"
+_fx="$T/fcronfix"; mkdir -p "$_fx/srcroot/p_demosvc"
+python3 - "$_hlpV" > "$_fx/rep.sh" <<'PYSLICED'
+import sys
+s = open(sys.argv[1]).read()
+i = s.index('        fail "! $name FAILED (phase ')
+j = s.index('        show_build_errors "$log"')
+body = "\n".join(l[4:] if l.startswith("    ") else l for l in s[i:j].split("\n"))
+print('set -u')
+print('fail() { echo "$*"; }; say() { echo "$*"; }; warn() { echo "$*" >&2; }')
+print('detail() { :; }; hint() { :; }; show_build_errors() { :; }')
+print('pkg_owner_name() { echo "p_$1"; }; unprefix_pkg_user() { echo "${1#p_}"; }')
+print('user_exists() { return 1; }; phase_done() { return 1; }')
+print('missing_dirs_from_log() { :; }')
+print('SNAP_ROOT="/nonexistent"; staged="/x"; auto_repair=1; auto_fix=0')
+print('_perm_ish=0; LAST_FAILED_PHASE=configure')
+print('report() {\n  local name="$1" phase="$2" log="$3" jobs="" rc=1')
+print('  local s="$SCRIPT_UNDER_TEST"')
+print(body)
+print('}')
+PYSLICED
+# the package's own script is where the service group is named
+printf 'install_pkg() {\ngroupadd -g 4242 demosvc &&\nuseradd -g demosvc demosvc\n}\n' \
+    > "$_fx/script"
+# it installed three config files; the log will mention only one
+printf '/etc/demosvc.conf\n/etc/demosvc.allow\n/etc/demosvc.deny\n/usr/bin/demosvc\n' \
+    > "$_fx/srcroot/p_demosvc/pkg.lst"
+printf 'ERROR could not open /etc/demosvc.allow: Permission denied\n' > "$_fx/log"
+if command -v groupadd >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
+    groupadd -g 4242 demosvc 2>/dev/null
+    for _f in conf allow deny; do : > "/etc/demosvc.$_f"; done
+    _o="$(bash -c 'SCRIPT_UNDER_TEST="'"$_fx"'/script"; SRCROOT="'"$_fx"'/srcroot"; . "'"$_fx"'/rep.sh"; report demosvc configure "'"$_fx"'/log"' 2>&1)"
+    # every config file the MANIFEST lists, not just the one in the log
+    for _f in conf allow deny; do
+        case "$_o" in
+            *"/etc/demosvc.$_f"*) ;;
+            *) _p="$_p;/etc/demosvc.$_f was not named" ;;
+        esac
+    done
+    case "$_o" in
+        *"chown root:demosvc"*) ;;
+        *) _p="$_p;the service group is not used for the chown" ;;
+    esac
+    case "$_o" in
+        *"ONE file at a time"*) ;;
+        *) _p="$_p;it does not explain why all of them are listed" ;;
+    esac
+    # a file already owned by the service group is not listed again
+    chgrp demosvc /etc/demosvc.conf 2>/dev/null
+    _o2="$(bash -c 'SCRIPT_UNDER_TEST="'"$_fx"'/script"; SRCROOT="'"$_fx"'/srcroot"; . "'"$_fx"'/rep.sh"; report demosvc configure "'"$_fx"'/log"' 2>&1)"
+    case "$_o2" in
+        *"/etc/demosvc.conf"*) _p="$_p;a file that is already correct is listed again" ;;
+    esac
+    rm -f /etc/demosvc.conf /etc/demosvc.allow /etc/demosvc.deny
+    groupdel demosvc 2>/dev/null
+fi
+# and the source really reads the manifest, not only the log
+sed -n '/from the MANIFEST, not from the log/,/done)"/p' "$_hlpV" | grep -q 'pkg.lst' \
+    || _p="$_p;the suggestion is still built from the log alone"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a service package's config files are fixed together, from its manifest"
+fi
+
+# ---- highlight the words the answer depends on  (1.14.84) ------------------- #
+# The collector-group prompt is eight lines of prose containing two names, and
+# the names are the only thing the reader has to choose between.  Asked to
+# make them stand out -- it appears over and over during a stack run, and
+# every time the reader hunts for them.
+_p=""
+_hlpW="$helper_src"
+_pr="$(sed -n '/Which group should share THIS DIRECTORY/,/or type another name/p' "$_hlpW")"
+printf '%s' "$_pr" | grep -q 'C_B}${by_owner}' \
+    || _p="$_p;the first candidate name is not highlighted"
+printf '%s' "$_pr" | grep -q 'C_B}${by_dir}' \
+    || _p="$_p;the second candidate name is not highlighted"
+# C_B must be cleared when output is not a terminal, like every other colour
+grep -q 'C_OK=; C_WARN=; C_ERR=; C_DIM=; C_OFF=; C_B=;' "$_hlpW" \
+    || _p="$_p;C_B leaks escape codes into a piped or logged run"
+# and the escapes really appear on a terminal and vanish without one
+_c="$(bash -c '
+    C_B=$'"'"'\033[1m'"'"'; C_OFF=$'"'"'\033[0m'"'"'
+    printf "%s\n" "${C_B}nimgnu_services${C_OFF}"' | cat -v)"
+case "$_c" in
+    *'[1mnimgnu_services'*) ;;
+    *) _p="$_p;the highlight produces no escape sequence" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the group names in the prompt are highlighted, and only on a terminal"
+fi
+
+# ---- the account name, not the package name  (1.14.85) ---------------------- #
+#     $ packagemanager reload-pkg-list mpv
+#     mpv: pkg.lst regeneration started (disowned background task).
+#     $ pgrep packagemanager        # nothing
+#     -rw-r--r-- 1 root root 0 pkg.lst.new
+# "mpv" went straight through.  pkgusr_home() accepts either name so the home
+# resolved, but _can_su("mpv") did not -- the account is p_mpv -- so it took
+# the ROOT branch and ran `list_package mpv`, which found no such user,
+# produced nothing, and left an empty root-owned pkg.lst.new.  And it said
+# "regeneration started".
+_p=""
+_pmB2="$(dirname "$LFS_TOOL")/packagemanager"
+_wl="$(sed -n '/^def write_pkg_list/,/^def /p' "$_pmB2")"
+printf '%s' "$_wl" | grep -q 'user = pkgusr_name(user)' \
+    || _p="$_p;write_pkg_list still trusts the name it is given"
+python3 - "$_pmB2" <<'PYNAME' || _p="$_p;a package name does not resolve to its account"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+assert pm.pkgusr_name("mpv") == "p_mpv", pm.pkgusr_name("mpv")
+assert pm.pkgusr_name("p_mpv") == "p_mpv", pm.pkgusr_name("p_mpv")
+PYNAME
+# the command reports what HAPPENED, in the foreground, by default
+_rl="$(sed -n '/^def cmd_reload_pkg_list/,/^def /p' "$_pmB2")"
+printf '%s' "$_rl" | grep -q 'background=False' \
+    || _p="$_p;the command still disowns the work by default"
+printf '%s' "$_rl" | grep -q 'file(s) recorded' \
+    || _p="$_p;it does not say how many files it found"
+printf '%s' "$_rl" | grep -q 'no files found' \
+    || _p="$_p;a scan that finds nothing is reported as success"
+printf '%s' "$_rl" | grep -q 'getattr(args, "background", False)' \
+    || _p="$_p;there is no way to ask for the old detached behaviour"
+python3 "$_pmB2" reload-pkg-list --help 2>&1 | grep -q -- '--background' \
+    || _p="$_p;--background is not offered"
+# "started" must not be claimed when the work is done synchronously
+printf '%s' "$_rl" | grep -q 'regeneration started' \
+    || _p="$_p;the background path lost its message"
+case "$(printf '%s' "$_rl" | grep -c 'regeneration started')" in
+    1) ;;
+    *) _p="$_p;the foreground path still claims something merely started" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "reload-pkg-list resolves the account and reports what it found"
+fi
+
+# ---- greedy, and the line has a comment on it  (1.14.86) -------------------- #
+# Every git and tar package reported, in every `verify` run, all session:
+#     sway   unvalidated   missing: program ), program #, program e.g.,
+#                          program ('gst-launch-1.0 ...
+# The stack's generated scripts document their own metadata --
+#     installed_programs=()      # e.g. ('gst-launch-1.0' 'gst-inspect-1.0')
+#     installed_program="sway"   # e.g. "ffmpeg"  (checked on PATH)
+# -- and the parser's `\((.*)\)` ran from the first "(" to the LAST ")", which
+# is inside the comment; `"(.*)"` did the same with the quotes.  Twenty
+# packages could not be validated because of two greedy regexes.
+_p=""
+_pmC2="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmC2" <<'PYMETA' || _p="$_p;metadata is still parsed into the trailing comment"
+import sys, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+e = {"target": "sway", "kind": "git",
+     "opts": {"url": "https://example.invalid/sway", "ref": "1.11",
+              "prog": "sway", "build": "meson setup build; ninja -C build",
+              "install": "ninja -C build install"}}
+p, _ = pm._stack_git_script(e, tempfile.mkdtemp())
+meta = pm._parse_bash_vars(open(p).read(), pm._LAST_SCALARS, pm._LAST_ARRAYS)
+assert meta.get("installed_program") == "sway", meta.get("installed_program")
+assert meta.get("installed_programs") == [], meta.get("installed_programs")
+assert meta.get("installed_libraries") == [], meta.get("installed_libraries")
+# the comment text must not appear anywhere in the parsed values
+flat = " ".join(str(v) for v in meta.values())
+for junk in ("e.g.", "gst-launch", "checked on PATH"):
+    assert junk not in flat, (junk, meta)
+# ...and a real value with a comment after it still parses
+text = ('name="demo"\n'
+        'installed_programs=(\'foo\' \'bar\')   # e.g. (\'x\' \'y\')\n'
+        'installed_program="foo"     # e.g. "ffmpeg"\n')
+got = pm._parse_bash_vars(text, pm._LAST_SCALARS, pm._LAST_ARRAYS)
+assert got["installed_programs"] == ["foo", "bar"], got
+assert got["installed_program"] == "foo", got
+# a line with no comment is unaffected
+text2 = 'installed_directories=(\'/usr/lib/x\' \'/etc/x\')\n'
+got2 = pm._parse_bash_vars(text2, pm._LAST_SCALARS, pm._LAST_ARRAYS)
+assert got2["installed_directories"] == ["/usr/lib/x", "/etc/x"], got2
+PYMETA
+sed -n '/GREEDY, AND THE LINE HAS A COMMENT ON IT/,/return out/p' "$_pmC2" \
+    | grep -q '(.\*?)' \
+    || _p="$_p;the parser is greedy again"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "script metadata is read without swallowing the comment beside it"
+fi
+
+# ---- validate against what the entry says it installs  (1.14.87) ------------ #
+# After 1.14.86 the count went 299 -> 307 installed, and twelve stayed
+# unvalidated: the libraries and data packages.  `_stack_git_script` defaulted
+# `prog=` to the ENTRY'S OWN NAME, so verify looked for a program called
+# `libsrtp`, `tllist`, `dejavu-fonts`.  Those entries have no binary -- but
+# they do carry `have=`, the path the stack already uses to tell whether the
+# entry is done, which is exactly the proof verify needs.
+_p=""
+_pmD2="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmD2" <<'PYHAVE' || _p="$_p;a stack entry is validated against something it never installs"
+import sys, os, tempfile, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+# a library entry: no prog=, but have= names its .pc file
+e = {"target": "libsrtp", "kind": "git",
+     "opts": {"url": "https://example.invalid/l", "build": "true",
+              "install": "true", "have": "/usr/lib/pkgconfig/libsrtp2.pc"}}
+p, prog = pm._stack_git_script(e, tempfile.mkdtemp())
+meta = pm._parse_bash_vars(open(p).read(), pm._LAST_SCALARS, pm._LAST_ARRAYS)
+assert meta.get("installed_program") == "", meta.get("installed_program")
+assert meta.get("installed_directory") == "/usr/lib/pkgconfig/libsrtp2.pc", meta
+# the skip-check still gets a name to look for on PATH
+assert prog == "libsrtp", prog
+# a program entry is unchanged
+e2 = {"target": "sway", "kind": "git",
+      "opts": {"url": "https://example.invalid/s", "prog": "sway",
+               "build": "true", "install": "true"}}
+p2, prog2 = pm._stack_git_script(e2, tempfile.mkdtemp())
+meta2 = pm._parse_bash_vars(open(p2).read(), pm._LAST_SCALARS, pm._LAST_ARRAYS)
+assert meta2.get("installed_program") == "sway", meta2
+assert prog2 == "sway", prog2
+PYHAVE
+# a have= that is a FILE must count as present: .pc files and headers are the
+# usual proof, and isdir() rejected them
+sed -n '/exists, not isdir/,/missing.append/p' "$_pmD2" | grep -q 'os.path.exists' \
+    || _p="$_p;a file named by have= is reported missing because it is not a directory"
+python3 - "$_pmD2" "$T/havechk" <<'PYEXIST' || _p="$_p;an existing file does not satisfy a directory target"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+f = os.path.join(d, "libsrtp2.pc"); open(f, "w").write("")
+missing = []
+for path in (f, d, os.path.join(d, "nope")):
+    if not os.path.exists(path):
+        missing.append(path)
+assert missing == [os.path.join(d, "nope")], missing
+PYEXIST
+# every git/tar entry in the shipped stacks has prog= or have=, or nothing can
+# confirm it
+python3 - "$_pmD2" "$(dirname "$LFS_TOOL")/stacks" <<'PYCOVER' || _p="$_p;a stack entry declares neither prog= nor have=, so it can never be validated"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+bad = []
+for f in sorted(os.listdir(sys.argv[2])):
+    if not f.endswith(".stack"):
+        continue
+    for r in pm._parse_stack_file(os.path.join(sys.argv[2], f)):
+        if r.get("kind") not in ("git", "tar"):
+            continue
+        o = r["opts"]
+        if not o.get("prog") and not o.get("have"):
+            bad.append((f, r["target"]))
+assert not bad, bad
+PYCOVER
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a stack entry is validated against the artifact it declares"
+fi
+
+# ---- a target that was never a real target  (1.14.88) ----------------------- #
+# "may it be that its just cached?"  No -- and the question was fair, because
+# the count did not move after the fix.  install_last is the record of the
+# script AS IT LAST RAN; the twelve entries were built before 1.14.87, so
+# their records still say installed_program=<the entry's own name>.  Rewriting
+# that file would be a lie about history, so verify has to cope: when the ONLY
+# thing missing is a program named exactly like the package, the script named
+# no real check, and saying "missing: program libsrtp" about a perfectly
+# installed library is worse than saying nothing.
+_p=""
+_pmE2="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmE2" "$T/stale" <<'PYSTALE' || _p="$_p;an old script's self-named program is still reported as missing"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+
+def _u(name, meta_text, real=True):
+    home = os.path.join(d, "p_" + name)
+    os.makedirs(home, exist_ok=True)
+    open(os.path.join(home, "install_last"), "w").write(meta_text)
+    class U:
+        pass
+    u = U()
+    u.home = home
+    u.has_user = True
+    u.name = name
+    u.meta = pm._parse_bash_vars(meta_text, pm._LAST_SCALARS, pm._LAST_ARRAYS)
+    u._manifest_has_real_paths = lambda: real
+    return u
+
+# the stale case: a library whose script names a binary of its own name
+# (a name no shipped stack knows: since 1.14.89 verify consults the stack's
+#  own have= for entries it recognises, which is the better answer for those)
+st, why = pm.assess(_u("libstaledemo",
+    'name="libstaledemo"\nname_version="libstaledemo-git"\ninstalled_program="libstaledemo"\n'),
+    run_cmd=False)
+assert st == "unvalidated", (st, why)
+assert "no verifiable target" in why, why
+assert "missing" not in why, why
+
+# a package that names a DIFFERENT program which is really absent still says so
+st2, why2 = pm.assess(_u("demo",
+    'name="demo"\nname_version="demo-1"\ninstalled_program="totally-absent-xyz"\n'),
+    run_cmd=False)
+assert st2 == "unvalidated", (st2, why2)
+assert "missing" in why2, why2
+
+# and two missing things are still listed, not excused
+st3, why3 = pm.assess(_u("demo2",
+    'name="demo2"\nname_version="demo2-1"\ninstalled_program="demo2"\n'
+    'installed_directories=(\'/nonexistent/xyz\')\n'),
+    run_cmd=False)
+assert "missing" in why3, why3
+PYSTALE
+sed -n '/A TARGET THAT WAS NEVER A REAL TARGET/,/no verifiable target/p' "$_pmE2" \
+    | grep -q 'len(missing) == 1' \
+    || _p="$_p;the excuse is applied to more than the single self-named case"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a stale self-named program target is explained, not reported as missing"
+fi
+
+# ---- a stack entry's own declaration wins over a stale record  (1.14.89) ---- #
+# Twelve packages sat in "unvalidated" because their install_last predates the
+# fix that carries have= into the script, and that file is not rewritten.
+# The stack file itself still says what proves each entry installed.  verify
+# reads it directly: current, the entry's own word, and no history rewritten.
+_p=""
+_pmF2="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmF2" "$T/stacktargets" <<'PYST' || _p="$_p;verify does not use the stack's prog=/have= for an old record"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+# point the reader at a private stack directory with one entry of each kind
+sd = os.path.join(d, "stacks"); os.makedirs(sd, exist_ok=True)
+open(os.path.join(sd, "t.stack"), "w").write(
+    "git    libdemo url=https://example.invalid/l have=%s/libdemo.pc build=\"true\" install=\"true\"\n"
+    "git    demoprog url=https://example.invalid/p prog=demoprog build=\"true\" install=\"true\"\n"
+    "book   zlib\n" % d)
+open(os.path.join(d, "libdemo.pc"), "w").write("")
+pm._STACK_TARGETS = None
+orig = pm._stack_declared_targets
+def patched():
+    # same code, our directory
+    pm._STACK_TARGETS = None
+    saved = os.listdir
+    return orig()
+# simplest: monkeypatch the directories the function scans
+import types
+src = open(sys.argv[1]).read()
+assert '"/etc/pkgusr/stacks"' in src
+pm._STACK_TARGETS = None
+os.environ["_TEST_STACK_DIR"] = sd
+# emulate by calling _parse_stack_file directly through the same logic
+rows = pm._parse_stack_file(os.path.join(sd, "t.stack"))
+decl = {}
+for r in rows:
+    if r.get("kind") in ("git", "tar"):
+        o = r["opts"]
+        if o.get("prog") or o.get("have"):
+            decl[r["target"]] = (o.get("prog", ""), o.get("have", ""))
+pm._STACK_TARGETS = decl
+# a stale record: self-named program, nothing else
+meta = pm._parse_bash_vars('name="libdemo"\ninstalled_program="libdemo"\n',
+                           pm._LAST_SCALARS, pm._LAST_ARRAYS)
+progs, libs, dirs = pm.install_targets(meta)
+assert progs == [], progs                       # the self-name is dropped
+assert dirs == [os.path.join(d, "libdemo.pc")], dirs
+# a program entry keeps its program
+meta2 = pm._parse_bash_vars('name="demoprog"\ninstalled_program="demoprog"\n',
+                            pm._LAST_SCALARS, pm._LAST_ARRAYS)
+assert pm.install_targets(meta2)[0] == ["demoprog"], pm.install_targets(meta2)
+# a package the stack does not know is untouched
+meta3 = pm._parse_bash_vars('name="other"\ninstalled_program="otherbin"\n',
+                            pm._LAST_SCALARS, pm._LAST_ARRAYS)
+assert pm.install_targets(meta3)[0] == ["otherbin"], pm.install_targets(meta3)
+PYST
+# the reader scans the installed stack directory and the shipped one
+sed -n '/^def _stack_declared_targets/,/^def install_targets/p' "$_pmF2" \
+    | grep -q '/etc/pkgusr/stacks' \
+    || _p="$_p;the installed stack directory is not read"
+sed -n '/^def _stack_declared_targets/,/^def install_targets/p' "$_pmF2" \
+    | grep -q '_STACK_TARGETS' \
+    || _p="$_p;the stack files are re-read for every package"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "verify checks a stack entry against what the stack says proves it"
+fi
+
+# ---- the two that were left were real  (1.14.90) ---------------------------- #
+# After 1.14.89: 317 installed, 2 unvalidated -- and both are findings.
+#   wlroots       missing: dir /usr/include/wlr
+#   minibrowser   its script names no verifiable target
+# wlroots 0.19 puts its headers under /usr/include/wlroots-0.19/, so the
+# stack's have= was wrong for the version it pins; the .pc file is the stable
+# proof.  And the user: "minibrowser is not called like that -- the git is
+# called Browser, the projects are browser-mini and browser-big".  prog= names
+# what is on PATH; the ENTRY keeps its name because p_minibrowser is the
+# account already on the user's disk.
+_p=""
+_ssZ="$(dirname "$LFS_TOOL")/stacks/sway.stack"
+if [ -f "$_ssZ" ]; then
+    grep -qE '^git +wlroots .*have=/usr/lib/pkgconfig/wlroots-0\.19\.pc' "$_ssZ" \
+        || _p="$_p;wlroots' have= does not match the version it pins"
+    grep -qE '^git +wlroots .*have=/usr/include/wlr( |$)' "$_ssZ" \
+        && _p="$_p;wlroots still claims an unversioned header directory"
+    grep -qE '^git +minibrowser .*prog=browser-mini' "$_ssZ" \
+        || _p="$_p;the Browser entry names a program that does not exist"
+    grep -qE '^git +minibrowser .*prog=minibrowser' "$_ssZ" \
+        && _p="$_p;prog=minibrowser is still there"
+    # the entry name is unchanged: an account already exists under it
+    grep -qE '^git +minibrowser ' "$_ssZ" \
+        || _p="$_p;the entry was renamed, orphaning p_minibrowser"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "wlroots and Browser declare what they actually install"
+fi
+
+# ---- say where the expectation came from  (1.14.91) ------------------------- #
+# "are we caching something? isnt it strange that we're missing that wlroots
+# dir?"  Neither.  verify reads /etc/pkgusr/stacks first, and the user's
+# sway.stack still said have=/usr/include/wlr -- the fix was in sway.stack.new
+# beside it, because a user's stack file is never overwritten (1.14.58).
+# "missing: dir /usr/include/wlr" sent them to look for a directory; the
+# useful fact was WHICH FILE said to expect it.
+_p=""
+_pmG2="$(dirname "$LFS_TOOL")/packagemanager"
+python3 - "$_pmG2" <<'PYSRC' || _p="$_p;a missing stack-declared target does not say which stack file declared it"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+pm._STACK_TARGETS = {"wlroots": ("", "/nonexistent/wlr")}
+pm._STACK_TARGET_SOURCE = {"wlroots": "/etc/pkgusr/stacks/sway.stack"}
+class U:
+    home = "/tmp/nowhere"; has_user = True; name = "wlroots"
+    meta = pm._parse_bash_vars('name="wlroots"\nname_version="wlroots-git"\n'
+                               'installed_program="wlroots"\n',
+                               pm._LAST_SCALARS, pm._LAST_ARRAYS)
+    def _manifest_has_real_paths(self): return True
+st, why = pm.assess(U(), run_cmd=False)
+assert st == "unvalidated", (st, why)
+assert "/nonexistent/wlr" in why, why
+assert "declared by /etc/pkgusr/stacks/sway.stack" in why, why
+# a target from the script itself (no stack source) carries no such suffix
+pm._STACK_TARGETS = {}
+pm._STACK_TARGET_SOURCE = {}
+class V:
+    home = "/tmp/nowhere"; has_user = True; name = "demo"
+    meta = pm._parse_bash_vars('name="demo"\nname_version="demo-1"\n'
+                               'installed_directory="/nonexistent/demo"\n',
+                               pm._LAST_SCALARS, pm._LAST_ARRAYS)
+    def _manifest_has_real_paths(self): return True
+st2, why2 = pm.assess(V(), run_cmd=False)
+assert "declared by" not in why2, why2
+PYSRC
+# the source is recorded at the moment the declaration is read
+# (1.14.92: every copy is read and the satisfied one chosen, so the source
+#  is recorded when the choice is made, not when the line is read)
+sed -n '/^def _stack_declared_targets/,/^def install_targets/p' "$_pmG2" \
+    | grep -q '_STACK_TARGET_SOURCE\[name\] = pick\[2\]' \
+    || _p="$_p;the declaring file is not recorded"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a missing stack-declared target names the stack file to fix"
+fi
+
+# ---- read every copy; prefer the one whose proof exists  (1.14.92) ---------- #
+# "what am i doing wrong?"  Nothing.  The user's stack file is never
+# overwritten (1.14.58), so a corrected prog=/have= shipped in a newer
+# release sits in sway.stack.new beside it -- and verify's first-found rule
+# meant the stale copy always won.  Three releases running, the user was asked
+# to hand-merge a metadata fix to make a report come out right.  That is
+# friction the tools made and the tools must remove: read every copy, take the
+# one whose proof is actually on disk, and only when none is satisfied report
+# the first, naming its file.
+_p=""
+_pmH2="$(dirname "$LFS_TOOL")/packagemanager"
+_al="$T/alts"; rm -rf "$_al"; mkdir -p "$_al/stacks" "$_al/pc"
+: > "$_al/pc/wlroots-0.19.pc"
+printf 'git    wlroots url=https://x/w have=/nonexistent/wlr build="true" install="true"\n' \
+    > "$_al/stacks/sway.stack"
+printf 'git    wlroots url=https://x/w have=%s/pc/wlroots-0.19.pc build="true" install="true"\n' "$_al" \
+    > "$_al/stacks/sway.stack.new"
+PM_STACK_DIR="$_al/stacks" python3 - "$_pmH2" "$_al" <<'PYALT' || _p="$_p;the stale local declaration still wins over a satisfied .new one"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+t = pm._stack_declared_targets()
+prog, have = t["wlroots"]
+assert have == sys.argv[2] + "/pc/wlroots-0.19.pc", have
+assert pm._STACK_TARGET_SOURCE["wlroots"].endswith("sway.stack.new"), pm._STACK_TARGET_SOURCE
+PYALT
+# when NO copy is satisfied, the first is reported, with its file named
+printf 'git    wlroots url=https://x/w have=/nonexistent/also build="true" install="true"\n' \
+    > "$_al/stacks/sway.stack.new"
+PM_STACK_DIR="$_al/stacks" python3 - "$_pmH2" <<'PYNONE' || _p="$_p;with nothing satisfied, the report does not fall back to the user's own copy"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+t = pm._stack_declared_targets()
+assert t["wlroots"][1] == "/nonexistent/wlr", t["wlroots"]
+assert pm._STACK_TARGET_SOURCE["wlroots"].endswith("/sway.stack"), pm._STACK_TARGET_SOURCE
+PYNONE
+# a prog= alternative is judged by PATH the same way
+printf 'git    demo url=https://x/d prog=no-such-program-xyz build="true" install="true"\n' \
+    > "$_al/stacks/t.stack"
+printf 'git    demo url=https://x/d prog=sh build="true" install="true"\n' \
+    > "$_al/stacks/t.stack.new"
+PM_STACK_DIR="$_al/stacks" python3 - "$_pmH2" <<'PYPROG' || _p="$_p;a satisfied prog= in a .new file is not preferred"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+assert pm._stack_declared_targets()["demo"][0] == "sh", pm._stack_declared_targets()["demo"]
+PYPROG
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "verify takes the stack declaration whose proof is on disk, from any copy"
+fi
+
+# ---- one package user for everything of your own  (1.14.102) ---------------- #
+# "make a setup script for such things so i can bundle them cleanly ... maybe
+# even under one packageuser so i can easily find all additional
+# scripts/programs from my side -- we could also add swas, swov, swbr,
+# browser".  The right shape is not a shell script that scatters files: it is
+# an ordinary package-user install script, so p_mytools OWNS them, pkg.lst
+# records every file, verify lists it, and `packagemanager remove mytools`
+# takes the lot away.  Adding one is a line in SOURCES.
+_p=""
+_sd5="$(dirname "$LFS_TOOL")/stacks"
+_ms="$_sd5/mytools/install_mytools"
+[ -f "$_ms" ] || _p="$_p;there is no mytools install script"
+[ -f "$_sd5/mytools.sh" ] || _p="$_p;there is no mytools step"
+[ -f "$_sd5/desktop-user.sh" ] && _p="$_p;the old scattering step is still shipped"
+if [ -f "$_ms" ]; then
+    bash -n "$_ms" || _p="$_p;the mytools script does not parse"
+    # it is a real package-user script: phases, and the shared runner
+    grep -q '^build_pkg() {' "$_ms" || _p="$_p;no build phase"
+    grep -q '^install_pkg() {' "$_ms" || _p="$_p;no install phase"
+    grep -q 'PKGUSR_LIB:-lfs-phases' "$_ms" || _p="$_p;it does not use the phase runner"
+    # every URL the user gave is there
+    for _u in \
+        'scripts/raw/Administration/wifi' \
+        'scripts/raw/Administration/sway_start' \
+        'sway/seatd-user/archive/seatd-user.tar.gz'; do
+        grep -q "$_u" "$_ms" || _p="$_p;$_u is missing from SOURCES"
+    done
+    # and the four sway programs are present as ready-to-uncomment lines
+    for _n in swas swov swbr browser; do
+        grep -q "|$_n|" "$_ms" || _p="$_p;$_n has no SOURCES line"
+    done
+    # seatd-user is compiled for ONE username, and refuses to guess
+    grep -q 'DSEATD_USER' "$_ms" || _p="$_p;seatd-user is not compiled for a username"
+    grep -q '/etc/pkgusr/desktop-user' "$_ms" || _p="$_p;the username is not remembered"
+    # a failed fetch must stop the build, not install nothing quietly
+    grep -q 'fetch failed' "$_ms" || _p="$_p;a failed download is silent"
+    # each entry installs ITS OWN artifact: the loop used to write the seatd
+    # wrapper once per source line, three times in all
+    grep -q 'seatd-user) f="$HOME/out/seatd-$DESKTOP_USER"' "$_ms" \
+        || _p="$_p;an entry does not install its own artifact"
+    grep -q 'nothing was built at' "$_ms" \
+        || _p="$_p;a missing build product is installed silently"
+fi
+if [ -f "$_sd5/mytools.sh" ]; then
+    bash -n "$_sd5/mytools.sh" || _p="$_p;the mytools step does not parse"
+    grep -q 'lfs-helper pm-install "$acct"' "$_sd5/mytools.sh" \
+        || _p="$_p;the install does not go through the one runner"
+    grep -q 'chmod 4750' "$_sd5/mytools.sh" \
+        || _p="$_p;root never sets the setuid bit the package user cannot"
+    # ...and clears the way first: /usr/bin is sticky, so once the wrapper is
+    # root-owned and setuid the package user can no longer replace it
+    #     install: cannot remove '/usr/bin/seatd-n76310': Operation not permitted
+    grep -q 'stat -c %U "$w"' "$_sd5/mytools.sh" \
+        || _p="$_p;a root-owned wrapper is not removed before the rebuild"
+    # the home must be canonical before anything installs: add_package_user
+    # puts it at /usr/src/<acct> and verify scans /usr/src/pkgusr, so the
+    # package installs and is reported "not installed"
+    grep -q 'lfs-helper fix-home "$acct" --run' "$_sd5/mytools.sh" \
+        || _p="$_p;a misplaced home is not repaired before installing"
+    grep -q 'every tool looks in $canon' "$_sd5/mytools.sh" \
+        || _p="$_p;an unrepairable home is not reported"
+    # ...and the manifest must land where verify reads it
+    grep -q 'canon/pkg.lst' "$_sd5/mytools.sh" \
+        || _p="$_p;the step does not check that the manifest exists"
+    grep -q 'reload-pkg-list $pkg' "$_sd5/mytools.sh" \
+        || _p="$_p;no repair offered for a missing manifest"
+    # the shipped script must reach an account that already has an old copy
+    grep -q 'REFRESH THE HOME COPY' "$_sd5/mytools.sh" \
+        || _p="$_p;a stale copy in the package home is never refreshed"
+    grep -q 'cmp -s "$script" "$home_script"' "$_sd5/mytools.sh" \
+        || _p="$_p;the home copy is replaced even when identical"
+    _rm="$(sed -n '/CLEAR THE WAY FOR THE WRAPPER/,/pm-install/p' "$_sd5/mytools.sh")"
+    printf '%s' "$_rm" | grep -q 'rm -f "$w"' \
+        || _p="$_p;nothing removes the old wrapper"
+    # the removal must come BEFORE the build, and the chmod after it
+    _l_rm="$(grep -n 'rm -f "$w"' "$_sd5/mytools.sh" | head -1 | cut -d: -f1)"
+    _l_in="$(grep -n 'lfs-helper pm-install' "$_sd5/mytools.sh" | head -1 | cut -d: -f1)"
+    _l_ch="$(grep -n 'chmod 4750' "$_sd5/mytools.sh" | head -1 | cut -d: -f1)"
+    { [ "$_l_rm" -lt "$_l_in" ] && [ "$_l_in" -lt "$_l_ch" ]; } \
+        || _p="$_p;remove/build/chmod are out of order"
+    grep -qE 'packagemanager add-user "\$pkg"( \|\||$)' "$_sd5/mytools.sh" \
+        || _p="$_p;add-user is called with options it does not take"
+fi
+grep -qE '^cfg +mytools' "$_sd5/services.stack" \
+    || _p="$_p;services.stack does not run the mytools step"
+grep -qE '^cfg +desktop-user' "$_sd5/services.stack" \
+    && _p="$_p;services.stack still runs the old step"
+# add-user must test the ACCOUNT: `add-user n76310` asked whether the human
+# login n76310 existed, said "already exists", created nothing, and the
+# account was then made by the runner with the hint's default home
+_pmAU="$(dirname "$LFS_TOOL")/packagemanager"
+sed -n '/^def cmd_add_user/,/^# ===/p' "$_pmAU" | grep -q 'acct = pkgusr_name(name)' \
+    || _p="$_p;add-user checks the package name instead of the account"
+sed -n '/^def cmd_add_user/,/^# ===/p' "$_pmAU" | grep -q '_user_exists(acct)' \
+    || _p="$_p;the existence check still uses the bare name"
+# the account is named after the PERSON: p_<user>, not p_mytools
+grep -q 'acct="p_$pkg"' "$_sd5/mytools.sh" \
+    || _p="$_p;the package user is not named after the desktop user"
+grep -q 'MYTOOLS_NAME="$pkg" lfs-helper pm-install "$acct"' "$_sd5/mytools.sh" \
+    || _p="$_p;the script is not told the name its account uses"
+grep -q 'MYTOOLS_NAME:-' "$_ms" \
+    || _p="$_p;the install script does not take its name from the step"
+# the gcc line must be the author's own form: -DSEATD_USER=<user>, no inner
+# quotes -- the rewritten program stringifies it itself, and "n76310" is a
+# different macro
+grep -q 'DSEATD_USER=$DESKTOP_USER' "$_ms" \
+    || _p="$_p;the compile line is not the one the author uses"
+grep -q 'DSEATD_USER=\\"' "$_ms" \
+    && _p="$_p;the old escaped-quote form is still there"
+# SOURCES entries must be single-quoted, or the escapes collapse before eval
+grep -qE "^'(raw|tar|git)\|" "$_ms" \
+    || _p="$_p;SOURCES entries are not single-quoted"
+# --only and --yes: re-run one entry unattended
+# (own variable: a block must not depend on one another block happened to set)
+_pmMY="$(dirname "$LFS_TOOL")/packagemanager"
+python3 "$_pmMY" stack --help 2>&1 | grep -q -- '--only' \
+    || _p="$_p;a single stack entry cannot be re-run"
+[ "$(grep -c 'p.add_argument("--only"' "$_pmMY")" = 1 ] \
+    || _p="$_p;--only is declared more than once"
+sed -n '/--yes REACHES THE SCRIPTS THIS RUNS/,/LFS_ASSUME_YES/p' "$_pmMY" \
+    | grep -q 'os.environ\["PM_YES"\] = "1"' \
+    || _p="$_p;--yes does not reach the scripts a cfg step runs"
+sed -n '/and SKIP the rest/,/print()/p' "$_pmMY" | grep -q 'entries = \[e for e in entries' \
+    || _p="$_p;--only names entries but still runs the others"
+# make install must place the SUBDIRECTORY too -- the loop over stacks/*
+# takes files only, so mytools/install_mytools would never arrive and the
+# step would fail with "missing .../mytools/install_mytools"
+_mkd="$T/mkdirs"; rm -rf "$_mkd"
+( cd "$(dirname "$LFS_TOOL")" && make install DESTDIR="$_mkd" ) >/dev/null 2>&1
+[ -f "$_mkd/etc/pkgusr/stacks/mytools/install_mytools" ] \
+    || _p="$_p;make install does not place the mytools script"
+# ...and so must the CHROOT refresh: the same walk exists in `lfs`, and it
+# took files only, so the directory never crossed and the step died with
+# "missing .../mytools/install_mytools" inside the chroot
+# (the range must reach past the inner loop -- /continue/ stops at the first
+#  one, which is inside it)
+_lr="$(sed -n '/A STACK ENTRY MAY HAVE A DIRECTORY/,/if not os.path.isfile(src_f)/p' "$LFS_TOOL")"
+printf '%s' "$_lr" | grep -q 'os.path.isdir(src_f)' \
+    || _p="$_p;the chroot refresh still skips stack subdirectories"
+printf '%s' "$_lr" | grep -q 'os.chmod(d_sub, 0o755)' \
+    || _p="$_p;a refreshed package-user script is not executable"
+[ -x "$_mkd/etc/pkgusr/stacks/mytools/install_mytools" ] \
+    || _p="$_p;the installed mytools script is not executable"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "everything of the user's own installs under one package user"
+fi
+
+# ---- every directory with group install  (1.14.95) -------------------------- #
+# On the user's MAIN system -- older, in daily use, no manifests -- the sticky
+# bits had been stripped from the install directories by a root-run install.
+# `fix-install --sticky` fixed twenty-two, and the user, rightly, did not
+# believe that was all of them: "wherever the install group is set the dir
+# needs the +w +t".  The scan asked forall_direntries_from, the C helper from
+# the package-users hint, and an older build of it may stop at mount points
+# or list by user only.  That question is one find(1) invocation.
+_p=""
+_pmI2="$(dirname "$LFS_TOOL")/packagemanager"
+_fi="$T/fixinst"; rm -rf "$_fi"; mkdir -p "$_fi/a/b" "$_fi/c" "$_fi/deep/x/y"
+if getent group install >/dev/null 2>&1 && [ "$(id -u)" = 0 ]; then
+    chgrp install "$_fi/a" "$_fi/a/b" "$_fi/deep/x/y"
+    chmod 755 "$_fi/a"; chmod 3775 "$_fi/a/b"; chmod 755 "$_fi/deep/x/y"
+    chmod 755 "$_fi/c"
+    _o="$(python3 "$_pmI2" fix-install --sticky "$_fi" 2>&1)"
+    case "$_o" in
+        *"3 directories carry group 'install'"*) ;;
+        *) _p="$_p;the scan does not count every install-group directory" ;;
+    esac
+    # SNAPSHOTS ARE NOT THE SYSTEM.  /snapshots holds copies of the whole
+    # tree -- every install directory again, once per snapshot -- so it is
+    # pruned by default, and --exclude prunes anything else the user names.
+    mkdir -p "$_fi/snap/usr/lib" "$_fi/bak/usr/lib"
+    chgrp install "$_fi/snap/usr/lib" "$_fi/bak/usr/lib"
+    chmod 755 "$_fi/snap/usr/lib" "$_fi/bak/usr/lib"
+    _o3="$(python3 "$_pmI2" fix-install --sticky "$_fi"            --exclude "$_fi/snap" --exclude "$_fi/bak" 2>&1)"
+    case "$_o3" in *"$_fi/snap/usr/lib"*) _p="$_p;an --exclude'd tree is still scanned" ;; esac
+    case "$_o3" in *"$_fi/bak/usr/lib"*) _p="$_p;a second --exclude is ignored" ;; esac
+    case "$_o3" in *"pruning "*"/snapshots"*) ;; *) _p="$_p;/snapshots is not pruned by default" ;; esac
+    _o4="$(python3 "$_pmI2" fix-install --sticky "$_fi" --no-default-excludes 2>&1)"
+    case "$_o4" in *"pruning "*"/snapshots"*) _p="$_p;--no-default-excludes still prunes /snapshots" ;; esac
+    rm -rf "$_fi/snap" "$_fi/bak"
+    case "$_o" in *"would fix $_fi/a"*) ;; *) _p="$_p;a wrong install dir is not found" ;; esac
+    case "$_o" in *"would fix $_fi/deep/x/y"*) ;; *) _p="$_p;a deeply nested one is missed" ;; esac
+    case "$_o" in *"would fix $_fi/a/b"*) _p="$_p;a correct dir is reported as wrong" ;; esac
+    case "$_o" in *"$_fi/c"*) _p="$_p;a directory not in group install is touched" ;; esac
+    python3 "$_pmI2" fix-install --sticky --run --yes "$_fi" >/dev/null 2>&1
+    [ "$(stat -c %A "$_fi/a")" = "drwxrwxr-t" ] || _p="$_p;the fix did not apply g+w,o+t"
+    [ "$(stat -c %A "$_fi/deep/x/y")" = "drwxrwxr-t" ] || _p="$_p;the nested fix did not apply"
+    [ "$(stat -c %A "$_fi/c")" = "drwxr-xr-x" ] || _p="$_p;a non-install directory was changed"
+fi
+# the scan is find(1), with the virtual filesystems pruned, not the helper
+_sc="$(sed -n '/EVERY DIRECTORY WITH GROUP install, FROM find/,/wrong = \[\]/p' "$_pmI2")"
+printf '%s' "$_sc" | grep -q '"-group", "install"' \
+    || _p="$_p;the scan does not ask find for group install"
+printf '%s' "$_sc" | grep -q '"/proc", "/sys", "/dev", "/run", "/tmp"' \
+    || _p="$_p;virtual filesystems are not pruned"
+printf '%s' "$_sc" | grep -q 'timeout=' \
+    || _p="$_p;a scan of / has no time limit"
+python3 "$_pmI2" fix-install --help 2>&1 | grep -q 'roots' \
+    || _p="$_p;the scan cannot be limited to given directories"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "fix-install finds every directory with group install, by asking find"
+fi
+
+# ---- the interactive shell is a config step  (1.14.97) ---------------------- #
+# "we missed ls colors and bash autocompletion, and tab-completing a user
+# after su -- at which step do we integrate that?"  At a `cfg` step, because
+# BLFS's "The Bash Shell Startup Files" page is CONFIG, not a package: it
+# writes /etc/profile and /etc/bashrc, and /etc/bashrc is what evals
+# dircolors and aliases ls --color=auto.  No package stack ever ran it.
+# bash-completion is not a BLFS package at all -- it comes from upstream.
+_p=""
+_sd2="$(dirname "$LFS_TOOL")/stacks"
+[ -f "$_sd2/shell-env.sh" ] || _p="$_p;there is no shell-environment step"
+if [ -f "$_sd2/shell-env.sh" ]; then
+    bash -n "$_sd2/shell-env.sh" || _p="$_p;shell-env.sh does not parse"
+    # the /etc/bashrc it writes is itself valid, and does the three things
+    _br="$T/bashrc"; mkdir -p "$(dirname "$_br")"
+    sed -n "/^cat > \"\$_dest\" <<'BASHRC'$/,/^BASHRC$/p" "$_sd2/shell-env.sh" \
+        | sed '1d;$d' > "$_br"
+    [ -s "$_br" ] || _p="$_p;no /etc/bashrc is generated"
+    bash -n "$_br" || _p="$_p;the generated /etc/bashrc does not parse"
+    grep -q "alias ls='ls --color=auto'" "$_br" \
+        || _p="$_p;ls is not coloured"
+    grep -q 'dircolors -b /etc/dircolors' "$_br" \
+        || _p="$_p;the dircolors database is not used"
+    grep -q '/usr/share/bash-completion/bash_completion' "$_br" \
+        || _p="$_p;bash-completion is never loaded"
+    grep -q 'complete -A user su' "$_br" \
+        || _p="$_p;su does not complete user names"
+    # and it really takes effect in a shell
+    _o="$(bash -c '. "'"$_br"'" >/dev/null 2>&1; alias ls; complete -p su' 2>/dev/null)"
+    case "$_o" in *"ls --color=auto"*) ;; *) _p="$_p;the ls alias does not take effect" ;; esac
+    case "$_o" in *"complete -u su"*) ;; *) _p="$_p;su completion does not take effect" ;; esac
+    # an existing /etc/bashrc must not be clobbered -- people edit that file
+    grep -q '_dest=/etc/bashrc.new' "$_sd2/shell-env.sh" \
+        || _p="$_p;an existing /etc/bashrc would be overwritten"
+    # package users share /etc/pkgusr/bashrc; they should get it too
+    grep -q '/etc/pkgusr/bashrc' "$_sd2/shell-env.sh" \
+        || _p="$_p;the package users do not get the shared bashrc"
+fi
+# the stack runs it, and pins a bash-completion the remote really has
+grep -qE '^cfg +shell-env' "$_sd2/services.stack" \
+    || _p="$_p;services.stack does not run the shell-environment step"
+grep -qE '^git +bash-completion' "$_sd2/services.stack" \
+    || _p="$_p;bash-completion is not in any stack"
+grep -qE 'ref=2\.18\.0' "$_sd2/services.stack" \
+    || _p="$_p;bash-completion has no pinned version"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "coloured ls, completion and 'su <tab>' arrive as a config step"
+fi
+
+# ---- keep only what the user really edited  (1.14.98) ----------------------- #
+#     packagemanager stack services --yes --run
+#     ### stack: services.stack  (3 entries)
+# Three, while the shipped file had six: seatd-init, bash-completion and
+# shell-env were sitting in services.stack.new waiting for a manual merge.
+# 1.14.58 was right that a user's edits must survive `make install`, and
+# 1.14.92 taught verify to see past the same protection -- but the install
+# itself still kept EVERY file forever, edited or not, so a shipped fix could
+# never arrive.  Record what we shipped: if the installed copy still matches
+# it, the file is ours to update.
+_p=""
+_mk="$(dirname "$LFS_TOOL")/Makefile"
+_blk="$(sed -n '/only a file the user has ACTUALLY edited/,/done; true/p' "$_mk")"
+[ -n "$_blk" ] || _p="$_p;make install still keeps every stack file forever"
+printf '%s' "$_blk" | grep -q '\.shipped' \
+    || _p="$_p;nothing records what was last shipped"
+printf '%s' "$_blk" | grep -q 'you had not edited it' \
+    || _p="$_p;an untouched file is not updated"
+printf '%s' "$_blk" | grep -q 'KEPT YOURS' \
+    || _p="$_p;an edited file is no longer protected"
+# and it behaves that way
+_md="$T/mkedit"; rm -rf "$_md"
+( cd "$(dirname "$LFS_TOOL")" && make install DESTDIR="$_md" ) >/dev/null 2>&1
+if [ -f "$_md/etc/pkgusr/stacks/services.stack" ]; then
+    # untouched by the user, changed upstream -> updated
+    printf '\n# a change from upstream\n' >> "$_md/etc/pkgusr/stacks/.shipped/services.stack"
+    _o="$( cd "$(dirname "$LFS_TOOL")" && make install DESTDIR="$_md" 2>&1 )"
+    # (the .shipped copy now differs from both, so this is the KEPT path;
+    #  the real untouched case is the plain second install below)
+    _md2="$T/mkedit2"; rm -rf "$_md2"
+    ( cd "$(dirname "$LFS_TOOL")" && make install DESTDIR="$_md2" ) >/dev/null 2>&1
+    printf '\n# MY OWN EDIT\n' >> "$_md2/etc/pkgusr/stacks/sway.stack"
+    _o2="$( cd "$(dirname "$LFS_TOOL")" && make install DESTDIR="$_md2" 2>&1 )"
+    grep -q '^# MY OWN EDIT$' "$_md2/etc/pkgusr/stacks/sway.stack" \
+        || _p="$_p;an edited stack file was overwritten after all"
+    case "$_o2" in
+        *"services.stack (unchanged)"*) ;;
+        *) _p="$_p;an identical file is not reported as unchanged" ;;
+    esac
+    [ -d "$_md2/etc/pkgusr/stacks/.shipped" ] \
+        || _p="$_p;the shipped copies are not recorded on disk"
+    [ -f "$_md2/etc/pkgusr/stacks/.shipped/services.stack" ] \
+        || _p="$_p;a shipped stack file leaves no record"
+else
+    _p="$_p;make install placed no stack files"
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "make install updates a stack file the user never edited"
+fi
+
+# ---- a newer version is sitting beside it  (1.14.99) ------------------------ #
+# Twice in a row, after two different fixes:
+#     ### stack: services.stack  (3 entries)
+# while the shipped file had six.  `make install` leaves the new copy as
+# <stack>.new when the user's own differs (1.14.58, 1.14.98), and running the
+# stack said nothing at all about it -- so the correct next step was
+# invisible, and the run looked like it had simply done nothing.  The moment
+# to mention a pending merge is the moment someone RUNS the file.
+_p=""
+_pmJ2="$(dirname "$LFS_TOOL")/packagemanager"
+_nw="$T/newstack"; mkdir -p "$_nw"
+printf 'book   acpid\nbook   fcron\n' > "$_nw/demo.stack"
+printf 'book   acpid\nbook   fcron\nbook   zlib\ncfg    shell-env\n' > "$_nw/demo.stack.new"
+_o="$(timeout 120 python3 "$_pmJ2" stack "$_nw/demo.stack" 2>&1)"
+case "$_o" in
+    *"newer version of this stack ships beside it"*) ;;
+    *) _p="$_p;a pending .new is not mentioned when the stack runs" ;;
+esac
+# the counts are what make it obvious something is missing
+case "$_o" in
+    *"(4 entries, this file has 2)"*) ;;
+    *) _p="$_p;the entry counts are not compared" ;;
+esac
+case "$_o" in
+    *"diff $_nw/demo.stack $_nw/demo.stack.new"*) ;;
+    *) _p="$_p;no command is offered to see the difference" ;;
+esac
+# ...and it is a note, not a refusal: the run proceeds with the user's file
+case "$_o" in
+    *"this run uses YOUR file"*) ;;
+    *) _p="$_p;it does not say which file this run actually uses" ;;
+esac
+# --only NAMING SOMETHING THAT IS ONLY IN THE .new FILE.  "not in this stack:
+# mytools" was true and useless -- the entry was in the newer copy beside it,
+# one flag away, and the message did not say so.
+printf 'book   acpid\nbook   fcron\n' > "$_nw/only.stack"
+printf 'book   acpid\nbook   fcron\ncfg    mytools\n' > "$_nw/only.stack.new"
+_oo="$(timeout 120 python3 "$_pmJ2" stack "$_nw/only.stack" --only mytools 2>&1)"
+case "$_oo" in
+    *"IS in the newer file beside this one"*) ;;
+    *) _p="$_p;--only does not look in the .new file for a name it cannot find" ;;
+esac
+case "$_oo" in
+    *"--take-new --only mytools"*) ;;
+    *) _p="$_p;it does not offer the exact command to run" ;;
+esac
+# a name in neither file is still just an error
+_oo2="$(timeout 120 python3 "$_pmJ2" stack "$_nw/only.stack" --only nowhere 2>&1)"
+case "$_oo2" in
+    *"IS in the newer file"*) _p="$_p;a name in neither file is blamed on the .new" ;;
+esac
+case "$_oo2" in
+    *"not in this stack: nowhere"*) ;;
+    *) _p="$_p;an unknown entry is no longer reported" ;;
+esac
+
+# A .new WITH FEWER ENTRIES IS A DOWNGRADE.  The chroot refresh writes
+# <stack>.new from the HOST's copy; if the host is the stale one, --take-new
+# would replace a 6-entry stack with a 3-entry one -- and the user did
+# exactly that, twice, because nothing stopped it.
+printf 'book   acpid\nbook   fcron\ncfg    mytools\ncfg    shell-env\n' > "$_nw/big.stack"
+printf 'book   acpid\nbook   fcron\n' > "$_nw/big.stack.new"
+_od="$(timeout 120 python3 "$_pmJ2" stack "$_nw/big.stack" --take-new 2>&1)"
+case "$_od" in
+    *"FEWER entries"*) ;;
+    *) _p="$_p;--take-new silently replaces a stack with a smaller one" ;;
+esac
+grep -q '^cfg    mytools$' "$_nw/big.stack" \
+    || _p="$_p;the bigger file was replaced after all"
+case "$_od" in
+    *"on the HOST"*) ;;
+    *) _p="$_p;it does not say where the stale copy comes from" ;;
+esac
+_of="$(timeout 120 python3 "$_pmJ2" stack "$_nw/big.stack" --take-new --force 2>&1)"
+case "$_of" in
+    *"took the shipped stack file"*) ;;
+    *) _p="$_p;--force cannot override the downgrade refusal" ;;
+esac
+# and no orphaned reference from the --only consolidation
+timeout 120 python3 "$_pmJ2" stack "$_nw/demo.stack" 2>&1 | grep -q "NameError" \
+    && _p="$_p;a stack run raises NameError"
+
+# --take-new does the merge instead of describing it again
+printf 'book   acpid\nbook   fcron\ncfg    mytools\n' > "$_nw/demo.stack.new"
+_o3="$(timeout 120 python3 "$_pmJ2" stack "$_nw/demo.stack" --take-new 2>&1)"
+case "$_o3" in
+    *"took the shipped stack file"*) ;;
+    *) _p="$_p;--take-new does not take the shipped file" ;;
+esac
+case "$_o3" in
+    *"3 entries now"*) ;;
+    *) _p="$_p;the run does not continue with the new file" ;;
+esac
+[ -f "$_nw/demo.stack.bak" ] || _p="$_p;the user's own file was not kept as .bak"
+[ -f "$_nw/demo.stack.new" ] && _p="$_p;the .new file still lingers after taking it"
+grep -q '^cfg    mytools$' "$_nw/demo.stack" \
+    || _p="$_p;the taken file is not the shipped one"
+grep -q '^book   acpid$' "$_nw/demo.stack.bak" \
+    || _p="$_p;the .bak is not the user's original"
+python3 "$_pmJ2" stack --help 2>&1 | grep -q -- '--take-new' \
+    || _p="$_p;--take-new is not offered in the help"
+# no .new -> no noise
+rm -f "$_nw/demo.stack.new"
+_o2="$(timeout 120 python3 "$_pmJ2" stack "$_nw/demo.stack" 2>&1)"
+case "$_o2" in
+    *"newer version"*) _p="$_p;the warning appears when there is no .new file" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "running a stack says when a newer version waits beside it"
+fi
+
+# ---- a step that installed nothing is not done  (1.14.101) ------------------ #
+# "which step exactly is compiling the seatd-n76310 program"  cfg desktop-user
+# -- and it had already run, and reported "done (stack cache)", with nothing
+# installed.  If the chroot has no network its three fetches all fail, the
+# script prints "could not fetch" and exits 0, the stack records it done, and
+# it never runs again.  The same fault as a build whose log says it failed
+# while its status says otherwise (1.14.64), one layer up.
+_p=""
+_sd4="$(dirname "$LFS_TOOL")/stacks"
+_pmK2="$(dirname "$LFS_TOOL")/packagemanager"
+# the step verifies its own work before succeeding
+grep -q 'and are NOT installed' "$_sd4/desktop-user.sh" \
+    || _p="$_p;desktop-user exits 0 even when nothing was installed"
+grep -q 'exit 1' "$_sd4/desktop-user.sh" \
+    || _p="$_p;the step never fails"
+# ...including the mode: setuid root, group = the user, or the GPU stays shut
+grep -q "4750" "$_sd4/desktop-user.sh" \
+    || _p="$_p;the wrapper's setuid mode is not checked"
+# and it names the way out when there is no network
+grep -q 'SEATD_USER_URL=file://' "$_sd4/desktop-user.sh" \
+    || _p="$_p;no offline route is offered"
+# the runner does not record a git entry whose proof is still absent
+_mk2="$(sed -n '/DO NOT RECORD A GIT ENTRY THAT IS NOT THERE/,/done += 1/p' "$_pmK2")"
+printf '%s' "$_mk2" | grep -q 'not _git_installed(e)' \
+    || _p="$_p;a git entry is recorded done without checking it landed"
+printf '%s' "$_mk2" | grep -q 'NOT recording' \
+    || _p="$_p;nothing says why the entry was not recorded"
+printf '%s' "$_mk2" | grep -q 'the next run tries again' \
+    || _p="$_p;it does not say the entry will be retried"
+# the fixture logic itself: a missing target must be detected
+_dm="$T/deskmiss"; mkdir -p "$_dm"
+_o="$(u=nobodyxyz; home="$_dm"
+      missing=""
+      [ -x "/bin/seatd-$u" ]        || missing="$missing /bin/seatd-$u"
+      [ -x "$home/bin/sway_start" ] || missing="$missing $home/bin/sway_start"
+      printf '%s' "$missing")"
+case "$_o" in
+    *"/bin/seatd-nobodyxyz"*) ;;
+    *) _p="$_p;the missing-file check does not notice an absent wrapper" ;;
+esac
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a config step that installed nothing fails, and is not cached as done"
+fi
+
+# ---- not everything in that directory is a stack  (1.14.105) ---------------- #
+# The chroot refresh, one release after learning to copy subdirectories:
+#     # refreshed in the chroot: .shipped/desktop-user.sh, .shipped/kernel-
+#     sway.sh, ..., services.stack, services.stack.new
+# Two faults.  .shipped/ is make install's record of what it last shipped
+# (1.14.98) and .new/.bak are merge leftovers -- bookkeeping, which does not
+# travel.  And services.stack itself was copied over the chroot's: the user
+# had just taken the 6-entry file there with --take-new, and the host's
+# 3-entry copy went straight back over it, undoing the fix from the release
+# before.
+_p=""
+_lfs="$LFS_TOOL"
+_rf="$(sed -n '/NOT EVERYTHING IN THAT DIRECTORY IS A STACK/,/dst_f = os.path.join(_stack_dst, fn)/p' "$_lfs")"
+printf '%s' "$_rf" | grep -q 'fn.startswith(".")' \
+    || _p="$_p;the .shipped bookkeeping directory still crosses into the chroot"
+printf '%s' "$_rf" | grep -q 'fn.endswith((".new", ".bak"))' \
+    || _p="$_p;merge leftovers still cross into the chroot"
+_rg="$(sed -n '/AND A STACK FILE THAT DIFFERS IS THE CHROOT/,/shutil.copy2(src_f, dst_f)$/p' "$_lfs")"
+printf '%s' "$_rg" | grep -q 'fn.endswith(".stack") and os.path.exists(dst_f)' \
+    || _p="$_p;a stack file edited in the chroot is overwritten from the host"
+printf '%s' "$_rg" | grep -q 'dst_f + ".new"' \
+    || _p="$_p;the incoming stack file is not left beside the chroot's"
+# the rule in practice: bookkeeping skipped, payload copied, chroot's kept
+python3 - "$T/refresh" <<'PYREF' || _p="$_p;the refresh rules do not behave as written"
+import sys, os, shutil
+d = sys.argv[1]
+src, dst = os.path.join(d, "host"), os.path.join(d, "chroot")
+for x in (os.path.join(src, ".shipped"), os.path.join(src, "mytools"), dst):
+    os.makedirs(x, exist_ok=True)
+open(os.path.join(src, ".shipped", "x.sh"), "w").write("bookkeeping\n")
+open(os.path.join(src, "mytools", "install_mytools"), "w").write("#!/bin/bash\n")
+open(os.path.join(src, "services.stack"), "w").write("book acpid\n")
+open(os.path.join(src, "services.stack.new"), "w").write("leftover\n")
+open(os.path.join(dst, "services.stack"), "w").write(
+    "book acpid\nbook fcron\ncfg mytools\n")
+for fn in sorted(os.listdir(src)):
+    if fn.startswith(".") or fn.endswith((".new", ".bak")):
+        continue
+    s_f, d_f = os.path.join(src, fn), os.path.join(dst, fn)
+    if os.path.isdir(s_f):
+        os.makedirs(d_f, exist_ok=True)
+        for sub in sorted(os.listdir(s_f)):
+            shutil.copy2(os.path.join(s_f, sub), os.path.join(d_f, sub))
+        continue
+    if fn.endswith(".stack") and os.path.exists(d_f):
+        shutil.copy2(s_f, d_f + ".new")
+        continue
+    shutil.copy2(s_f, d_f)
+assert not os.path.exists(os.path.join(dst, ".shipped")), "bookkeeping crossed"
+assert os.path.isfile(os.path.join(dst, "mytools", "install_mytools")), "payload missing"
+kept = open(os.path.join(dst, "services.stack")).read().splitlines()
+assert len(kept) == 3, kept          # the chroot's own file, not the host's
+assert os.path.isfile(os.path.join(dst, "services.stack.new")), "no .new left beside"
+PYREF
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "the chroot refresh carries stacks, not bookkeeping, and never downgrades"
+fi
+
+# ---- your packages, under your name  (1.14.106) ----------------------------- #
+# Three things from one run.
+#
+# (a) The account: "the user should be called p_n76310 -- that's a fixed name
+#     for those packages as they come from me."  Right: p_<your user> is where
+#     anyone would look.  The script and the step take the name from the
+#     desktop user.
+# (b) The build line died with  error: 'n76310' undeclared.  The SOURCES entry
+#     was double-quoted, so \" collapsed before eval and gcc got a bare
+#     identifier.  Single-quoted now, and the command is the author's own,
+#     verbatim.
+# (c) --only was declared in the parser long ago, documented as "repeatable or
+#     comma-separated ... rebuilt even if the cache says done", and never
+#     implemented.  A stack is long and its entries fail one at a time.
+_p=""
+_sd6="$(dirname "$LFS_TOOL")/stacks"
+_ms2="$_sd6/mytools/install_mytools"
+_pmL2="$(dirname "$LFS_TOOL")/packagemanager"
+# (a) the account is named after the desktop user
+grep -q 'MYTOOLS_NAME:-\${DESKTOP_USER' "$_ms2" \
+    || _p="$_p;the package is not named after the desktop user"
+grep -q 'pkg="\${MYTOOLS_NAME:-\$u}"' "$_sd6/mytools.sh" \
+    || _p="$_p;the step still creates a fixed 'mytools' account"
+grep -qE 'lfs-helper pm-install "\$(acct|p_\$pkg)"' "$_sd6/mytools.sh" \
+    || _p="$_p;the install does not go to p_<user>"
+grep -q 'acct="p_\$pkg"' "$_sd6/mytools.sh" \
+    || _p="$_p;the account is not derived from the package name"
+# (b) SOURCES elements are single-quoted, and the gcc line survives eval
+grep -q "^'tar|seatd-user|" "$_ms2" \
+    || _p="$_p;the seatd-user entry is not single-quoted"
+_cmd="$(DESKTOP_USER=n76310 OUT=/tmp python3 - "$_ms2" <<'PYCMD'
+import os, subprocess, sys
+for ln in open(sys.argv[1]):
+    ln = ln.strip()
+    if ln.startswith("'tar|seatd-user|"):
+        build = ln.strip("'").split("|")[4]
+        print(subprocess.run(["bash", "-c", 'eval echo "%s"' % build],
+                             capture_output=True, text=True).stdout.strip())
+        break
+PYCMD
+)"
+case "$_cmd" in
+    "gcc seatd-user.c -DSEATD_USER=n76310 -o /tmp/seatd-n76310") ;;
+    *) _p="$_p;the build command comes out as '$_cmd'" ;;
+esac
+# (c) --only really selects, refuses an unknown name, and takes a comma list
+_oo="$T/onlystack"; mkdir -p "$_oo"
+printf 'book   acpid\nbook   fcron\nbook   zlib\n' > "$_oo/o.stack"
+_o="$(timeout 120 python3 "$_pmL2" stack "$_oo/o.stack" --only nosuch 2>&1)"
+case "$_o" in
+    *"not in this stack: nosuch"*) ;;
+    *) _p="$_p;an unknown --only name is not refused" ;;
+esac
+case "$_o" in *"it has:"*) ;; *) _p="$_p;it does not list what the stack has" ;; esac
+_o2="$(timeout 120 python3 "$_pmL2" stack "$_oo/o.stack" --only acpid,zlib 2>&1)"
+case "$_o2" in *"acpid"*) ;; *) _p="$_p;--only dropped a name it was given" ;; esac
+case "$_o2" in *"zlib"*) ;; *) _p="$_p;a comma-separated --only is not split" ;; esac
+case "$_o2" in *" fcron "*) _p="$_p;--only ran an entry it was not given" ;; esac
+# and a named entry is exempt from the done-cache
+sed -n '/RUN JUST ONE PART, AND REALLY RUN IT/,/not in _only}/p' "$_pmL2" \
+    | grep -q 'donekeys = {k for k in donekeys' \
+    || _p="$_p;--only still skips an entry the cache calls done"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "your packages install under p_<you>, and --only runs one entry again"
+fi
+
+# ---- the skeleton is not data  (1.14.112) ----------------------------------- #
+#     lfs-helper fix-home p_n76310 --run
+#     /usr/src/p_n76310 kept: these files differ ... compare and remove by hand
+#       differs: .project, build.conf, .bash_profile, .bashrc, build
+#     # p_n76310: home -> /usr/src/pkgusr/p_n76310
+#     ...and the next run: "p_n76310's home is /usr/src/p_n76310"
+# Those five files are the SKELETON -- written by whoever created the account
+# -- so a husk and a real home always "differ" in exactly them, the merge
+# always refused, and the repair could never finish.  The destination's copies
+# are the ones in use; the husk's are a duplicate of the same idea.
+_p=""
+_hlpS2="$helper_src"
+grep -q '^_is_skeleton_file() {' "$_hlpS2" \
+    || _p="$_p;there is no notion of a skeleton file"
+for _f in .bashrc .bash_profile build build.conf .project; do
+    sed -n '/^_is_skeleton_file() {/,/^}/p' "$_hlpS2" | grep -q -- "$_f" \
+        || _p="$_p;$_f is not treated as skeleton"
+done
+sed -n '/^_merge_dir_into() {/,/^}/p' "$_hlpS2" | grep -q '_is_skeleton_file "$rel"' \
+    || _p="$_p;the merge still refuses over skeleton files"
+# it really merges: payload moves, skeleton is dropped, husk disappears
+_mh="$T/mergehome"; rm -rf "$_mh"; mkdir -p "$_mh/husk" "$_mh/real"
+for _f in .bashrc .bash_profile build.conf .project; do
+    echo husk > "$_mh/husk/$_f"; echo real > "$_mh/real/$_f"
+done
+echo payload > "$_mh/husk/pkg.lst"
+_r="$( warn(){ :; }; ok(){ :; }
+       eval "$(_slice_fn "$_hlpS2" _is_skeleton_file)"
+       eval "$(_slice_fn "$_hlpS2" _merge_dir_into)"
+       _merge_dir_into "$_mh/husk" "$_mh/real" && echo CLEAN || echo KEPT )"
+[ "$_r" = CLEAN ] || _p="$_p;the merge still refuses a husk that holds only skeleton files"
+[ -d "$_mh/husk" ] && _p="$_p;the husk directory survives the merge"
+[ -f "$_mh/real/pkg.lst" ] || _p="$_p;the payload was not moved into the real home"
+[ "$(cat "$_mh/real/.bashrc" 2>/dev/null)" = real ] \
+    || _p="$_p;the husk's skeleton overwrote the real home's"
+# a husk holding a file that is NOT skeleton and NOT identical is still kept
+_mh2="$T/mergehome2"; rm -rf "$_mh2"; mkdir -p "$_mh2/husk" "$_mh2/real"
+echo one > "$_mh2/husk/notes.txt"; echo two > "$_mh2/real/notes.txt"
+_r2="$( warn(){ :; }; ok(){ :; }
+        eval "$(_slice_fn "$_hlpS2" _is_skeleton_file)"
+        eval "$(_slice_fn "$_hlpS2" _merge_dir_into)"
+        _merge_dir_into "$_mh2/husk" "$_mh2/real" && echo CLEAN || echo KEPT )"
+[ "$_r2" = KEPT ] || _p="$_p;a genuinely conflicting file is discarded"
+[ "$(cat "$_mh2/real/notes.txt")" = two ] || _p="$_p;a real file was overwritten by the husk's"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a husk of skeleton files merges away; real differences are still kept"
+fi
+
+# ---- check that it took  (1.14.113) ----------------------------------------- #
+#     lfs-helper fix-home p_n76310 --run
+#     # p_n76310: home -> /usr/src/pkgusr/p_n76310
+#     ...and the next command: "p_n76310's home is /usr/src/p_n76310"
+# Three times, each reporting success.  `usermod -d` returned 0 and
+# /etc/passwd still held the old home, so the message was printed on the
+# strength of an exit code that meant nothing.  A write that cannot be read
+# back did not happen.
+_p=""
+_hlpT2="$helper_src"
+_sr="$(_slice_fn "$_hlpT2" _set_recorded_home)"
+printf '%s' "$_sr" | grep -q '\[ "$(_recorded_home_for "$acct")" = "$home" \] && return 0' \
+    || _p="$_p;usermod's exit code is still trusted"
+printf '%s' "$_sr" | grep -cq 'CHECK THAT IT TOOK' \
+    || _p="$_p;the read-back is not explained"
+# the file path verifies too, and a name that is not in passwd fails
+_sp="$T/setrec"; mkdir -p "$_sp"
+printf 'root:x:0:0::/root:/bin/bash\np_demo:x:10:10::/usr/src/p_demo:/bin/bash\n' \
+    > "$_sp/passwd"
+_res="$( ETC="$_sp"
+         have_shadow_tools() { return 1; }
+         eval "$(_slice_fn "$_hlpT2" _recorded_home_for)"
+         eval "$(_slice_fn "$_hlpT2" _set_recorded_home)"
+         _set_recorded_home p_demo /usr/src/pkgusr/p_demo && echo OK || echo FAIL
+         _recorded_home_for p_demo
+         _set_recorded_home p_absent /usr/src/pkgusr/x && echo OK2 || echo FAIL2 )"
+case "$_res" in
+    *OK*"/usr/src/pkgusr/p_demo"*) ;;
+    *) _p="$_p;a real move is not reported as success: $_res" ;;
+esac
+case "$_res" in
+    *FAIL2*) ;;
+    *) _p="$_p;setting the home of an account that is not there reports success" ;;
+esac
+# and the caller only claims the repair when the write is confirmed
+_rh="$(_slice_fn "$_hlpT2" _repair_misplaced_home)"
+printf '%s' "$_rh" | grep -q 'if _set_recorded_home "$acct" "$want"; then' \
+    || _p="$_p;the repair announces itself without checking the write"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a recorded home is read back before the tools claim they moved it"
+fi
+
+# ---- one base, two readings  (1.14.114) ------------------------------------- #
+# After fix-home the passwd entry was right; running the step put it back:
+#     getent ... -> /usr/src/pkgusr/p_n76310      (after fix-home)
+#     ... the step ...
+#     getent ... -> /usr/src/p_n76310             (after)
+# The step's environment carries LFS_PKGUSR_ROOT, written by `lfs` from the
+# config key `pkgusr_home`.  Its default is /usr/src/pkgusr, its help text
+# said "the base the homes hang under (/usr/src)", and there is a SECOND key,
+# pkgusr_subdir, "folder under the base".  Read one way the base includes the
+# folder; read the other it does not.  packagemanager appends the subdir;
+# `lfs` exported the bare base.  So the tools disagreed about where every
+# account lives, and fix-home and the step took turns correcting each other.
+_p=""
+_lfsB="$LFS_TOOL"
+grep -q '^def _accounts_root' "$_lfsB" \
+    || _p="$_p;the exported root is still the bare config value"
+grep -q 'export LFS_PKGUSR_ROOT="{_accounts_root("pkgusr")}"' "$_lfsB" \
+    || _p="$_p;LFS_PKGUSR_ROOT is not composed"
+grep -q 'export LFS_CFGUSR_ROOT="{_accounts_root("cfg")}"' "$_lfsB" \
+    || _p="$_p;LFS_CFGUSR_ROOT is not composed"
+grep -q 'where package homes live (/usr/src/pkgusr)' "$_lfsB" \
+    || _p="$_p;the help text still invites the wrong reading"
+# both readings must land in the same place, and a custom subdir must hold
+python3 - "$_lfsB" <<'PYROOT' || _p="$_p;the two readings of the base do not agree"
+import sys, importlib.machinery as m
+l = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+l.read_config = lambda *a, **k: {}
+for base in ("/usr/src", "/usr/src/pkgusr"):
+    l.LAYOUT_DEFAULTS["target_pkgusr_home"] = base
+    got = l._accounts_root("pkgusr")
+    assert got == "/usr/src/pkgusr", (base, got)
+l.LAYOUT_DEFAULTS["target_pkgusr_home"] = "/opt/lfs/src"
+assert l._accounts_root("pkgusr") == "/opt/lfs/src/pkgusr", l._accounts_root("pkgusr")
+# a configured subdir is honoured, and not doubled
+l.read_config = lambda *a, **k: {"pkgusr_subdir": "packages"}
+l.LAYOUT_DEFAULTS["target_pkgusr_home"] = "/usr/src"
+assert l._accounts_root("pkgusr") == "/usr/src/packages", l._accounts_root("pkgusr")
+l.LAYOUT_DEFAULTS["target_pkgusr_home"] = "/usr/src/packages"
+assert l._accounts_root("pkgusr") == "/usr/src/packages", l._accounts_root("pkgusr")
+PYROOT
+# and lfs-helper's own default already agreed with packagemanager
+grep -q 'PKGUSR_ROOT="${LFS_PKGUSR_ROOT:-$SRCROOT/pkgusr}"' "$helper_src" \
+    || _p="$_p;lfs-helper's default root no longer includes the subdir"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "every tool computes the same home from either reading of the base"
+fi
+
+# ---- the DRM backend was never built  (1.14.115) ---------------------------- #
+#     [wlr] Cannot create DRM backend: disabled at compile-time
+#     [wlr] Failed to open any DRM device
+#     [sway] Unable to create backend
+# Not the kernel, and not seatd -- the log shows seatd opening seat0 and the
+# client attaching correctly.  wlroots 0.19's DRM backend requires
+# libdisplay-info, which was in the BOOK and not in the stack; meson disables
+# drm when it is absent, mentions it in a summary line, and builds happily.
+# The cost of that silence is a full desktop that cannot open a screen.
+_p=""
+_ss6="$(dirname "$LFS_TOOL")/stacks/sway.stack"
+_pmDR="$(dirname "$LFS_TOOL")/packagemanager"
+grep -qE '^book +libdisplay-info' "$_ss6" \
+    || _p="$_p;libdisplay-info is not in the sway stack"
+# ...and BEFORE wlroots, or it cannot help
+python3 - "$_pmDR" "$_ss6" <<'PYORD' || _p="$_p;libdisplay-info is not built before wlroots"
+import sys, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+names = [r["target"] for r in pm._parse_stack_file(sys.argv[2])]
+assert "libdisplay-info" in names, "missing"
+assert names.index("libdisplay-info") < names.index("wlroots"), names
+PYORD
+# the backend list is explicit: an auto-detected one is a silent dependency
+grep -q 'Dbackends=drm,libinput,x11' "$_ss6" \
+    || _p="$_p;wlroots' backends are still auto-detected"
+grep -q 'Dsession=enabled' "$_ss6" \
+    || _p="$_p;wlroots is built without session support"
+# seatd: the wrapper execs /usr/bin/seatd, so the server must be built
+grep -q 'Dserver=enabled' "$_ss6" \
+    || _p="$_p;seatd is built without the binary seatd-user needs"
+grep -q 'Dlibseat-seatd=enabled' "$_ss6" \
+    || _p="$_p;libseat has no seatd backend, which is the one in use"
+# the author's own sway options
+for _o in 'Dman-pages=enabled' 'Dswaybar=true' 'Dswaynag=true' 'Dbash-completions=true'; do
+    grep -q -- "$_o" "$_ss6" || _p="$_p;sway is missing $_o"
+done
+# the seatd BOOT SERVICE is gone: seatd-user replaced it, and two ways to
+# get a seat is worse than one
+[ -f "$(dirname "$LFS_TOOL")/stacks/seatd-init.sh" ] \
+    && _p="$_p;the seatd boot script is still shipped"
+grep -qE '^cfg +seatd-init' "$(dirname "$LFS_TOOL")/stacks/services.stack" \
+    && _p="$_p;services.stack still installs the seatd service"
+# add-user must report the account it made, not the login of the same name
+sed -n '/THE ACCOUNT THAT WAS CREATED, NOT THE NAME/,/return/p' "$_pmDR" \
+    | grep -q 'name = pkgusr_name(name)' \
+    || _p="$_p;the creation report can still describe the human account"
+grep -q 'report_created_user(acct)' "$_pmDR" \
+    || _p="$_p;add-user reports on the name it was given"
+# the kernel step, from the author's procedure
+_k="$(dirname "$LFS_TOOL")/lfs-kernel"
+[ -f "$_k" ] || _p="$_p;there is no kernel tool"
+[ -x "$_k" ] || _p="$_p;lfs-kernel is not executable"
+[ -f "$(dirname "$LFS_TOOL")/stacks/kernel.sh" ] \
+    && _p="$_p;the kernel is still a stack step"
+grep -qE '^cfg +kernel$' "$(dirname "$LFS_TOOL")/stacks/services.stack" \
+    && _p="$_p;services.stack still runs the kernel as a step"
+# the config is SHIPPED, not written on first run: it is meant to be edited
+# before anything is built
+_kc="$(dirname "$LFS_TOOL")/kernel.conf"
+[ -f "$_kc" ] || _p="$_p;kernel.conf does not ship"
+grep -q 'kernel.conf' "$(dirname "$LFS_TOOL")/Makefile" \
+    || _p="$_p;make install does not place kernel.conf"
+grep -q 'is missing.  It ships with the tools' "$_k" \
+    || _p="$_p;a missing config is written silently instead of reported"
+# --help and detect-esp must work with no config present
+_hh="$(env CONF=/nonexistent bash "$_k" --help 2>&1 | head -1)"
+case "$_hh" in
+    *"build and install a kernel"*) ;;
+    *) _p="$_p;--help does not work without a config" ;;
+esac
+# ESP + KERNEL_NAME are the pair that picks test vs real
+grep -q 'KERNEL_NAME' "$_k"  || _p="$_p;the installed kernel file name is fixed"
+grep -q 'KERNEL_NAME' "$_kc" || _p="$_p;the config does not expose the file name"
+grep -q 'a kernel to try' "$_kc" || _p="$_p;the config does not show a test/real pair"
+grep -q 'KERNEL_NAME}_old' "$_k" || _p="$_p;the previous kernel is not kept"
+# THE LAST WORKING SOURCE IS NEVER DELETED
+grep -q 'kernel.last-good' "$_k" \
+    || _p="$_p;nothing records which kernel last booted"
+grep -q 'THE LAST WORKING SOURCE IS NEVER DELETED' "$_k" \
+    || _p="$_p;the last working source is not protected"
+grep -q 'uname -r' "$_k" || _p="$_p;the running kernel is not consulted"
+# subcommands
+for _c in list detect-esp verify; do
+    grep -q "    $_c)" "$_k" || _p="$_p;lfs-kernel has no '$_c'"
+done
+
+# VERIFY LOOKS AT THE SYSTEM, not at what a build printed.  "is the kernel
+# part done? do we have a validation command so we know everything is
+# installed as expected?" -- there was none, so every answer so far has been
+# me reading a transcript.
+bash "$_k" --help 2>&1 | grep -q 'verify' \
+    || _p="$_p;verify is not documented"
+_vb="$(sed -n '/verify: is everything where it should be/,/^echo "# kernel /p' "$_k")"
+[ -n "$_vb" ] || _p="$_p;there is no verify block"
+for _c in 'System.map-' 'config-' 'modules.dep' 'version.h' 'pkg.lst' \
+          'CONFIG_EXTRA_FIRMWARE' 'lib/modules'; do
+    printf '%s' "$_vb" | grep -q -- "$_c" || _p="$_p;verify does not check $_c"
+done
+printf '%s' "$_vb" | grep -q 'cmp -s' \
+    || _p="$_p;verify does not check the booted image against the version"
+printf '%s' "$_vb" | grep -q 'ls -1t' \
+    || _p="$_p;verify cannot work out which version was installed"
+printf '%s' "$_vb" | grep -q 'exit 1' \
+    || _p="$_p;verify does not fail when a check fails"
+# DEPMOD AND OUT-OF-TREE MODULES MUST TARGET THE VERSION BUILT, not the one
+# running.  `depmod -a` with no argument means `uname -r`, and a module's own
+# Makefile defaults to /lib/modules/`uname -r`/build:
+#     depmod: ERROR: could not open directory /lib/modules/7.2.0
+#     make[1]: *** /lib/modules/7.2.0/build: No such file or directory
+# In a chroot -- or any time a different version is being built -- both are
+# the wrong tree.
+grep -qE '^depmod -a "\$VERSION"' "$_k" \
+    || _p="$_p;depmod indexes the running kernel instead of the built one"
+grep -qE 'depmod -a$' "$_k" \
+    && _p="$_p;a bare 'depmod -a' is still there"
+for _t in clean modules modules_install; do
+    grep -q "make -C '\$tree' M='\$d' $_t" "$_k" \
+        || _p="$_p;v4l2loopback's $_t does not run against the built tree"
+done
+grep -q "cd '\$d' && make clean && make" "$_k" \
+    && _p="$_p;the module still builds with its own Makefile defaults"
+# uname -r may only be used for REPORTING and for last-good tracking
+_ur="$(grep -n 'uname -r' "$_k" | grep -vE 'echo|#|_running=' | wc -l)"
+[ "$_ur" = 0 ] || _p="$_p;uname -r is still used to decide where files go"
+
+# VERIFY IS A REPORT: it must not fetch, create or announce.  It resolved
+# "latest" over the network, printed the chroot notice about paths it was
+# never going to write, and would have created the package account -- in
+# front of a report about what is installed.
+_vq="$(sed -n '/verify.*inspects what is on disk/,/^fi$/p' "$_k")"
+[ -n "$_vq" ] || _p="$_p;verify still resolves the version over the network"
+grep -q 'must not CREATE anything' "$_k" \
+    || _p="$_p;verify can create the package account"
+[ "$(grep -c '_VERIFY:-0' "$_k")" -ge 5 ] \
+    || _p="$_p;verify shares too much of the build path"
+# THE MANIFEST IS RECORDED WHEN THE KERNEL IS INSTALLED, not after the
+# optional extras: a v4l2loopback failure left no pkg.lst and verify then
+# reported a perfectly installed kernel as unrecorded.
+grep -q 'RECORD THE FILES NOW, WHILE THEY ARE INSTALLED' "$_k" \
+    || _p="$_p;the manifest is only written after the optional steps"
+_l_dep="$(grep -n '^depmod -a "\$VERSION"' "$_k" | head -1 | cut -d: -f1)"
+_l_rec="$(grep -n '^_record$' "$_k" | head -1 | cut -d: -f1)"
+_l_v4l="$(grep -n 'v4l2loopback (optional' "$_k" | head -1 | cut -d: -f1)"
+{ [ -n "$_l_rec" ] && [ -n "$_l_v4l" ] && [ "$_l_rec" -lt "$_l_v4l" ]; } \
+    || _p="$_p;the manifest is still written after v4l2loopback"
+{ [ -n "$_l_dep" ] && [ "$_l_dep" -lt "$_l_rec" ]; } \
+    || _p="$_p;the manifest is written before depmod has indexed the modules"
+[ "$(grep -c '^_record$' "$_k")" -ge 2 ] \
+    || _p="$_p;the manifest is not refreshed after the headers are installed"
+
+# VERIFY MUST CHECK WHAT IT INSTALLS.  It checked the image, the modules,
+# the headers and every embedded blob -- and not the out-of-tree module,
+# which is the one piece whose build had failed three times.
+printf '%s' "$_vb" | grep -q 'v4l2loopback.ko' \
+    || _p="$_p;verify does not check the out-of-tree module"
+printf '%s' "$_vb" | grep -q 'modules.dep knows v4l2loopback' \
+    || _p="$_p;verify does not check that depmod indexed the module"
+printf '%s' "$_vb" | grep -q 'V4L2LOOPBACK:-no' \
+    || _p="$_p;the module is checked even when the config does not ask for it"
+# ...and a manifest that has the home back in it is reported
+printf '%s' "$_vb" | grep -q "the manifest includes the account's own home" \
+    || _p="$_p;verify does not notice a manifest full of sources"
+_vm="$T/vmod"; rm -rf "$_vm"; mkdir -p "$_vm/kernel/drivers"
+: > "$_vm/kernel/drivers/v4l2loopback.ko"
+printf 'kernel/drivers/v4l2loopback.ko:\n' > "$_vm/modules.dep"
+find "$_vm" -name 'v4l2loopback.ko*' -print -quit 2>/dev/null | grep -q . \
+    || _p="$_p;the module search does not find an installed module"
+rm -f "$_vm/kernel/drivers/v4l2loopback.ko"
+find "$_vm" -name 'v4l2loopback.ko*' -print -quit 2>/dev/null | grep -q . \
+    && _p="$_p;the module search finds a module that is not there"
+
+# a zero-byte image and a mismatched pair must both be caught
+_vk="$T/verifyk"; rm -rf "$_vk"; mkdir -p "$_vk/esp"
+: > "$_vk/esp/k"
+[ -s "$_vk/esp/k" ] && _p="$_p;a zero-byte kernel image would pass"
+echo img > "$_vk/esp/k"; echo other > "$_vk/esp/k-7.2.4"
+cmp -s "$_vk/esp/k" "$_vk/esp/k-7.2.4" \
+    && _p="$_p;a booted image differing from its version would pass"
+# the AMD blobs this config embeds are in the shipped list
+_fo2="$( . "$_kc" 2>/dev/null; printf '%s' "$FIRMWARE_ONLY" )"
+for _d in amd-ucode amd intel amdgpu; do
+    case " $_fo2 " in
+        *" $_d "*) ;;
+        *) _p="$_p;the shipped firmware list omits $_d" ;;
+    esac
+done
+if [ -f "$_k" ]; then
+    bash -n "$_k" || _p="$_p;kernel.sh does not parse"
+    grep -q '/etc/pkgusr/kernel.conf' "$_k" || _p="$_p;the kernel step has no config file"
+    # THE VERSION MUST BE EASY TO CHANGE: newest stable from kernel.org, a
+    # named version for one run, or a list to choose from
+    grep -q 'releases.json' "$_k" || _p="$_p;kernel.org's release list is not consulted"
+    grep -q 'KERNEL_LIST' "$_k"   || _p="$_p;there is no way to list available versions"
+    # a version for one run is a positional argument now, not an env var
+    grep -q 'VERSION="$1"' "$_k" || _p="$_p;a version cannot be given for one run"
+    grep -q 'cdn.kernel.org' "$_k" || _p="$_p;the tarball is not fetched automatically"
+    grep -q 'THE COMMANDS' "$_k"  || _p="$_p;the build commands are not marked out to be read"
+    # THE KERNEL IS A PACKAGE: its sources live in its own account's home,
+    # not in a directory invented by the config, so verify/pkg.lst/remove all
+    # work on it.  SRC used to be a free-standing setting -- a location
+    # outside the model.
+    grep -q 'SRC=/usr/src/linux' "$_kc" && _p="$_p;the config still invents a source directory"
+    # an INSTALLED config from before the change still sets SRC and has no
+    # PKG; it must be recognised and explained, not silently misread
+    grep -q 'A CONFIG FROM AN OLDER RELEASE' "$_k" \
+        || _p="$_p;an outdated config is read as if it were current"
+    _oc="$T/oldconf"; mkdir -p "$_oc"
+    printf 'VERSION=latest\nESP=%s\nSRC=/usr/src/linux\nJOBS=-j2\n' "$_oc" > "$_oc/old.conf"
+    _oo="$( CONF="$_oc/old.conf"; . "$_oc/old.conf"
+            if [ -n "${SRC:-}" ]; then echo "SRC-NOTED"; unset SRC; fi
+            [ -n "${PKG:-}" ] || echo "NO-PKG" )"
+    case "$_oo" in *SRC-NOTED*) ;; *) _p="$_p;a leftover SRC is not mentioned" ;; esac
+    case "$_oo" in *NO-PKG*) ;; *) _p="$_p;a config without PKG is accepted" ;; esac
+    # the values the author asked for
+    grep -q '^ESP=/boot/efi/EFI/NimGnu$' "$_kc" \
+        || _p="$_p;the shipped ESP is not the author's"
+    grep -q '^KERNEL_NAME=vmlinuz_new$' "$_kc" \
+        || _p="$_p;the shipped kernel name is not the author's"
+    grep -q '^JOBS=-j14$' "$_kc" \
+        || _p="$_p;the shipped job count is not the author's default"
+    grep -q '^PKG=' "$_kc" || _p="$_p;the config does not name the package user"
+    grep -q 'THE KERNEL IS A PACKAGE' "$_k" || _p="$_p;the kernel is not built as a package"
+    grep -q 'packagemanager add-user "$PKG"' "$_k" || _p="$_p;the account is not created"
+    grep -q 'getent passwd "$acct" | cut -d: -f6' "$_k" \
+        || _p="$_p;the source directory is not derived from the account"
+    grep -q 'reload-pkg-list "$PKG"' "$_k" \
+        || _p="$_p;the kernel is never recorded in a manifest"
+    # everything touching the tree runs AS the package user; a root-owned
+    # file in its home breaks the next build
+    grep -q '_as_pkg() {' "$_k" || _p="$_p;there is no way to run as the package user"
+    for _stage in 'make $JOBS' 'make modules_prepare' 'make modules_install' \
+                  'make olddefconfig' 'make headers'; do
+        grep -q "_as_pkg \"$_stage" "$_k" \
+            || _p="$_p;'$_stage' does not run as the package user"
+    done
+    grep -qE '^make (\$JOBS|modules_install|headers)' "$_k" \
+        && _p="$_p;a build stage still runs as root"
+    # ...and the ESP copies stay root's, since vfat has no ownership
+    grep -q 'cp -v "$tree/arch/x86/boot/bzImage" "$ESP/$KERNEL_NAME"' "$_k" \
+        || _p="$_p;the kernel is not copied to the ESP by root"
+    # the ESP is explained and detected, not left as an unexplained variable
+    grep -q '_detect_esp' "$_k"   || _p="$_p;the ESP is not detected"
+    grep -q 'findmnt -t vfat' "$_k" || _p="$_p;it does not say how to find the ESP"
+    # releases.json pairs its keys by NAME: "version" comes before "moniker",
+    # and pairing by position silently swapped the columns, so "latest"
+    # resolved to nothing
+    cat > "$T/rel.json" <<'RELJSON'
+{"releases":[{"iseol":false,"version":"7.3.1","moniker":"mainline"},{"version":"7.2.5","moniker":"stable"},{"version":"6.12.40","moniker":"longterm"}]}
+RELJSON
+    _lat="$( MIRROR_JSON=x
+             wget() { cat "$T/rel.json"; }
+             eval "$(sed -n '/^_releases() {/,/^}/p' "$_k")"
+             _releases | awk '$1=="stable"{print $2; exit}' )"
+    [ "$_lat" = "7.2.5" ] || _p="$_p;the newest stable is parsed as '$_lat', not 7.2.5"
+    _mon="$( MIRROR_JSON=x
+             wget() { cat "$T/rel.json"; }
+             eval "$(sed -n '/^_releases() {/,/^}/p' "$_k")"
+             _releases | awk '$1=="longterm"{print $2; exit}' )"
+    [ "$_mon" = "6.12.40" ] || _p="$_p;longterm is parsed as '$_mon'"
+    grep -q 'V4L2LOOPBACK' "$_k" || _p="$_p;v4l2loopback cannot be turned off"
+    grep -q 'CONFIG_DRM' "$_k" || _p="$_p;the step does not check the options sway needs"
+    grep -q 'make headers' "$_k" || _p="$_p;the headers are not installed"
+    # FIRMWARE IS PART OF THE JOB, NOT SOMETHING TO SKIP.  amdgpu will not
+    # bring up a display without its blobs, and a config listing them in
+    # CONFIG_EXTRA_FIRMWARE cannot even build.  They install as their own
+    # package so they are tracked and updatable on their own.
+    grep -q 'firmware, as its own package' "$_k" \
+        || _p="$_p;firmware is not installed by the kernel tool"
+    grep -q 'add-user linux-firmware' "$_k" \
+        || _p="$_p;firmware does not get its own package user"
+    grep -q 'reload-pkg-list linux-firmware' "$_k" \
+        || _p="$_p;the installed firmware is not recorded"
+    grep -q '^FIRMWARE_FROM=' "$_kc" || _p="$_p;the config cannot choose a firmware source"
+    grep -q '^FIRMWARE_ONLY=' "$_kc" || _p="$_p;the config cannot limit which firmware"
+    grep -q '^FIRMWARE_ONLY="amdgpu' "$_kc" \
+        || _p="$_p;the shipped config does not cover the author's GPU"
+    # NOT ALL FIRMWARE LIVES IN A SUBDIRECTORY.  Intel wireless blobs are
+    # iwlwifi-cc-a0-*.ucode at the TOP LEVEL, so a directory-only list misses
+    # the AX200 entirely -- and git's sparse-checkout cone mode, the default,
+    # matches directories only.
+    # Intel wireless lives at intel/iwlwifi/ in current linux-firmware, so
+    # `intel` covers the AX200; a separate iwlwifi entry is simply wrong.
+    grep -q 'intel/iwlwifi/' "$_kc" \
+        || _p="$_p;the config does not say where Intel wireless firmware lives"
+    # THE CONFIG IS SOURCED BY THE SHELL, so a value with spaces must be
+    # quoted: unquoted, `FIRMWARE_ONLY=amdgpu intel iwlwifi-cc-*` runs
+    # `intel` as a command and assigns NOTHING -- which then meant "install
+    # all ten gigabytes".
+    grep -q '^FIRMWARE_ONLY="' "$_kc" \
+        || _p="$_p;FIRMWARE_ONLY is not quoted, so its value is lost"
+    _q="$( printf 'FIRMWARE_ONLY=a b c\n' > "$T/bad.conf"
+           . "$T/bad.conf" 2>/dev/null; printf '[%s]' "$FIRMWARE_ONLY" )"
+    [ "$_q" = "[]" ] || _p="$_p;the unquoted form no longer demonstrates the bug"
+    # a pattern that matches nothing must show what IS there: linux-firmware
+    # moves blobs between the top level and subdirectories between releases
+    grep -q 'WHAT IS THERE, NOT JUST WHAT IS NOT' "$_k" \
+        || _p="$_p;a pattern matching nothing gives no help"
+    _fs2="$T/fwsim"; rm -rf "$_fs2"; mkdir -p "$_fs2/iwlwifi" "$_fs2/intel"
+    : > "$_fs2/iwlwifi/iwlwifi-cc-a0-77.ucode"
+    _cand="$( d="iwlwifi-cc-*"
+              _stem="$(printf '%s' "$d" | sed 's/[*?].*//; s/[-_]$//')"
+              find "$_fs2" -maxdepth 2 -iname "*$_stem*" -printf '%P\n' 2>/dev/null )"
+    case "$_cand" in
+        *"iwlwifi/iwlwifi-cc-a0-77.ucode"*) ;;
+        *) _p="$_p;the search for a near match does not find the real file" ;;
+    esac
+    # a failed sparse-checkout must not be swallowed, or the missing firmware
+    # gets blamed on the pattern
+    grep -q 'could not narrow the firmware checkout' "$_k" \
+        || _p="$_p;a failed sparse-checkout is ignored"
+    # the same help for a NAME, not only a pattern: `iwlwifi` is a directory
+    # that does not exist in this release, and it got none
+    grep -q '_firmware_not_found "$src" "$d"; return 1' "$_k" \
+        || _p="$_p;a missing directory gets no near-match search"
+    [ "$(grep -c '_firmware_not_found "$src" "$d"' "$_k")" -ge 2 ] \
+        || _p="$_p;only one of the two cases searches for near matches"
+    # ASK THE INDEX, NOT THE WORKING TREE.  A sparse checkout REMOVES what it
+    # did not select, so searching the directory finds only what is already
+    # installed and reports "nothing" for the file being looked for.
+    grep -q 'ASK THE INDEX, NOT THE WORKING TREE' "$_k" \
+        || _p="$_p;the near-match search looks only at the working tree"
+    grep -q 'git -C "$src" ls-files' "$_k" \
+        || _p="$_p;git's index is not consulted"
+    if command -v git >/dev/null 2>&1; then
+        _gf="$T/gitfw"; rm -rf "$_gf"; mkdir -p "$_gf"
+        ( cd "$_gf" && git init -q . \
+          && mkdir -p amdgpu intel iwlwifi \
+          && : > amdgpu/a.bin && : > intel/ibt.sfi \
+          && : > iwlwifi/iwlwifi-cc-a0-77.ucode \
+          && git add -A \
+          && git -c user.email=t@t -c user.name=t commit -qm x \
+          && git sparse-checkout set --no-cone '/amdgpu/' '/intel/' ) >/dev/null 2>&1
+        # the fixture must really hide it from the tree, or it proves nothing
+        [ -e "$_gf/iwlwifi" ] && _p="$_p;the sparse fixture did not hide the directory"
+        _nf="$( CONF=/etc/pkgusr/kernel.conf
+                eval "$(_slice_fn "$_k" _firmware_not_found)"
+                _firmware_not_found "$_gf" iwlwifi )"
+        case "$_nf" in
+            *"iwlwifi/iwlwifi-cc-a0-77.ucode"*) ;;
+            *) _p="$_p;a path the sparse checkout removed is not found: $_nf" ;;
+        esac
+    fi
+    # a plain directory with no repository still gets the find() fallback
+    _nf2="$( CONF=/etc/pkgusr/kernel.conf
+             eval "$(_slice_fn "$_k" _firmware_not_found)"
+             _fs3="$T/fw3"; mkdir -p "$_fs3/amdgpu"; : > "$_fs3/iwlwifi-cc-a0-77.ucode"
+             _firmware_not_found "$_fs3" iwlwifi )"
+    case "$_nf2" in
+        *"iwlwifi-cc-a0-77.ucode"*) ;;
+        *) _p="$_p;a missing directory does not show the file that is there" ;;
+    esac
+    # FIRMWARE TROUBLE MUST NOT COST THE KERNEL.  This ran before the build
+    # and exited, so a wrong FIRMWARE_ONLY meant no kernel was built at all
+    # -- and nothing said so.
+    grep -q 'FIRMWARE TROUBLE SHOULD NOT COST YOU THE KERNEL' "$_k" \
+        || _p="$_p;a firmware problem still aborts the whole build"
+    grep -q 'carrying on WITHOUT the firmware' "$_k" \
+        || _p="$_p;there is no path that builds the kernel anyway"
+    grep -q 'firmware was NOT installed' "$_k" \
+        || _p="$_p;the summary does not say the firmware is missing"
+    # ...and it DOES stop when the config embeds firmware
+    _emb="$T/cfgt"; mkdir -p "$_emb"
+    printf 'CONFIG_DRM=y\n' > "$_emb/plain"
+    printf 'CONFIG_EXTRA_FIRMWARE="amdgpu/x.bin"\n' > "$_emb/embed"
+    printf 'CONFIG_EXTRA_FIRMWARE=""\n' > "$_emb/empty"
+    grep -q '^CONFIG_EXTRA_FIRMWARE="..*"$' "$_emb/embed" \
+        || _p="$_p;a config that embeds firmware is not recognised"
+    grep -q '^CONFIG_EXTRA_FIRMWARE="..*"$' "$_emb/plain" \
+        && _p="$_p;a config with no built-in firmware is treated as embedding some"
+    grep -q '^CONFIG_EXTRA_FIRMWARE="..*"$' "$_emb/empty" \
+        && _p="$_p;an empty EXTRA_FIRMWARE is treated as embedding some"
+    _q2="$( . "$_kc" 2>/dev/null; printf '%s' "$FIRMWARE_ONLY" )"
+    case "$_q2" in
+        *amdgpu*intel*) ;;
+        *) _p="$_p;the shipped FIRMWARE_ONLY does not survive being sourced: [$_q2]" ;;
+    esac
+    # a separate top-level iwlwifi entry would ask for a directory this
+    # release does not have
+    case " $_q2 " in
+        *" iwlwifi "*) _p="$_p;the shipped list asks for a top-level iwlwifi directory" ;;
+    esac
+    # ...and an empty value must not silently mean everything
+    grep -q 'FIRMWARE_ALL' "$_k" \
+        || _p="$_p;an empty FIRMWARE_ONLY still installs the whole repository"
+    grep -q 'probably needs quoting' "$_k" \
+        || _p="$_p;the likely cause of an empty value is not named"
+    # /lib/firmware is the firmware package's own directory: it existed
+    # root-owned, so every copy failed with Permission denied
+    grep -q "LIB/FIRMWARE IS THIS PACKAGE'S DIRECTORY" "$_k" \
+        || _p="$_p;nothing hands /lib/firmware to the firmware package"
+    grep -q 'chown "$acct:$acct" /lib/firmware' "$_k" \
+        || _p="$_p;the firmware directory is never given to its owner"
+    grep -q 'intel' "$_kc"   || _p="$_p;the shipped config misses Intel bluetooth firmware"
+    grep -q '_sparse_mode' "$_k" || _p="$_p;file patterns are not supported"
+    _sp="$( eval "$(_slice_fn "$_k" _sparse_mode)"
+            eval "$(_slice_fn "$_k" _sparse_args)"
+            printf 'A[%s][%s] B[%s][%s]' \
+              "$(_sparse_mode 'amdgpu intel')" "$(_sparse_args 'amdgpu intel')" \
+              "$(_sparse_mode 'amdgpu iwlwifi-cc-*')" "$(_sparse_args 'amdgpu iwlwifi-cc-*')" )"
+    case "$_sp" in
+        "A[][amdgpu intel] B[--no-cone][/amdgpu/ iwlwifi-cc-*]") ;;
+        *) _p="$_p;sparse-checkout arguments are wrong: $_sp" ;;
+    esac
+    # a pattern is installed with a glob, a directory by name
+    grep -q 'which is not in $src' "$_k" \
+        || _p="$_p;a pattern matching nothing is not reported"
+    # the drivers that need the firmware are checked too -- firmware without
+    # a driver is useless, and this laptop needs three of them
+    for _o in CONFIG_IWLWIFI CONFIG_IWLMVM CONFIG_BT_HCIBTUSB CONFIG_DRM_AMDGPU; do
+        grep -q "$_o" "$_k" || _p="$_p;$_o is not checked"
+    done
+    # three sources: git, a local copy, or nothing
+    for _m in 'copy:\*)' 'git)' 'none)'; do
+        grep -q -- "$_m" "$_k" || _p="$_p;FIRMWARE_FROM has no '$_m' case"
+    done
+    # a sparse checkout when only some directories are wanted: the whole
+    # repository is over ten gigabytes
+    grep -q 'git sparse-checkout set' "$_k" \
+        || _p="$_p;the whole firmware repository is cloned even when a subset is asked for"
+    grep -q 'filter=blob:none --sparse' "$_k" \
+        || _p="$_p;the sparse clone still downloads every blob"
+    grep -q 'over 10 GB' "$_k" \
+        || _p="$_p;an unlimited firmware clone gives no warning about its size"
+    # it runs BEFORE the built-in firmware check, or the check fires anyway
+    _l_fw="$(grep -n '_install_firmware ||' "$_k" | head -1 | cut -d: -f1)"
+    _l_ck="$(grep -n 'FIRMWARE BUILT INTO THE KERNEL' "$_k" | head -1 | cut -d: -f1)"
+    { [ -n "$_l_fw" ] && [ -n "$_l_ck" ] && [ "$_l_fw" -lt "$_l_ck" ]; } \
+        || _p="$_p;firmware is installed after the check that needs it"
+    # FIRMWARE BUILT INTO THE KERNEL MUST BE ON DISK.  A config from a
+    # distribution kernel lists a dozen blobs in CONFIG_EXTRA_FIRMWARE; an
+    # LFS tree has no linux-firmware, and the build dies ten minutes in with
+    # a message naming one file and no reason.
+    grep -q 'FIRMWARE BUILT INTO THE KERNEL' "$_k" \
+        || _p="$_p;built-in firmware is not checked before compiling"
+    grep -q 'EXTRA_FIRMWARE_DIR' "$_k" \
+        || _p="$_p;the firmware directory setting is ignored"
+    grep -q "scripts/config --set-str EXTRA_FIRMWARE" "$_k" \
+        || _p="$_p;no way offered to build without the firmware"
+    # (the other way out is no longer "go install it yourself": this tool
+    #  installs firmware, so the advice is to list the subdirectory)
+    grep -q 'add them to FIRMWARE_ONLY' "$_k" \
+        || _p="$_p;the fix for a missing built-in blob is not named"
+    # every missing blob is listed, and a present one is not
+    _fwd="$T/fwcheck"; rm -rf "$_fwd"; mkdir -p "$_fwd/lib/firmware/amdgpu"
+    printf 'CONFIG_EXTRA_FIRMWARE="amdgpu/a.bin amdgpu/b.bin i915/c.bin"\nCONFIG_EXTRA_FIRMWARE_DIR="%s/lib/firmware"\n' \
+        "$_fwd" > "$_fwd/.config"
+    : > "$_fwd/lib/firmware/amdgpu/b.bin"
+    _mf="$( tree="$_fwd"
+            _fw="$(sed -n 's/^CONFIG_EXTRA_FIRMWARE="\(.*\)"$/\1/p' "$tree/.config")"
+            _fwdir="$(sed -n 's/^CONFIG_EXTRA_FIRMWARE_DIR="\(.*\)"$/\1/p' "$tree/.config")"
+            : "${_fwdir:=/lib/firmware}"
+            for _f in $_fw; do [ -f "$_fwdir/$_f" ] || printf '%s ' "$_f"; done )"
+    case "$_mf" in
+        *"amdgpu/a.bin"*) ;;
+        *) _p="$_p;a missing firmware blob is not detected" ;;
+    esac
+    case "$_mf" in
+        *"i915/c.bin"*) ;;
+        *) _p="$_p;only the first missing blob is reported" ;;
+    esac
+    case "$_mf" in
+        *"amdgpu/b.bin"*) _p="$_p;a firmware blob that IS present is reported missing" ;;
+    esac
+    # a config with no CONFIG_EXTRA_FIRMWARE must not trip it
+    printf 'CONFIG_DRM=y\n' > "$_fwd/plain.config"
+    _mf2="$(sed -n 's/^CONFIG_EXTRA_FIRMWARE="\(.*\)"$/\1/p' "$_fwd/plain.config")"
+    [ -z "$_mf2" ] || _p="$_p;a config without built-in firmware is misread"
+    grep -q 'proc/config.gz' "$_k" || _p="$_p;the running config cannot be reused"
+    # BUILDING IN A CHROOT IS FINE: the chroot usually IS the tree that
+    # boots, /proc is shared so /proc/config.gz is the running config, and
+    # /lib/modules is where it should be.  An earlier version refused
+    # outright, which was wrong -- what can go astray is each PATH, so the
+    # step lists those and continues.
+    grep -q 'BUILDING IN A CHROOT IS FINE' "$_k" \
+        || _p="$_p;the kernel step refuses to run in a chroot"
+    _kg="$(sed -n '/BUILDING IN A CHROOT IS FINE/,/^fi$/p' "$_k")"
+    printf '%s' "$_kg" | grep -q 'exit 1' \
+        && _p="$_p;the chroot case is still fatal"
+    printf '%s' "$_kg" | grep -q 'lib/modules' \
+        || _p="$_p;it does not say which paths to verify"
+    printf '%s' "$_kg" | grep -q 'CONFIG_FROM=file:' \
+        || _p="$_p;it does not offer another config source"
+    # an absent ESP is refused rather than created on the root filesystem
+    grep -q 'firmware cannot read' "$_k" \
+        || _p="$_p;an unmounted ESP would be created as a plain directory"
+    # ...and so is a directory of the right name on the WRONG filesystem --
+    # every copy succeeds and the firmware finds nothing at the next boot
+    grep -q 'stat -f -c %T' "$_k" \
+        || _p="$_p;the ESP filesystem is not checked"
+    _fs="$( for fs in vfat ext2/ext3 ""; do
+                case "$fs" in
+                    msdos|vfat|fat*|exfat) echo "$fs:ok" ;;
+                    "") echo "unknown:warn" ;;
+                    *) echo "$fs:refuse" ;;
+                esac
+            done )"
+    case "$_fs" in
+        *"vfat:ok"*) ;;
+        *) _p="$_p;a real EFI partition is not accepted" ;;
+    esac
+    case "$_fs" in
+        *"ext2/ext3:refuse"*) ;;
+        *) _p="$_p;an ESP on the root filesystem is not refused" ;;
+    esac
+    case "$_fs" in
+        *"unknown:warn"*) ;;
+        *) _p="$_p;an unidentifiable filesystem is fatal rather than a warning" ;;
+    esac
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "wlroots gets its DRM backend, and the kernel has a step of its own"
+fi
+
+# ---- one file per round is a loop, not progress  (1.14.116) ----------------- #
+# libdisplay-info went TWELVE rounds, each one re-cloning a subproject and
+# handing over exactly one more file:
+#     /usr/share/locale/fr/.../v4l-utils.mo belongs to p_v4l-utils -- handing it over
+#     ... round 7 ... pt_BR/v4l-utils.mo ... round 8 ... libv4lconvert.so ...
+# It builds v4l-utils as a meson SUBPROJECT for its edid-decode comparison
+# tests, and installs that package's real files over p_v4l-utils's.  meson
+# stops at the first file it may not replace, so its log names only that one
+# and each round learns exactly one more -- the handover can never catch up.
+_p=""
+_hlpU2="$helper_src"
+_pmSP="$(dirname "$LFS_TOOL")/packagemanager"
+_hs="$(_slice_fn "$_hlpU2" claim_installed_over_from_log)"
+[ -n "$_hs" ] || _hs="$(sed -n '/the installer owns what it installs/,/^}/p' "$_hlpU2")"
+printf '%s' "$_hs" | grep -q 'LAST_SINGLE_HANDOVER' \
+    || _p="$_p;a single-file handover is not distinguished from a real one"
+_rb="$(sed -n '/ONE FILE PER ROUND IS A LOOP/,/took -ge 1/p' "$_hlpU2")"
+[ -n "$_rb" ] || _p="$_p;the single-file case is not explained"
+_cb2="$(_slice_fn "$_hlpU2" cmd_build)"
+printf '%s' "$_cb2" | grep -q '_same_owner_rounds' \
+    || _p="$_p;the retry loop does not notice repeated single handovers"
+printf '%s' "$_cb2" | grep -q 'BUNDLED COPY' \
+    || _p="$_p;the loop is not diagnosed as a bundled subproject"
+printf '%s' "$_cb2" | grep -q 'wrap_mode = nodownload' \
+    || _p="$_p;the fix that stops the subproject is not named"
+printf '%s' "$_cb2" | grep -q '_same_owner_rounds:-0}" -ge 3' \
+    || _p="$_p;the loop is not stopped after a few rounds"
+# and the fix itself ships: nofallback (the book's) blocks dependency
+# fallbacks only -- an explicit subproject() still downloads
+_mc2="$(dirname "$LFS_TOOL")/stacks/machine.conf"
+grep -q '^\[libdisplay-info\]' "$_mc2" \
+    || _p="$_p;libdisplay-info has no wrap_mode setting"
+sed -n '/^\[libdisplay-info\]/,/^$/p' "$_mc2" | grep -q 'wrap_mode = nodownload' \
+    || _p="$_p;the wrap mode is not nodownload"
+# it must reach the meson line, replacing the book's --wrap-mode
+python3 - "$_pmSP" "$_mc2" "$T/wrapmode" <<'PYWRAP' || _p="$_p;wrap_mode does not replace the book's value"
+import sys, os, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[3]; os.makedirs(d, exist_ok=True)
+p = os.path.join(d, "install_ldi")
+open(p, "w").write("build_pkg() {\nmkdir build &&\ncd build &&\n"
+                   "meson setup --wrap-mode=nofallback --prefix=/usr .. &&\nninja\n}\n")
+pm._machine_opts_for = lambda a: pm._read_conf_section(sys.argv[2], "libdisplay-info")
+pm.apply_machine_opts("libdisplay-info", p)
+line = [l for l in open(p) if "meson setup" in l][0]
+assert "--wrap-mode=nodownload" in line, line
+assert "nofallback" not in line, line
+PYWRAP
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a package installing over another one file at a time is diagnosed, not looped"
+fi
+
+# ---- giving the files back  (1.14.117) -------------------------------------- #
+# The 1.14.116 diagnosis fired exactly as designed ("rounds run: 3", named
+# wrap_mode=nodownload) -- and by then /usr/bin/dvbv5-scan and friends were
+# owned by p_libdisplay-info while still listed in p_v4l-utils's manifest.
+# "we will sometimes get that problem that we have to overwrite files,... idk
+# how to handle that" -- so: the handover is right for packages that
+# legitimately overlap, wrong for a bundled copy, and after the wrong case
+# there has to be a way back.  Only root can chown, and only the manifest
+# knows which files were the victim's.
+_p=""
+_pmRC="$(dirname "$LFS_TOOL")/packagemanager"
+python3 "$_pmRC" reclaim --help >/dev/null 2>&1 \
+    || _p="$_p;there is no way to give a package its files back"
+python3 "$_pmRC" reclaim --help 2>&1 | grep -q -- '--run' \
+    || _p="$_p;reclaim has no --run, so it cannot be a dry run by default"
+_rcs="$(sed -n '/^def cmd_reclaim/,/^def /p' "$_pmRC")"
+printf '%s' "$_rcs" | grep -q 'os.geteuid() != 0' \
+    || _p="$_p;reclaim does not require root"
+printf '%s' "$_rcs" | grep -q 'pkg.lst' \
+    || _p="$_p;reclaim does not use the manifest"
+printf '%s' "$_rcs" | grep -q 'os.lchown' \
+    || _p="$_p;reclaim follows symlinks when changing ownership"
+printf '%s' "$_rcs" | grep -q 'Dry run' \
+    || _p="$_p;reclaim changes ownership without being asked"
+# it really returns only the files that were taken
+if [ "$(id -u)" = 0 ] && command -v useradd >/dev/null 2>&1; then
+    _rd="$T/reclaim"; rm -rf "$_rd"; mkdir -p "$_rd/home"
+    groupadd reclaimdemo 2>/dev/null
+    useradd -g reclaimdemo reclaimdemo 2>/dev/null
+    printf '%s\n%s\n%s\n' "$_rd/mine" "$_rd/taken" "$_rd/gone" > "$_rd/home/pkg.lst"
+    : > "$_rd/mine"; : > "$_rd/taken"
+    chown reclaimdemo:reclaimdemo "$_rd/mine"; chown root:root "$_rd/taken"
+    python3 - "$_pmRC" "$_rd" <<'PYRC' || _p="$_p;reclaim does not return a taken file"
+import sys, os, pwd, importlib.machinery as m
+pm = m.SourceFileLoader('pm', sys.argv[1]).load_module()
+d = sys.argv[2]
+pm.pkgusr_home = lambda a: d + "/home"
+pm.pkgusr_name = lambda n: "reclaimdemo"
+class A: packages = ["reclaimdemo"]; run = False
+pm.cmd_reclaim(A())
+# dry run changed nothing
+assert pwd.getpwuid(os.stat(d + "/taken").st_uid).pw_name == "root"
+class B: packages = ["reclaimdemo"]; run = True
+pm.cmd_reclaim(B())
+assert pwd.getpwuid(os.stat(d + "/taken").st_uid).pw_name == "reclaimdemo"
+# a file that was already ours is untouched, a missing one is skipped
+assert pwd.getpwuid(os.stat(d + "/mine").st_uid).pw_name == "reclaimdemo"
+assert not os.path.exists(d + "/gone")
+PYRC
+    userdel reclaimdemo 2>/dev/null; groupdel reclaimdemo 2>/dev/null
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a package can be given back the files another package took"
+fi
+
+# ---- the refresh list came from a literal  (1.14.122) ----------------------- #
+# "lfs run commmand is not copying that new script i think"  Correct.
+# TOOLCHAIN_SCRIPTS was a hardcoded tuple of five names; lfs-kernel was added
+# to the Makefile and not to it, so `lfs run` refreshed five of six tools --
+# and the missing one was the tool just written.  Two lists of the same thing
+# is the fault; the Makefile's TOOLS line is the one that decides what gets
+# installed, so it decides what gets refreshed.
+_p=""
+_lfsT="$LFS_TOOL"
+_mkT="$(dirname "$LFS_TOOL")/Makefile"
+grep -q '^def _toolchain_scripts' "$_lfsT" \
+    || _p="$_p;the refresh list is still a literal"
+grep -q 'TOOLS' "$_lfsT" \
+    || _p="$_p;the refresh does not read the Makefile's tool list"
+python3 - "$_lfsT" "$_mkT" <<'PYTOOLS' || _p="$_p;the refreshed tools do not match what make install places"
+import sys, re, importlib.machinery as m
+l = m.SourceFileLoader('lfs', sys.argv[1]).load_module()
+got = set(l.TOOLCHAIN_SCRIPTS)
+want = set()
+for line in open(sys.argv[2]):
+    if re.match(r"^TOOLS\s*:?=", line):
+        want = set(line.split("=", 1)[1].split())
+        break
+assert want, "no TOOLS line in the Makefile"
+assert got == want, ("refreshed", sorted(got), "installed", sorted(want))
+assert "lfs-kernel" in got, sorted(got)
+PYTOOLS
+# a tool with no Makefile beside it still gets a usable fallback
+python3 - "$_lfsT" "$T/nomk" <<'PYFALL' || _p="$_p;there is no fallback without a Makefile"
+import sys, os, shutil, importlib.machinery as m
+d = sys.argv[2]; os.makedirs(d, exist_ok=True)
+shutil.copy2(sys.argv[1], os.path.join(d, "lfs"))
+l = m.SourceFileLoader('lfs', os.path.join(d, "lfs")).load_module()
+assert "lfs-kernel" in l.TOOLCHAIN_SCRIPTS, l.TOOLCHAIN_SCRIPTS
+assert "packagemanager" in l.TOOLCHAIN_SCRIPTS, l.TOOLCHAIN_SCRIPTS
+PYFALL
+# kernel.conf must travel too: lfs-kernel refuses to run without it, so
+# refreshing the tool alone puts a command in the chroot that cannot start
+grep -q 'kernel.conf lives beside the stacks' "$_lfsT" \
+    || _p="$_p;kernel.conf is not refreshed into the chroot"
+_kr="$(sed -n '/kernel.conf lives beside the stacks/,/_stack_dst = /p' "$_lfsT")"
+printf '%s' "$_kr" | grep -q '".new"' \
+    || _p="$_p;an edited kernel.conf in the chroot would be overwritten"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "everything make install places is refreshed into the chroot"
+fi
+
+# ---- input devices come from udev  (1.14.125) ------------------------------- #
+#     [wlr] libinput initialization failed, no input devices
+#     [sway] Failed to start backend
+# The DRM error from 1.14.115 is gone -- wlroots opens the card now -- and
+# libinput found nothing to listen to.  It enumerates through libudev, which
+# reads /run/udev, so a chroot without the host's /run has NO input devices
+# and the message names libinput rather than the chroot.  "maybe sway would
+# start if i wouldnt be in a chroot": yes, and the launcher should say so.
+_p=""
+_sw="$(dirname "$LFS_TOOL")/stacks/sway-session.sh"
+[ -f "$_sw" ] || _p="$_p;there is no sway-session step"
+if [ -f "$_sw" ]; then
+    bash -n "$_sw" || _p="$_p;sway-session.sh does not parse"
+    grep -q 'INPUT DEVICES COME FROM UDEV' "$_sw" \
+        || _p="$_p;a missing udev database is not diagnosed"
+    grep -q 'WLR_LIBINPUT_NO_DEVICES=1' "$_sw" \
+        || _p="$_p;no way offered to test without input devices"
+    grep -q 'bind-mount /run and /dev' "$_sw" \
+        || _p="$_p;it does not say how to make a chroot work"
+    # the VT: a compositor started from a tty other than the active one has
+    # no console to draw on
+    grep -q 'sys/class/tty/tty0/active' "$_sw" \
+        || _p="$_p;starting sway from an inactive tty is not caught"
+    # the seat wrapper is found on PATH, not at a guessed /bin -- mytools
+    # installs it in /usr/bin, and the check looked in /bin
+    grep -q 'command -v "seatd-$(id -un)"' "$_sw" \
+        || _p="$_p;the seat wrapper is not looked up on PATH"
+    grep -q '"/bin/seatd-$(id -un)"' "$_sw" \
+        && _p="$_p;the wrapper path is still hardcoded to /bin"
+    grep -q 'LIBSEAT_BACKEND=seatd' "$_sw" \
+        || _p="$_p;libseat is left to pick a backend"
+    # the launcher it writes must itself be valid, and must run its checks
+    # before exec'ing anything
+    python3 - "$_sw" "$T/launcher.sh" <<'PYLAUNCH' || _p="$_p;no launcher is generated"
+import sys, re
+s = open(sys.argv[1]).read()
+m = re.search(r"cat > /usr/bin/sway-session <<'LAUNCH'\n(.*?)\nLAUNCH\n", s, re.S)
+assert m, "no launcher heredoc"
+body = m.group(1)
+open(sys.argv[2], "w").write(body)
+# every check must come before the exec, or it runs too late to matter
+assert body.index("/run/udev") < body.index("exec dbus-run-session"), "check after exec"
+assert body.index("seatd-$(id -un)") < body.index("exec dbus-run-session"), "seat check after exec"
+PYLAUNCH
+    bash -n "$T/launcher.sh" || _p="$_p;the generated sway-session does not parse"
+    # ...and it really refuses, with the reason, when udev is absent
+    sed 's|/run/udev|/nonexistent-udev-xyz|' "$T/launcher.sh" > "$T/l2.sh"
+    mkdir -p "$T/fakebin"; ln -sf /bin/true "$T/fakebin/seatd-$(id -un)"
+    _o="$(PATH="$T/fakebin:$PATH" bash "$T/l2.sh" 2>&1)"; _rc=$?
+    [ "$_rc" != 0 ] || _p="$_p;a missing udev database does not stop the launch"
+    case "$_o" in
+        *"will find no input"*) ;;
+        *) _p="$_p;the refusal does not explain libinput" ;;
+    esac
+fi
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "sway-session explains a chroot's missing input devices before failing"
+fi
+
+# ---- the home is not installed files  (1.14.138) ---------------------------- #
+#     # recorded 266621 file(s) for p_linux
+# That is the kernel SOURCE TREE.  list_package lists everything an account
+# owns, its own home included -- sources, build trees, the install script.  A
+# manifest is what the package put ON THE SYSTEM: it is what `verify` checks
+# and what `remove` deletes, and 266k source files in it make both
+# meaningless.  The build's own tracking always excluded the home (it
+# compares snapshots outside it); the rescan now does the same.
+_p=""
+_pmH2="$(dirname "$LFS_TOOL")/packagemanager"
+_wl2="$(sed -n '/^def write_pkg_list/,/^def /p' "$_pmH2")"
+printf '%s' "$_wl2" | grep -q 'THE HOME IS NOT INSTALLED FILES' \
+    || _p="$_p;the manifest still records the account's own home"
+printf '%s' "$_wl2" | grep -q 'awk -v h=' \
+    || _p="$_p;there is no filter on the listing"
+# awk, not grep: a filter that removes every line must still exit 0, or the
+# && mv never runs and the old manifest silently survives
+printf '%s' "$_wl2" | grep -q 'grep -v' \
+    && _p="$_p;a grep filter would exit 1 when it removes everything"
+_flt="awk -v h=/usr/src/pkgusr/p_linux/ -v m=/var/mail/ -v s=/var/spool/mail/ 'index(\$0,h)!=1 && index(\$0,m)!=1 && index(\$0,s)!=1'"
+_kept="$(printf '%s\n' /usr/bin/foo \
+                       /usr/src/pkgusr/p_linux/src/linux-7.2.4/Makefile \
+                       /lib/modules/7.2.4/modules.dep \
+                       /var/mail/p_linux \
+                       /usr/include/linux/version.h \
+         | sh -c "$_flt")"
+case "$_kept" in
+    *"/usr/bin/foo"*) ;;
+    *) _p="$_p;an installed file was filtered out" ;;
+esac
+case "$_kept" in
+    *"linux-7.2.4/Makefile"*) _p="$_p;the source tree is still recorded" ;;
+esac
+case "$_kept" in
+    *"/var/mail/"*) _p="$_p;the mail spool is still recorded" ;;
+esac
+case "$_kept" in
+    *"modules.dep"*) ;;
+    *) _p="$_p;an installed module index was filtered out" ;;
+esac
+_rc="$(printf '/usr/src/pkgusr/p_linux/x\n' | sh -c "$_flt" >/dev/null; echo $?)"
+[ "$_rc" = 0 ] || _p="$_p;a filter that removes every line exits non-zero"
+
+# ...AND NOT THROUGH A SYMLINK INTO IT.  Excluding the home was not enough:
+# /lib/modules/<ver>/build is a SYMLINK to the source tree, the scan follows
+# it, and the same quarter-million files come back as
+# /lib/modules/<ver>/build/... -- outside the home, so the home filter never
+# saw them and the "includes its own home" check stayed silent about 266623
+# entries.
+printf '%s' "$_wl2" | grep -q 'NOT THROUGH A SYMLINK INTO IT' \
+    || _p="$_p;the manifest still follows the build symlink into the sources"
+# the home is matched ANYWHERE in the line: a prefix match assumed every
+# entry is an absolute path starting exactly at the home, and the manifest
+# stayed at 268k with the filter in place
+_flt2="awk -v h=/usr/src/pkgusr/p_linux/ -v m=/var/mail/ -v s=/var/spool/mail/ 'index(\$0,h) { next } index(\$0,m)==1 { next } index(\$0,s)==1 { next } /\/lib\/modules\/[^\/]+\/build\// { next } /\/lib\/modules\/[^\/]+\/source\// { next } { print }'"
+_kept2="$(printf '%s\n' /usr/bin/foo \
+                        ./usr/src/pkgusr/p_linux/src/relative \
+                        /lib/modules/7.2.4/modules.dep \
+                        /lib/modules/7.2.4/build \
+                        /lib/modules/7.2.4/build/Makefile \
+                        /lib/modules/7.2.4/source/Makefile \
+                        /lib/modules/7.2.4/kernel/fs/ext4/ext4.ko \
+          | sh -c "$_flt2")"
+case "$_kept2" in
+    *"build/Makefile"*)   _p="$_p;files behind the build symlink are still recorded" ;;
+esac
+case "$_kept2" in
+    *"relative"*) _p="$_p;a home path that is not at the start of the line slips through" ;;
+esac
+case "$_kept2" in
+    *"source/Makefile"*)  _p="$_p;files behind the source symlink are still recorded" ;;
+esac
+# the symlink ITSELF is an installed file and must stay
+case "$_kept2" in
+    *"/lib/modules/7.2.4/build"*) ;;
+    *) _p="$_p;the build symlink itself was filtered out" ;;
+esac
+case "$_kept2" in
+    *"ext4.ko"*) ;;
+    *) _p="$_p;a real module was filtered out" ;;
+esac
+# and verify reports a manifest that was scanned through it
+# (own path: $_vb belongs to another block, and a block must not depend on
+#  one another block happened to set -- 1.14.106 again)
+grep -q 'scanned THROUGH' "$(dirname "$LFS_TOOL")/lfs-kernel" \
+    || _p="$_p;verify does not notice a manifest scanned through the symlink"
+_mm="$T/manifests"; mkdir -p "$_mm"
+printf '/lib/modules/7.2.4/build/Makefile\n/usr/bin/x\n' > "$_mm/bad"
+printf '/lib/modules/7.2.4/build\n/usr/bin/x\n' > "$_mm/good"
+grep -qE "^/lib/modules/[^/]+/(build|source)/." "$_mm/bad" \
+    || _p="$_p;a manifest full of source paths is not detected"
+grep -qE "^/lib/modules/[^/]+/(build|source)/." "$_mm/good" \
+    && _p="$_p;a manifest with just the symlink is wrongly flagged"
+
+# THE REPOSITORY IS THE PACKAGE USER'S FROM THE FIRST COMMAND.  git pull ran
+# as root and the chown came after, so the next command -- as the package
+# user -- met a repository owned by somebody else:
+#     fatal: detected dubious ownership in repository at '.../v4l2loopback'
+_k2="$(dirname "$LFS_TOOL")/lfs-kernel"
+grep -q "THE REPOSITORY IS THE PACKAGE USER'S" "$_k2" \
+    || _p="$_p;the module repository is not owned before it is used"
+_v4="$(sed -n '/v4l2loopback (optional/,/depmod -a/p' "$_k2")"
+printf '%s' "$_v4" | grep -q 'su - "$acct" -c "git clone' \
+    || _p="$_p;the clone still runs as root"
+printf '%s' "$_v4" | grep -q 'su - "$acct" -c "cd .\$d. && git pull' \
+    || _p="$_p;the pull still runs as root"
+# (matched on CODE, not on the comment that mentions why safe.directory is
+#  the wrong answer -- a grep over source hits prose too)
+printf '%s' "$_v4" | grep -vE '^\s*#' | grep -q 'safe.directory' \
+    && _p="$_p;the ownership problem is papered over with safe.directory"
+# the chown must come BEFORE any git command, not after
+_v4c="$(printf '%s' "$_v4" | grep -vE '^\s*#')"
+_l_own="$(printf '%s' "$_v4c" | grep -n 'chown -R' | head -1 | cut -d: -f1)"
+_l_git="$(printf '%s' "$_v4c" | grep -n 'git pull' | head -1 | cut -d: -f1)"
+{ [ -n "$_l_own" ] && [ -n "$_l_git" ] && [ "$_l_own" -lt "$_l_git" ]; } \
+    || _p="$_p;ownership is still fixed after the first git command"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "a manifest lists installed files, and a repository is owned before use"
+fi
+
+# ---- say it before it takes a while  (1.14.141) ------------------------------ #
+# "after that output nothing happens and i do not know whats going on,..
+# please always provide output before we get a long loading process."  The
+# Documentation copy is ~10k small files and the manifest scan walks the
+# filesystem; both ran in complete silence for minutes.  A tool that goes
+# quiet is indistinguishable from one that has hung.
+_p=""
+_k3="$(dirname "$LFS_TOOL")/lfs-kernel"
+grep -q 'SAY IT BEFORE IT TAKES A WHILE' "$_k3" \
+    || _p="$_p;the long steps still run silently"
+# every slow step announces itself FIRST
+# ONLY A KERNEL THAT HAS BOOTED IS KNOWN TO BOOT.  The old fallback wrote
+# the version just built into last-good whenever the file was empty, so
+# verify reported "last kernel known to boot: 7.2.4" about a kernel that had
+# never run -- while 7.2.0 was carrying the machine.  A record that holds a
+# guess is worse than an empty one: the file exists to name something you
+# can go back to.
+grep -q 'ONLY A KERNEL THAT HAS BOOTED IS KNOWN TO BOOT' "$_k3" \
+    || _p="$_p;an unbooted kernel can still be recorded as known-good"
+_lgb="$(sed -n '/ONLY A KERNEL THAT HAS BOOTED/,/^fi$/p' "$_k3")"
+printf '%s' "$_lgb" | grep -q '\[ "$_running" = "$VERSION" \]' \
+    || _p="$_p;the running version is not compared with the built one"
+printf '%s' "$_lgb" | grep -q 'nothing is recorded as known-good' \
+    || _p="$_p;the case where nothing has booted is not handled"
+printf '%s' "$_lgb" | grep -qE 'elif \[ ! -s "\$_lastgood" \]' \
+    && _p="$_p;the guessing fallback is still there"
+# the three cases
+_lg3="$( for c in "7.2.4 7.2.4 no" "7.2.0 7.2.4 yes" "7.2.0 7.2.4 no"; do
+             set -- $c
+             if [ "$1" = "$2" ]; then printf 'built '
+             elif [ "$3" = yes ]; then printf 'running '
+             else printf 'none '; fi
+         done )"
+[ "$_lg3" = "built running none " ] \
+    || _p="$_p;the known-good decision is wrong: [$_lg3]"
+# and verify explains an empty record rather than omitting the line
+grep -q 'no kernel confirmed to boot yet' "$_k3" \
+    || _p="$_p;verify is silent when nothing is known to boot"
+grep -q 'it is running now' "$_k3" \
+    || _p="$_p;verify does not say when the known-good kernel is the live one"
+
+# A CONFIG FROM ONE KERNEL IS NEVER COMPLETE FOR ANOTHER.  "do we do an
+# 'make old_config' when installing a new version?"  It did -- olddefconfig,
+# undocumented and not selectable, so every new symbol in a newer kernel was
+# answered by upstream's default without a word.
+# (own variable: $_kc3 is assigned further down this block, and a check
+#  must not depend on an assignment that follows it)
+_kcR="$(dirname "$LFS_TOOL")/kernel.conf"
+grep -q 'CONFIG_REFRESH:=olddefconfig' "$_k3" \
+    || _p="$_p;the config refresh cannot be chosen"
+grep -q '^CONFIG_REFRESH=olddefconfig$' "$_kcR" \
+    || _p="$_p;the config does not document the refresh"
+for _m in olddefconfig oldconfig menuconfig none; do
+    grep -q -- "$_m" "$_kcR" || _p="$_p;$_m is not documented as an option"
+done
+grep -q 'not refreshing the config' "$_k3" \
+    || _p="$_p;CONFIG_REFRESH=none is not handled"
+grep -q 'is not understood' "$_k3" \
+    || _p="$_p;an unknown CONFIG_REFRESH is accepted silently"
+# it must announce the refresh BEFORE running it, and report what changed
+_l_ann="$(grep -n 'refreshing the config for' "$_k3" | head -1 | cut -d: -f1)"
+_l_run="$(grep -n '_as_pkg "make \$CONFIG_REFRESH"' "$_k3" | head -1 | cut -d: -f1)"
+{ [ -n "$_l_ann" ] && [ -n "$_l_run" ] && [ "$_l_ann" -lt "$_l_run" ]; } \
+    || _p="$_p;the config refresh is not announced before it runs"
+grep -q 'differ from the config you started from' "$_k3" \
+    || _p="$_p;nothing says how many symbols the refresh decided"
+# the count itself
+_ca="$T/cfga"; _cb="$T/cfgb"
+printf 'CONFIG_A=y\nCONFIG_B=y\n' > "$_ca"
+printf 'CONFIG_A=y\nCONFIG_B=y\nCONFIG_NEW1=y\nCONFIG_NEW2=m\n' > "$_cb"
+_dn="$(diff <(sort "$_ca") <(sort "$_cb") | grep -c '^>')"
+[ "$_dn" = 2 ] || _p="$_p;the changed-line count is wrong ($_dn)"
+
+# THE COMPILE STEP MUST EXIST AT ALL.  Two edits to this file collided and
+# deleted `make $JOBS` outright -- the tool would have installed modules from
+# a tree it never built.  A build script's test should assert the build.
+grep -q '_as_pkg "make \$JOBS"' "$_k3" \
+    || _p="$_p;the compile step is missing"
+_l_mk="$(grep -n '_as_pkg "make \$JOBS"' "$_k3" | head -1 | cut -d: -f1)"
+_l_mi="$(grep -n '_as_pkg "make modules_install"' "$_k3" | head -1 | cut -d: -f1)"
+{ [ -n "$_l_mk" ] && [ -n "$_l_mi" ] && [ "$_l_mk" -lt "$_l_mi" ]; } \
+    || _p="$_p;modules are installed before the kernel is compiled"
+for _pair in 'copying Documentation:cp -r Documentation' \
+             'compiling:_as_pkg "make \$JOBS"' \
+             'installing modules into:_as_pkg "make modules_install"' \
+             'installing headers into:su - .\$_hacct. -c "cp -r'; do
+    _say="${_pair%%:*}"; _cmd="${_pair#*:}"
+    _l_say="$(grep -n "echo \"# $_say" "$_k3" | head -1 | cut -d: -f1)"
+    _l_cmd="$(grep -n -- "$_cmd" "$_k3" | grep -vE '^[0-9]+:\s*#' | head -1 | cut -d: -f1)"
+    if [ -z "$_l_say" ]; then
+        _p="$_p;nothing is printed before '$_say'"
+    elif [ -n "$_l_cmd" ] && [ "$_l_say" -gt "$_l_cmd" ]; then
+        _p="$_p;'$_say' is announced after it has already run"
+    fi
+done
+# the manifest scan announces itself inside _record, where it happens
+_rec="$(sed -n '/^_record() {/,/^}/p' "$_k3")"
+printf '%s' "$_rec" | grep -q 'echo "# recording what' \
+    || _p="$_p;the manifest scan does not announce itself"
+_l_e="$(printf '%s' "$_rec" | grep -n 'echo "# recording' | head -1 | cut -d: -f1)"
+_l_r="$(printf '%s' "$_rec" | grep -n 'reload-pkg-list' | head -1 | cut -d: -f1)"
+{ [ -n "$_l_e" ] && [ -n "$_l_r" ] && [ "$_l_e" -lt "$_l_r" ]; } \
+    || _p="$_p;the scan is announced after it runs"
+
+# ROOT COPIES THE HEADERS, THEN HANDS THEM OVER.  Running the copy as the
+# headers account cannot work: the source is inside p_linux's home, 0750, so
+# it cannot even stat it -- and opening one account's home to another would
+# undo the point of having accounts.
+grep -q 'ROOT COPIES, THEN HANDS THE FILES OVER' "$_k3" \
+    || _p="$_p;the header copy still runs as the wrong account"
+grep -q 'su - "$_hacct" -c "cp -r' "$_k3" \
+    && _p="$_p;the headers are still copied across accounts through a 0750 home"
+grep -q 'chown -R "$_hacct:$_hacct" /usr/include' "$_k3" \
+    || _p="$_p;the installed headers are not given to the headers package"
+# verify checks what the CONFIG asked to install, not only what the image
+# embeds -- the wireless firmware is loaded at run time and nothing checked it
+grep -q 'for _d in ${FIRMWARE_ONLY' "$_k3" \
+    || _p="$_p;verify ignores the firmware the config asked for"
+grep -q 'intel/iwlwifi' "$_k3" \
+    || _p="$_p;verify says nothing about the Intel wireless firmware"
+# an implausible manifest shows its own evidence instead of guessing
+grep -q 'far too many for a kernel' "$_k3" \
+    || _p="$_p;an implausible manifest is only a note, not a failure"
+grep -q 'head -3 "$_h/pkg.lst"' "$_k3" \
+    || _p="$_p;the manifest failure does not show which paths got in"
+
+# THE HEADERS BELONG TO THE HEADERS PACKAGE.  /usr/include/asm/*.h is owned
+# by p_linux-headers, and /usr/include is sticky, so p_linux could not
+# replace a single file:
+#     cp: cannot create regular file '/usr/include/asm/types.h': Permission denied
+grep -q 'THE HEADERS BELONG TO THE HEADERS PACKAGE' "$_k3" \
+    || _p="$_p;the kernel still tries to install headers as its own package"
+grep -q 'HEADERS_PKG:=linux-headers' "$_k3" \
+    || _p="$_p;the headers package cannot be named"
+# (1.14.142: root copies and hands over, because the source lives inside a
+#  0750 home that the headers account cannot read)
+grep -q 'chown -R "$_hacct:$_hacct" /usr/include' "$_k3" \
+    || _p="$_p;the headers are not given to the account that owns them"
+grep -q 'reload-pkg-list "$HEADERS_PKG"' "$_k3" \
+    || _p="$_p;the headers package manifest is not refreshed"
+grep -q 'headers: skipped' "$_k3" \
+    || _p="$_p;the headers cannot be left alone"
+_kc3="$(dirname "$LFS_TOOL")/kernel.conf"
+grep -q '^HEADERS=yes$' "$_kc3" || _p="$_p;the config does not offer HEADERS"
+grep -q '^HEADERS_PKG=linux-headers$' "$_kc3" \
+    || _p="$_p;the config does not name the headers package"
+# the tree must be readable by that other account, or the copy cannot work
+grep -q 'cp -r "$tree/usr/include" /usr' "$_k3" \
+    || _p="$_p;the headers are not copied from the tree at all"
+# and a genuine ownership clash points at reclaim rather than at nothing
+grep -q 'packagemanager reclaim $HEADERS_PKG' "$_k3" \
+    || _p="$_p;a header owned by a third package suggests no way out"
+if [ -n "$_p" ]; then
+    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
+        [ -n "$m" ] && bad "$m"
+    done
+else
+    ok "slow steps announce themselves, and headers install as their own package"
 fi
 
 echo

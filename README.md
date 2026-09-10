@@ -25,7 +25,7 @@ Works **offline** from a downloaded copy of the books.
 
 ---
 
-## The four tools
+## The tools
 
 | Tool | Runs | Does |
 |---|---|---|
@@ -33,6 +33,9 @@ Works **offline** from a downloaded copy of the books.
 | `lfs-helper` | inside the chroot | Builds each package as its user (bash, no Python needed) |
 | `packagemanager` | built system | Installs and updates packages |
 | `blfs` | built system | Reads the BLFS book, generates install scripts |
+| `lfs-sysvbook` | host | Grafts SysV init onto a systemd-only LFS book |
+| `lfs-phases` | everywhere | The runner every generated install script sources |
+| `lfs-kernel` | booted system or chroot | Build, install and verify a kernel, its firmware and its headers |
 
 ---
 
@@ -46,9 +49,11 @@ make uninstall
 ```
 
 `/usr` is the default: the chroot invokes these by name, and
-`packagemanager` runs `packagemanager_install` off `$PATH`.
+`packagemanager` runs `lfs-helper pm-install` for installs.
 
-Installs the four tools, `packagemanager_install`, and the completion script.
+Installs the tools, the stack files and `kernel.conf` (never over an edited
+copy — a changed one lands beside yours as `.new`), and the completion
+script.
 
 **Requires:** Python 3.9+, bash, coreutils, tar. Book parsing needs
 `beautifulsoup4` and `requests`.
@@ -57,14 +62,20 @@ Installs the four tools, `packagemanager_install`, and the completion script.
 
 ## Build a system
 
+**Read [BUILD.md](BUILD.md).** It walks the whole thing, host to desktop, and
+says at each step what to configure first. The short form:
+
 ```sh
-lfs build-system session      # partition, mount point, prefix, locale
+lfs build-system session      # the interview: partition, prefixes, locale, login
 lfs run                       # everything up to the chroot, then enter it
-lfs-helper build-all          # inside: build chapters 7-9
+lfs-helper build-all          # inside: chapters 7-9
+packagemanager bootstrap --run   # wget, Python modules, BLFS book, certificates
+packagemanager stack sway --run  # then network, services
+lfs-kernel                    # the kernel, from /etc/pkgusr/kernel.conf
 ```
 
-`lfs run` continues from wherever it stopped. Run it again after a reboot, a
-failure, or a cancel.
+`lfs run` and `build-all` continue from wherever they stopped. Run them again
+after a reboot, a failure, or a cancel.
 
 | Command | Does |
 |---|---|
@@ -76,19 +87,86 @@ failure, or a cancel.
 
 ---
 
-## Use the built system
+## SysV on LFS 13.0+
 
-A fresh system has no download tool, and `lfs` and `blfs` need `requests` and
-`beautifulsoup4` to read the books. Bootstrap both, offline, from what
-`get-sources` already downloaded:
+LFS dropped the SysV edition with 13.0. `lfs-sysvbook` grafts the SysV
+flavour of the last SysV book (12.4) onto a new systemd release and stores
+the result as a normal book:
 
 ```sh
-packagemanager setup            # what it would do
-packagemanager setup --run
+lfs fetch 12.4                # donor: the last SysV book
+lfs fetch 13.0-systemd        # target: the new release
+lfs-sysvbook make             # -> 13.0-sysv (book + wget-list + md5sums)
+lfs-sysvbook check --book 13.0-sysv
+lfs --book 13.0-sysv run
 ```
 
-Each module is installed as its own package user. Run it again after fixing a
-failure; it skips what is already there.
+Everything builds at 13.0 versions. The transplanted SysV pieces (udev from
+systemd, sysvinit, sysklogd, bootscripts, chapter 9) stay pinned at the
+donor's versions — those instructions are known to work. Section numbers on
+transplanted pages keep the donor's numbering; the build order is by document
+position and is correct.
+
+For a newer release later: `lfs-sysvbook make --target 13.1-systemd`.
+`check` fails loudly if a future book layout breaks a rule.
+
+---
+
+## Install scripts
+
+A generated script is the package's variables and its commands, nothing else:
+
+```sh
+name_version="binutils-2.45"
+pkg_glob="binutils-2.45.tar.*"
+pkgusr_stage="cross"
+
+build_pkg() {
+mkdir -v build
+cd       build
+../configure --prefix=$LFS/tools ...
+make
+}
+install_pkg() {
+make install
+}
+test_pkg() {
+make check
+}
+
+. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"
+```
+
+The last line hands over to `lfs-phases`: it finds or fetches the tarball,
+unpacks it, runs each phase as its own process under `set -e`, resumes in the
+build directory, and takes `all | unpack | build | test | install | configure
+| update` as `$1`. Edit the functions; the rest is shared.
+
+Tests run only with `PKGUSR_TESTS=1` and never stop the install. The runner is
+found on `PATH` or through `PKGUSR_LIB`.
+
+Scripts written by 1.13 and earlier carry their own runner and keep working;
+`--regenerate` produces the new shape.
+
+---
+
+## Use the built system
+
+A freshly booted system has no download tool, no Python modules to read a book
+with, no BLFS book and no certificates. `bootstrap` shows all five stages and
+does the two that need no network:
+
+```sh
+packagemanager bootstrap        # where you are
+packagemanager bootstrap --run  # wget and the Python modules, offline
+```
+
+Stages 1 and 2 come from what `get-sources` already downloaded, so they need no
+network. Each module is installed as its own package user. The rest — the BLFS
+book, `make-ca`, the certificate bundle — needs a working download, which is
+what stages 1 and 2 buy you, so `--run` does those too. A stage whose
+dependency failed is skipped, not attempted. Run it again after fixing
+anything; it does only what is left.
 
 ```sh
 packagemanager install <pkg> --recursive --run
@@ -206,6 +284,29 @@ let any package user delete another package's home.
 
 ---
 
+## The kernel
+
+`lfs-kernel` treats the kernel as a package: its sources live in
+`/usr/src/pkgusr/p_linux/src`, its files are recorded in that account's
+manifest, and `packagemanager remove linux` takes it away. Firmware is its
+own package (`p_linux-firmware`) and the headers update the package that owns
+`/usr/include`.
+
+```sh
+lfs-kernel list          # what kernel.org offers
+lfs-kernel               # build the version in /etc/pkgusr/kernel.conf
+lfs-kernel 6.12.40       # that version, once
+lfs-kernel verify        # is everything installed?
+```
+
+Everything it does is configured in `/etc/pkgusr/kernel.conf`, which is
+installed rather than generated so it can be edited first. `ESP` and
+`KERNEL_NAME` together decide whether a build replaces the working kernel or
+lands beside it as something to try; the tree of the last kernel known to
+boot is never deleted.
+
+---
+
 ## Checking your version
 
 The tools print a fingerprint of their own contents:
@@ -229,21 +330,22 @@ bash test_lfs_crosschain.sh ./lfs
 Each test encodes a bug that actually happened, with a comment explaining
 what broke.
 
-Run it from a directory holding all five scripts — about 100 tests skip
-without them.
+Run it from a directory holding all the tools — about 100 tests skip
+without them. It no longer fits one sandbox slot; on a real machine run it
+whole, or one block at a time (each starts `# ---- <title>`).
 
 ---
 
 ## Caveats
 
-- **The kernel and the bootloader are yours.** Nothing here configures, builds
-  or installs a kernel, and nothing is written to any ESP, boot sector or
-  partition table. The machine keeps booting exactly as it does now. The build
-  ends by saying so and printing what to run.
-- A rEFInd entry can be added beside your existing bootloader if you ask for it
-  (`lfs config bootloader refind`). It only ever adds to a mounted ESP.
-- `lfs-helper` and `packagemanager_install` duplicate some logic. Unifying them
-  is worthwhile but not done.
+- **The kernel and the bootloader are separate, deliberate steps.**
+  `build-all` builds neither; it ends by saying so. `lfs-kernel` builds the
+  kernel from a config you edit first. Nothing is ever written to an ESP,
+  boot sector or partition table unless you ask (`lfs config bootloader
+  refind` adds an entry beside your existing one, on a mounted ESP).
+- Built for SysV init. BLFS pages from the systemd book are used with a
+  shim that turns `systemctl` calls into visible skips; `services.stack`
+  installs the SysV boot scripts instead.
 - Tested on x86_64 only.
 
 ---

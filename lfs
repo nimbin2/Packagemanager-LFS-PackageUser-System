@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.11.6"
+LFS_VERSION = "1.14.146"
 
 
 def _build_id():
@@ -241,6 +241,39 @@ LAYOUT_DEFAULTS = {
     "cfguser_home":        "/usr/src/cfg",
     "appuser_home":        "/usr/src",
 }
+
+
+def _accounts_root(kind):
+    """Where the homes of one kind of account actually live.
+
+    The config has TWO keys that both claim to answer this: `pkgusr_home`,
+    whose default is /usr/src/pkgusr, and `pkgusr_subdir`, "folder under the
+    base for package homes (pkgusr)".  Read one way the base already includes
+    the folder; read the other it does not -- and pkgusr_home's own help text
+    says "(/usr/src)", which invites the second reading.  A config written
+    that way exported LFS_PKGUSR_ROOT=/usr/src, so every account's home became
+    /usr/src/p_<name>, `add_package_user` made it there, and every tool that
+    computes /usr/src/pkgusr/p_<name> disagreed with the passwd file -- for
+    the whole life of that tree.
+
+    Accept both readings: append the subdir when the base does not already
+    end in it.
+    """
+    # (packagemanager already composes it this way -- see PKGUSR_SUBDIR
+    #  there -- which is exactly why the two disagreed: one appended the
+    #  subdir and the other exported the bare base.)
+    base = layout("pkgusr_home" if kind == "pkgusr" else "cfguser_home",
+                  target=True).rstrip("/")
+    _c = {}
+    try:
+        _c = read_config() or {}
+    except Exception:
+        _c = {}
+    sub = str(_c.get("pkgusr_subdir" if kind == "pkgusr" else "cfguser_subdir")
+              or ("pkgusr" if kind == "pkgusr" else "cfg")).strip("/")
+    if not sub or os.path.basename(base) == sub:
+        return base
+    return base + "/" + sub
 
 
 def layout(key, target=False):
@@ -490,15 +523,32 @@ def resolve_book_arg(val):
 # --------------------------------------------------------------------------- #
 # book loading + section walking
 # --------------------------------------------------------------------------- #
+_SOUP_CACHE = {}
+
+
 def load_soup(path):
+    """Parse a book, once per path per process.
+
+    Without the cache `_find_lfs_package` re-parsed the whole book for EVERY
+    name it was asked about -- `lfs update` with 77 packages parsed a 10 MB
+    HTML file 77 times, which is minutes of work and long enough for a caller
+    with a timeout to give up on it."""
+    key = os.path.abspath(path)
+    if key in _SOUP_CACHE:
+        return _SOUP_CACHE[key]
     with open(path, "rb") as f:
         html = f.read()
+    soup = None
     for parser in ("lxml", "html.parser"):
         try:
-            return BeautifulSoup(html, parser)
+            soup = BeautifulSoup(html, parser)
+            break
         except Exception:
             continue
-    return BeautifulSoup(html, "html.parser")
+    if soup is None:
+        soup = BeautifulSoup(html, "html.parser")
+    _SOUP_CACHE[key] = soup
+    return soup
 
 
 def _is_admonition(tag):
@@ -678,18 +728,34 @@ def _tar_compressor():
     return "--gzip", ".tar.gz"
 
 
+def _build_is_finished(lfs):
+    """Has the build run to the end of its own step order?
+
+    The same question lfs-sanity.sh asks, answered the same way: every step in
+    progress/steporder is in progress/steps-built.  Nothing else in the tree
+    distinguishes "chapter 6, and something went wrong" from "finished", and
+    several checks mean opposite things on either side of that line.
+    """
+    prog = pkgusr_state(lfs, "progress")
+    try:
+        order = [l for l in open(os.path.join(prog, "steporder")) if l.strip()]
+        built = [l for l in open(os.path.join(prog, "steps-built")) if l.strip()]
+    except OSError:
+        return False
+    return bool(order) and len(built) >= len(order)
+
+
 def _toolchain_state(lfs):
     """What state is the toolchain in, judged from the tree alone?
 
     Checkable from the host, without entering the chroot: the C++ headers must
-    exist under the target the tree was built for, and a NATIVE gcc directory
-    must not be present -- chapter 6 only ever installs under $LFS_TGT, so a
-    native one means a chapter-8 gcc was installed on top.
+    exist under the target the tree was built for.
 
     Returns a short phrase for the snapshot metadata.
     """
     import glob as _glob
     tgt = lfs_tgt()
+    finished = _build_is_finished(lfs)
     inc = _glob.glob(os.path.join(lfs, "usr", "include", "c++", "*"))
     if not inc:
         return "chapter 6 unfinished (no C++ headers)"
@@ -698,12 +764,31 @@ def _toolchain_state(lfs):
             if os.path.isfile(os.path.join(d, "bits", "c++config.h"))]
     native = _glob.glob(os.path.join(lfs, "usr", "lib", "gcc",
                                      "*-pc-linux-gnu"))
+    # A NATIVE GCC MEANS OPPOSITE THINGS ON EITHER SIDE OF THE BUILD.
+    #
+    # Chapter 6 installs only under $LFS_TGT, so during the build a native gcc
+    # on top of the cross one is the toolchain being clobbered.  Chapter 8
+    # REPLACES the cross toolchain with exactly that native gcc -- it is the
+    # finished state, the thing the build is for.  Reporting one rule for both
+    # told someone snapshotting a complete, working system:
+    #     toolchain: BROKEN: a native gcc (x86_64-pc-linux-gnu) is installed
+    #     ! this snapshot is of a tree whose toolchain is already broken.
+    # about a tree with nothing wrong with it.  Same species as the sticky-bit
+    # check in lfs-sanity.sh, which had to learn the same distinction.
     if native and tgt not in [os.path.basename(n) for n in native]:
-        return ("BROKEN: a native gcc (%s) is installed over the cross one"
+        if finished:
+            return ("ok (native %s -- chapter 8 replaced the cross toolchain)"
+                    % os.path.basename(native[0]))
+        return ("BROKEN: a native gcc (%s) is installed over the cross one, "
+                "and the build has not finished"
                 % os.path.basename(native[0]))
     if not have:
         return "chapter 6 unfinished (no c++config.h)"
     if tgt not in have:
+        # Finished, and the headers moved to the native triplet: chapter 8
+        # again, not damage.
+        if finished and native:
+            return "ok (C++ headers under %s -- finished system)" % ", ".join(have)
         return "BROKEN: headers are under %s, but LFS_TGT is %s" % (
             ", ".join(have), tgt)
     return "ok (C++ headers under %s)" % tgt
@@ -833,8 +918,8 @@ def cmd_snapshot(args):
         mounted = [d for d in ("dev", "proc", "sys", "run")
                    if _is_mounted(os.path.join(lfs, d))]
         if mounted:
-            sys.stderr.write(
-                "\n! these are still mounted in the tree: %s\n"
+            fail(
+                "\n! these are still mounted in the tree: %s"
                 "  Restoring now could write through them onto this system.\n"
                 "  Unmount first:\n"
                 "      %slfs build-system chroot unmount --run\n"
@@ -1034,8 +1119,6 @@ def cmd_set_default(args):
     cfg["default"] = ver
     save_config(cfg)
     print(f"book for installing packages set to {ver}")
-    print("  (the book the SYSTEM is built from is 'build_book':")
-    print("   lfs build-system set-default <version>)")
 
 
 def cmd_fetch(args):
@@ -1069,8 +1152,6 @@ def cmd_import(args):
         cfg["default"] = ver
         save_config(cfg)
         print(f"book for installing packages set to {ver}")
-    print("  (the book the SYSTEM is built from is 'build_book':")
-    print("   lfs build-system set-default <version>)")
 
 
 def cmd_sources(args):
@@ -1200,7 +1281,30 @@ def _lfs_env_prefix(lfs):
         f'CONFIG_SITE="$LFS/usr/share/config.site"\n'
         f'export CONFIG_SITE\n'
         f'export MAKEFLAGS="{mkf}"\n'
+        + (f'export PKGUSR_LIB="{lib}"\n' if (lib := _host_phases_lib()) else "")
     )
+
+
+def _host_phases_lib():
+    """The phase runner, where the lfs user can read it.  The checkout may sit
+    in /root, so the copy goes into the shared store, refreshed from the one
+    beside this tool whenever they differ."""
+    src = _find_helper_source("lfs-phases")
+    if not src:
+        return None
+    try:
+        import shutil
+        dest = os.path.join(_ensure_store(), "lfs-phases")
+        import hashlib
+        def _sum(f):
+            with open(f, "rb") as fh:
+                return hashlib.md5(fh.read()).hexdigest()
+        if not os.path.isfile(dest) or _sum(src) != _sum(dest):
+            shutil.copy(src, dest)
+        _make_world_readable(dest)
+        return dest
+    except OSError:
+        return src
 
 
 def run_as_lfs(script, lfs=None):
@@ -1290,8 +1394,8 @@ def _refuse_host_tree(lfs):
     if not _is_host_path(lfs):
         return lfs
     real = os.path.realpath(lfs)
-    sys.stderr.write(
-        "\n!! REFUSING: %s is part of the running system.\n"
+    fail(
+        "\n!! REFUSING: %s is part of the running system."
         "   Every path this tool writes is $LFS/something, so this would\n"
         "   build into, and `restart` would delete, the machine you are\n"
         "   sitting on.\n"
@@ -1305,10 +1409,7 @@ def require_lfs_for_root():
     back to the saved session config and exports it so child shells inherit it."""
     d = _lfs_dir()
     if not d:
-        sys.stderr.write(
-            "! no LFS mount set (neither $LFS nor a saved session).\n"
-            "  Configure it once:  lfs build-system session\n"
-            "  or for this shell:   export LFS=/mnt/lfs\n")
+        fail('! no LFS mount set (neither $LFS nor a saved session).\n  Configure it once:  lfs build-system session\n  or for this shell:   export LFS=/mnt/lfs')
         sys.exit(2)
     _refuse_host_tree(d)
     os.environ["LFS"] = d
@@ -1395,12 +1496,11 @@ _SESSION_KEYS = [
                          "no"),
     # Off by default and deliberately so: stripping REWRITES each binary, and
     # in this system a file's owner is the record of which package installed
-    # it, so stripping has to run as that owner or the record drifts.
+    # it -- which is why `lfs-helper strip` runs each file as its owner.
     ("strip",            "strip debug symbols at the end?  Saves several GB, "
                          "but rewrites every binary -- slower, and harder to "
-                         "debug a crash afterwards.  NOT YET IMPLEMENTED: the "
-                         "answer is stored and the build says so at the end "
-                         "rather than acting on it (yes/no)",
+                         "debug a crash afterwards.  Runs as `lfs-helper "
+                         "strip --run` when the build finishes (yes/no)",
                          "no"),
     # The account you will actually log in as.  The `init-accounts` step reads
     # this; without it, a freshly booted system has only root, with no password.
@@ -1439,8 +1539,8 @@ def _prompt_session_config(cfg, force=False):
         # the fix is to work out which config key to edit.
         if k == "lfs_mount" and val:
             while _is_host_path(val):
-                sys.stderr.write(
-                    "    !! %s is part of the running system -- refusing.\n"
+                fail(
+                    "    !! %s is part of the running system -- refusing."
                     "       The LFS mount point is an empty directory the LFS\n"
                     "       partition mounts on, e.g. /mnt/lfs.\n" % val)
                 val = input(f"  {desc} [{cur}]: ").strip() or cur
@@ -1496,15 +1596,13 @@ def _emit_or_run(args, name, script, needs_lfs=False):
     print(script)
     if not args.run:
         if needs_lfs and not _lfs_dir():
-            sys.stderr.write("\n! no LFS mount set. Configure it: "
-                             "lfs build-system session\n")
+            fail('\n! no LFS mount set. Configure it: lfs build-system session')
         dry_run_note("execute")
         return
     if needs_lfs:
         require_mounted_lfs()
     if os.geteuid() != 0:
-        sys.stderr.write("\n! not root -- these steps write under $LFS / add "
-                         "users and will likely fail.\n")
+        fail('\n! not root -- these steps write under $LFS / add users and will likely fail.')
     rc = _run_bash(script)
     if rc != 0:
         sys.stderr.write(f"\n{name}: exited {rc}\n")
@@ -1752,9 +1850,40 @@ def cmd_bs_session(args):
     if active and not args.reconfigure:
         print(f"Active session: {mount} is already mounted.")
     else:
-        print("Session config:")
+        # SAY WHICH FILE, AND WHOSE PREFIXES.
+        #
+        # The user set pkgusr_prefix empty on their HOST and then saw
+        #     pkgusr_prefix = (unset)
+        # in the session that builds the new system -- the host's setting
+        # about to name the accounts of a different machine.  1.13.51 stopped
+        # the host's prefixes reaching the chroot's environment; this is the
+        # same leak one step earlier, in the session config itself.
+        #
+        # A tree that already has a config decides its own prefixes.  And the
+        # file being used is named, because "which config is this?" was the
+        # question that could not be answered.
+        print("Session config:  (%s)" % config_path())
+        _tree = cfg.get("lfs_mount") or "/mnt/lfs"
         for k, desc, _ in _SESSION_KEYS:
-            print(f"  {k:<16} = {cfg.get(k, '') or '(unset)'}")
+            _v = cfg.get(k, "")
+            _note = ""
+            if k in ("pkgusr_prefix", "cfguser_prefix", "collector_prefix"):
+                _tv = _tree_prefix(_tree, k, None)
+                if _tv is not None and _tv != (_v or "").rstrip("_"):
+                    _v, _note = _tv, "   <- from the tree's own config"
+            # AN EMPTY PREFIX IS A DECISION, NOT A GAP.
+            #
+            # "pkgusr_prefix = (unset)" read as "nothing chosen yet" when it
+            # was in fact an empty value -- and an empty prefix means every
+            # account in the BUILT system is named plainly (mesa, not
+            # p_mesa).  The display could not tell the two apart, which is
+            # the same ambiguity that cost 1.13.26 and 1.13.69.
+            if not _v and k.endswith("_prefix"):
+                _shown = ("(none -- accounts will be named without a prefix)"
+                          if k in cfg else "(unset -- will ask)")
+            else:
+                _shown = _v or "(unset)"
+            print(f"  {k:<16} = {_shown}{_note}")
         have_all = all(cfg.get(k) for k, _, d in _SESSION_KEYS
                        if d != "" or k == "lfs_device")
         if sys.stdin.isatty():
@@ -1791,8 +1920,7 @@ def cmd_bs_session(args):
 
     require_lfs_for_root()
     if os.geteuid() != 0:
-        sys.stderr.write("! session --run must be run as root (it mounts "
-                         "partitions and chowns the build tree).\n")
+        fail('! session --run must be run as root (it mounts partitions and chowns the build tree).')
         sys.exit(2)
     import subprocess
     subprocess.run(["mkdir", "-pv", mount], cwd="/")
@@ -1948,11 +2076,7 @@ def cmd_bs_get_sources(args):
         # Verified both ways -- rc was 0 either way.  Check the status itself.
         rc = _run_bash(f'cd "{srcdir}" && md5sum -c md5sums --quiet')
         if rc != 0:
-            sys.stderr.write(
-                "\n! some downloads do not match their md5sum.\n"
-                "  The lines above name them.  A mirror returning an error\n"
-                "  page with status 200 looks exactly like this.\n"
-                "  Delete those files and run get-sources again.\n")
+            fail('\n! some downloads do not match their md5sum.\n  The lines above name them.  A mirror returning an error\n  page with status 200 looks exactly like this.\n  Delete those files and run get-sources again.')
             sys.exit(1)
         print("all md5sums OK")
     if fail:
@@ -2041,6 +2165,14 @@ def _pkg_glob_for(pkgver, tarpfx):
     pats = [f"{st}.{e}" for st in stems for e in exts]
     # last resort: allow a suffix (tcl8.6.16-src.tar.gz, foo-1.2-source.tar.gz)
     pats += [f"{st}*.{e}" for st in stems for e in ("tar.*", "tgz")]
+    # very last: an INFIX between name and version -- SQLite-3510200 ships as
+    # sqlite-autoconf-3510200.tar.gz, a new package in 13.0 that broke unpack.
+    # The unpack loop's doc filter keeps this from grabbing sqlite-doc-* or
+    # systemd-man-pages-*.  (from the SysV-book session)
+    m = re.match(r"(.+?)-([0-9][\w.]*)$", pkgver or "")
+    if m:
+        pats += [f"{m.group(1).lower()}-*{m.group(2)}.{e}"
+                 for e in ("tar.*", "tgz")]
     return " ".join(pats)
 
 
@@ -2194,7 +2326,7 @@ def crosschain_script_path(ver, name):
     return os.path.join(crosschain_dir(ver), f"{name}.sh")
 
 
-CROSSCHAIN_SCRIPT_VERSION = 17  # v17: test scaffolding stays with the tests
+CROSSCHAIN_SCRIPT_VERSION = 18  # v18: the runner moved out into lfs-phases
 
 _INSTALL_BLOCK_RE = re.compile(r'\b(make|ninja)\b[^\n]*\binstall\b')
 
@@ -2366,286 +2498,72 @@ def _indent(text, tab="\t"):
                      for ln in text.splitlines())
 
 
+def _fn_body(cmds, empty=": # (nothing to do in this phase)"):
+    """A command block as a function body.  NOT indented: the books are full
+    of heredocs (cat > file << "EOF" ... EOF), and an indented terminator is
+    no terminator.  The commands read exactly as the book prints them."""
+    if not cmds or not cmds.strip():
+        return empty
+    body = cmds.strip("\n")
+    # a body of comments alone is a syntax error to bash; give it a command
+    if not any(ln.strip() and not ln.lstrip().startswith("#")
+               for ln in body.split("\n")):
+        body += "\n:"
+    return body
+
+
 def _crosschain_script_body(name, sid, pkgver, glob, cmds):
+    """A generated install script: the package's variables at the top, its
+    commands in one function per phase, and one line at the end that hands
+    over to the shared runner (lfs-phases).  Everything that is the same for
+    every package -- finding the tarball, unpacking, running each phase as its
+    own process under set -e, resuming in the build subdir, the dispatcher --
+    lives in the runner, not in every script."""
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     build_cmds, install_cmds, config_cmds, test_cmds = \
         _split_crosschain_phases(cmds)
+    book = "LFS %s" % (load_config().get("default") or "?")
     L = []
     w = L.append
     w("#!/bin/bash")
     w("############################################")
     w(f"### {name}  ({pkgver})")
+    # The SHARED stamp: both generators write this line, so a tool can ask
+    # what a script is instead of guessing from its dialect.  `origin` says
+    # whose format counter the number belongs to.
     w(f"{CROSSCHAIN_MARK} v{CROSSCHAIN_SCRIPT_VERSION}: {name}")
-    w("### phased build script -- run a single phase with its name as $1:")
-    w("###   all (default) | unpack | build | install | configure | test")
-    w("### re-run just 'install' after fixing a failure, without recompiling.")
-    w("###")
+    w(f"### book      : {book}")
+    w(f"### generated : {ts}")
+    w(f"### script format v{CROSSCHAIN_SCRIPT_VERSION} origin=lfs")
+    w("### phases: all (default) | unpack | build | test | install | configure")
     w("### This is YOUR editable script -- lfs reuses it as-is on every --run.")
-    w(f"### To pull a fresh copy from the book (discarding edits):")
-    w(f"###   lfs build-system crosschain {name} --regenerate\n")
-    w(f'section="{sid}"')
+    w(f"### Fresh copy from the book (discarding edits): "
+      f"lfs build-system crosschain {name} --regenerate")
+    w("")
     w(f'name_version="{pkgver}"')
     w(f'pkg_glob="{glob}"')
+    w(f'section="{sid}"')
+    w('pkgusr_stage="cross"')
     w("")
-    w("# safety net: these are normally embedded by 'lfs build-system crosschain")
-    w("# --run' itself, but if you run this script directly (e.g. from inside your")
-    w("# own 'su - lfs' session) it still notices and fixes an unset LFS_TGT/PATH,")
-    w("# and refuses rather than silently building against the wrong toolchain.")
-    w('if [ -z "$LFS" ]; then')
-    w('\techo "!! \\$LFS is not set -- refusing to guess. '
-      'export LFS=/mnt/lfs (see book 2.6) and re-run." >&2')
-    w('\texit 2')
-    w("fi")
-    w('if [ -z "$LFS_TGT" ]; then')
-    w('\tLFS_TGT=$(uname -m)-lfs-linux-gnu')
-    w('\texport LFS_TGT')
-    w('\techo "note: \\$LFS_TGT was unset -- defaulting to $LFS_TGT (book 4.4)" >&2')
-    w("fi")
-    w('case ":$PATH:" in')
-    w('\t*":$LFS/tools/bin:"*) ;;')
-    w('\t*) PATH="$LFS/tools/bin:$PATH"; export PATH')
-    w('\t   echo "note: added $LFS/tools/bin to \\$PATH (book 4.4)" >&2 ;;')
-    w("esac")
-    w('if [ -z "$MAKEFLAGS" ]; then')
-    w('\texport MAKEFLAGS="-j$(nproc)"')
-    w('\techo "note: \\$MAKEFLAGS was unset -- defaulting to $MAKEFLAGS "'
-      '"(book 4.4, use all cores)" >&2')
-    w("fi")
-
-    w('\n# exported: the phase bodies below run as separate `bash -s` processes,')
-    w('# so anything they reference must be in the ENVIRONMENT, not just a shell')
-    w('# variable of this script.')
-    w('export LFS')
-    w('# Two directories, two jobs.')
-    w('#   SOURCES_DIR  the downloaded tarballs and patches.  Written once by')
-    w('#                get-sources, read-only to every build, root:root 1777.')
-    w('#   BUILD_ROOT   scratch: unpacked trees, build markers, anything a')
-    w('#                book command drops beside the source.  Deleted whole.')
-    w('# They used to be one directory, which is why a rebuild had to pick')
-    w('# stale markers and foreign ownership out of the tarball store.')
-    w('SOURCES_DIR="${SOURCES_DIR:-$LFS/sources}"')
-    w('BUILD_ROOT="${BUILD_ROOT:-$LFS/build}"')
-    w('export SOURCES_DIR BUILD_ROOT')
-    w('pkg_dir=""')
-    w("")
-    w("# Make BUILD_ROOT look like the sources directory to anything that")
-    w("# walks up out of an unpacked tree.  The book writes commands like")
-    w("#     tar -xf ../tcl8.6.16-html.tar.gz --strip-components=1")
-    w("# from INSIDE the unpacked directory, so '..' has to hold the")
-    w("# downloaded files or the command fails.")
-    w("#")
-    w("# Link EVERY downloaded file rather than the ones some package is known")
-    w("# to reach for.  A list of those would be a second thing to keep in")
-    w("# sync with the book, and it would be wrong the first time a new")
-    w("# release adds a package that does the same trick.  Linking the lot")
-    w("# means any '../<anything-we-downloaded>' resolves, for any package,")
-    w("# in any future book -- and it costs a few hundred symlinks.")
-    w("_link_sources() {")
-    w('\t[ -d "$SOURCES_DIR" ] || return 0')
-    w('\tmkdir -p "$BUILD_ROOT" || return 1')
-    w('\tlocal f b')
-    w('\t# a link whose target went away (re-downloaded, renamed) would make')
-    w('\t# the glob in unpack_pkg match a file that cannot be read')
-    w('\tfor b in "$BUILD_ROOT"/*; do')
-    w('\t\t[ -L "$b" ] || continue')
-    w('\t\t[ -e "$b" ] || rm -f "$b"')
-    w('\tdone')
-    w('\tfor f in "$SOURCES_DIR"/*; do')
-    w('\t\t[ -f "$f" ] || continue')
-    w('\t\tb="$BUILD_ROOT/${f##*/}"')
-    w('\t\t# never shadow real content: an unpacked tree wins over a link')
-    w('\t\tif [ -e "$b" ] && [ ! -L "$b" ]; then continue; fi')
-    w('\t\tln -sfn "$f" "$b" 2>/dev/null || true')
-    w('\tdone')
-    w("}\n")
-    w("# Run a phase body as its OWN process, from a FILE -- never piped in on")
-    w("# stdin.  A book command that reads stdin (Expect's PTY check does:")
-    w("#   python3 -c 'from pty import spawn; spawn([\"echo\", \"ok\"])' )")
-    w("# would otherwise swallow the rest of the script and silently skip the")
-    w("# real build.  stdin is /dev/null so nothing can consume it or hang.")
-    w("_phase_body() {")
-    w('\tlocal _f; _f="$(mktemp)" || return 1')
-    w('\tcat > "$_f"')
-    w('\tbash "$_f" </dev/null')
-    w('\tlocal _r=$?')
-    w('\trm -f "$_f"')
-    w('\treturn $_r')
-    w("}\n")
-    w("_enter_build() {")
-    w('\tcd "$BUILD_ROOT" || return 1')
-    w(f'\t[ -z "$pkg_dir" ] && pkg_dir="$(cat .cc-dir-{name} 2>/dev/null)"')
-    w('\tif [ -n "$pkg_dir" ] && [ -d "$pkg_dir" ]; then cd "$pkg_dir" || return 1')
-    w('\telse echo "no unpacked source in $BUILD_ROOT -- run: $0 unpack" >&2; return 1; fi')
-    w("}\n")
-
-    w("# resume in the SAME subdir build_pkg finished in (e.g. pkg_dir/build),")
-    w("# not just pkg_dir -- the book's own post-build commands (install,")
-    w("# post-install fixups) assume they're still there, same as reading the")
-    w("# book top-to-bottom would put you.")
-    w("_resume_build_dir() {")
-    w(f'\tif [ -f "$BUILD_ROOT/.cc-build-{name}" ] && '
-      f'[ -d "$(cat "$BUILD_ROOT/.cc-build-{name}")" ]; then')
-    w(f'\t\tcd "$(cat "$BUILD_ROOT/.cc-build-{name}")"')
-    w('\t\treturn 0')
-    w('\tfi')
-    w('\t# No marker: build_pkg records the build directory as its LAST step, so')
-    w('\t# a build that died part-way (a failed test suite, an interrupted')
-    w('\t# compile) never wrote one.  Fall back to the usual out-of-tree layout')
-    w('\t# -- without this, `make install` runs in the source root and glibc')
-    w('\t# stops with "objdir must be defined by the build-directory Makefile".')
-    w('\tlocal _d')
-    w('\tfor _d in build builddir _build obj; do')
-    w('\t\tif [ -d "$_d" ] && { [ -f "$_d/Makefile" ] || [ -f "$_d/build.ninja" ] '
-      '|| [ -f "$_d/config.status" ]; }; then')
-    w('\t\t\techo "# resuming in ./$_d (no build marker was recorded)" >&2')
-    w('\t\t\tcd "$_d"; return 0')
-    w('\t\tfi')
-    w('\tdone')
-    w('\treturn 0')
-    w("}\n")
-
-    w("unpack_pkg() {")
-    w("#### UNPACK ####")
-    w('\t_link_sources')
-    w('\tcd "$BUILD_ROOT" || return 1')
-    w('\t# Pick the source tarball.  Two traps here:')
-    w('\t#  * do NOT use `ls $pkg_glob` -- patterns that match nothing make ls')
-    w('\t#    fail and swallow the one that did match;')
-    w('\t#  * several packages ship docs beside the source (tcl8.6.16-html.tar.gz')
-    w('\t#    sorts BEFORE tcl8.6.16-src.tar.gz), so prefer an explicit -src')
-    w('\t#    archive and never pick a documentation one.')
-    w('\tpkg=""')
-    w('\tfor _c in $pkg_glob; do')
-    w('\t\t[ -e "$_c" ] || continue')
-    w('\t\tcase "$_c" in *-src.*|*-source.*) pkg="$_c"; break ;; esac')
-    w('\tdone')
-    w('\tif [ -z "$pkg" ]; then')
-    w('\t\tfor _c in $pkg_glob; do')
-    w('\t\t\t[ -e "$_c" ] || continue')
-    w('\t\t\tcase "$_c" in')
-    w('\t\t\t\t*-html.*|*-doc.*|*-docs.*|*-man.*|*-manual.*|*-tests.*) continue ;;')
-    w('\t\t\tesac')
-    w('\t\t\tpkg="$_c"; break')
-    w('\t\tdone')
-    w('\tfi')
-    w('\t[ -n "$pkg" ] || { echo "no $pkg_glob in $SOURCES_DIR -- run: '
-      'lfs build-system get-sources --run" >&2; return 1; }')
-    w('\tdir=$(tar tf "$pkg" | head -n1 | cut -d/ -f1)')
-    w('\t# --no-same-owner: as root, tar would restore the UIDs recorded IN the')
-    w('\t# archive, littering /sources with owners like 8282 or 15399 that do')
-    w('\t# not exist here.  The unpacking user should own what it unpacks.')
-    w('\trm -rf "$dir"; tar --no-same-owner -xf "$pkg"')
-    w('\tpkg_dir="$dir"')
-    w(f'\techo "$pkg_dir" > "$BUILD_ROOT/.cc-dir-{name}"')
-    w('\techo "unpacked into $BUILD_ROOT/$pkg_dir"')
-    w("#### UNPACK DONE ####")
-    w("}\n")
-
-    w("# Each phase body runs as a SEPARATE 'bash -s' process.  This matters:")
-    w("# bash disables 'set -e' inside any function reached from a tested")
-    w("# context (an && chain, an || handler), and that suppression is even")
-    w("# inherited by nested subshells -- so a failing 'make' would be silently")
-    w("# ignored and the step would wrongly report success.  A separate process")
-    w("# has its own -e state that nothing upstream can suppress, so failures")
-    w("# always propagate.")
     w("build_pkg() {")
-    w("#### BUILD ####")
-    w("\t_enter_build")
-    w("\t_phase_body <<'__LFS_PHASE__'")
-    w("set -e")
-    # record the build directory as soon as the commands have cd'd into it, so
-    # a later failure still leaves install/configure able to find it
-    w("_mark_build_dir() { pwd > \"$BUILD_ROOT/.cc-build-%s\"; }" % name)
-    w("trap _mark_build_dir EXIT")
-    w(build_cmds if build_cmds.strip() else ': # (nothing to build)')
-    w(f'pwd > "$BUILD_ROOT/.cc-build-{name}"')
-    w("__LFS_PHASE__")
-    w("\t_rc=$?; [ $_rc -eq 0 ] || return $_rc")
-    w("#### BUILD DONE ####")
-    w("}\n")
-
+    w(_fn_body(build_cmds, ": # (nothing to build)"))
+    w("}")
+    w("")
     w("install_pkg() {")
-    w("#### INSTALL ####")
-    w("\t_enter_build")
-    w("\t_resume_build_dir")
-    w("\t_phase_body <<'__LFS_PHASE__'")
-    w("set -e")
-    w(install_cmds if install_cmds.strip()
-      else ': # (this step installs during the build phase)')
-    w("__LFS_PHASE__")
-    w("\t_rc=$?; [ $_rc -eq 0 ] || return $_rc")
-    w("#### INSTALL DONE ####")
-    w("}\n")
-
+    w(_fn_body(install_cmds, ": # (this step installs during the build phase)"))
+    w("}")
     if config_cmds.strip():
+        w("")
         w("configure_pkg() {")
-        w("#### CONFIGURE ####")
-        w("\t_enter_build")
-        w("\t_resume_build_dir")
-        w("\t_phase_body <<'__LFS_PHASE__'")
-        w("set -e")
-        w(config_cmds)
-        w("__LFS_PHASE__")
-        w("\t_rc=$?; [ $_rc -eq 0 ] || return $_rc")
-        w("#### CONFIGURE DONE ####")
-        w("}\n")
-    else:
-        w("configure_pkg() { : ; }\n")
-
+        w(_fn_body(config_cmds))
+        w("}")
+    w("")
     w("test_pkg() {")
-    if test_cmds.strip():
-        w("#### TEST ####")
-        w("\t_enter_build")
-        w("\t_resume_build_dir")
-        w("\t# The book expects some tests to fail, so this reports the result")
-        w("\t# instead of aborting -- read the summary and judge for yourself.")
-        w("\t_phase_body <<'__LFS_PHASE__'")
-        w(test_cmds)
-        w("__LFS_PHASE__")
-        w('\t_rc=$?')
-        w('\tif [ $_rc -ne 0 ]; then')
-        w('\t\techo "!! test suite exited $_rc -- check the summary above." >&2')
-        w('\t\techo "   Some failures are normal (the book lists the usual"' 
-          ' >&2')
-        w('\t\techo "   suspects); this does NOT stop the install." >&2')
-        w('\tfi')
-        w('\treturn 0')
-        w("#### TEST DONE ####")
-    else:
-        w('\t: # the book defines no test suite for this step')
-        w('\techo "no test suite for this step"')
-    w("}\n")
-
-    w('_phase_fail() { echo "!! phase \'$1\' FAILED (exit $2)" >&2; exit "$2"; }')
-    w('case "${LFS_CC_PHASE:-${1:-all}}" in')
-    w("\tall)        unpack_pkg    || _phase_fail unpack $?")
-    w("\t            build_pkg     || _phase_fail build $?")
-    w('\t            [ "${LFS_RUN_TESTS:-0}" = "1" ] && test_pkg')
-    w("\t            install_pkg   || _phase_fail install $?")
-    w("\t            configure_pkg || _phase_fail configure $? ;;")
-    w("\tunpack)     unpack_pkg    || _phase_fail unpack $? ;;")
-    w("\tbuild)      build_pkg     || _phase_fail build $? ;;")
-    w("\tinstall)    install_pkg   || _phase_fail install $? ;;")
-    w("\tconfigure)  configure_pkg || _phase_fail configure $? ;;")
-    w("\ttest)       test_pkg      || _phase_fail test $? ;;")
-    w('\t*) echo -e "usage: $0 {all|unpack|build|install|configure|test}\\n'
-      '  all        full run (default)\\n'
-      '  unpack     fetch tarball from $LFS/sources + extract\\n'
-      '  build      configure + compile (needs unpack)\\n'
-      '  install    install step only -- re-run after fixing a failure\\n'
-      '  configure  post-install fixups (symlinks, sanity checks)\\n'
-      '  test       run this step\'s tests (edit test_pkg first)" ;;')
-    w("esac")
-
-    header_tag = f"{CROSSCHAIN_MARK} v{CROSSCHAIN_SCRIPT_VERSION}: {name}"
-    body = "\n".join(L) + "\n"
-    # Stamp which book this came from: the scripts outlive the book version,
-    # and "where did this come from?" is otherwise unanswerable.
-    book = "LFS %s" % (load_config().get("default") or "?")
-    body = body.replace(header_tag,
-                        f"{header_tag}\n### book      : {book}"
-                        f"\n### generated : {ts}", 1)
-    return body
+    w(_fn_body(test_cmds, ": # the book defines no test suite for this step"))
+    w("}")
+    w("")
+    w('. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"')
+    return "\n".join(L) + "\n"
 
 
 def ensure_crosschain_script(args, ver, name, sid, tarpfx, force_regen=False,
@@ -2766,8 +2684,7 @@ def _require_lfs_writable_by_lfs(lfs):
     try:
         want = _pwd.getpwnam("lfs").pw_uid
     except KeyError:
-        sys.stderr.write("! the 'lfs' user doesn't exist yet.\n"
-                         "  Run: lfs build-system add-user --run\n")
+        fail("! the 'lfs' user doesn't exist yet.\n  Run: lfs build-system add-user --run")
         sys.exit(2)
     # After book 7.2 the whole tree is handed to root on purpose, and chapters
     # 5-6 are finished -- don't demand it be given back to lfs.
@@ -2846,19 +2763,14 @@ def cmd_bs_fix_ownership(args):
         dry_run_note("apply")
         return
     if os.geteuid() != 0:
-        sys.stderr.write("! must be run as root.\n")
+        fail('! must be run as root.')
         sys.exit(2)
     # The third copy of this chown, and the third guard.  `fix-ownership` is a
     # chapter 5-6 repair: it hands the tree to the build user so packages can
     # install as `lfs`.  After chapter 7 the packages ARE the users, and doing
     # it would strip all of them in one pass.
     if not _handover_is_safe(lfs):
-        sys.stderr.write(
-            "! not doing that: package users own files here, so this tree is\n"
-            "  past chapter 7.  chown -R lfs would strip every package's\n"
-            "  ownership, and only the manifests could rebuild it.\n"
-            "  To repair ownership on a built tree, inside the chroot:\n"
-            "      lfs-helper verify --fix\n")
+        fail("! not doing that: package users own files here, so this tree is\n  past chapter 7.  chown -R lfs would strip every package's\n  ownership, and only the manifests could rebuild it.\n  To repair ownership on a built tree, inside the chroot:\n      lfs-helper verify --fix")
         sys.exit(2)
     for p in targets:
         _run_bash(f'chown -R lfs "{p}"')
@@ -2997,7 +2909,7 @@ def require_complete_config():
     missing = [(k, why, how) for k, why, how in REQUIRED_CONFIG if not cfg.get(k)]
     if not missing:
         return
-    sys.stderr.write("! the build session is not fully configured:\n")
+    fail('! the build session is not fully configured:')
     for k, why, how in missing:
         sys.stderr.write(f"    {k:<18} -- {why}\n"
                          f"    {'':<18}    set it with:  {sudo_prefix()}{how}\n")
@@ -3102,7 +3014,101 @@ def strip_binaries():
     return v in ("1", "on", "true", "yes")
 
 
+# The keys worth asking about, with what they mean.  Anything else can still
+# be set with `lfs config --target <key> <value>`.
+_TARGET_KEYS = (
+    ("pkgusr_prefix",
+     "prefix for package users in the new system (p -> p_mesa; empty -> mesa)"),
+    ("cfguser_prefix", "prefix for its config users (cfg -> cfg_bootscripts)"),
+    ("collector_prefix", "prefix for its shared install-dir groups"),
+    ("pkgusr_subdir", "folder under the base for package homes (pkgusr)"),
+    ("cfguser_subdir", "folder under the base for config-user homes (cfg)"),
+    ("pkgusr_home", "where package homes live (/usr/src/pkgusr); the "
+                    "subdir is appended if you give just the base"),
+)
+
+
+def _target_config_path():
+    return os.path.join(store_dir(), "target-config.json")
+
+
+def cmd_config_target(args):
+    """Show or change the config the BUILT system will get.
+
+    Laid out like `packagemanager config --show`: value, then where it comes
+    from.  The user asked for the config commands to look and behave the same
+    across the tools, and this is the first of them to follow that shape.
+    """
+    path = _target_config_path()
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+    except (OSError, ValueError):
+        cfg = {}
+    # INTERACTIVE, LIKE THE OTHERS.
+    #
+    # `packagemanager config` asks for what is missing and `packagemanager env
+    # --ask` walks the build variables; this took only a key and a value -- so
+    # the config a person most needs to set deliberately, the NEW SYSTEM'S,
+    # was the one with no guided way to set it.
+    if getattr(args, "ask", False):
+        print()
+        print("# === Config the BUILT system will get ===")
+        print("  file: %s" % path)
+        print("  Enter keeps the current value; '-' clears it (means 'none').")
+        print()
+        for key, what in _TARGET_KEYS:
+            cur = cfg.get(key)
+            shown = ("(none)" if cur == "" else
+                     cur if cur is not None else "this host's value")
+            try:
+                ans = input("  %s\n    %-16s [%s]: " % (what, key, shown)).strip()
+            except EOFError:
+                print()
+                break
+            if ans == "":
+                continue
+            cfg[key] = "" if ans == "-" else ans
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print()
+        print("  saved %s" % path)
+        print("  it reaches the build system on the next `lfs run`.")
+        return
+    if args.key and args.value is not None:
+        cfg[args.key] = args.value
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(cfg, f, indent=2, sort_keys=True)
+            f.write("\n")
+        print("  %s = %r  ->  %s" % (args.key, args.value, path))
+        print("  it reaches the build system on the next `lfs run`.")
+        return
+    print()
+    print("# === Config the BUILT system will get ===")
+    print("  file: %s%s" % (path, "" if os.path.isfile(path)
+                            else "   (not created yet)"))
+    print()
+    if not cfg:
+        print("  nothing set -- the build system will use this host's values")
+        print("  for the shared keys (prefixes, layout, books).")
+        print()
+        print("  set one with, for example:")
+        print("    lfs config --target pkgusr_prefix p")
+        print("    lfs config --target pkgusr_subdir packages")
+        return
+    for k in sorted(cfg):
+        print("  %-22s = %r" % (k, cfg[k]))
+    print()
+    print("  these override this host's values when the tree is built;")
+    print("  a config the tree already has wins over both.")
+
+
 def cmd_config(args):
+    if getattr(args, "target", False):
+        return cmd_config_target(args)
     """Show or change every setting, and show where things live on disk."""
     cfg = load_config()
 
@@ -3558,16 +3564,16 @@ def write_chroot_env(lfs, quiet=False):
                 f'# this prefix when it reads them.\n'
                 f'export LFS_HOST_MOUNT="{lfs}"\n'
                 f'# prefix for collector groups -- see `lfs config`\n'
-                f'export LFS_COLLECTOR_PREFIX="{collector_prefix()}"\n'
+                f'export LFS_COLLECTOR_PREFIX="{_tree_prefix(lfs, "collector_prefix", collector_prefix())}"\n'
                 f'# prefix for package users.  lfs-helper has always READ this;\n'
                 f'# nothing wrote it, so the default applied by accident.\n'
-                f'export LFS_PKGUSR_PREFIX="{pkgusr_prefix()}"\n'
+                f'export LFS_PKGUSR_PREFIX="{_tree_prefix(lfs, "pkgusr_prefix", pkgusr_prefix())}"\n'
                 f'# prefix for config-step users.  Its own, NOT the package\n'
                 f'# prefix stacked on top -- one account, one prefix.\n'
-                f'export LFS_CFGUSR_PREFIX="{cfguser_prefix()}"\n'
+                f'export LFS_CFGUSR_PREFIX="{_tree_prefix(lfs, "cfguser_prefix", cfguser_prefix())}"\n'
                 f'# where accounts live, by kind -- see LAYOUT_DEFAULTS\n'
-                f'export LFS_PKGUSR_ROOT="{layout("pkgusr_home", target=True)}"\n'
-                f'export LFS_CFGUSR_ROOT="{layout("cfguser_home", target=True)}"\n'
+                f'export LFS_PKGUSR_ROOT="{_accounts_root("pkgusr")}"\n'
+                f'export LFS_CFGUSR_ROOT="{_accounts_root("cfg")}"\n'
                 f'# languages to keep -- see `lfs-helper prune-locales`\n'
                 f'export LFS_LOCALES="{cfg.get("locales") or "en de"}"\n'
                 f'# answers collected by `lfs build-system session`, so the\n'
@@ -3606,8 +3612,31 @@ def _find_helper_source(name="lfs-helper"):
 # They cannot be USED until the last build step provides Python and the two
 # book-parsing modules.  That is fine: they are there, and `packagemanager
 # setup` completes them.
-TOOLCHAIN_SCRIPTS = ("lfs-helper", "packagemanager", "packagemanager_install",
-                     "blfs", "lfs")
+# packagemanager_install is retired (1.12.0): folded into `lfs-helper
+# pm-install`.  Four tools is the endpoint item 6 named.
+# Every tool `make install` places, so a new one is refreshed into the chroot
+# without anyone remembering this list.  lfs-kernel was added to the Makefile
+# and not here, so `lfs run` quietly refreshed five of six tools -- and the
+# sixth was the one just written.  The Makefile's TOOLS line is the source of
+# truth; the literal tuple below is the fallback for a tree with no Makefile
+# beside the tools.
+def _toolchain_scripts():
+    here = os.path.dirname(os.path.abspath(__file__))
+    mk = os.path.join(here, "Makefile")
+    try:
+        with open(mk) as fh:
+            for line in fh:
+                if re.match(r"^TOOLS\s*:?=", line):
+                    names = line.split("=", 1)[1].split()
+                    if names:
+                        return tuple(names)
+    except OSError:
+        pass
+    return ("lfs-helper", "packagemanager", "blfs", "lfs", "lfs-phases",
+            "lfs-kernel", "lfs-sysvbook")
+
+
+TOOLCHAIN_SCRIPTS = _toolchain_scripts()
 
 # The package user that owns them.
 #
@@ -3646,6 +3675,20 @@ def install_helper(lfs, quiet=False):
         if name == "lfs-helper":
             helper_dest = dest
 
+    # Sweep retired tools OUT of the tree.  packagemanager_install was folded
+    # into `lfs-helper pm-install` (1.12.0); a stale copy left on the chroot's
+    # PATH is exactly the "old code running after the fix" this sync exists to
+    # prevent.
+    for retired in ("packagemanager_install",):
+        r = os.path.join(dest_dir, retired)
+        if os.path.lexists(r):
+            try:
+                os.unlink(r)
+                if not quiet:
+                    print("# removed retired %s from the tree" % retired)
+            except OSError as e:
+                fail("! could not remove retired %s: %s" % (retired, e))
+
     # Give them an owner.  The account may not exist yet -- chapter 7 creates
     # /etc/passwd -- so this is best-effort now and repeated on the next run,
     # by which time it will exist.  Failing to chown is not worth stopping a
@@ -3657,10 +3700,10 @@ def install_helper(lfs, quiet=False):
             print("# installed %s -> %s (on PATH in the chroot)"
                   % (", ".join(copied), dest_dir))
         for name in missing:
-            sys.stderr.write("! %s not found next to this tool -- the chroot "
-                             "won't have it.\n" % name)
+            fail("! %s not found next to this tool -- the chroot "
+                             "won't have it." % name)
     if helper_dest is None and not quiet:
-        sys.stderr.write("! lfs-helper is missing: the chroot cannot build.\n")
+        fail('! lfs-helper is missing: the chroot cannot build.')
     return helper_dest
 
 
@@ -3682,7 +3725,7 @@ def _chown_tools(lfs, dest_dir, names, quiet=False):
             os.chown(p, uid, uid)
             n += 1
         except OSError as e:
-            sys.stderr.write("! could not give %s to %s: %s\n" % (p, user, e))
+            fail("! could not give %s to %s: %s" % (p, user, e))
     if n and not quiet:
         print("# gave %d tool(s) to '%s'" % (n, user))
 
@@ -3707,23 +3750,11 @@ def _uid_in_tree(lfs, user):
 
 
 def _chrootify(text):
-    """Turn a cross-compile script into an IN-CHROOT one.  Inside the chroot the
-    final system is simply '/', so $LFS must not be required (the cross-build
-    guard would refuse to run), sources live at /sources, and there's no
-    cross-compiler prefix to put on PATH."""
-    text = text.replace('SOURCES_DIR="${SOURCES_DIR:-$LFS/sources}"',
-                        'SOURCES_DIR="${SOURCES_DIR:-/sources}"')
-    text = text.replace('BUILD_ROOT="${BUILD_ROOT:-$LFS/build}"',
-                        'BUILD_ROOT="${BUILD_ROOT:-/build}"')
-    text = text.replace('export LFS\n', 'export LFS="${LFS:-/}"\n')
-    # drop the "refusing to guess without $LFS" guard: correct outside, wrong here
-    text = re.sub(r'if \[ -z "\$LFS" \]; then\n.*?\nfi\n', '', text, count=1,
-                  flags=re.S)
-    # $LFS/tools/bin doesn't exist inside the chroot -- the real toolchain is on
-    # the normal PATH
-    text = re.sub(r'case ":\$PATH:" in\n.*?\nesac\n', '', text, count=1,
-                  flags=re.S)
-    return text
+    """Turn a cross-compile script into an IN-CHROOT one.  Inside the chroot
+    the final system is simply '/', so $LFS is not required, sources live at
+    /sources and there is no cross-compiler prefix to put on PATH.  The runner
+    (lfs-phases) decides all of that from one variable."""
+    return text.replace('pkgusr_stage="cross"', 'pkgusr_stage="chroot"', 1)
 
 
 def _plain_root_script(name, sid, title, cmds):
@@ -3764,6 +3795,7 @@ def _plain_root_script(name, sid, title, cmds):
 ############################################
 ### {name}  --  {title}
 {CROSSCHAIN_MARK} v{CROSSCHAIN_SCRIPT_VERSION}: {name}
+### script format v{CROSSCHAIN_SCRIPT_VERSION} origin=lfs
 ### section   : {sid}
 ### book      : {book}
 ### generated : {ts}
@@ -4072,8 +4104,8 @@ def _install_collector_groups(lfs):
             return
     src = os.path.expanduser(src)
     if not os.path.isfile(src):
-        sys.stderr.write("! collector_import_file is set but %s does not "
-                         "exist\n" % src)
+        fail("! collector_import_file is set but %s does not "
+                         "exist" % src)
         return
     import shutil
     # groups/, where lfs-helper looks for it.  These two paths are the whole
@@ -4121,8 +4153,8 @@ def _gen_blfs_extra(outdir, order, unresolved):
         return 0
     blfs = _find_blfs()
     if not blfs:
-        sys.stderr.write("! extra_packages is set (%s) but the 'blfs' tool is "
-                         "not next to this one -- skipping\n" % " ".join(extras))
+        fail("! extra_packages is set (%s) but the 'blfs' tool is "
+                         "not next to this one -- skipping" % " ".join(extras))
         return 0
     import subprocess
     written = 0
@@ -4144,7 +4176,7 @@ def _gen_blfs_extra(outdir, order, unresolved):
                                capture_output=True, text=True,
                                timeout=600, cwd=tmp)
         except (OSError, subprocess.SubprocessError) as e:
-            sys.stderr.write("! blfs script %s: %s\n" % (pkg, e))
+            fail("! blfs script %s: %s" % (pkg, e))
             continue
         made = [f for f in os.listdir(tmp) if f.startswith("install_")]
         if r.returncode != 0 or not made:
@@ -4153,7 +4185,7 @@ def _gen_blfs_extra(outdir, order, unresolved):
                 if line.strip():
                     detail = ": " + line.strip()
                     break
-            sys.stderr.write("! blfs has no script for '%s'%s\n" % (pkg, detail))
+            fail("! blfs has no script for '%s'%s" % (pkg, detail))
             continue
         with open(os.path.join(tmp, made[0])) as f:
             raw = f.read()
@@ -4191,17 +4223,33 @@ def bootstrap_sources():
     """
     import subprocess
     try:
-        out = subprocess.run(["packagemanager", "setup", "--sources"],
+        # `bootstrap` since 1.11.7; `setup` is still accepted as an alias, so
+        # this keeps working against an older packagemanager on the tree.
+        out = subprocess.run(["packagemanager", "bootstrap", "--sources"],
                              capture_output=True, text=True, timeout=180)
+        if out.returncode != 0 and not (out.stdout or "").strip():
+            out = subprocess.run(["packagemanager", "setup", "--sources"],
+                                 capture_output=True, text=True, timeout=180)
     except (OSError, subprocess.SubprocessError):
-        warn("! could not run `packagemanager setup --sources`.")
+        warn("! could not run `packagemanager bootstrap --sources`.")
         warn("  The built system will have no way to fetch anything until you")
         warn("  put a download tool on it by hand.")
         return []
     urls = [l.strip() for l in (out.stdout or "").splitlines()
             if l.strip().startswith(("http://", "https://", "ftp://"))]
     if not urls:
-        warn("! `packagemanager setup --sources` listed nothing.")
+        if not _blfs_book_on_host():
+            # No package named here, deliberately: which packages the built
+            # system needs is packagemanager's list, and a copy of it in this
+            # file is the thing a test forbids.  What lfs knows is that the
+            # answer comes from a book, and that there is no book.
+            warn("! No BLFS book on this machine, so nothing can say where")
+            warn("  those sources are -- and the built system cannot fetch the")
+            warn("  book until it has a download tool, which is itself looked")
+            warn("  up in the book.  Break the circle here:")
+            warn("      blfs fetch")
+            warn("  then run get-sources again.")
+        warn("! `packagemanager bootstrap --sources` listed nothing.")
         for line in (out.stderr or "").splitlines():
             warn("    %s" % line)
     return urls
@@ -4278,6 +4326,84 @@ def _run_choose_book():
     return True
 
 
+def _blfs_book_on_host():
+    """Is a BLFS book cached where install-tools will find it?
+
+    Its own store, not lfs's -- /usr/share/blfs/books.  This is the same list
+    install-tools copies into the tree, so asking here answers exactly the
+    question the built system will have.
+
+    When $BLFS_STORE is set it is the ONLY place looked: an override that
+    half-applies is this project's oldest bug shape -- an empty overridden
+    store fell through to /usr/share/blfs and reported the system's books as
+    the override's.
+    """
+    if os.environ.get("BLFS_STORE"):
+        cands = (os.environ["BLFS_STORE"],)
+    else:
+        cands = ("/usr/share/blfs", os.path.expanduser("~/.cache/blfs"))
+    for cand in cands:
+        d = os.path.join(cand, "books")
+        try:
+            if any(f.endswith((".html", ".html.gz")) for f in os.listdir(d)):
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _run_choose_blfs_book():
+    """Offer to fetch the BLFS book, HERE, where there is still a network.
+
+    The chicken and egg this closes: on the built system `packagemanager
+    bootstrap` installs wget by looking it up in the BLFS book -- and without
+    a book there is nothing to look wget up in, while fetching the book needs
+    the wget that cannot be installed:
+
+        wget: there is no BLFS book on this system to look it up in.
+        Could not install: wget
+
+    The host has a network and the copy machinery already exists; all that was
+    missing was asking, at a moment when the answer can still be acted on.
+
+    Declining is recorded, so the checklist does not ask again on every resume.
+    """
+    print("\nThe built system needs the BLFS book to install anything beyond")
+    print("LFS itself -- including wget, which is how it would otherwise")
+    print("fetch the book.  This machine has a network; that one will not")
+    print("until wget exists.")
+    print("\nFetching it now copies it into the tree with the tools.")
+    try:
+        ans = input("\nFetch the BLFS book now? [Y/n] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False
+    if ans in ("n", "no", "skip"):
+        cfg = load_config()
+        cfg["blfs_book"] = "skip"
+        save_config(cfg)
+        print("\nSkipped.  Get it later with `blfs fetch` on this machine, or")
+        print("inside the chroot once it has a download tool:")
+        print("      blfs import /path/to/BLFS-BOOK-...-nochunks.html")
+        return True
+
+    blfs = _find_blfs()
+    if not blfs:
+        fail('! blfs is not on this machine, so it cannot fetch.\n  Install the tools first:  make install')
+        return False
+    rc = subprocess.call(blfs + ["fetch"])
+    if rc != 0:
+        fail('\n! `blfs fetch` failed.  It needs a working network here.\n  Fetch it by hand, or skip and import it later:\n      blfs books --discover\n      blfs fetch <version>')
+        return False
+    if not _blfs_book_on_host():
+        fail('! blfs fetch reported success but cached nothing.')
+        return False
+    cfg = load_config()
+    cfg["blfs_book"] = "fetched"
+    save_config(cfg)
+    return True
+
+
 def _run_banner(step, steps, cmd=None):
     """One consistent header before every step, so it is always clear what is
     happening now, how far along it is, and what comes next.  Long steps print
@@ -4306,12 +4432,67 @@ def _run_banner(step, steps, cmd=None):
     print("+" + "-" * (W - 2) + "+")
 
 
+_STACK_VERSION_RE = re.compile(r"^#\s*stack-version:\s*(\S+)", re.M)
+
+
+def _stack_version(path):
+    """The version a stack file declares, if it declares one."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            m = _STACK_VERSION_RE.search(f.read(2000))
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def _version_tuple(v):
+    out = []
+    for part in str(v).split("."):
+        digits = "".join(c for c in part if c.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+def _tree_prefix(lfs, key, fallback):
+    """The BUILT SYSTEM'S own prefix, not this host's.
+
+    The chroot scripts export LFS_*_PREFIX, and the values were read from the
+    HOST -- so a prefix the user changed on their own machine was baked into
+    the build system's environment, where it overrode the tree's config.
+    That is how an empty LFS_PKGUSR_PREFIX reached a chroot whose config says
+    "p".
+
+    The tree's config decides for the tree.  The host's value is only a
+    fallback for a tree that has not been configured yet.
+    """
+    for cand in ("usr/share/lfs/config.json", "root/.local/share/lfs/config.json"):
+        path = os.path.join(lfs, cand)
+        try:
+            with open(path) as f:
+                v = json.load(f).get(key)
+            if v is not None:
+                return str(v).rstrip("_")
+        except (OSError, ValueError):
+            continue
+    return fallback
+
+
 def _refresh_chroot_tools(lfs, quiet=False):
-    """Copy the tools into the tree if what is in there is out of date.
+    """Copy the TOOLS into the tree if what is in there is out of date.
 
     Compares content, so an unchanged tool is not touched and there is no
-    output in the common case."""
-    import hashlib
+    output in the common case.
+
+    All five, not just lfs-helper.  Refreshing only the bash driver left the
+    python tools inside the chroot older than the host's, and every
+    packagemanager run opened with "These tools differ from the copies on the
+    host" plus advice to sync -- from a tool that had just been given the
+    chance to sync and had refreshed one file.
+
+    Nothing here touches the tree's config or its books: `lfs set-default`
+    inside the chroot is the system's own decision, and entering must not
+    quietly undo it."""
+    import hashlib, shutil
 
     def _md5(p):
         try:
@@ -4320,16 +4501,195 @@ def _refresh_chroot_tools(lfs, quiet=False):
         except OSError:
             return None
 
-    src = _find_helper_source()
-    if not src:
-        return
-    dst = os.path.join(lfs, "usr", "bin", "lfs-helper")
-    if _md5(src) == _md5(dst):
-        return
-    install_helper(lfs, quiet=True)
-    if not quiet:
-        print("# lfs-helper in the chroot was out of date -- updated to %s "
-              "(build %s)" % (LFS_VERSION, _build_id()))
+    here = os.path.dirname(os.path.abspath(__file__))
+    updated, failed, pairs = [], [], []
+    # Sweep retired tools out of the tree first -- a stale
+    # packagemanager_install on the chroot's PATH is old code waiting to run.
+    for retired in ("packagemanager_install",):
+        r = os.path.join(lfs, "usr", "bin", retired)
+        if os.path.lexists(r):
+            try:
+                os.unlink(r)
+                updated.append(retired + " (removed, retired)")
+            except OSError as e:
+                failed.append("%s (%s)" % (retired, e))
+    # THE STACKS TRAVEL WITH THE TOOLS.
+    #
+    # This refreshed the four binaries and nothing else, so a chroot kept the
+    # sway.stack it was first given -- the user updated the tools four times
+    # and kept reading a 39-entry file while the source had 47, wondering why
+    # the package count never changed.  machine.conf is the exception: it is
+    # the user's own choice of build options, so it is only placed when it
+    # does not exist yet.
+    refreshed_stacks = []
+    # WHERE THE STACKS ACTUALLY ARE.
+    #
+    # This looked only beside the running tool -- and the running tool is
+    # /usr/bin/lfs, so it looked in /usr/bin/stacks and found nothing, in
+    # silence.  The host had 31 book entries and the chroot kept 23.  A
+    # checkout keeps them beside the tool; an installed system keeps them in
+    # /etc/pkgusr/stacks.  Look in both, nearest first.
+    _stack_src = ""
+    for _cand in (os.path.join(here, "stacks"), "/etc/pkgusr/stacks"):
+        if os.path.isdir(_cand) and os.path.abspath(_cand) != os.path.abspath(
+                os.path.join(lfs, "etc", "pkgusr", "stacks")):
+            _stack_src = _cand
+            break
+    if not _stack_src and not quiet:
+        print("# no stack files found to refresh (looked beside the tool and"
+              " in /etc/pkgusr/stacks)")
+    if _stack_src and os.path.isdir(_stack_src):
+        # kernel.conf lives beside the stacks, not in them, and lfs-kernel
+        # refuses to run without it -- so refreshing the tool and not the
+        # config would put a working command in the chroot that cannot start.
+        # An edited copy in the chroot is kept, as everywhere else.
+        # ...found either beside the tool (a checkout) or in /etc/pkgusr
+        # (an installed system), the same two places as the stacks.
+        for _cf in ("kernel.conf",):
+            _cs = ""
+            for _c2 in (os.path.join(here, _cf),
+                        os.path.join("/etc/pkgusr", _cf)):
+                if os.path.isfile(_c2) and os.path.abspath(_c2) != os.path.abspath(
+                        os.path.join(lfs, "etc", "pkgusr", _cf)):
+                    _cs = _c2
+                    break
+            if not _cs:
+                continue
+            _cd = os.path.join(lfs, "etc", "pkgusr", _cf)
+            try:
+                os.makedirs(os.path.dirname(_cd), exist_ok=True)
+                if not os.path.exists(_cd):
+                    shutil.copy2(_cs, _cd)
+                    refreshed_stacks.append(_cf)
+                elif _md5(_cs) != _md5(_cd):
+                    shutil.copy2(_cs, _cd + ".new")
+                    refreshed_stacks.append(_cf + ".new (yours kept)")
+            except OSError as e:
+                fail("! could not refresh %s: %s" % (_cf, e))
+
+        _stack_dst = os.path.join(lfs, "etc", "pkgusr", "stacks")
+        try:
+            os.makedirs(_stack_dst, exist_ok=True)
+            for fn in sorted(os.listdir(_stack_src)):
+                # NOT EVERYTHING IN THAT DIRECTORY IS A STACK.
+                #
+                # .shipped/ is make install's record of what it last shipped
+                # (1.14.98), and .new/.bak are the merge leftovers.  The
+                # refresh copied all of them into the chroot -- ".shipped/
+                # desktop-user.sh" and a services.stack.new that had nothing
+                # to do with the chroot's own file.  Bookkeeping does not
+                # travel.
+                if fn.startswith(".") or fn.endswith((".new", ".bak")):
+                    continue
+                src_f = os.path.join(_stack_src, fn)
+                dst_f = os.path.join(_stack_dst, fn)
+                # A STACK ENTRY MAY HAVE A DIRECTORY.
+                #
+                # stacks/mytools/install_mytools is the package-user script
+                # the mytools step runs, and this loop took files only -- so
+                # the directory never crossed into the chroot and the step
+                # died with "missing .../mytools/install_mytools".  The
+                # Makefile had the same fault (1.14.102) and was fixed there;
+                # this is the second copy of the same walk.
+                if os.path.isdir(src_f):
+                    try:
+                        os.makedirs(dst_f, exist_ok=True)
+                        for sub in sorted(os.listdir(src_f)):
+                            s_sub, d_sub = os.path.join(src_f, sub), os.path.join(dst_f, sub)
+                            if not os.path.isfile(s_sub):
+                                continue
+                            if os.path.exists(d_sub) and _md5(s_sub) == _md5(d_sub):
+                                continue
+                            shutil.copy2(s_sub, d_sub)
+                            os.chmod(d_sub, 0o755)
+                            refreshed_stacks.append("%s/%s" % (fn, sub))
+                    except OSError as e:
+                        fail("! could not refresh %s: %s" % (fn, e))
+                    continue
+                if not os.path.isfile(src_f):
+                    continue
+                if fn == "machine.conf" and os.path.exists(dst_f):
+                    continue            # the machine's own options: never overwritten
+                if os.path.exists(dst_f) and _md5(src_f) == _md5(dst_f):
+                    continue            # already current
+                # NEVER GO BACKWARDS.  A stack file edited in the chroot, or
+                # one from a newer release, must not be replaced by an older
+                # copy from the host -- the tools are versioned, so ask.
+                _sv, _dv = _stack_version(src_f), _stack_version(dst_f)
+                if _sv and _dv and _version_tuple(_dv) > _version_tuple(_sv):
+                    if not quiet:
+                        print("# kept the newer %s already in the chroot (%s > %s)"
+                              % (fn, _dv, _sv))
+                    continue
+                # AND A STACK FILE THAT DIFFERS IS THE CHROOT'S OWN.
+                #
+                # Stack files carry no version, so the guard above never
+                # fires for them: the host's copy simply won.  The user had
+                # just taken the 6-entry services.stack inside the chroot
+                # with --take-new, and this loop put the host's 3-entry file
+                # back over it.  Same rule as `make install`: an existing
+                # file that differs is theirs, and the incoming one waits
+                # beside it.
+                if fn.endswith(".stack") and os.path.exists(dst_f):
+                    shutil.copy2(src_f, dst_f + ".new")
+                    if not quiet:
+                        print("# %s differs in the chroot -- kept it, new one"
+                              " is %s.new" % (fn, fn))
+                    continue
+                shutil.copy2(src_f, dst_f)
+                if fn.endswith(".sh"):
+                    os.chmod(dst_f, 0o755)
+                refreshed_stacks.append(fn)
+            if refreshed_stacks and not quiet:
+                print("# refreshed in the chroot: %s" % ", ".join(refreshed_stacks))
+        except OSError as e:
+            fail("! could not refresh the stacks: %s" % e)
+
+    for tool in TOOLCHAIN_SCRIPTS:
+        src = _find_helper_source() if tool == "lfs-helper" \
+            else os.path.join(here, tool)
+        if not src or not os.path.isfile(src):
+            continue
+        pairs.append((tool, src))
+        dst = os.path.join(lfs, "usr", "bin", tool)
+        if _md5(src) == _md5(dst):
+            continue
+        try:
+            shutil.copy(src, dst)
+            os.chmod(dst, 0o755)
+        except OSError as e:
+            failed.append("%s (%s)" % (tool, e))
+            continue
+        # Verify, rather than assume.  A copy that does not stick -- a
+        # read-only mount, a busy binary, the wrong destination -- would
+        # otherwise show up only as this same message on every entry, which
+        # is exactly what it did.
+        if _md5(src) != _md5(dst):
+            failed.append("%s (copied, but the file did not change)" % tool)
+            continue
+        updated.append(tool)
+    # the completion travels with them; stale completion is worse than none
+    if updated:
+        try:
+            _install_completion(lfs, verbose=False)
+        except Exception:
+            pass
+    # The stamps are what `packagemanager` compares against to decide whether
+    # the chroot is behind.  Refreshing the binaries and leaving the stamps
+    # alone made it announce "these tools differ from the copies on the host"
+    # about tools it had just been given, and tell the user to sync -- on the
+    # path that had synced them.
+    if pairs and (updated or failed):
+        try:
+            _write_tool_stamps(lfs, pairs)
+        except OSError:
+            pass
+    if failed and not quiet:
+        fail("! could not refresh in the chroot: %s" % ", ".join(failed))
+    if updated and not quiet:
+        print("# refreshed in the chroot: %s  (now %s, build %s)"
+              % (", ".join(updated), LFS_VERSION, _build_id()))
+    return updated
 
 
 def cmd_bs_run(args):
@@ -4345,6 +4705,31 @@ def cmd_bs_run(args):
     this execs `chroot enter` and you are inside."""
     if inside_chroot():
         _refuse_inside_chroot("build-system", "run")
+
+    # A FRESH run (mounted tree, nothing laid out yet) states the book and the
+    # whole saved config ONCE before touching anything.  Reusing last month's
+    # settings -- or last month's default book -- should be a decision made
+    # here, not a surprise discovered nine steps in.  (SysV-book session)
+    cfg = load_config()
+    ver = build_version()
+    lfs_dir = _lfs_dir()
+    mounted = bool(lfs_dir) and (not cfg.get("lfs_device")
+                                 or _is_mounted(lfs_dir))
+    if (ver and mounted and sys.stdin.isatty()
+            and not os.path.isdir(os.path.join(lfs_dir, "tools"))):
+        print(f"\nFresh build -- nothing is laid out under {lfs_dir} yet.")
+        print(f"\n  book             = {ver}")
+        for k, _desc, _d in _SESSION_KEYS:
+            print(f"  {k:<16} = {cfg.get(k, '') or '(unset)'}")
+        ans = input("\nBuild with this? [Y/n/e(dit)]: ").strip().lower()
+        if ans in ("n", "no"):
+            print("stopped, nothing touched.")
+            print("  another book:    lfs set-default <version>   "
+                  "(lfs books shows them)")
+            print("  other settings:  lfs build-system session --reconfigure")
+            sys.exit(0)
+        if ans in ("e", "edit"):
+            _prompt_session_config(cfg, force=True)
 
     def enter_chroot():
         lfs = require_mounted_lfs()
@@ -4382,9 +4767,9 @@ def cmd_bs_run(args):
             enter_chroot()
 
         if title == last_title:
-            sys.stderr.write("\n! '%s' ran but is still pending -- stopping "
+            fail("\n! '%s' ran but is still pending -- stopping "
                              "rather than looping.\n  Run it by hand to see "
-                             "why:\n      %s\n"
+                             "why:\n      %s"
                              % (title, nxt["cmds"][0] if nxt["cmds"] else "?"))
             sys.exit(1)
         last_title = title
@@ -4400,6 +4785,12 @@ def cmd_bs_run(args):
         if title == "choose and fetch a book":
             _run_banner(nxt, steps)
             if not _run_choose_book():
+                sys.exit(1)
+            last_title = None
+            continue
+        if title == "fetch the BLFS book (for the built system)":
+            _run_banner(nxt, steps)
+            if not _run_choose_blfs_book():
                 sys.exit(1)
             last_title = None
             continue
@@ -4428,12 +4819,11 @@ def cmd_bs_run(args):
         argv = [sys.executable, os.path.abspath(__file__)] + shlex.split(cmd)[1:]
         rc = subprocess.call(argv)
         if rc != 0:
-            sys.stderr.write("\n! step failed (exit %d): %s\n"
+            fail("\n! step failed (exit %d): %s"
                              "  Fix it, then just run `lfs build-system run` "
                              "again -- it continues from here.\n" % (rc, title))
             sys.exit(rc)
-    sys.stderr.write("! 30 steps and still not at the chroot -- something is "
-                     "cycling. Run `lfs build-system next --all`.\n")
+    fail('! 30 steps and still not at the chroot -- something is cycling. Run `lfs build-system next --all`.')
     sys.exit(1)
 
 
@@ -4572,7 +4962,7 @@ def _restart_source_debris(srcdir):
         return markers, foreign
     for n in names:
         p = os.path.join(srcdir, n)
-        if n.startswith(".cc-"):
+        if n.startswith((".cc-", ".pkgusr-")):
             markers.append(p)
             continue
         try:
@@ -4600,8 +4990,8 @@ def cmd_bs_restart(args):
     mounted = [d for d in ("dev/pts", "dev/shm", "dev", "proc", "sys", "run")
                if _is_mounted(os.path.join(lfs, d))]
     if mounted:
-        sys.stderr.write(
-            "\n! the chroot is still mounted: %s\n"
+        fail(
+            "\n! the chroot is still mounted: %s"
             "  Deleting through those would reach the running system.\n"
             "  Unmount first:\n      %slfs build-system chroot unmount --run\n"
             % (", ".join(mounted), sudo_prefix()))
@@ -4797,7 +5187,10 @@ def _tree_state(lfs):
         pass
 
     native = _glob.glob(os.path.join(lfs, "usr", "lib", "gcc", "*-pc-linux-gnu"))
-    if native:
+    if native and not _build_is_finished(lfs):
+        # Only worth saying mid-build.  On a finished tree the native gcc IS
+        # the answer -- printing it as a WARNING there says a completed system
+        # is wrong.
         out.append(("WARNING",
                     "a native gcc is present (%s) -- chapter 8 has run"
                     % os.path.basename(native[0])))
@@ -4868,7 +5261,11 @@ def cmd_bs_sync_tools(args):
     updated in place, so a chroot built earlier keeps running an old copy until
     this is re-run.  Copies:
       * /etc/pkgusr/skel-package  -- the package-user home skeleton
+      * /etc/pkgusr/skel-u_xdg    -- the shared-user XDG profile (host's
+                                     verbatim, else the placeholder copy
+                                     beside the tools; never clobbered)
       * /etc/pkgusr/{bash_profile,bashrc,build}
+      * the bash completion (lfs, with blfs/packagemanager/lfs-helper links)
       * the hint's helper scripts (add_package_user and friends)
       * lfs-helper itself
       * a collector-group export, if one is configured
@@ -4879,6 +5276,10 @@ def cmd_bs_sync_tools(args):
         _sync_report("package-user skeleton",
                      ["/etc/pkgusr/skel-package",
                       "/etc/pkgusr/{bash_profile,bashrc,build}"])
+        _sync_report("shared-user XDG profile",
+                     ["/etc/pkgusr/skel-u_xdg/.bash_profile"])
+        _sync_report("bash completion",
+                     ["lfs-completion.bash -> completions/{lfs,blfs,...}"])
         _sync_report("helper scripts",
                      ["add_package_user, install_package, list_package, ...",
                       "the chown/chgrp/chmod/mkdir/install wrappers"])
@@ -4896,6 +5297,10 @@ def cmd_bs_sync_tools(args):
     _sync_report("package-user skeleton",
                  ["/etc/pkgusr/skel-package" if skel_ok
                   else "none on this machine -- a default will be written"])
+    _sync_report("shared-user XDG profile",
+                 [_install_xdg_skel(lfs, verbose=False)])
+    _sync_report("bash completion",
+                 [_install_completion(lfs, verbose=False)])
 
     copied = _install_pkgusr_helpers(lfs, verbose=False)
     if copied:
@@ -4904,6 +5309,13 @@ def cmd_bs_sync_tools(args):
         _sync_report("helper scripts",
                      ["none on this machine"],
                      note="the tools use Shadow's useradd/groupadd instead")
+
+    # ONE SYNC PATH.  `run` and `chroot enter` refresh the chroot through
+    # _refresh_chroot_tools; sync-tools installed the helper and the skels and
+    # left the other three tools and the stack files to whatever was there --
+    # so which command you used decided what got updated.  It calls the same
+    # function now, and every entry point keeps the chroot current.
+    _refresh_chroot_tools(lfs, quiet=True)
 
     install_helper(lfs, quiet=True)
     _sync_report("the build driver",
@@ -5273,9 +5685,7 @@ def cmd_bs_gen_chroot_scripts(args):
     print(f"# wrote {written}, kept {skipped} existing "
           f"(use --overwrite to replace)")
     if unresolved:
-        sys.stderr.write(
-            "\n! these scripts still contain a placeholder the book expects "
-            "you to fill in;\n  edit the script before building them:\n")
+        fail('\n! these scripts still contain a placeholder the book expects you to fill in;\n  edit the script before building them:')
         for nm, left in unresolved:
             sys.stderr.write("    %-18s %s\n"
                              % (nm, ", ".join("<%s>" % x for x in left)))
@@ -5349,8 +5759,8 @@ def _copy_resolv_conf(lfs):
         print("# copied the host's /etc/resolv.conf into the chroot (for DNS "
               "during the build)")
     except OSError as e:
-        sys.stderr.write("! could not copy /etc/resolv.conf into the chroot: "
-                         "%s\n" % e)
+        fail("! could not copy /etc/resolv.conf into the chroot: "
+                         "%s" % e)
 
 
 def cmd_bs_chroot(args):
@@ -5403,8 +5813,8 @@ def cmd_bs_chroot(args):
         mism = _crosschain_tgt_mismatch(lfs)
         if mism and not getattr(args, "force", False):
             was, now = mism
-            sys.stderr.write(
-                "\n! this tree was built for a different target:\n"
+            fail(
+                "\n! this tree was built for a different target:"
                 "      built with : %s\n"
                 "      configured : %s\n"
                 "  The C++ headers are installed under the first name and the\n"
@@ -5419,8 +5829,8 @@ def cmd_bs_chroot(args):
 
         cc_ok, cc_n = _crosschain_looks_done(lfs)
         if not cc_ok and not getattr(args, "force", False):
-            sys.stderr.write(
-                "\n! chapters 5-6 are not finished: %d of %d steps built.\n"
+            fail(
+                "\n! chapters 5-6 are not finished: %d of %d steps built."
                 "  Preparing the chroot gives the tree to root, after which\n"
                 "  they cannot be resumed.  Finish them first:\n"
                 "      %slfs build-system crosschain --run\n"
@@ -5623,9 +6033,15 @@ def cmd_bs_chroot(args):
             print("#     lfs-helper status      # where the session stands")
             print("#     lfs-helper list        # all steps + progress")
         print("#")
+        # SAY that this is the chroot, rather than guessing later.
+        #
+        # inside_chroot() used to answer "does /usr/src/lfs-pkgusr exist" --
+        # which is true on ANY system these tools built, so a finished host
+        # was told it was inside the chroot and refused every build command.
+        # The shell that IS the chroot knows it; it says so.
         inner = (f'chroot "{lfs}" /usr/bin/env -i '
                  f'HOME=/root TERM="$TERM" PS1="(lfs chroot) \\u:\\w\\$ " '
-                 f'PATH=/usr/bin:/usr/sbin '
+                 f'PATH=/usr/bin:/usr/sbin LFS_IN_CHROOT=1 '
                  f'MAKEFLAGS="{mkf}" TESTSUITEFLAGS="{mkf}" '
                  f'/bin/bash --login')
         import subprocess
@@ -5798,7 +6214,9 @@ def cmd_bs_crosschain(args):
                     sys.exit(preclean_rc)
 
             print(f"# [lfs] running {path} (phase: {phase}) ...")
-            full = f'export LFS_CC_PHASE="{phase}"\n' + script
+            # By PATH, not on stdin: the runner re-executes the script once
+            # per phase, so it has to be a file the lfs user can read.
+            full = f'exec bash "{path}" "{phase}"\n'
             rc = _run_tracked(name, full, as_lfs=True, lfs=lfs)
             if rc != 0:
                 bar = "!" * 58
@@ -6111,7 +6529,7 @@ def _install_pkgusr_skel(lfs, verbose=True):
             shutil.rmtree(dst)
         shutil.copytree(PKGUSR_SKEL_SRC, dst, symlinks=True)
     except OSError as e:
-        sys.stderr.write("! could not copy %s: %s\n" % (PKGUSR_SKEL_SRC, e))
+        fail("! could not copy %s: %s" % (PKGUSR_SKEL_SRC, e))
         return False
     # the shared files the skeleton's symlinks point at
     for name in ("bash_profile", "bashrc", "build"):
@@ -6124,6 +6542,92 @@ def _install_pkgusr_skel(lfs, verbose=True):
     if verbose:
         print("# package-user skeleton copied from %s" % PKGUSR_SKEL_SRC)
     return True
+
+
+# The shared-user XDG profile.  skel-package above covers PACKAGE users;
+# shared application users get their session environment from this ONE file,
+# which `packagemanager user create --shared` links from
+# /etc/pkgusr/skel-u_xdg and fills in.  It used to arrive only via `make
+# install`, so a system that got its tools through this sync never had it and
+# every --shared creation warned about the missing file.
+#
+# The host's copy is preferred VERBATIM, like skel-package: a host that has
+# one has usually filled the runtime directory in already, and that answer is
+# right for the machine being synced to.  The placeholder copy beside the
+# tools is the fallback; packagemanager only substitutes where the
+# placeholder is still present, so a filled-in file passes through untouched.
+# An existing copy in the tree is never clobbered -- same as the Makefile.
+XDG_SKEL_REL = "etc/pkgusr/skel-u_xdg/.bash_profile"
+
+
+def _install_xdg_skel(lfs, verbose=True):
+    """Place the shared-user XDG profile in the tree.  Returns a short
+    report string for the sync summary."""
+    import shutil
+    dst = os.path.join(lfs, XDG_SKEL_REL)
+    if os.path.isfile(dst):
+        return "kept the tree's existing copy"
+    src = "/" + XDG_SKEL_REL
+    if not os.path.isfile(src):
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "skel-u_xdg", ".bash_profile")
+    if not os.path.isfile(src):
+        if verbose:
+            print("# no skel-u_xdg/.bash_profile on this machine or beside "
+                  "the tools -- shared users will warn until one exists")
+        return "none found -- shared users will warn"
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copy(src, dst)
+        os.chmod(dst, 0o644)
+    except OSError as e:
+        fail("! could not copy %s: %s" % (src, e))
+        return "copy failed: %s" % e
+    if verbose:
+        print("# shared-user XDG profile copied from %s" % src)
+    return "copied from %s" % src
+
+
+# The bash completion.  Same forgotten-file story as the XDG profile above:
+# the Makefile installed it, but the chroot gets its tools from THIS sync,
+# so a synced system never had tab completion.  Tooling, so it is
+# overwritten, not kept -- stale completion is worse than none.
+COMPLETION_REL = "usr/share/bash-completion/completions"
+
+
+def _install_completion(lfs, verbose=True):
+    """Place the bash completion + its tool symlinks in the tree.  Returns a
+    short report string for the sync summary."""
+    import shutil
+    src = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "lfs-completion.bash")
+    if not os.path.isfile(src):
+        src = "/" + COMPLETION_REL + "/lfs"
+    if not os.path.isfile(src):
+        if verbose:
+            print("# no lfs-completion.bash beside the tools or installed "
+                  "here -- skipping completion")
+        return "none found -- skipped"
+    dst_dir = os.path.join(lfs, COMPLETION_REL)
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        shutil.copy(src, os.path.join(dst_dir, "lfs"))
+        os.chmod(os.path.join(dst_dir, "lfs"), 0o644)
+        for t in ("blfs", "packagemanager", "lfs-helper"):
+            link = os.path.join(dst_dir, t)
+            try:
+                if os.path.islink(link) or os.path.isfile(link):
+                    os.remove(link)
+                os.symlink("lfs", link)
+            except OSError:
+                pass
+    except OSError as e:
+        fail("! could not install completion: %s" % e)
+        return "copy failed: %s" % e
+    if verbose:
+        print("# bash completion installed (lfs, blfs, packagemanager, "
+              "lfs-helper)")
+    return "lfs + 3 symlinks"
 
 
 def _install_pkgusr_helpers(lfs, verbose=True):
@@ -6144,7 +6648,7 @@ def _install_pkgusr_helpers(lfs, verbose=True):
             copied.append("%s -> /%s" % (name, subdir))
             claimed.append((name, subdir))
         except OSError as e:
-            sys.stderr.write("! %s: %s\n" % (name, e))
+            fail("! %s: %s" % (name, e))
     # Give them an owner, the same as install_helper does for lfs/lfs-helper/
     # packagemanager/blfs.
     #
@@ -6208,16 +6712,12 @@ def cmd_bs_install_tools(args):
     including for BLFS packages later on."""
     lfs = require_mounted_lfs()
     if not _chroot_has_python(lfs):
-        sys.stderr.write(
-            "! there is no Python inside the chroot yet, so the Python tooling\n"
-            "  cannot run there.  Build it first (inside the chroot):\n"
-            "      lfs-helper build Python\n")
+        fail('! there is no Python inside the chroot yet, so the Python tooling\n  cannot run there.  Build it first (inside the chroot):\n      lfs-helper build Python')
         sys.exit(2)
 
     missing = _chroot_missing_tool_deps(lfs)
     if missing and not args.force:
-        sys.stderr.write(
-            "! the Python tooling needs modules that base LFS does not ship:\n")
+        fail('! the Python tooling needs modules that base LFS does not ship:')
         for mod, pkg in missing:
             sys.stderr.write("    %-16s (pip install %s)\n" % (mod, pkg))
         sys.stderr.write(
@@ -6235,13 +6735,12 @@ def cmd_bs_install_tools(args):
 
     here = os.path.dirname(os.path.abspath(__file__))
     tools = []
-    for name in ("lfs", "packagemanager", "blfs", "lfs-helper",
-                 "packagemanager_install"):
+    for name in ("lfs", "packagemanager", "blfs", "lfs-helper"):
         src = os.path.join(here, name)
         if os.path.isfile(src):
             tools.append((name, src))
     if not tools:
-        sys.stderr.write("! no tools found next to %s\n" % here)
+        fail("! no tools found next to %s" % here)
         sys.exit(2)
 
     dest_dir = os.path.join(lfs, "usr", "bin")
@@ -6292,9 +6791,19 @@ def cmd_bs_install_tools(args):
             print("    %-22s -> /usr/share/blfs/books" % ("BLFS book" if _n == 1
                                                           else "BLFS books"))
     else:
-        print("    %-22s (none cached here -- `blfs fetch` inside, or"
-              % "BLFS book:")
-        print("    %-22s  `blfs import <file>`)" % "")
+        # NOT an aside.  This is the whole of `packagemanager bootstrap`
+        # failing later, announced early and quietly enough to scroll past:
+        # with no book here, `blfs sources wget` gave nothing, so get-sources
+        # staged no wget tarball either, and the tree ends up unable to fetch
+        # the book because it has no download tool and unable to install the
+        # download tool because it has no book.
+        warn("!   BLFS book: none cached on this host, so none was copied in.")
+        warn("      The tree will have no book AND no wget tarball, and")
+        warn("      `packagemanager bootstrap` inside cannot break that circle.")
+        warn("      Fix it here, while there is still a network:")
+        warn("          blfs fetch          # or: blfs import <book.html>")
+        warn("          lfs build-system get-sources --run")
+        warn("          lfs build-system install-tools --run")
 
     for sub in ("books", "crosschain"):
         s_dir = os.path.join(store_dir(), sub)
@@ -6305,7 +6814,57 @@ def cmd_bs_install_tools(args):
             shutil.copytree(s_dir, d_dir)
     cfgsrc = config_path()
     if os.path.isfile(cfgsrc):
-        shutil.copy(cfgsrc, os.path.join(store, "config.json"))
+        # The tree's OWN choices win.  A system inside the chroot has its own
+        # `lfs set-default` / `blfs set-default`, and copying the host's
+        # config over it silently moved a built system back to the host's
+        # book -- the setting the person changed last, undone by the next
+        # `chroot enter`.  So: merge, host values only where the tree has
+        # nothing to say.
+        cfgdst = os.path.join(store, "config.json")
+        merged = {}
+        try:
+            with open(cfgsrc) as f:
+                merged.update(json.load(f))
+        except Exception:
+            pass
+        # THE BUILD SYSTEM'S OWN CONFIG, WRITTEN BEFORE IT EXISTS.
+        #
+        # The user asked for this directly: a file on the host that IS the new
+        # system's config, so it can be configured before there is a tree to
+        # configure -- and the run copies THAT in, not the host's own
+        # settings.  Otherwise the only way to give the new system a different
+        # prefix or layout was to wait for the tree, then edit it there.
+        #
+        # Precedence: the host's session config is the floor, the target
+        # config overrides it, and a config the TREE already has wins over
+        # both (it is the system's own choice, made after this file was
+        # written).
+        _target = os.path.join(store_dir(), "target-config.json")
+        if os.path.isfile(_target):
+            try:
+                with open(_target) as f:
+                    _tgt = json.load(f)
+                merged.update(_tgt)
+                print("    %-22s from %s" % ("target config", _target))
+                for _k in sorted(_tgt):
+                    print("      %-20s = %r" % (_k, _tgt[_k]))
+            except (OSError, ValueError) as e:
+                print("    could not read %s: %s" % (_target, e))
+        try:
+            with open(cfgdst) as f:
+                tree_cfg = json.load(f)
+            merged.update(tree_cfg)          # the tree overrides both
+        except Exception:
+            tree_cfg = {}
+        try:
+            with open(cfgdst, "w") as f:
+                json.dump(merged, f, indent=2)
+            if tree_cfg.get("default") and \
+                    tree_cfg.get("default") != load_config().get("default"):
+                print("    %-22s kept: %s (the tree's own choice)"
+                      % ("book default", tree_cfg["default"]))
+        except OSError:
+            shutil.copy(cfgsrc, cfgdst)
 
     # packagemanager's own config, matching the settings used out here so the
     # collector groups it creates line up with the ones already on the system
@@ -6321,10 +6880,25 @@ def cmd_bs_install_tools(args):
             f.write("# written by lfs build-system install-tools\n")
             f.write("collector_prefix=%s\n" % collector_prefix())
             f.write("user_prefix=u\n")
+            # The rest of what the interview already asked for.  Without these
+            # packagemanager's first run opened a wizard asking for the
+            # package-user prefix and the login account -- on a system built
+            # from the very answers it was asking for.
+            # WITHOUT the trailing underscore.  lfs's accessors return `p_`
+            # ready to concatenate; packagemanager stores the bare word and
+            # adds the underscore itself.  Writing `p_` here survives only
+            # because it rstrips on read -- an accident, not an agreement.
+            f.write("pkgusr_prefix=%s\n" % pkgusr_prefix().rstrip("_"))
+            f.write("cfguser_prefix=%s\n" % cfguser_prefix().rstrip("_"))
+            _mu = load_config().get("main_user")
+            if _mu:
+                f.write("main_user=%s\n" % _mu)
             # the layout of the system being BUILT, not this machine's
             f.write("pkgusr_home=%s\n" % layout("pkgusr_home", target=True))
             f.write("appuser_home=%s\n" % layout("appuser_home", target=True))
     _install_pkgusr_skel(lfs)
+    _install_xdg_skel(lfs)
+    _install_completion(lfs)
     _install_pkgusr_helpers(lfs)
     _write_tool_stamps(lfs, tools)
     _run_bash('chmod -R a+rX "%s" "%s" 2>/dev/null; true' % (store, cfg_dir))
@@ -6357,17 +6931,42 @@ def _blfs_knows(name):
     BLFS is the better source when both books carry a package: its scripts
     carry the dependency information and the configure options that matter for
     a package used as a library, where LFS only builds what the base system
-    needs."""
+    needs.
+
+    Asks `blfs versions` -- a fact, listing every anchor the book has.  It
+    used to ask `blfs debug <name>`, which is a DIAGNOSTIC: it prints
+    "resolve: NOT FOUND" and exits 0, so this returned True for every string
+    ever passed to it.  `lfs update` then told the user to run
+    `blfs update gcc-pass1 cfg_fstab init-dirs ...` -- build steps of the LFS
+    book, offered as BLFS packages, because the check could not say no."""
     blfs = _find_blfs()
     if not blfs:
         return False
-    import subprocess
-    try:
-        r = subprocess.run(blfs + ["debug", name], capture_output=True,
-                           text=True, timeout=60, cwd="/")
-        return r.returncode == 0 and bool(r.stdout.strip())
-    except (OSError, subprocess.SubprocessError):
-        return False
+    return name.lower() in _blfs_anchor_set()
+
+
+_BLFS_ANCHORS = None
+
+
+def _blfs_anchor_set():
+    """Every anchor in the BLFS book, once per process."""
+    global _BLFS_ANCHORS
+    if _BLFS_ANCHORS is not None:
+        return _BLFS_ANCHORS
+    _BLFS_ANCHORS = set()
+    blfs = _find_blfs()
+    if blfs:
+        import subprocess
+        try:
+            r = subprocess.run(blfs + ["versions"], capture_output=True,
+                               text=True, timeout=120, cwd="/")
+            if r.returncode == 0:
+                for line in r.stdout.splitlines():
+                    if "\t" in line:
+                        _BLFS_ANCHORS.add(line.split("\t", 1)[0].strip().lower())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _BLFS_ANCHORS
 
 
 def _lfs_script_path(lfs, name):
@@ -6390,6 +6989,131 @@ def _find_lfs_package(args, name):
                 if s2 == sid:
                     return sid, t2, sec2
     return None, None, None
+
+
+def _have_source_for(lfs, pkgver):
+    """Is a tarball for this package version already in the tree's /sources?
+
+    Deliberately loose, and deliberately the same shape the generated script
+    globs for: the book calls it 'M4-1.4.21', the tarball is 'm4-1.4.21.tar.xz'.
+    A stricter test here than in the script would fetch a file the build then
+    refuses to see."""
+    srcdir = os.path.join(lfs, "sources")
+    if not os.path.isdir(srcdir):
+        return False
+    want = pkgver.lower().replace("_", "-")
+    try:
+        for f in os.listdir(srcdir):
+            fl = f.lower().replace("_", "-")
+            if fl.startswith(want + ".") or fl.startswith(want + "-") \
+                    or fl.startswith(want):
+                if re.search(r"\.(tar\.[a-z0-9]+|tgz|tbz2|zip)$", fl):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _wget_list_url_for(ver, pkgver):
+    """The wget-list URL whose filename matches this package version.
+
+    The book ships a wget-list with every source URL in it, and the tools
+    already cache it per book -- but only `get-sources` ever read it, in bulk.
+    So moving to a newer book left `lfs install --reinstall m4` failing with
+    "no M4-1.4.21.tar.* in /sources", when the URL for exactly that tarball
+    was sitting in a file on disk.  Matched on the version token, so
+    'M4-1.4.21' finds 'm4-1.4.21.tar.xz' whatever the site calls its
+    directories."""
+    urls = _wget_list_urls(ver) or []
+    if not pkgver:
+        return None
+    want = pkgver.lower()
+    # 'M4-1.4.21' -> 'm4' + '1.4.21'; a tarball is <name>-<version>.<ext>
+    m = re.match(r"^(.*?)-([0-9][0-9a-z.+_-]*)$", want)
+    name, version = (m.group(1), m.group(2)) if m else (want, "")
+    name = name.replace("_", "-")
+    for u in urls:
+        base = os.path.basename(u).lower()
+        if version and version not in base:
+            continue
+        stem = re.split(r"-[0-9]", base, maxsplit=1)[0].replace("_", "-")
+        if stem == name or base.startswith(name + "-") or base.startswith(name):
+            return u
+    return None
+
+
+def _fetch_one_source(args, lfs, pkgver, quiet=False):
+    """Download one package's tarball into the tree's /sources.  True if it is
+    there afterwards (including when it already was).
+
+    `lfs` is passed in rather than guessed: inside the chroot the tree is "/"
+    and /sources is /sources, outside it is $LFS/sources, and a fetch that
+    landed in the wrong one would look like it worked and change nothing."""
+    ver, _path = resolve_book(args)
+    srcdir = os.path.join(lfs, "sources")
+    url = _wget_list_url_for(ver, pkgver)
+    if not url:
+        return False
+    dest = os.path.join(srcdir, os.path.basename(url))
+    if os.path.isfile(dest):
+        return True
+    if not quiet:
+        print("    fetching %s" % os.path.basename(url))
+        print("      from %s" % url)
+    try:
+        os.makedirs(srcdir, exist_ok=True)
+        _download_to(url, dest)
+    except Exception as e:
+        fail("    ! download failed: %s" % e)
+        return False
+    return os.path.isfile(dest)
+
+
+def _ensure_lfs_script(args, lfs, name, sid, title, sec, regenerate):
+    """Generate (or keep) the LFS-book install script for one package.
+    Returns the script path, or None when the book has nothing to write.
+    The ONE generator: cmd_install builds through it and `lfs script fetch`
+    stops right after it, so the two can never drift apart."""
+    script = _lfs_script_path(lfs, name)
+    print("%s  (%s)" % (name, title.strip()))
+    print("    script: %s" % script)
+
+    if regenerate or not os.path.isfile(script):
+        pkgver = _title_pkgver(title) or name
+        glob = _pkg_glob_for(pkgver, name)
+        text = _chrootify(_crosschain_script_body(name, sid, pkgver, glob,
+                                                  sec["commands"]))
+        text, left = _fill_placeholders(text, name)
+        os.makedirs(os.path.dirname(script), exist_ok=True)
+        with open(script, "w") as f:
+            f.write(text)
+        os.chmod(script, 0o755)
+        print("    regenerated from the book")
+        if left:
+            fail("    ! still contains: %s -- edit the script "
+                             "before building"
+                             % ", ".join("<%s>" % x for x in left))
+    else:
+        # The existing script is KEPT -- it is yours, and regenerating would
+        # discard your edits.  But the line above prints the BOOK's title, so
+        # a script written for an older book sat under a heading naming the
+        # new version, with nothing to say they differ.  Say it.
+        book_ver = _title_pkgver(title)
+        have = None
+        try:
+            m = re.search(r'^name_version="([^"]+)"',
+                          open(script, errors="replace").read(), re.M)
+            have = m.group(1) if m else None
+        except OSError:
+            pass
+        if have and book_ver and have != book_ver:
+            print("    kept your existing script, which builds %s" % have)
+            print("    (the book now has %s -- rebuild the script from it "
+                  "with --regenerate," % book_ver)
+            print("     which discards any edits you made)")
+        else:
+            print("    kept your existing script")
+    return script
 
 
 def cmd_install(args):
@@ -6423,34 +7147,32 @@ def cmd_install(args):
 
         sid, title, sec = _find_lfs_package(args, name)
         if not sid:
-            sys.stderr.write("! '%s' is not an LFS package.\n"
+            fail("! '%s' is not an LFS package."
                              "  List them with:  lfs packages\n"
                              "  BLFS packages are blfs' job:  blfs script %s\n"
                              % (name, name))
             continue
         if not sec["commands"]:
-            sys.stderr.write("! %s has no build commands in the book.\n" % name)
+            fail("! %s has no build commands in the book." % name)
             continue
 
-        script = _lfs_script_path(lfs, name)
-        print("%s  (%s)" % (name, title.strip()))
-        print("    script: %s" % script)
+        script = _ensure_lfs_script(args, lfs, name, sid, title, sec,
+                                    args.regenerate)
 
-        if args.regenerate or not os.path.isfile(script):
-            pkgver = _title_pkgver(title) or name
-            glob = _pkg_glob_for(pkgver, name)
-            text = _chrootify(_crosschain_script_body(name, sid, pkgver, glob,
-                                                      sec["commands"]))
-            text, left = _fill_placeholders(text, name)
-            os.makedirs(os.path.dirname(script), exist_ok=True)
-            with open(script, "w") as f:
-                f.write(text)
-            os.chmod(script, 0o755)
-            print("    regenerated from the book")
-            if left:
-                sys.stderr.write("    ! still contains: %s -- edit the script "
-                                 "before building\n"
-                                 % ", ".join("<%s>" % x for x in left))
+        # The tarball has to be there before the build starts.  Moving to a
+        # newer book means the new tarballs are NOT in /sources, and the build
+        # failed with "no M4-1.4.21.tar.* in /sources -- run: get-sources"
+        # while the URL for exactly that file sat in the book's cached
+        # wget-list.  Fetch the one that is needed, and say so.
+        _pv = _title_pkgver(title)
+        if _pv and not _have_source_for(lfs, _pv):
+            if not _fetch_one_source(args, lfs, _pv):
+                fail("    ! no tarball for %s in %s/sources, and none found in"
+                     " the book's wget-list." % (_pv, lfs))
+                fail("      Fetch everything the book needs with:")
+                fail("        %slfs build-system get-sources --run"
+                     % sudo_prefix())
+                sys.exit(1)
 
         # Reinstalling re-runs the CONFIGURE phase too, and that is not always
         # harmless: those are the post-install steps that move files about,
@@ -6459,7 +7181,9 @@ def cmd_install(args):
         if reinstall:
             has_cfg = False
             if os.path.isfile(script):
-                has_cfg = "#### CONFIGURE ####" in open(script).read()
+                # a phase is a function (format v18+); older scripts carried a marker
+                has_cfg = bool(re.search(r"^configure_pkg\(\)|^#### CONFIGURE ####",
+                                         open(script).read(), re.M))
             if has_cfg:
                 print()
                 print("    %s has a configure phase -- the post-install steps" % name)
@@ -6493,6 +7217,57 @@ def cmd_install(args):
             print("        %s" % " ".join(cmd))
 
 
+def cmd_search(args):
+    """Find a package or section in the LFS book by name fragment."""
+    label, path = resolve_book(args)
+    soup = load_soup(path)
+    needle = args.name.lower().replace(" ", "-")
+    hits = []
+    for sid, title, sec in iter_sections(soup):
+        hay = (sid + " " + title).lower().replace(" ", "-")
+        if needle not in hay:
+            continue
+        nv = package_name_version(sid, title)
+        kind = "package" if (nv and sec["commands"]) else "section"
+        hits.append((kind, sid, title.strip()))
+    if not hits:
+        print(f"No match for '{args.name}' in the {label} book.")
+        print(f"  BLFS is searched separately:  blfs search {args.name}")
+        sys.exit(1)
+    for kind, sid, title in hits:
+        print(f"  [{kind:>7}] {sid:<34} {title}")
+    print(f"\n{len(hits)} result(s)  [{label}].")
+
+
+def cmd_script_fetch(args):
+    """Get a package's install script from the book -- run nothing.
+
+    Stops exactly where cmd_install would start building: the script lands at
+    the same path, generated by the same code, so "fetch, edit, install" edits
+    the file the install will run."""
+    inside = os.path.isdir(os.path.join("/", PKGUSR_DIR))
+    lfs = "/" if inside else require_mounted_lfs()
+    name = args.package
+    if not args.lfs_book and _blfs_knows(name):
+        print("%s is in the BLFS book -- fetch that script (more complete):"
+              % name)
+        print("    packagemanager script fetch %s" % name)
+        print("    (force the LFS book's with: lfs script fetch --lfs-book %s)"
+              % name)
+        return
+    sid, title, sec = _find_lfs_package(args, name)
+    if not sid:
+        fail("! '%s' is not an LFS package.  List them with:  lfs packages"
+             % name)
+        sys.exit(1)
+    if not sec["commands"]:
+        fail("! %s has no build commands in the book." % name)
+        sys.exit(1)
+    script = _ensure_lfs_script(args, lfs, name, sid, title, sec,
+                                args.regenerate)
+    print("    edit it, then:  lfs install --reinstall %s" % name)
+
+
 def cmd_update(args):
     """Rebuild packages whose installed version differs from the book's."""
     inside = os.path.isdir(os.path.join("/", PKGUSR_DIR))
@@ -6506,13 +7281,46 @@ def cmd_update(args):
         installed = {f[:-6] for f in os.listdir(manifests) if f.endswith(".files")}
 
     names = args.packages or sorted(installed)
+
+    # BOOK ORDER, not alphabetical.  The book builds glibc before Python for
+    # a reason -- each package is compiled against the ones before it -- and
+    # an alphabetical list puts Python, binutils and coreutils ahead of
+    # glibc.  Rebuilt in that order, the earlier ones link against the old
+    # glibc and are then stale again the moment it is replaced.  Chapter 8's
+    # own sequence is the safe one, so the report is sorted by where each
+    # package appears in the book, and anything the book does not name goes
+    # last rather than jumping the queue.
+    _order = {}
+    for _i, (_sid, _title, _sec) in enumerate(iter_sections(soup)):
+        _nv = package_name_version(_sid, _title)
+        if _nv:
+            _order.setdefault(_nv[0].lower(), _i)
+    names = sorted(names, key=lambda n: (_order.get(n.lower(), 10 ** 6),
+                                         n.lower()))
     if not names:
         print("nothing is installed yet -- build the system first:")
         print("    %slfs build-system next" % sudo_prefix())
         return
 
     stale, current, unknown = [], [], []
+    # The chapter 5-7 STAGE VARIANTS are not upgradable packages.
+    # gettext-tmp, python-tmp and util-linux-tmp are the TEMPORARY builds that
+    # existed to get chapter 8 built; binutils-pass1 and gcc-pass2 are cross
+    # stages.  Comparing them with the current book reported "util-linux-tmp
+    # 2.41.1 -> 2.41.3" and put them in the reinstall line, which would
+    # rebuild the temporary toolchain onto a finished system.
+    #
+    # Only the VARIANT names are excluded, never the plain one.  Chapter 6
+    # builds glibc and coreutils under their own names, so taking every name
+    # in the step tables would have silently hidden two of the packages most
+    # worth knowing about -- the first draft of this did exactly that.
+    _stage_steps = {n.lower() for n, _sid in CHROOT_STEPS_7
+                    if n.lower().endswith("-tmp")}
+    _stage_steps |= {n.lower() for n, _sid, _pkg in CROSSCHAIN_STEPS
+                     if re.search(r"-(pass\d+|tmp)$", n.lower())}
     for name in names:
+        if name.lower() in _stage_steps:
+            continue
         sid, title, sec = _find_lfs_package(args, name)
         if not sid:
             unknown.append(name)
@@ -6541,11 +7349,41 @@ def cmd_update(args):
         else:
             current.append((name, have or book_ver))
 
+    if getattr(args, "porcelain", False):
+        # One fact per line, tab-separated, and NOTHING else -- no headings,
+        # no advice, no colour.  packagemanager builds its plan from this;
+        # parsing the human report would break the first time a word changed.
+        #
+        # --include-current adds the packages whose version did NOT move.
+        # After glibc changes, "up to date" and "built against the current
+        # system" stop being the same statement: the version is right and the
+        # binary is still the old one.  Rebuilding those, in book order, is
+        # the only way to know the whole system was built against the new
+        # toolchain.  Emitted in the same shape, with installed == book.
+        rows = list(stale)
+        if getattr(args, "include_current", False):
+            _stale_names = {n for n, _h, _b in stale}
+            for name, v in current:
+                if name not in _stale_names:
+                    rows.append((name, v or "?", v or "?"))
+            rows.sort(key=lambda r: (_order.get(r[0].lower(), 10 ** 6),
+                                     r[0].lower()))
+        for name, have, book_ver in rows:
+            print("%s\t%s\t%s" % (name, have, book_ver))
+        return
+
     if stale:
         print("Out of date -- comparing what is installed with the %s book:\n"
               % ver)
+        _c = _C_OK if _tty_out() else ""
+        _o = _C_OFF if _tty_out() else ""
         for name, have, book_ver in stale:
-            print("  %-20s %s  ->  %s" % (name, have, book_ver))
+            # the version you would move TO, in colour -- the same emphasis
+            # packagemanager's plan gives it, so the two reports read alike.
+            # Guarded by _tty_out() like every other colour here: escape codes
+            # in a piped report are noise in a file.
+            print("  %-20s %s  ->  %s%s%s"
+                  % (name, have, _c, book_ver, _o))
         print()
         print("Rebuild them with:")
         print("    lfs install --reinstall %s"
@@ -6678,10 +7516,36 @@ def _next_steps():
                        "%slfs build-system add-user --run" % sudo_prefix()))
 
     srcdir = os.path.join(lfs, "sources")
-    have_sources = os.path.isdir(srcdir) and any(
-        f.endswith((".tar.xz", ".tar.gz", ".tar.bz2", ".tgz"))
-        for f in os.listdir(srcdir)) if os.path.isdir(srcdir) else False
-    steps.append(_step(have_sources, "download the sources",
+    # "done" is EVERY basename of the current book's wget-list being present,
+    # not "some tarball exists".  Leftovers from an older book made the step
+    # look finished, and the download was skipped for a book whose tarballs
+    # were not there.  (from the SysV-book session)
+    src_missing = 0
+    if os.path.isdir(srcdir):
+        wl_urls = _wget_list_urls(build_version())
+        if wl_urls is not None:
+            have = set(os.listdir(srcdir))
+            src_missing = sum(1 for u in wl_urls
+                              if u.split("/")[-1] not in have)
+            have_sources = src_missing == 0
+        else:
+            # no wget-list cached yet: the old heuristic is all there is
+            have_sources = any(
+                f.endswith((".tar.xz", ".tar.gz", ".tar.bz2", ".tgz"))
+                for f in os.listdir(srcdir))
+    else:
+        have_sources = False
+    # BEFORE the sources, deliberately.  `get-sources` asks
+    # `packagemanager bootstrap --sources`, which asks the BLFS book where
+    # wget's tarball is -- with no book that URL is silently absent from the
+    # download list, and the gap only shows up on the built system.
+    steps.append(_step(_blfs_book_on_host() or cfg.get("blfs_book") == "skip",
+                       "fetch the BLFS book (for the built system)",
+                       "blfs fetch",
+                       note="the built system cannot fetch it itself until it "
+                            "has wget, and wget is looked up in this book"))
+    steps.append(_step(have_sources, "download the sources"
+                       + (f" ({src_missing} missing)" if src_missing else ""),
                        "%slfs build-system get-sources --run" % sudo_prefix()))
 
     cc_done, cc_n = _crosschain_looks_done(lfs)
@@ -6828,12 +7692,53 @@ _INSIDE_EQUIVALENT = {
 }
 
 
+def _root_differs_from_pid1():
+    """Is this process's / a different directory from PID 1's?
+
+    THE KERNEL KNOWS.  That is what a chroot IS -- a root that is not the
+    real one -- and /proc/1/root resolves to the real one, so comparing the
+    two answers the question outright instead of inferring it from files
+    that happen to be there.  Returns None when it cannot be asked: no
+    /proc mounted, or not privileged enough to read PID 1's root.
+    """
+    if os.geteuid() != 0:
+        return None                # /proc/1/root is root's to read
+    try:
+        a, b = os.stat("/"), os.stat("/proc/1/root")
+    except OSError:
+        return None                # no /proc, or a kernel that will not say
+    return (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino)
+
+
 def inside_chroot():
     """Are we running inside the LFS chroot?
 
-    The state directory lives at the root of the built system, so it is only at
-    /usr/src/lfs-pkgusr when we are in there."""
-    return os.path.isdir(os.path.join("/", PKGUSR_DIR))
+    The chroot SAYS SO: `lfs build-system chroot enter` sets LFS_IN_CHROOT in
+    the environment it starts.  Failing that, the kernel is asked
+    (_root_differs_from_pid1).
+
+    It used to be inferred from "/usr/src/lfs-pkgusr exists", and that is true
+    of any system these tools have built -- so a finished host running its own
+    lfs refused every command with "you are inside the LFS chroot".  An
+    inference that is true of the destination cannot identify the journey.
+
+    The guard on that inference was "...and /mnt/lfs/usr/src does not exist",
+    which fails at the one moment it matters: a FRESH build, where the
+    partition is mounted and still empty, on a host these tools built.  That
+    is the report this fix comes from.  The old test survives only as a last
+    resort -- no LFS_IN_CHROOT, no readable /proc/1 -- and then against the
+    CONFIGURED mount point, not a hardcoded one.
+    """
+    if os.environ.get("LFS_IN_CHROOT"):
+        return True
+    differs = _root_differs_from_pid1()
+    if differs is not None:
+        return differs
+    if os.environ.get("LFS"):
+        return False                      # there is a build target: we are outside
+    mount = load_config().get("lfs_mount") or "/mnt/lfs"
+    return (os.path.isdir(os.path.join("/", PKGUSR_DIR))
+            and not os.path.isdir(mount))
 
 
 def _refuse_inside_chroot(cmd, sub=None):
@@ -6855,6 +7760,19 @@ def _refuse_inside_chroot(cmd, sub=None):
                          "      lfs-helper status    # where things stand\n"
                          "      lfs-helper list      # every step\n")
     sys.stderr.write("\n  To run this, leave the chroot first (type 'exit').\n")
+    # WHICH lfs SAID SO, AND WHY.
+    #
+    # A host was refused by this message for days.  1.14.1 fixed the
+    # detection, but the binary being run was 1.11.26 -- `make install` had
+    # been going somewhere else, and nothing on screen said which copy was
+    # talking or what convinced it.  A refusal has to identify itself, or a
+    # stale install looks like a bug in the current one.
+    how = "LFS_IN_CHROOT is set" if os.environ.get("LFS_IN_CHROOT") \
+        else ("this process's / is not PID 1's"
+              if _root_differs_from_pid1() else "no $LFS, and no mounted tree")
+    sys.stderr.write("\n  (said by %s %s, build %s -- because %s)\n"
+                     % (os.path.abspath(sys.argv[0]), LFS_VERSION,
+                        _build_id(), how))
     sys.exit(2)
 
 
@@ -6903,6 +7821,13 @@ def main():
                        "LFS_TGT, mirror, ...)")
     # values can start with '-' (e.g. makeflags -j4), so don't let argparse
     # try to parse them as flags
+    # --target: the config the BUILT system will get, editable here, before
+    # the tree exists.  `lfs run` copies it in (see target-config.json).
+    p.add_argument("--target", action="store_true",
+                   help="show or change the config the BUILT system will get "
+                        "(not this host's)")
+    p.add_argument("--ask", action="store_true",
+                   help="walk the settings one at a time (with --target)")
     p.add_argument("key", nargs="?", help="setting to show, or set with a value")
     p.add_argument("value", nargs="?", help="new value")
     p.usage = ("lfs config [key] [value] | lfs config --edit | "
@@ -6966,11 +7891,33 @@ def main():
                    help="packages to check (default: everything installed)")
     p.add_argument("--verbose", "-v", action="store_true",
                    help="list up-to-date packages too")
+    p.add_argument("--porcelain", action="store_true",
+                   help="machine-readable: name<TAB>installed<TAB>book, one "
+                        "per line, nothing else (for packagemanager)")
+    p.add_argument("--include-current", action="store_true",
+                   help="with --porcelain: list up-to-date packages too, so a "
+                        "caller can rebuild the whole system in book order")
     p.set_defaults(func=cmd_update)
 
     p = sub.add_parser("packages", help="list chapter-8 build packages "
                        "(name<TAB>version<TAB>id) of the main book")
     p.set_defaults(func=cmd_packages)
+
+    p = sub.add_parser("search", help="find a package or section in the "
+                       "LFS book by name")
+    p.add_argument("name", help="name fragment to look for")
+    p.set_defaults(func=cmd_search)
+
+    p = sub.add_parser("script", help="fetch a package's install script from "
+                       "the book for editing (runs nothing)")
+    p.add_argument("action", choices=["fetch"],
+                   help="'fetch': generate/keep the script and print its path")
+    p.add_argument("package")
+    p.add_argument("--regenerate", action="store_true",
+                   help="rebuild from the book even if the script exists")
+    p.add_argument("--lfs-book", action="store_true",
+                   help="use the LFS book even when BLFS also has the package")
+    p.set_defaults(func=cmd_script_fetch)
 
     p = sub.add_parser("commands", help="print a section's shell commands")
     p.add_argument("section", help="section id or exact title")

@@ -1,0 +1,63 @@
+# services.stack -- the boot-time services a SysV desktop needs.
+#
+# /etc/init.d after an LFS build holds only LFS's own scripts; nothing starts
+# dbus, alsa, bluetooth or a cron daemon.  Those scripts live in
+# blfs-bootscripts, which is a separate tarball, not a BLFS package -- which
+# is why a package's own page says "make install-<service>" and the generated
+# script comments it out (1.14.20): the target is in THIS package, not that
+# one.
+#
+#   packagemanager stack services --yes --run
+#
+# Run it after sway.stack and network.stack: a boot script for a service that
+# is not installed is harmless but pointless.
+
+# Everything of your own, under ONE package user (p_mytools): the seatd-user
+# wrapper, sway_start, the wifi script, and -- when you uncomment them in
+# stacks/mytools/install_mytools -- swas, swov, swbr and browser.  Add a line
+# to SOURCES there and re-run; the package user owns the files, pkg.lst
+# records them, and `packagemanager remove mytools` removes the lot.
+#
+# seatd-user replaces a seatd boot service: a setuid program compiled for ONE
+# username, so there is no daemon and no `seat` group.
+cfg    mytools
+
+# (The kernel is NOT a stack entry: it is `lfs-kernel`, its own tool, so the
+#  config can be edited before anything is built.  See /etc/pkgusr/kernel.conf
+#  and `lfs-kernel --help`.)
+
+# bash-completion is NOT a BLFS package -- it comes from upstream.  2.18.0 is
+# what the remote reports as newest (checked with git ls-remote); `--check-refs`
+# will confirm it before any build.
+git    bash-completion url=https://github.com/scop/bash-completion ref=2.18.0 \
+       have=/usr/share/bash-completion/bash_completion \
+       build="autoreconf -i && ./configure --prefix=/usr --sysconfdir=/etc" \
+       install="make install"
+
+# coloured ls, the BLFS /etc/bashrc, and `su <tab>` over the package users.
+# The Bash Shell Startup Files page is CONFIG, not a package, so no package
+# stack ever ran it.
+cfg    shell-env
+
+book   acpid                    # power/lid/button events -- what a laptop needs
+book   fcron                    # the cron daemon; make-ca's weekly update needs one
+
+# blfs-bootscripts: 20250225 is the FINAL release (BLFS has stopped shipping
+# the SysV edition).  Only the scripts for services this system actually has
+# are installed -- adding one for something uninstalled just leaves a symlink
+# in rc?.d that fails at boot.
+#
+#   dbus         needed by sway, elogind and most of the desktop
+#   alsa         saves/restores the mixer state across reboots
+#   bluetooth    bluetoothd, from BlueZ
+#   acpid        lid and power button
+#   fcron        cron
+#   iptables     restores the firewall ruleset at boot
+#   random       seeds /dev/urandom from the saved pool
+#   service-wpa  the `wpa` helper `ifup` uses for a wireless interface
+tar    blfs-bootscripts \
+       url=https://anduin.linuxfromscratch.org/BLFS/blfs-bootscripts/blfs-bootscripts-20250225.tar.xz \
+       pkg=blfs-bootscripts-20250225.tar.xz \
+       have=/etc/rc.d/init.d/dbus \
+       build="true" \
+       install="make install-dbus install-alsa install-bluetooth install-acpid install-fcron install-iptables install-random install-service-wpa"

@@ -78,21 +78,19 @@ except ImportError:
 
 def _need_requests():
     if requests is None:
-        sys.stderr.write(
-            "this command needs the 'requests' module, which base LFS does not\n"
-            "ship.  Install it as a package user:\n"
-            "    packagemanager pip install requests\n"
-            "Commands that only read an already-downloaded book work without it.\n")
+        fail("this command needs the 'requests' module, which base LFS does not\n"
+             "ship.  Install it as a package user:\n"
+             "    packagemanager pip install requests\n"
+             "Commands that only read an already-downloaded book work without it.")
         sys.exit(2)
     return requests
 
 
 def _need_bs4():
     if BeautifulSoup is None:
-        sys.stderr.write(
-            "this command needs 'beautifulsoup4' to parse the book.  Install it\n"
-            "as a package user:\n"
-            "    packagemanager pip install beautifulsoup4\n")
+        fail("this command needs 'beautifulsoup4' to parse the book.  Install it\n"
+             "as a package user:\n"
+             "    packagemanager pip install beautifulsoup4")
         sys.exit(2)
     return BeautifulSoup
 
@@ -109,16 +107,28 @@ except Exception:
 # --------------------------------------------------------------------------- #
 
 SITE = os.environ.get("BLFS_SITE", "https://www.linuxfromscratch.org")
-DEFAULT_SELECTOR = "stable-systemd"
+
+def _default_selector():
+    """The flavour follows the SYSTEM, not a constant.
+
+    A hardcoded stable-systemd default handed a SysV system the systemd
+    book: elogind read NOT IN BOOK (it only exists in the SysV edition) and
+    every generated script leaned systemd.  A set default (blfs set-default)
+    always wins; this only decides what happens when nobody chose."""
+    if os.path.isdir("/run/systemd/system"):
+        return "stable-systemd"
+    return "stable-sysv"
+
+DEFAULT_SELECTOR = _default_selector()
 VALID_INITS = ("systemd", "sysv")
 
 # Bump whenever the extracted-data shape or extraction logic changes, so stale
 # on-disk caches are rebuilt automatically.
-CACHE_VERSION = 4
+CACHE_VERSION = 56   # v56: a skipped build variant does not keep its install step
 # tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
 # of generated install scripts changes (phases, dispatcher, ...), and
 # CACHE_VERSION when the parsed/cached data structure changes.
-BLFS_VERSION = "1.11.6"
+BLFS_VERSION = "1.14.146"
 
 
 def _build_id():
@@ -136,7 +146,7 @@ def _build_id():
     except OSError:
         return "unknown"
 
-SCRIPT_VERSION = 4
+SCRIPT_VERSION = 17   # v17: the runner moved out into lfs-phases
 
 
 def _tty_out():
@@ -147,6 +157,37 @@ _C_OFF = "\033[0m"
 _C_HEAD = "\033[1m"
 _C_GROUP = "\033[1;36m"
 _C_CMD = "\033[0;32m"
+
+# The same three-colour vocabulary as every other tool in this set: red says
+# something failed, yellow says look at this, green says it worked.  blfs had
+# green for commands and nothing else, so its errors were the only uncoloured
+# errors in the toolchain -- and an error that does not look like the other
+# tools' errors reads as less serious, which is backwards.
+_C_ERR = "\033[0;31m"
+_C_WARN = "\033[0;33m"
+_C_OK = "\033[0;32m"
+
+
+def _paint(msg, colour, stream):
+    if stream.isatty():
+        stream.write(colour + msg + _C_OFF + "\n")
+    else:
+        stream.write(msg + "\n")
+
+
+def fail(msg):
+    """Red, stderr: something failed or cannot be done."""
+    _paint(msg, _C_ERR, sys.stderr)
+
+
+def warn(msg):
+    """Yellow, stderr: needs attention, nothing has gone wrong yet."""
+    _paint(msg, _C_WARN, sys.stderr)
+
+
+def ok(msg):
+    """Green, stdout: finished, and finished correctly."""
+    _paint(msg, _C_OK, sys.stdout)
 
 
 def _colour_epilog(text):
@@ -301,10 +342,17 @@ def _find_svn_archive(base):
     return fn, base + fn
 
 
-def discover_dir(selector):
+def discover_dir(selector, listing=False):
     """Locate a downloadable book for `selector`.  Released books are a nochunks
     HTML under downloads/<selector>/; the development book ('svn') is a dated
-    chunked-HTML .tar.xz, so fall back to that."""
+    chunked-HTML .tar.xz, so fall back to that.
+
+    `listing` marks enumeration (discover_all probing every index directory):
+    the cached-book fallback below is a RESOLVE-FOR-USE courtesy -- during a
+    listing it turned every stale index directory ('oldsvn',
+    'blfs-book-6.0-html') into a note plus the cached book masquerading under
+    that name.  A listing probe that finds nothing simply raises, and the
+    caller skips the directory."""
     found = (_find_nochunks_at(f"{SITE}/blfs/downloads/{selector}/")
              or _find_nochunks_at(f"{SITE}/blfs/view/{selector}/"))
     if found:
@@ -340,13 +388,37 @@ def discover_dir(selector):
     # A book imported by hand (or copied in by `lfs build-system install-tools`)
     # has no metadata recording which selector it is, so the lookup failed and
     # every package came back "not in the BLFS book" while the book sat right
-    # there.  Fall back to what is actually on disk.
+    # there.  Fall back to what is actually on disk -- but only when RESOLVING
+    # a selector someone wants to use, never while merely listing the site.
     cached = _cached_book_files()
-    if cached:
+    if cached and not listing:
         pick = _best_cached_for(selector, cached)
-        sys.stderr.write(
-            "note: no book matched '%s'; using the cached %s\n"
-            % (selector, os.path.basename(pick)))
+        # NAME WHAT ELSE WAS ON DISK.
+        #
+        # The score prefers the asked-for INIT flavour over everything, so
+        # 'stable-sysv' picked the 12.4 sysv book the moment it was fetched --
+        # and the user, who was building 13.0, silently started building 12.4
+        # packages (BlueZ-5.83 instead of 5.86).  The note named the book it
+        # chose but not the one it passed over, and a version going backwards
+        # is exactly what someone needs told.
+        warn("note: no book matched '%s'; using the cached %s"
+             % (selector, os.path.basename(pick)))
+        try:
+            _pv = parse_book_filename(os.path.basename(pick))[0]
+            _others = [(parse_book_filename(os.path.basename(c))[0], c)
+                       for c in cached if c != pick]
+            _newer = [o for o in _others
+                      if _version_key(o[0]) > _version_key(_pv)]
+            if _newer:
+                _n = sorted(_newer, key=lambda o: _version_key(o[0]))[-1]
+                warn("      a NEWER book is also cached: %s (%s)"
+                     % (os.path.basename(_n[1]), _n[0]))
+                warn("      building from %s.  To pin the other one:" % _pv)
+                warn("          blfs set-default %s" % _n[0]
+                     + ("-systemd" if "systemd" in os.path.basename(_n[1])
+                        else ""))
+        except Exception:
+            pass
         fn = os.path.basename(pick)
         version, init2 = parse_book_filename(fn)
         return {"selector": selector, "url": None, "filename": fn,
@@ -367,6 +439,14 @@ def _cached_book_files():
         return []
 
 
+def _version_key(v):
+    """Sortable version: '13.0' > '12.4' > 'unknown'."""
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except (TypeError, ValueError):
+        return (-1,)
+
+
 def _best_cached_for(selector, cached):
     """Pick the cached book that best matches what was asked for.
 
@@ -383,7 +463,13 @@ def _best_cached_for(selector, cached):
         if selector.lower() in n:
             s += 8                      # an exact selector match wins
         return s
-    return sorted(cached, key=lambda p: (-score(p), p))[0]
+    # ...and among equals, the NEWEST book: a fallback should not quietly
+    # take a system backwards a release.
+    return sorted(cached,
+                  key=lambda p: (-score(p),
+                                 [-x for x in _version_key(
+                                     parse_book_filename(os.path.basename(p))[0])],
+                                 p))[0]
 
 
 def book_record_from_selector(selector):
@@ -412,13 +498,20 @@ def discover_all():
     (stable, svn, systemd, ...) are probed live for their real filename, with a
     best-guess fallback so they're always listed."""
     dirs = set(KNOWN_NAMED_BOOKS)
+    reached = False
     for index in (downloads_index_url(), view_index_url()):
         try:
             resp = _need_requests().get(index, timeout=60)
             resp.raise_for_status()
             dirs.update(_extract_subdirs(resp.text))
+            reached = True
         except Exception:
             continue
+    # Offline, this would fall through to the named-book guesses and look
+    # like a successful (tiny) discovery -- an empty result read as a pass.
+    # No index reached is a failure, and the caller decides what that means.
+    if not reached:
+        raise RuntimeError("no downloads index reachable")
     books = {}
     for d in sorted(dirs):
         if not _looks_like_book_dir(d):
@@ -426,7 +519,7 @@ def discover_all():
         rec = book_record_from_selector(d)             # fast path, no request
         if rec is None:                                # named book -> probe
             try:
-                rec = discover_dir(d)
+                rec = discover_dir(d, listing=True)
             except Exception:
                 fb = _NAMED_FALLBACK.get(d)
                 if not fb:
@@ -774,6 +867,14 @@ class Book:
         return self.packages.get(anchor)
 
 
+def _book_version_of(book):
+    """'13.0' from the book file's name, '' when it has none."""
+    try:
+        return parse_book_filename(os.path.basename(book.path))[0]
+    except Exception:
+        return ""
+
+
 def build_packages(soup):
     """Extract data for every resolvable package/module in the book."""
     packages = {}
@@ -830,6 +931,25 @@ def get_book(args, rebuild=False):
 # --------------------------------------------------------------------------- #
 # anchor / section resolution   (the part that was broken)
 # --------------------------------------------------------------------------- #
+
+def resolve_anchor(book, anchor):
+    """The book's own spelling of an anchor, whatever case was typed.
+
+    BLFS anchor ids are not all lower case -- the Python modules keep their
+    project capitalisation (Mako, PyYAML, Cython).  `blfs search mako` found
+    it (search is case-insensitive) and every other command then failed:
+        ERROR: 'mako' not found.  try: blfs debug mako
+    A user who has just been shown a name should be able to type it.
+    """
+    keys = getattr(book, "packages", book) or {}
+    if not keys or anchor in keys:
+        return anchor
+    low = anchor.lower()
+    for key in keys:
+        if key.lower() == low:
+            return key
+    return anchor
+
 
 def anchor_from_input(value):
     """Reduce a bare name / page url / fragment url to the anchor we look up."""
@@ -1063,34 +1183,142 @@ def extract_md5(sec):
 
 
 def extract_additional_downloads(sec):
+    """EVERY additional download the page lists.  Which ones are actually
+    fetched is decided later, by whether an ACTIVE command mentions the file
+    (_needed_additional_links) -- not by the label.
+
+    Labels were the first attempt: keep "required" entries and every .patch.
+    alsa-lib then failed, because its alsa-ucm-conf tarball is labelled
+    "Recommended file:" and is used by a command that is NOT conditional:
+        make install && tar -C /usr/share/alsa ... -xf ../alsa-ucm-conf-...
+    Reading the label is guessing; reading the commands is knowing.
+
+    string= matching on the h3 broke silently when the heading holds nested
+    tags (BeautifulSoup's string= only matches a lone text child), which is
+    why docbook-xsl's additional_links came back EMPTY -- match on
+    get_text() instead."""
     pd = package_div(sec)
     if not pd:
         return []
-    h3_add = pd.find("h3", string=re.compile(r"\s*Additional Downloads\s*"))
-    h3_dep = pd.find("h3", string=re.compile(r"\s*Dependencies\s*"))
+    def _h3(title):
+        # h3 in older book editions, h4 in 13.0 -- the tag is layout, the
+        # TITLE is the contract.  Matching only h3 left additional_links
+        # empty for every package in the 13.0 book.
+        return pd.find(lambda t: t.name in ("h3", "h4")
+                       and title in " ".join(t.get_text().split()))
+    h3_add = _h3("Additional Downloads")
+    h3_dep = _h3("Dependencies")
     if not h3_add:
         return []
     out, cur = [], h3_add.find_next_sibling()
     while cur and cur != h3_dep:
-        for u in cur.find_all("a", class_="ulink"):
-            href = u.get("href")
-            if href:
-                out.append(href)
+        blocks = cur.find_all(["p", "li"]) or [cur]
+        for blk in blocks:
+            for u in blk.find_all("a", class_="ulink"):
+                href = u.get("href")
+                if href:
+                    out.append(href)
         cur = cur.find_next_sibling()
-    return out
+    # blocks may nest (li holding p): keep order, drop duplicates
+    seen, uniq = set(), []
+    for h in out:
+        if h not in seen:
+            seen.add(h); uniq.append(h)
+    return uniq
+
+
+DEP_KINDS = ("required", "recommended", "optional")
+
+
+def _in_parenthetical(node):
+    """Is this link inside a ( ... ) aside rather than in the list itself?
+
+    A dependency line is "Package, Package, and Package", and the book
+    qualifies entries in parentheses -- which often NAME OTHER PACKAGES:
+
+        Graphite2-1.3.14 (required for building texlive-20250308 or
+        LibreOffice-26.2.1.2 with system harfbuzz)
+        Qt-6.10.2 (required for okular)
+
+    Harvesting every link made harfbuzz depend on LibreOffice and TeX Live,
+    and poppler on Qt6 and okular.  Planning Xwayland then came to 235
+    packages, of which 178 hung off that one sentence: a JDK, PostgreSQL, an
+    office suite, for an X server.
+
+    The qualified package itself is the link BEFORE the parenthesis, so
+    dropping what is inside loses nothing real.
+    """
+    prev = ""
+    for sib in node.previous_siblings:
+        prev = (sib.get_text() if hasattr(sib, "get_text") else str(sib)) + prev
+        if "(" in prev or ")" in prev:
+            break
+    opens = prev.count("(") - prev.count(")")
+    return opens > 0
+
+
+def _dep_xrefs(pd, kind):
+    """The <a class="xref"> nodes of one dependency kind, in a package div.
+
+    THE CLASS IS NOT GUARANTEED.  Both extractors selected `p.{kind} a.xref`
+    and nothing else, so on libheif -- whose Recommended list is a plain <p>
+    under an <h5>Recommended</h5> -- the list vanished and `blfs deps libheif`
+    answered "libheif".  Losing a dependency silently is the worst way to be
+    wrong: the build gets further before failing, and fails somewhere else.
+    """
+    nodes = [n for n in pd.select(f"p.{kind} a.xref")
+             if not _in_parenthetical(n)]
+    if nodes:
+        return nodes
+    for h in pd.find_all(["h3", "h4", "h5", "h6"]):
+        if " ".join(h.get_text().split()).strip().lower() != kind:
+            continue
+        out = []
+        for sib in h.next_siblings:
+            name = getattr(sib, "name", None)
+            if name is None:
+                continue
+            if name in ("h3", "h4", "h5", "h6"):
+                break
+            if name == "p":
+                # a classed paragraph belongs to the kind its class names
+                classes = sib.get("class") or []
+                if any(c in DEP_KINDS and c != kind for c in classes):
+                    break
+                out.extend(n for n in sib.select("a.xref")
+                           if not _in_parenthetical(n))
+        if out:
+            return out
+    return []
 
 
 def _xref_titles(sec, kind):
+    """The dependencies of one kind (required / recommended / optional).
+
+    The book usually marks the list with a class -- <p class="required"> --
+    and this selected on that alone.  But the class is not guaranteed: on
+    libheif the Recommended list is a plain <p> under an <h5>Recommended</h5>,
+    so the whole list vanished and `blfs deps libheif` answered "libheif".
+    Silently losing dependencies is the worst way to be wrong: the build gets
+    further before it fails, and fails somewhere else.
+
+    So: the class when it is there, and otherwise the heading that says what
+    the list is.
+    """
     pd = package_div(sec)
     if not pd:
         return []
-    out = []
-    for x in pd.select(f"p.{kind} a.xref"):
-        title = " ".join((x.get("title") or "").split())
-        if not title or re.match(r"(Chapter|Part)\b", title):
-            continue
-        out.append(title.replace(" ", "-"))
-    return out
+
+    def _titles_from(nodes):
+        out = []
+        for x in nodes:
+            title = " ".join((x.get("title") or "").split())
+            if not title or re.match(r"(Chapter|Part)\b", title):
+                continue
+            out.append(title.replace(" ", "-"))
+        return out
+
+    return _titles_from(_dep_xrefs(pd, kind))
 
 
 def extract_installed_content(sec):
@@ -1181,7 +1409,20 @@ def extract_commands(sec, selector):
         elif name == "pre":
             text = _pre_command_text(el)
             if text:
-                out.append(text)
+                # THE GUARD BELONGS HERE TOO.  extract_commands_phased checks
+                # each <pre> for a conditional sentence; this extractor (used
+                # for the CONFIGURATION section) did not -- so cyrus-sasl ran
+                #     make install-saslauthd
+                # which the book introduces with "If you want the saslauthd
+                # daemon to start at system startup ... install the
+                # saslauthd.service unit included in blfs-systemd-units".
+                # A conditional block is conditional wherever it appears.
+                _g = _conditional_guard(el)
+                if _g:
+                    out.append("## OPTIONAL, skipped -- the book says: " + _g)
+                    out.append(_commented(text))
+                else:
+                    out.append(text)
         elif name == "div":
             classes = list(el.get("class", []))
             if "admon" in classes:
@@ -1202,6 +1443,75 @@ def extract_commands(sec, selector):
                         out.append("## " + " ".join(lines).replace(" , ", ", "))
                         out.append("")
     return "\n".join(out)
+
+
+# The book's conditionals live in PROSE: "If you wish to build and install
+# the manual pages ... run:" precedes a command block that hard-requires
+# doxygen.  The extractor took every block unconditionally, so a fresh system
+# died in libxml2's documentation build for want of a tool the book calls
+# optional.  A block whose introducing paragraph is conditional is emitted
+# COMMENTED, with the book's own sentence above it -- visible, one uncomment
+# away, never a surprise requirement.
+# ANY sentence that opens with a condition, not a list of verbs.
+#
+# The verb list caught libuv's "If you installed the optional sphinx module,
+# create the man page:" and missed the very next block, "If you BUILT the man
+# page, install it as the root user:" -- so the build of the page was skipped
+# and its install was not, and libuv died on a file that was never made.
+# Enumerating verbs is guessing at English; the pattern is the conditional
+# opening.  Skipping is safe either way: the block is emitted commented with
+# the book's own sentence above it, one uncomment away.
+_COND_GUARD_RE = re.compile(r"^(if\b|optionally\b|should you\b)", re.I)
+
+# A block the book offers as a TEST is not part of installing.
+#
+# "To test the results, issue: gs -q -dBATCH .../tiger.eps" sits in the build
+# section and runs a program that is not installed yet.  It was harmless while
+# a failing command was ignored; the moment the dispatcher started honouring
+# set -e it would fail every such package.  Tests belong to `test`
+# (PM_TEST=1), not to a build.
+_TEST_BLOCK_RE = re.compile(
+    r"^(to test\b|to check\b|the test suite\b|tests? (can|may) be run\b)", re.I)
+
+def _conditional_guard(pre):
+    """The conditional sentence introducing this <pre>, or None if the block
+    must run.
+
+    A condition is only worth skipping when it depends on something we do NOT
+    guarantee.  These tools install required AND recommended dependencies by
+    default -- that is the contract -- so a block conditioned on those is
+    satisfied by construction and must RUN.  Ghostscript proved the cost of
+    not knowing that:
+        If you have installed the recommended dependencies on your system,
+        remove the copies of freetype, lcms2, libjpeg, libpng, and openjpeg:
+            rm -rf freetype lcms2mt jpeg libpng openjpeg
+    Commented out, ghostscript kept its bundled copies and configure died:
+        Mixing local libtiff with shared libjpeg not supported
+    "optional" wins over both: an optional tool is exactly what we do not
+    install."""
+    prev = pre.find_previous(["p", "pre", "h3", "h4"])
+    if prev is None or prev.name != "p":
+        return None
+    txt = " ".join(prev.get_text().split())
+    if _TEST_BLOCK_RE.match(txt):
+        return txt                      # a test, never part of installing
+    if not _COND_GUARD_RE.match(txt):
+        return None
+    low = txt.lower()
+    # "If sudo or su is invoked for switching to the root user, ensure ..."
+    # is about HOW to become root, not whether to run the command -- and the
+    # command it introduces was `./x.py install`, the whole point of the
+    # package.  A sentence about privilege mechanics guards nothing.
+    if re.match(r"^if\s+(sudo|su)\b", low):
+        return None
+    if "optional" not in low and ("recommended" in low or "required" in low):
+        return None                     # our contract satisfies it
+    return txt
+
+
+def _commented(text):
+    return "\n".join("#" + (" " + l if l and not l.startswith("#") else l)
+                     for l in text.splitlines())
 
 
 def extract_commands_phased(sec):
@@ -1245,7 +1555,40 @@ def extract_commands_phased(sec):
             text = _pre_command_text(el)
             if not text:
                 continue
-            (install if "root" in classes else build).append(text)
+            # ORDER ACROSS THE STREAMS, not just within them.
+            #
+            # A page can go user -> root -> user, and GLib does:
+            #   build glib with introspection disabled           (user)
+            #   ninja -C gi-build install                        (root)
+            #   meson configure -D introspection=enabled; ninja  (user)
+            # Sorting blocks into "build" and "install" kept each stream's
+            # order but lost the INTERLEAVING, so the reconfigure ran in the
+            # build phase, before gobject-introspection was installed:
+            #   ERROR: Program 'g-ir-scanner' not found
+            # Once a root block has appeared, everything that follows belongs
+            # after it -- so later user blocks join the install stream, in
+            # the book's own order.  Both streams run as the same package
+            # user here (a package user installs its own files), so nothing
+            # is lost by moving a command across.
+            # A BLOCK THAT IS COMMENTED OUT DOES NOT MOVE THE STREAM.
+            #
+            # "everything after a root block belongs after it" is right for a
+            # root step that RUNS.  gegl's first root block is conditional --
+            # "If you are installing over a previous version ... remove it" --
+            # so it is emitted commented, and nothing has happened; but it
+            # flipped the latch anyway, and the whole build (mkdir build,
+            # meson setup, ninja) landed in install_pkg while build_pkg came
+            # out as `:`.  The build then ran inside the install phase, and
+            # when meson failed the following `ninja install` still ran:
+            #     ninja: error: loading 'build.ninja': No such file
+            guard = _conditional_guard(el)
+            is_root = "root" in classes and not guard
+            stream = install if (is_root or install) else build
+            if guard:
+                stream.append("## OPTIONAL, skipped -- the book says: " + guard)
+                stream.append(_commented(text))
+                continue
+            stream.append(text)
         else:                                            # h3 / h4
             title = " ".join(el.get_text().split())
             if title:
@@ -1309,9 +1652,6 @@ def anchor_from_href(href):
     return href, None
 
 
-DEP_KINDS = ("required", "recommended", "optional")
-
-
 def section_deps(sec, kinds=("required", "recommended")):
     """Return list of dicts: {title, anchor, external, kind}."""
     pd = package_div(sec)
@@ -1319,7 +1659,7 @@ def section_deps(sec, kinds=("required", "recommended")):
         return []
     deps = []
     for kind in kinds:
-        for x in pd.select(f"p.{kind} a.xref"):
+        for x in _dep_xrefs(pd, kind):
             title = strip_paren(" ".join(x.get("title", "").split()))
             # xrefs to whole chapters/parts aren't packages -- skip them
             if not title or re.match(r"(Chapter|Part)\b", title):
@@ -1347,22 +1687,87 @@ def deps_of(data, kinds):
     return [d for d in data.get("deps", []) if d["kind"] in kinds]
 
 
-def walk_deps(book, anchor, kinds=("required", "recommended")):
+_EXTRA_DEPS_PATH = os.environ.get(
+    "BLFS_PACKAGE_FIXES", "/etc/pkgusr/stacks/package-fixes.conf")
+
+
+def _extra_deps_for(anchor):
+    """Dependencies the BOOK does not record but the build needs.
+
+    libass hard-requires harfbuzz in its configure and its page lists only
+    FreeType, FriBidi, Fontconfig and NASM -- so no ordering could place it
+    (libass built at 143, harfbuzz at 199) and no entry order could either,
+    because both sit inside one plan.  glslang for mesa was the same class,
+    patched by hand into the stack.
+
+    package-fixes.conf can add the edge:
+        [libass]
+        needs = harfbuzz
+    They are treated as REQUIRED, because that is what they are.
+    """
+    if not hasattr(_extra_deps_for, "_map"):
+        m = {}
+        try:
+            import configparser
+            cp = configparser.ConfigParser()
+            cp.read(_EXTRA_DEPS_PATH)
+            for sect in cp.sections():
+                v = cp[sect].get("needs", "")
+                if v.strip():
+                    m[sect.lower()] = [x.strip() for x in
+                                       re.split(r"[,\s]+", v) if x.strip()]
+        except Exception:
+            m = {}
+        _extra_deps_for._map = m
+    # the same shape as a dep parsed from the book, or consumers KeyError
+    return [{"anchor": n, "kind": "required", "name_version": n,
+             "external": False, "title": n, "optional": False}
+            for n in _extra_deps_for._map.get(anchor.lower(), [])]
+
+
+def walk_deps(book, anchor, kinds=("required", "recommended"), ignore=()):
     """Depth-first walk over cached package data.  Returns (order, edges,
     missing, via).  `order` is install order (deps first); `edges` maps anchor
     -> child dep dicts; `via` maps each dependency anchor -> (parent_anchor,
-    kind) recording who first pulled it in and how."""
-    order, edges, missing, via, visited = [], {}, [], {}, set()
+    kind) recording who first pulled it in and how.
 
-    def visit(a):
+    AN AVOIDED PACKAGE IS NOT WALKED INTO.  Ignoring happened afterwards, on
+    the finished list, so `--ignore libreoffice` dropped LibreOffice and kept
+    everything only LibreOffice wanted: PostgreSQL, unixODBC, CLucene,
+    Redland, OpenJDK, apache-ant, Cups...  Planning harfbuzz with libreoffice
+    ignored came to 463 packages, and the plan stopped on a JT_JAVA guard for
+    a JDK nobody asked for.  sway.stack says what was meant -- "everything
+    they alone pull in goes with them" -- and it has an avoid list 80 names
+    long because that is what it took to say it by hand.
+
+    Not walking into it is the whole fix: anything ANOTHER package needs is
+    still reached through that package, so shared dependencies survive.
+    """
+    order, edges, missing, via, visited = [], {}, [], {}, set()
+    ignored_required = []
+    ignore = {x.lower() for x in (ignore or ())}
+
+    def visit(a, parent="", kind=""):
         if a in visited:
+            return
+        if a.lower() in ignore and a != anchor:
+            # AN IGNORED PACKAGE THAT SOMETHING REQUIRES.
+            #
+            # Not walking into an avoided branch is right (1.14.24).  But
+            # webkitgtk REQUIRES Ruby, the stack's avoid list contains ruby,
+            # and the plan therefore left out a hard requirement of a package
+            # the user had asked for -- silently, until cmake said "Ruby 2.5
+            # or higher is required" after everything else had built.
+            # Skipping is still correct; saying nothing is not.
+            if kind == "required" and parent:
+                ignored_required.append((parent, a))
             return
         visited.add(a)
         data = book.get(a)
         if data is None:
             missing.append(a)
             return
-        deps = deps_of(data, kinds)
+        deps = deps_of(data, kinds) + _extra_deps_for(a)
         edges[a] = deps
         for d in deps:
             if d["external"]:
@@ -1370,19 +1775,1144 @@ def walk_deps(book, anchor, kinds=("required", "recommended")):
                 via.setdefault(d["external"], (a, d["kind"]))
             elif d["anchor"]:
                 via.setdefault(d["anchor"], (a, d["kind"]))
-                visit(d["anchor"])
+                visit(d["anchor"], a, d["kind"])
         order.append(a)
 
     visit(anchor)
+    order = _dependencies_come_first(order, edges)
+    walk_deps.ignored_required = ignored_required
     return order, edges, missing, via
 
 
-# --------------------------------------------------------------------------- #
-# script generation
-# --------------------------------------------------------------------------- #
+# (dependant, dependency) pairs whose recommended edge was dropped to break a
+# cycle -- the dependant is built BEFORE something it recommends.
+_CYCLE_DROPS = []
+
+
+def _dependencies_come_first(order, edges):
+    """A real topological sort: every dependency before its dependant.
+
+    This was three times a REPAIR PASS -- walk the list, notice a dependency
+    that landed too late, move it earlier -- and three times something moved
+    it back (1.12.33, 1.12.52, 1.12.68: texlive, then GLib, then libxcb).  A
+    pass that repairs an order cannot guarantee one; it can only fix the
+    cases it happens to look at, and the next pass undoes them.
+
+    So: Kahn's algorithm over the dependency graph.  A node is emitted when
+    everything it depends on has been emitted, and nothing else can move it.
+    Ties keep the walk's original order, so the result stays stable and
+    readable.
+
+    Cycles are real in BLFS (GLib recommends shared-mime-info, which requires
+    GLib).  They are broken by strength: RECOMMENDED edges inside a cycle are
+    dropped first, because a recommendation is a preference and a requirement
+    is a fact.  A cycle made only of required edges is the book's own knot --
+    those nodes are emitted in their original order, and no reordering
+    pretends to have solved it.
+    """
+    del _CYCLE_DROPS[:]
+    nodes = list(order)
+    present = set(nodes)
+    deps = {a: [(d.get("anchor"), d.get("kind"))
+                for d in edges.get(a, [])
+                if d.get("anchor") in present and d.get("anchor") != a]
+            for a in nodes}
+
+    result, remaining = [], set(nodes)
+    while remaining:
+        ready = [a for a in nodes
+                 if a in remaining
+                 and not any(dep in remaining for dep, _k in deps[a])]
+        if ready:
+            for a in ready:
+                result.append(a)
+                remaining.discard(a)
+            continue
+        # Nothing is ready: something is in a cycle.  BREAK ONLY INSIDE IT.
+        #
+        # "Fewest blocking dependencies" is not the same as "in the cycle":
+        # it picked ffmpeg, whose recommended edge to libass was then
+        # dropped, and ffmpeg was ordered at 179 with libass at 208 --
+        #     ERROR: libass >= 0.11.0 not found using pkg-config
+        # The cycle was elsewhere (libass -> harfbuzz -> freetype2 ->
+        # libass, after 1.13.23 made libass REQUIRE harfbuzz).
+        #
+        # So find the strongly-connected components of what is left, and
+        # drop recommended edges only where BOTH ends are in the same one.
+        # An edge into or out of a cycle is not what is holding it.
+        _idx, _low, _on, _stack, _sccs, _counter = {}, {}, set(), [], [], [0]
+
+        def _strong(v):
+            _idx[v] = _low[v] = _counter[0]
+            _counter[0] += 1
+            _stack.append(v)
+            _on.add(v)
+            for _w, _k in deps.get(v, []):
+                if _w not in remaining:
+                    continue
+                if _w not in _idx:
+                    _strong(_w)
+                    _low[v] = min(_low[v], _low[_w])
+                elif _w in _on:
+                    _low[v] = min(_low[v], _idx[_w])
+            if _low[v] == _idx[v]:
+                comp = []
+                while True:
+                    _w = _stack.pop()
+                    _on.discard(_w)
+                    comp.append(_w)
+                    if _w == v:
+                        break
+                if len(comp) > 1:
+                    _sccs.append(set(comp))
+
+        import sys as _sys
+        _lim = _sys.getrecursionlimit()
+        _sys.setrecursionlimit(max(_lim, len(nodes) * 4 + 100))
+        try:
+            for v in nodes:
+                if v in remaining and v not in _idx:
+                    _strong(v)
+        finally:
+            _sys.setrecursionlimit(_lim)
+
+        broke = False
+        for comp in _sccs:
+            for a in comp:
+                kept = [(dep, k) for dep, k in deps[a]
+                        if not (dep in comp and k != "required")]
+                if len(kept) != len(deps[a]):
+                    # SAY WHAT WAS GIVEN UP.
+                    #
+                    # Breaking the cycle is right, and silent.  vala
+                    # recommends graphviz; graphviz -> gegl -> babl -> librsvg
+                    # -> vala closes the loop, so vala's edge was dropped and
+                    # vala built FIRST -- without valadoc, and with configure
+                    # stopping on "Package 'libgvc' not found".  The order was
+                    # the best available; not mentioning it was not.
+                    for _dep, _k in deps[a]:
+                        if _dep in comp and _k != "required":
+                            _CYCLE_DROPS.append((a, _dep))
+                    deps[a] = kept
+                    broke = True
+        if broke:
+            continue
+        # A REQUIRED-ONLY CYCLE IS THE BOOK'S KNOT -- but only the knot.
+        #
+        # This emitted EVERY remaining node in its original order, edges and
+        # all, so one unbreakable cycle threw away the ordering of everything
+        # after it: ffmpeg came out at 192 with libass, which it needs, at
+        # 205.  Release just the smallest strongly-connected component and
+        # carry on sorting the rest.
+        _knot = min(_sccs, key=len) if _sccs else set()
+        if not _knot:
+            _knot = {next(a for a in nodes if a in remaining)}
+        for a in nodes:
+            if a in _knot:
+                result.append(a)
+                remaining.discard(a)
+        for a in list(remaining):
+            deps[a] = [(dep, k) for dep, k in deps[a] if dep not in _knot]
+        continue
+    return result
+
+def _active_command_text(*chunks):
+    """The command text with commented-out lines removed -- what will really
+    run."""
+    out = []
+    for c in chunks:
+        for line in (c or "").splitlines():
+            t = line.strip()
+            if t.startswith("#"):
+                continue
+            out.append(line)
+    return "\n".join(out)
+
+
+def _page_env_definitions(sec, names):
+    """Variable definitions the PAGE itself makes, for variables its build
+    commands use.
+
+    TeX Live's build uses $TEXLIVE_PREFIX, and the same page sets it -- in
+    the block that writes /etc/profile.d/texlive.sh, further down:
+        TEXLIVE_PREFIX=/opt/texlive/2025
+    The extractor takes install commands and drops that block, so the script
+    used a variable the page defines a few paragraphs later.  A definition on
+    the page is the book's answer; asking the user to supply it again is
+    asking them to repeat the book.
+
+    Only simple, self-contained assignments (no command substitution beyond
+    what the page itself spells out), and only for variables actually used.
+    """
+    if not names:
+        return {}
+    # FOLLOW THE CHAIN.  The book defines
+    #     export XORG_PREFIX="/usr"
+    #     export XORG_CONFIG="--prefix=$XORG_PREFIX --sysconfdir=/etc ..."
+    # and rejecting a value because it names another variable ("the same
+    # question moved") threw away an answer the same page gives.  A value
+    # that depends on a variable we can ALSO find here is answered; only a
+    # chain that runs out is not.
+    names = set(names)
+    found = {}
+    # The definition may be on ANOTHER page: TeX Live's build uses
+    # $TEXLIVE_PREFIX and the value is set in "Setting the PATH for TeX Live"
+    # (anchor tex-path), which is its own section.  The book is one document;
+    # search it whole, nearest section first.
+    scopes = [sec]
+    root = sec
+    while getattr(root, "parent", None) is not None:
+        root = root.parent
+    if root is not sec:
+        scopes.append(root)
+    for pre in [q for sc in scopes for q in sc.find_all("pre")]:
+        text = pre.get_text()
+        for n in names:
+            if n in found:
+                continue
+            m = re.search(r"^\s*(?:export\s+)?%s=([^\n]+(?:\\\n[^\n]+)*)$"
+                          % re.escape(n), text, re.M)
+            if m:
+                # a value may continue over several lines with backslashes;
+                # a fragment ending in "\" is not a value, it is half of one
+                val = " ".join(x.strip() for x in
+                               m.group(1).replace("\\\n", " ").splitlines())
+                val = val.strip().strip("&").strip()
+                # a definition that needs another unknown variable is not an
+                # answer, it is the same question moved
+                # "<PREFIX>" and friends are placeholders in prose, not values
+                if "<" in val or ">" in val:
+                    continue
+                found[n] = val
+    # pull in what those values reference, up to a few links
+    for _ in range(4):
+        need = set()
+        for v in found.values():
+            need |= set(re.findall(r"\$\{?([A-Z][A-Z0-9_]{2,})", v))
+        need -= set(found)
+        if not need:
+            break
+        names |= need
+        for pre in [q for sc in scopes for q in sc.find_all("pre")]:
+            text = pre.get_text()
+            for n in list(need):
+                m = re.search(r"^\s*(?:export\s+)?%s=([^\n]+(?:\\\n[^\n]+)*)$"
+                              % re.escape(n), text, re.M)
+                if m and n not in found:
+                    v = " ".join(x.strip() for x in
+                                 m.group(1).replace("\\\n", " ").splitlines())
+                    found[n] = v.strip().strip("&").strip()
+    # drop anything still referencing something we could not find: an
+    # unanswered chain is not an answer
+    for n in list(found):
+        unresolved = set(re.findall(r"\$\{?([A-Z][A-Z0-9_]{2,})", found[n])) - set(found)
+        if unresolved or found[n].endswith("\\") or '"' in found[n].rstrip('"'):
+            del found[n]
+    return found
+
+
+def _required_env_guard(cmds, known):
+    """Variables the book expects the USER to set, checked before use.
+
+    TeX Live's page says to `export TEXLIVE_PREFIX=...` first; the commands
+    then use it.  Unset, the shell expands it to nothing and configure gets
+        error: expected an absolute directory name for --datarootdir:
+    followed by a tar reading "--strip-components=1" as a filename.  An empty
+    expansion produces nonsense far from its cause, so the script now refuses
+    at the top of the phase and names the variable.
+
+    Only variables the script does not set itself and that are not part of
+    its own vocabulary."""
+    # SINGLE-QUOTED TEXT IS NOT THE SHELL'S.
+    #
+    # $PACKAGE_PREFIX_DIR and $SAVE_PACKAGE_PREFIX_DIR are CMake variables,
+    # written by a sed expression into a .cmake file:
+    #     sed -e '/PACKAGE_INIT/i set(SAVE_PACKAGE_PREFIX_DIR "${PACKAGE_PREFIX_DIR}"...
+    # The shell never expands them -- they are inside single quotes -- so
+    # asking the user to set them was asking about another language's
+    # variables.  Strip single-quoted spans before looking for names.
+    # A COMMENTED LINE IS NOT A COMMAND.
+    #
+    # OpenJDK's page uses $JT_JAVA only in its test block, which the generated
+    # script comments out -- and it EXPORTS the variable there itself:
+    #     # export JT_JAVA=$(echo $PWD/build/*/jdk) &&
+    #     # jtreg/bin/jtreg -jdk:$JT_JAVA ...
+    # Scanning the commented text anyway produced a guard for a variable
+    # nothing live would ever read, and the whole plan refused to start until
+    # the user invented a value for it.  Read only what will run.
+    _live = "\n".join(l for l in (cmds or "").splitlines()
+                      if not l.strip().startswith("#"))
+    _scan = re.sub(r"'[^']*'", "''", _live)
+    names = set(re.findall(r"\$\{([A-Z][A-Z0-9_]{2,})\}", _scan))
+    names |= set(re.findall(r"\$([A-Z][A-Z0-9_]{2,})\b", _scan))
+    names -= set(known or ())
+    # ...and a variable the commands SET is not one to ask the user for,
+    # whether the assignment is live or not: the page is telling us its value.
+    names -= set(re.findall(r"(?:^|\s|;)(?:export\s+)?([A-Z][A-Z0-9_]{2,})=",
+                            cmds or "", re.M))
+    # The shell's own variables are not the user's to set, and asking for
+    # them is worse than useless: a list containing EUID teaches the user to
+    # ignore the list.
+    names -= {"PATH", "HOME", "PWD", "OLDPWD", "SHELL", "USER", "LOGNAME",
+              "TERM", "MAKEFLAGS", "MAKELEVEL", "CFLAGS", "CXXFLAGS",
+              "LDFLAGS", "CPPFLAGS", "PKG_CONFIG_PATH", "LD_LIBRARY_PATH",
+              "BUILD_ROOT", "PM_TEST", "DESTDIR", "SHLVL", "IFS", "EUID",
+              "UID", "PPID", "RANDOM", "SECONDS", "LINENO", "HOSTNAME",
+              "BASH", "BASH_SOURCE", "BASH_VERSION", "FUNCNAME", "REPLY",
+              "PIPESTATUS", "OSTYPE", "MACHTYPE", "LANG", "LC_ALL", "TMPDIR"}
+    if not names:
+        return cmds
+    lines = []
+    for n in sorted(names):
+        lines.append('\t[ -n "${%s:-}" ] || { echo "this package needs %s to be set '
+                     '(the book says to export it before building)" >&2; exit 1; }'
+                     % (n, n))
+    return "\n".join(lines) + "\n" + (cmds or "")
+
+
+# Subprojects the book has NO PAGE for, per package.
+#
+# --wrap-mode=nofallback exists to stop a package installing its own copy of
+# something another package owns (cairo once vendored freetype).  That is only
+# the right answer when the book HAS the dependency.  gegl needs libnsgif and
+# poly2tri-c; neither has a BLFS page, so no amount of planning can supply
+# them and the flag simply makes gegl unbuildable -- a package the book builds
+# with a plain `meson setup`.
+#
+# `--force-fallback-for` overrides the wrap mode for exactly the named
+# subprojects, so the protection stays for everything else.  Add an entry only
+# after checking `blfs search <name>` finds nothing: if the book gains a page,
+# the entry must go, and the failure box (1.14.39) covers anything not listed.
+_FALLBACK_ALLOWED = {
+    "gegl": ("libnsgif", "poly2tri-c"),
+}
+
+
+def _allow_missing_subprojects(cmds, anchor):
+    allowed = _FALLBACK_ALLOWED.get((anchor or "").lower())
+    if not allowed:
+        return cmds
+    out = []
+    for line in (cmds or "").splitlines():
+        if (re.search(r"\bmeson\s+setup\b", line)
+                and "force-fallback-for" not in line
+                and not line.strip().startswith("#")):
+            line = re.sub(r"(\bmeson\s+setup\b)",
+                          r"\1 --force-fallback-for=" + ",".join(allowed),
+                          line, count=1)
+        out.append(line)
+    return "\n".join(out)
+
+
+def _no_vendored_subprojects(cmds):
+    """A package must not quietly build a dependency it could not find.
+
+    cairo's meson fell back to its bundled subprojects and INSTALLED its own
+    freetype and fontconfig:
+        /usr/lib/libfreetype.so.6.20.1   p_cairo   (and no libfreetype.so)
+    There was no p_freetype2 at all -- never built, because the planner then
+    saw a libfreetype on disk and considered it done.  Every later
+    "cannot find -lfreetype" came from that one silent fallback: a vendored
+    copy is owned by the wrong package, carries no development symlink, and
+    hides the missing dependency instead of reporting it.
+
+    --wrap-mode=nofallback makes meson FAIL instead, naming the dependency,
+    which is what the planner and the user need to see.  It is added only
+    where it is not already specified."""
+    out = []
+    for line in (cmds or "").splitlines():
+        if (re.search(r"\bmeson\s+setup\b", line)
+                and "wrap-mode" not in line and "wrap_mode" not in line
+                and not line.strip().startswith("#")):
+            line = re.sub(r"(\bmeson\s+setup\b)", r"\1 --wrap-mode=nofallback", line, count=1)
+        out.append(line)
+    return "\n".join(out)
+
+
+# The tools the package-user system replaces with wrappers.  Kept here
+# because the generator has to know them: see _use_wrapped_tools.
+_WRAPPED_TOOLS = ("ldconfig", "install", "chown", "chgrp", "chmod", "mkdir", "cp")
+
+
+def _use_wrapped_tools(cmds):
+    r"""Call wrapped tools by NAME, so the wrappers are actually used.
+
+    The wrappers live in a directory on the package user's PATH, which means
+    an ABSOLUTE path walks straight past them.  The book's Xorg loop says
+        as_root /sbin/ldconfig
+    so the package user ran the real ldconfig and hit
+        Renaming of /etc/ld.so.cache~ to /etc/ld.so.cache failed
+    with the wrapper sitting unused.  This is not specific to ldconfig: any
+    of the wrapped tools written as /sbin/x or /usr/bin/x bypasses the whole
+    mechanism.
+    """
+    out = []
+    for line in (cmds or "").splitlines():
+        if not line.strip().startswith("#"):
+            for tool in _WRAPPED_TOOLS:
+                line = re.sub(r"(?<![\w/])/(?:usr/)?s?bin/%s\b" % tool, tool, line)
+        out.append(line)
+    return "\n".join(out)
+
+
+def _define_as_root(cmds):
+    r"""Define as_root when the book's commands use it.
+
+    The multi-package pages call `as_root make install` inside their loop,
+    and define as_root() in a NOTE -- prose, which is kept as a comment.  So
+    the loop called a function that did not exist:
+        install_xorg7-lib: line 198: as_root: command not found
+
+    In this model there is nothing to elevate: the package user owns the
+    directories it installs into, and the wrappers handle what it may not do.
+    So as_root simply runs the command."""
+    if not re.search(r"^[^#\n]*\bas_root\b", cmds or "", re.M):
+        return cmds
+    return ('\tas_root() { "$@"; }   # the package user installs its own files\n'
+            + (cmds or ""))
+
+
+def _unwrap_interactive_subshell(cmds):
+    r"""Drop the book's "start a subshell and paste this" wrapper.
+
+    Xorg Libraries (and the other multi-package pages) say:
+        bash -e
+        for package in $(...); do ... done
+        exit
+    A person types `bash -e`, pastes the loop, then `exit`.  A SCRIPT that
+    runs `bash -e` gets a shell reading its own stdin -- which is the
+    terminal -- and waits there forever:
+        bash install_xorg7-lib all
+          \_ bash -e            <- idle, holding the build
+    The loop belongs in the phase itself, which already runs under set -e,
+    so the wrapper line and its matching `exit` are removed.
+    """
+    lines = (cmds or "").splitlines()
+    if not any(re.match(r"^\s*bash\s+-e\s*$", l) for l in lines):
+        return cmds
+    out, dropped_open = [], False
+    for l in lines:
+        if not dropped_open and re.match(r"^\s*bash\s+-e\s*$", l):
+            out.append("## the book starts a subshell here and pastes the rest into it;")
+            out.append("## this phase IS that shell, and already runs under set -e")
+            dropped_open = True
+            continue
+        if dropped_open and re.match(r"^\s*exit\s*$", l):
+            out.append("## (the book's matching 'exit' -- leaving it would end the phase)")
+            continue
+        out.append(l)
+    return "\n".join(out)
+
+
+def _comment_typeset_doc_builds(cmds):
+    r"""Comment commands that TYPESET documentation.
+
+    libassuan's script ran `make -C doc pdf ps`, which needs a TeX
+    installation this desktop deliberately does not build:
+        You don't have a working TeX binary (tex) installed anywhere in
+        your PATH, and texi2dvi cannot proceed without one.
+    A --disable-doc flag cannot help -- the command asks for PDF by name.
+
+    pdf/ps/dvi are TYPESET formats: no package installs itself with them, so
+    a make invoking those targets is documentation and nothing else.  html,
+    info and man are left alone: they need no TeX and packages do install
+    them.
+    """
+    out = []
+    for line in (cmds or "").splitlines():
+        stripped = line.strip()
+        if (not stripped.startswith("#")
+                and re.match(r"^\s*make\b", stripped)
+                and re.search(r"\b(pdf|ps|dvi)\b", stripped)
+                and not re.search(r"\b(install|check)\b", stripped)):
+            out.append("## SKIPPED -- typesets documentation (pdf/ps/dvi need TeX,"
+                       " which this system does not build)")
+            out.append("# " + line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+# No leading \b: there is no word boundary before "./all.sh", so an outer
+# \b silently killed that alternative -- the regex compiled, matched the
+# make-based drivers, and let NSS's ./all.sh through.
+_FUNCDEF_RE = re.compile(r"^\s*\w[\w:-]*\s*\(\)\s*\{")
+
+
+def _is_definition(line):
+    """A line that DEFINES something is never a command to skip.
+
+    Xorg's loop defines do_build/do_test/do_install and calls them later.
+    The test filter commented `do_test() { make check; }`, so the loop called
+    a function that did not exist -- and the doc and pip filters had the same
+    flaw, waiting for a page that defines a function around those commands.
+    """
+    return bool(_FUNCDEF_RE.match(line))
+
+
+_TEST_DRIVER_RE = re.compile(
+    # A TEST RUNNER IS A COMMAND, NOT A SUBSTRING.
+    #
+    # `\bctest\b` matched inside a brace list -- cargo-c installs its
+    # binaries with
+    #     install -vm755 target/release/cargo-{capi,cbuild,cinstall,ctest} /usr/bin/
+    # and a comma is a word boundary, so the one line that installs anything
+    # was commented as "runs the test suite".  cargo-c then built and
+    # installed NOTHING, librsvg died on `Program 'cargo-cbuild' not found`,
+    # and verify was right to call cargo-c not installed.
+    # The lookbehind rejects a name that is part of a word, a path or a list.
+    r"(\bmake\s+(check|test)\b|(?<![\w./,{-])ctest\b|\bmeson\s+test\b|\bninja\s+test\b"
+    r"|(?<![\w./,{-])pytest\b|\./all\.sh\b|\./runtests\b|\bmake\s+-C\s+\S*tests?\b"
+    # Rust drives everything through x.py: `./x.py test` is its test suite
+    # (41425 tests, and the log-reading grep after it fails when they are
+    # skipped).  `./x.py build` and `./x.py install` must NOT match.
+    r"|\bx\.py\s+test\b|\bcargo\s+test\b|\bgo\s+test\b"
+    # ffmpeg's suite is `make fate`, with `make fate-rsync` to fetch its
+    # samples first -- 40 GB of them, over rsync, during an install.
+    r"|\bmake\s+(?:\S+=\S+\s+)*fate(-\w+)?\b"
+    # ...and the standalone fetch of the samples, which is its own statement:
+    #     rsync -vrltLW --delete ... rsync://fate-suite.ffmpeg.org/... 
+    # Commenting `make fate-rsync` left this running, and rsync is not even
+    # installed:  install_ffmpeg: line 242: rsync: command not found
+    r"|\brsync\b[^\n]*\bfate\b|\brsync://)")
+
+
+_TEST_LOG_RE = re.compile(r"\btee\s+(\S*testlog\S*)|\b(\S*testlog\S*)\b")
+
+
+# What makes a pushd group "a test suite being built" rather than part of the
+# build: the names of the suites the books actually fetch.
+_TEST_SETUP_RE = re.compile(
+    r"\b(piglit|xts|xtest|x-test-suite|test-?suite|fate-suite|jtreg|"
+    r"XTEST_DIR|PIGLIT_DIR)\b", re.I)
+
+
+def _comment_test_runs(cmds):
+    r"""Running the test suite is not building the package.
+
+    NSS's page puts its tests in the BUILD block:
+        cd tests &&
+        HOST=localhost DOMSUF=localdomain ./all.sh
+        cd ../
+    so `packagemanager install nss` ran 77549 tests -- hours -- and then
+    failed the package on a test artifact.  The script already HAS a test
+    phase (test_pkg, run only with PM_TEST=1); tests belong there.
+
+    The `cd tests &&` that leads into it is commented with the run, and the
+    `cd ..` that leads back out, or the chain would break.
+    """
+    lines = (cmds or "").splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        # A FUNCTION DEFINITION IS NOT A TEST RUN.
+        #
+        # Xorg's loop defines `do_test() { make check; }` and calls it later;
+        # commenting the DEFINITION left the loop calling a function that did
+        # not exist.  Only a command that RUNS the suite is commented, never a
+        # line that defines something.
+        if _is_definition(line):
+            out.append(line)
+            i += 1
+            continue
+        if line.strip().startswith("#") or not _TEST_DRIVER_RE.search(line):
+            out.append(line)
+            i += 1
+            continue
+        # the cd that led in (already emitted) goes with it
+        while out and re.match(r"^\s*cd\s+\S*tests?\S*\s*&&\s*$", out[-1]):
+            out[-1] = "# " + out[-1]
+            break
+        # ...AND SO DOES THE BLOCK THAT BUILT THE TEST SUITE.
+        #
+        # Xwayland's page fetches piglit and the X Test Suite, builds them
+        # against a temporary Xvfb, and only then runs `ninja test`.  All of
+        # that sits in the BUILD block, so commenting the run alone left the
+        # setup to run on every ordinary build: two git clones, an X server,
+        # and finally
+        #     install_Xwayland-24.1.9: line 54: cd: xts: No such file or
+        #     directory ... Fatal server error
+        # The setup is bracketed by pushd/popd, so the whole group can be
+        # taken -- but only when it is recognisably a test suite being built,
+        # never a plain pushd group that happens to precede a test.
+        _j = len(out) - 1
+        while _j >= 0 and not out[_j].strip():
+            _j -= 1
+        if _j >= 0 and re.match(r"^\s*popd\s*(&&)?\s*$", out[_j]):
+            _k = _j
+            while _k >= 0 and not re.match(r"^\s*(mkdir\s+\S+\s*&&\s*)?pushd\b",
+                                          out[_k]):
+                _k -= 1
+            if _k >= 0:
+                # `mkdir tools` and `pushd tools` are often separate lines;
+                # the directory is made only for the suite, so it goes too
+                _m = _k - 1
+                while _m >= 0 and not out[_m].strip():
+                    _m -= 1
+                if _m >= 0 and re.match(r"^\s*mkdir\s+\S+\s*(&&)?\s*$", out[_m]):
+                    _k = _m
+                _span = "\n".join(out[_k:_j + 1])
+                if _TEST_SETUP_RE.search(_span):
+                    for _n in range(_k, _j + 1):
+                        if out[_n].strip() and not out[_n].strip().startswith("#"):
+                            out[_n] = "# " + out[_n]
+                    out.insert(_k, "## SKIPPED -- builds the test suite that the"
+                                   " commented run below uses")
+        # A MATCH ON A CONTINUATION LINE BELONGS TO THE COMMAND ABOVE IT.
+        #
+        # ffmpeg's sample fetch is
+        #     rsync -vrltLW --delete ... \
+        #           rsync://fate-suite.ffmpeg.org/... fate-suite/
+        # and only the SECOND line matches, so the first stayed active and
+        # ran rsync with no arguments to speak of.
+        while out and re.search(r"\\\s*$", out[-1]) and not out[-1].lstrip().startswith("#"):
+            out[-1] = "# " + out[-1]
+        out.append("## SKIPPED -- runs the test suite; this script has a test "
+                   "phase for that (PM_TEST=1)")
+        out.append("# " + line)
+        # whatever reads the log it would have written goes too: rust pipes
+        # the run into rustc-testlog and greps it on the next lines
+        _logs = set(m for m in _TEST_LOG_RE.findall(line) for m in m if m)
+        i += 1
+        while i < len(lines) and _logs and any(l in lines[i] for l in _logs):
+            out.append("# " + lines[i])
+            i += 1
+        # a pipeline continues over lines: comment the rest of it, or the
+        # `awk` after a commented `grep ... |` runs on its own
+        while (out and re.search(r"(\||&&|\\)\s*$", out[-1])
+               and i < len(lines) and lines[i].strip()):
+            out.append("# " + lines[i])
+            i += 1
+        # and the cd back out
+        if i < len(lines) and re.match(r"^\s*cd\s+\.\.?/?\s*&*\s*$", lines[i]):
+            out.append("# " + lines[i])
+            i += 1
+    return "\n".join(out)
+
+
+_TYPESET_RE = re.compile(
+    r"\b(texi2pdf|texi2dvi|dvips|dvipdf|pdflatex|dblatex|latex)\b")
+
+
+def _comment_typeset_blocks(cmds):
+    r"""A loop that typesets the manuals needs TeX; skip the whole block.
+
+    ffmpeg's page ends its build with
+        pushd doc &&
+        for DOCNAME in `basename -s .html *.html`
+        do
+            texi2pdf -b $DOCNAME.texi &&
+            texi2dvi -b $DOCNAME.texi &&
+            dvips    -o $DOCNAME.ps $DOCNAME.dvi
+        done &&
+    which fails on a system that deliberately has no TeX.  Commenting only
+    the texi2* lines would leave an empty loop body, so the block goes as a
+    unit: from the `pushd`/`for` that opens it to the `done`/`popd` that
+    closes it.
+    """
+    lines = (cmds or "").splitlines()
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip().startswith("#") or not re.match(r"^\s*(pushd|for)\b", line):
+            out.append(line)
+            i += 1
+            continue
+        # find the end of this block, and whether it typesets anything
+        j, depth, typesets = i, 0, False
+        while j < len(lines):
+            if re.match(r"^\s*(for|while|until)\b", lines[j]):
+                depth += 1
+            if re.match(r"^\s*done\b", lines[j]):
+                depth -= 1
+            if _TYPESET_RE.search(lines[j]):
+                typesets = True
+            if depth <= 0 and j > i and re.match(r"^\s*(done|popd)\b", lines[j]):
+                break
+            j += 1
+        if not typesets or j >= len(lines):
+            out.append(line)
+            i += 1
+            continue
+        # swallow a trailing popd too, and any && that chains on
+        while j + 1 < len(lines) and re.match(r"^\s*popd\b", lines[j + 1]):
+            j += 1
+        out.append("## SKIPPED -- typesets the manuals (texi2pdf/dvips need TeX); "
+                   "the package itself does not need them")
+        for k in range(i, j + 1):
+            out.append("# " + lines[k])
+        i = j + 1
+    return "\n".join(out)
+
+
+def _comment_doc_format_builds(cmds):
+    r"""Comment `make ... pdf/ps/dvi` -- the book's OPTIONAL manuals.
+
+    libassuan's page ends with
+        make -C doc pdf ps
+    which typesets the manual and needs a TeX installation.  --disable-doc
+    does not help (libassuan has no such switch; autotools accepts unknown
+    --disable-* silently), because nothing is misconfigured: the command
+    explicitly asks for PDF.
+
+    A library is not installed by typesetting its manual, so these lines are
+    emitted commented, with the book's own command one uncomment away.  info
+    and html builds are left alone -- they need only texinfo, which LFS has.
+    """
+    out = []
+    for line in (cmds or "").splitlines():
+        if (not line.strip().startswith("#") and not _is_definition(line)
+                and re.search(r"\bmake\b[^#\n]*\s(pdf|ps|dvi)\b", line)):
+            out.append("## SKIPPED -- typesets the manual (needs TeX); the "
+                       "package itself does not need it")
+            out.append("# " + line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+_PROFILE_RUN_RE = re.compile(
+    r"^\s*(source|\.)\s+/etc/profile(\.d/\S+)?\s*$|^\s*/etc/profile\.d/\S+\.sh\s*$")
+
+
+# `make install-<name>` in a CONFIGURATION section is the SysV books' idiom
+# for installing a boot script, and the target lives in the blfs-bootscripts
+# package -- not in the package being built.  Run as-is it says:
+#     make: *** No rule to make target 'install-bluetooth'.  Stop.
+# after everything else has installed correctly, which turns a finished build
+# into a failure.  The systemd books have no such sections, so this only
+# appears once a SysV book is in use.
+_BOOTSCRIPT_RE = re.compile(r"^\s*make\s+(?:-C\s+\S+\s+)?install-([A-Za-z0-9_.+-]+)\s*$")
+_AUTOMAKE_INSTALL_TARGETS = {
+    "strip", "exec", "data", "html", "pdf", "ps", "dvi", "info", "man",
+    "exec-am", "data-am", "dist", "recursive",
+}
+
+
+# "You can test your installation ..." -- prose that introduces an EXAMPLE,
+# not a configuration step.  enchant's page ends with a spell-check demo that
+# needs an aspell dictionary; run as a configure phase it failed with
+#     No dictionary available for 'en_GB'
+# after the package had installed perfectly.  A demonstration is not part of
+# installing something.
+_CONFIG_TEST_INTRO_RE = re.compile(
+    r"you (can |may )?(now )?(test|verify|try)\b|to test (your|the) install"
+    r"|test your installation", re.I)
+
+
+def _comment_config_tests(cmds):
+    out, skipping = [], False
+    for line in (cmds or "").splitlines():
+        st = line.strip()
+        if st.startswith("#"):
+            if _CONFIG_TEST_INTRO_RE.search(st):
+                if not skipping:
+                    out.append("## SKIPPED -- the book offers this as a way to"
+                               " TEST the installation,")
+                    out.append("## not as a step of it.  Run it by hand if you"
+                               " want to check the package.")
+                skipping = True
+            elif skipping and st not in ("#", "##"):
+                skipping = False            # a new paragraph ends the example
+            out.append(line)
+            continue
+        if skipping and st:
+            out.append("# " + line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _comment_bootscript_installs(cmds, anchor=""):
+    out = []
+    for line in (cmds or "").splitlines():
+        m = _BOOTSCRIPT_RE.match(line)
+        # install-strip, install-exec, install-data and friends are REAL
+        # automake targets in the package itself -- only a name that is not
+        # one of those is a boot script.
+        if m and m.group(1) in _AUTOMAKE_INSTALL_TARGETS:
+            m = None
+        if m and not line.strip().startswith("#"):
+            out.append("## SKIPPED -- installs the '%s' boot script, whose "
+                       "target lives in blfs-bootscripts," % m.group(1))
+            out.append("## not in this package.  Install it from there:")
+            out.append("##   packagemanager install blfs-bootscripts --run")
+            out.append("##   cd <blfs-bootscripts source> && %s"
+                       % line.strip())
+            out.append("# " + line.strip())
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _comment_profile_sourcing(cmds):
+    r"""Writing a login profile is not running it.
+
+    Rust's configuration writes /etc/profile.d/rustc.sh and the page then
+    sources it.  Those snippets call pathprepend/pathappend -- helpers from
+    the BLFS bash startup files, absent from a build shell -- so a package
+    that had built and installed 2390 files failed at:
+        /etc/profile.d/rustc.sh: line 3: pathprepend: command not found
+
+    The file is written; it takes effect at the next login, which is what it
+    is for.  Sourcing it here tests the login shell, not the package.
+    """
+    out = []
+    for line in (cmds or "").splitlines():
+        if not line.strip().startswith("#") and _PROFILE_RUN_RE.match(line):
+            out.append("## SKIPPED -- sourcing a login profile; the file is "
+                       "written and applies at next login")
+            out.append("# " + line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+_LIST_LOOP_RE = re.compile(
+    r"^\s*for\s+\w+\s+in\s+\$\(.*?(\.\./[\w.-]+|\b[\w-]+\.md5)\b.*?\)")
+
+
+def _guard_list_loops(cmds):
+    r"""A loop over a list file must fail when the file is missing.
+
+    Xorg's build is
+        for package in $(grep -v '^#' ../lib-7.md5 | awk '{print $2}')
+    and when ../lib-7.md5 is not there, grep prints an error, the loop runs
+    ZERO times, and the `for` exits 0 -- so a package that built nothing was
+    recorded as installed.  Twice, before anyone noticed.
+
+    A guard in front of the loop turns that into a failure with a name.
+    """
+    out = []
+    for line in (cmds or "").splitlines():
+        m = (None if line.strip().startswith("#")
+             else _LIST_LOOP_RE.match(line))
+        if m:
+            f = m.group(1)
+            out.append('[ -s "%s" ] || { echo "the list this build loops over '
+                       'is missing or empty: %s" >&2; exit 1; }' % (f, f))
+        out.append(line)
+    return "\n".join(out)
+
+
+def _comment_orphan_doc_installs(cmds, context=""):
+    r"""`make install-man` when nothing active ran `make man`.
+
+    Git's page generates the man pages and html docs under "If you have
+    installed asciidoc-10.2.1 and xmlto-0.0.29 you can create ..." -- which
+    the conditional guard skips -- and then installs them unconditionally:
+        make install-man
+        make htmldir=/usr/share/doc/git-2.53.0 install-html
+    So the install tried to build them itself and died on
+        /bin/sh: line 1: asciidoc: command not found
+    after everything else had installed.
+
+    Fourth in this family (libuv's man page, the orphan log reader, brotli's
+    wheel): whenever the guard comments a block, something may still consume
+    what that block would have produced.
+    """
+    lines = (cmds or "").splitlines()
+    active = "\n".join(l for l in lines if not l.strip().startswith("#"))
+    if context:
+        active += "\n" + "\n".join(l for l in context.splitlines()
+                                   if not l.strip().startswith("#"))
+    # A BARE `make` BUILDS THE PACKAGE -- BUT NOT ITS MANUALS.
+    #
+    # Whois builds with `make` and installs with `make prefix=/usr
+    # install-whois`; there is no `make whois` target to look for, so all
+    # three of its install lines were commented and it installed nothing.
+    # But git ALSO has a bare `make`, and git's manuals still need `make man`
+    # -- which is exactly the conditional block this filter was written for.
+    # So a bare make covers ordinary targets and never the documentation ones.
+    _bare_make = bool(re.search(r"^\s*make\s*(?:\S+=\S+\s*)*$", active, re.M))
+    _DOC_TARGETS = {"man", "html", "info", "pdf", "ps", "dvi", "doc", "docs",
+                    "manual", "manuals"}
+    # `make htmldir=/usr/... install-html`: the book puts variable assignments
+    # between make and the target, so allow them.
+    pat = re.compile(r"\bmake\s+(?:\S+=\S+\s+)*(?:-C\s+\S+\s+)?install-(\w+)")
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        m = (None if line.strip().startswith("#") or _is_definition(line)
+             else pat.search(line))
+        if not m:
+            out.append(line)
+            i += 1
+            continue
+        what = m.group(1)
+        if (_bare_make and what not in _DOC_TARGETS) \
+                or re.search(r"\bmake\s+(?:\S+=\S+\s+)*(?:-C\s+\S+\s+)?%s\b"
+                             % re.escape(what), active):
+            out.append(line)          # something really does build it
+            i += 1
+            continue
+        out.append("## SKIPPED -- installs '%s', which nothing here builds "
+                   "(the book generates it in an optional step)" % what)
+        out.append("# " + line)
+        # The rest of ITS chain goes too: git follows install-html with
+        # `mkdir -vp .../html && mv ...`, moving files that only install-html
+        # would have put there.
+        i += 1
+        while (re.search(r"&&\s*$", out[-1])
+               and i < len(lines) and lines[i].strip()):
+            out.append("# " + lines[i])
+            i += 1
+    return "\n".join(out)
+
+def _comment_orphan_tree_shuffles(cmds):
+    r"""Rearranging a directory that only a SKIPPED command fills.
+
+    After git's optional "untar the html docs" block is commented, the page
+    still reorganises what it would have extracted:
+        mkdir -vp /usr/share/doc/git-2.53.0/man-pages/{html,text} &&
+        mv        /usr/share/doc/git-2.53.0/{git*.adoc,man-pages/text} &&
+    and the mv finds nothing:
+        mv: cannot stat '/usr/share/doc/git-2.53.0/git*.adoc'
+
+    A `mv` (or find/sed) whose source directory appears ONLY in commented
+    commands is moving something nobody produced.  `mkdir` does not count as
+    filling a directory -- it makes it empty.
+    """
+    lines = (cmds or "").splitlines()
+    commented, active = [], []
+    for l in lines:
+        (commented if l.strip().startswith("#") else active).append(l)
+    ctext, atext = "\n".join(commented), "\n".join(active)
+
+    def _fills(d):
+        """Does an ACTIVE command put anything INTO d (not just create it)?"""
+        for l in active:
+            if d not in l:
+                continue
+            if re.match(r"^\s*mkdir\b", l):
+                continue                       # creating it is not filling it
+            # mv/find/sed REARRANGE a directory; they do not fill it.  Only
+            # something that brings files in counts.
+            if re.match(r"^\s*(mv|find|sed)\b", l):
+                continue
+            if re.search(r"\b(tar|cp|install|make|ninja)\b", l):
+                return True
+        return False
+
+    out, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        if (line.strip().startswith("#") or _is_definition(line)
+                or not re.match(r"^\s*(mv|find|sed)\b", line)):
+            out.append(line)
+            i += 1
+            continue
+        dirs = [d.rstrip("/") for d in
+                re.findall(r"(/[A-Za-z0-9._/+-]{6,})", line)]
+        orphan = False
+        for d in dirs:
+            base = d.rstrip("/").rsplit("/", 1)[0] if "{" not in d else d
+            for probe in (d, base):
+                if probe and probe in ctext and not _fills(probe):
+                    orphan = True
+                    break
+            if orphan:
+                break
+        if not orphan:
+            out.append(line)
+            i += 1
+            continue
+        out.append("## SKIPPED -- rearranges files that only a skipped step "
+                   "would have put there")
+        out.append("# " + line)
+        i += 1
+        # and the rest of its chain, plus the mkdir that led into it
+        while out and re.search(r"&&\s*$", out[-1]) and i < len(lines) and lines[i].strip():
+            out.append("# " + lines[i])
+            i += 1
+        for j in range(len(out) - 1, -1, -1):
+            if out[j].startswith("#"):
+                continue
+            if re.match(r"^\s*mkdir\b", out[j]) and re.search(r"&&\s*$", out[j]):
+                out[j] = "# " + out[j]
+            break
+    return "\n".join(out)
+
+
+def _repair_dangling_operators(cmds):
+    r"""Commenting a command must not leave the previous one dangling.
+
+    libpwquality's install ended:
+        make install &&
+        # pip3 install ... --find-links dist pwquality     <- commented (1.13.3)
+    and bash refused the whole file:
+        syntax error near unexpected token `}'
+
+    Every filter that comments a line can do this, so the repair belongs at
+    the end, once: an ACTIVE line ending in && || or | with no active line
+    after it loses the operator.
+    """
+    lines = (cmds or "").splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith("#") or not re.search(r"(&&|\|\||\|)\s*$", line):
+            continue
+        nxt = next((l for l in lines[i + 1:]
+                    if l.strip() and not l.strip().startswith("#")), None)
+        if nxt is None:
+            lines[i] = re.sub(r"\s*(&&|\|\||\|)\s*$", "", line)
+    return "\n".join(lines)
+
+
+def _comment_orphan_pip_installs(cmds, context=""):
+    r"""A pip install whose wheel nothing built.
+
+    brotli's page builds optional Python bindings in two steps:
+        pip3 wheel -w dist --no-build-isolation --no-deps --no-cache-dir $PWD
+        pip3 install --no-index --find-links dist Brotli
+    The first is conditional ("if you want the bindings") and is commented
+    out; the second was not, so pip looked in a directory nobody had made:
+        WARNING: Location 'dist' is ignored: ... non-existing path
+        ERROR: No matching distribution found for Brotli
+    -- after the C library had installed perfectly.
+
+    An install that reads from a --find-links directory no ACTIVE command
+    fills is commented with its producer.
+
+    CONTEXT MATTERS.  The producer and the consumer are usually on one page
+    but NOT in one block: for a Python module the wheel is built in the build
+    phase and installed in the install phase, and judging the install block
+    alone found no producer and commented the only line that installs
+    anything.  Every python module page came out as "build a wheel, install
+    nothing" -- pathspec's manifest then held one path, /var/mail/p_pathspec,
+    created by useradd, which was enough to call it installed, and Hatchling
+    failed on `No module named 'pathspec'` twenty-two packages later.
+    """
+    lines = (cmds or "").splitlines()
+    active = "\n".join(l for l in lines if not l.strip().startswith("#"))
+    if context:
+        active += "\n" + "\n".join(l for l in context.splitlines()
+                                   if not l.strip().startswith("#"))
+    out = []
+    for line in lines:
+        m = (None if line.strip().startswith("#") or _is_definition(line)
+             else re.search(r"--find-links[= ]+(\S+)", line))
+        if m:
+            d = m.group(1)
+            builds = re.search(r"(pip3?\s+wheel[^\n]*-w[= ]+%s\b"
+                               r"|mkdir[^\n]*\b%s\b)" % (re.escape(d), re.escape(d)),
+                               active)
+            if not builds:
+                out.append("## SKIPPED -- installs from '%s', which nothing here "
+                           "builds (the wheel step is optional)" % d)
+                out.append("# " + line)
+                continue
+        out.append(line)
+    return "\n".join(out)
+
+
+def _comment_orphan_log_readers(cmds):
+    """Comment lines that read a log no ACTIVE command writes.
+
+    Xorg Libraries ends with
+        grep -A9 summary *make_check.log
+    which inspects the test logs -- and the line that WRITES them
+    (make check ... | tee ../$package-make_check.log) is part of the optional
+    test step, correctly commented out.  Under set -e the orphan grep then
+    failed the whole page:
+        grep: *make_check.log: No such file or directory
+
+    Same shape as the libuv man page (1.12.19), one layer earlier: a command
+    whose input nothing produces is not part of installing.  Only .log files
+    are treated this way -- a build artifact with a real name might be
+    produced by make itself, and guessing there would do harm."""
+    lines = (cmds or "").splitlines()
+    active = [l for l in lines if not l.strip().startswith("#")]
+    writes_log = any(re.search(r"(tee|>|>>)\s*\S*\.log", l) for l in active)
+    if writes_log:
+        return cmds
+    out = []
+    for line in lines:
+        if (not line.strip().startswith("#")
+                and re.search(r"\S*\.log\b", line)
+                and re.match(r"\s*(grep|cat|less|tail|head|awk|sed)\b", line)):
+            out.append("## SKIPPED -- reads a log that nothing here writes "
+                       "(it belongs to the optional test step)")
+            out.append("# " + line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _comment_own_program_demos(cmds, installed):
+    """Comment out BUILD lines that run a program this package installs.
+
+    The book demonstrates the result -- "You can now test the rendering ... To
+    do this, run the following command: gs -q -dBATCH .../tiger.eps" -- and
+    that command lands in the build, where the program does not exist yet:
+        install_gs: line 118: gs: command not found
+    It was harmless while failures were ignored; with the dispatcher honouring
+    set -e it fails the package.  Chasing the wording ("To do this...") is the
+    mistake this file keeps making; the structural fact is that a package
+    cannot run its own not-yet-installed program as part of building itself.
+    """
+    progs = set()
+    for chunk in (installed or {}).values():
+        for tok in re.split(r"[,\s]+", str(chunk)):
+            tok = tok.strip()
+            if tok and re.fullmatch(r"[A-Za-z0-9._+-]+", tok):
+                progs.add(tok)
+    if not progs:
+        return cmds
+    out = []
+    for line in (cmds or "").splitlines():
+        stripped = line.strip()
+        first = stripped.split()[0] if stripped else ""
+        if (first in progs and not stripped.startswith("#")
+                and not re.match(r"^(make|ninja|meson|cmake)\b", stripped)):
+            out.append("## SKIPPED -- runs %s, which this package has not "
+                       "installed yet (the book is demonstrating the result)"
+                       % first)
+            out.append("# " + line)
+        else:
+            out.append(line)
+    return "\n".join(out)
+
+
+def _needed_additional_links(data, emitted_lines):
+    """Of the page's additional downloads, the ones an ACTIVE command uses.
+
+    A file nothing runs is not fetched (optional doc tarballs, test suites --
+    their commands are emitted commented), and a file an active command needs
+    IS fetched whatever the book called it.  Patches are always kept: the
+    command that applies one is `patch -Np1 -i ../x.patch`, which does name
+    it, but a patch missed for any reason is a silent mis-build."""
+    links = data.get("additional_links", []) or []
+    if not links:
+        return []
+    # the PHASED text only: data["install_cmds"] is the raw page, where the
+    # conditional blocks are still live and would vote for their own
+    # downloads
+    active = _active_command_text(data.get("build_cmds", ""),
+                                  data.get("install_root_cmds", ""))
+    keep = []
+    for href in links:
+        base = href.rstrip("/").split("/")[-1]
+        if href.endswith(".patch") or (base and base in active):
+            keep.append(href)
+    return keep
+
+
+def bash_str(v):
+    """A book string as a bash literal that the shell will NOT interpret.
+
+    These values are PROSE lifted out of the book -- "Installed Directories:
+    $TEXLIVE_PREFIX/bin, $TEXLIVE_PREFIX/lib" -- and they were emitted inside
+    double quotes, so the shell expanded them.  pm-install sources the script
+    to read its metadata, and under set -u that killed the install before it
+    started:
+        install_texlive-20250308-source: line 25: TEXLIVE_PREFIX: unbound variable
+    A dollar sign in documentation is not a variable.  Single quotes, with
+    the only escape single quoting needs."""
+    return "'" + str(v).replace("'", "'\\''") + "'"
+
 
 def bash_array(items):
-    return "(" + " ".join(f"'{i}'" for i in items) + ")"
+    return "(" + " ".join(bash_str(i) for i in items) + ")"
 
 
 def extract_info(sec, is_module):
@@ -1455,6 +2985,11 @@ def extract_package_data(sec, is_module, group, anchor):
         "recommended": _xref_titles(sec, "recommended"),
         "optional": _xref_titles(sec, "optional"),
         "installed_content": extract_installed_content(sec),
+        # variables the PAGE defines for its own commands (see
+        # _page_env_definitions): collected here, where the section is in
+        # hand, and used by render_script
+        "page_env": _page_env_definitions(
+            sec, set(re.findall(r"\$\{?([A-Z][A-Z0-9_]{2,})", build_cmds or ""))),
         "install_cmds": install_cmds,
         "build_cmds": build_cmds,
         "install_root_cmds": install_root,
@@ -1464,11 +2999,112 @@ def extract_package_data(sec, is_module, group, anchor):
     }
 
 
-def render_script(data, source_url):
-    """Turn cached package data into a phased install_<name-version> script:
-    unpack -> build -> install -> configure, each a separate function with a
-    dispatcher, so a failed install (e.g. permissions) can be fixed and re-run
-    WITHOUT recompiling:  bash install_<pkg> install"""
+def _drop_orphaned_variant_install(cmds):
+    """An install step whose build variant was commented out.
+
+    WebKitGTK's page gives two builds, each with its own `ninja install`.  One
+    build is skipped, but its install line stayed live, so the install phase
+    ran `ninja install` twice.  The second is a no-op rather than a second
+    build -- but it reads exactly like one, and someone watching a package
+    that takes hours has no way to tell.  An identical command repeated after
+    a skipped block belongs to that block.
+    """
+    # ONLY THE PATTERN "X ; <skipped variant> ; X".
+    #
+    # A first attempt commented any repeat after a skipped block, and dropped
+    # GLib's LAST `ninja install` -- the one that installs the reconfigured
+    # build with introspection enabled, several live commands later.  A repeat
+    # is only redundant when nothing happened in between: the command
+    # immediately before the skipped block and the one immediately after it
+    # must be the same.
+    lines = (cmds or "").split("\n")
+    out, last_active, pending_skip = [], None, False
+    for line in lines:
+        st = line.strip()
+        if st.startswith("## OPTIONAL, skipped"):
+            pending_skip = True
+            out.append(line)
+            continue
+        if not st or st.startswith("#"):
+            out.append(line)
+            continue
+        if pending_skip and last_active is not None and st == last_active:
+            out.append("## SKIPPED -- the same command again, belonging to the "
+                       "build variant commented out above.")
+            out.append("# " + st)
+            pending_skip = False
+            continue
+        last_active = st
+        pending_skip = False
+        out.append(line)
+    return "\n".join(out)
+
+
+def _enable_one_alternative(cmds):
+    """A page that offers a CHOICE must still build something.
+
+    WebKitGTK's page gives two complete builds -- "If you want to install the
+    GTK-3 version, run the following commands" and the same for GTK-4 -- and
+    each is introduced by a conditional, so `_conditional_guard` commented
+    BOTH.  The build phase came out as `:` and the install phase then ran
+    `ninja install` against a directory with no build.ninja in it.
+
+    When nothing active is left but a skipped block exists, the first block is
+    restored: a package that builds one of two ways is not a package that
+    builds no ways.  The others stay commented, with a line saying so, because
+    which one is wanted is the reader's decision, not ours.
+    """
+    lines = (cmds or "").split("\n")
+    if any(l.strip() and not l.strip().startswith("#") and l.strip() != ":"
+           for l in lines):
+        return cmds
+    starts = [i for i, l in enumerate(lines)
+              if l.strip().startswith("## OPTIONAL, skipped")]
+    if not starts:
+        return cmds
+    i = starts[0]
+    end = starts[1] if len(starts) > 1 else len(lines)
+    out = lines[:i]
+    out.append("## Every build block on this page is conditional, so none "
+               "would have run.")
+    out.append("## ENABLED HERE: %s"
+               % lines[i].split("the book says:", 1)[-1].strip()[:110])
+    out.append("## If you want one of the page's other variants instead, "
+               "comment these")
+    out.append("## lines and uncomment that block.")
+    for l in lines[i + 1:end]:
+        st = l.strip()
+        if st.startswith("##"):
+            out.append(l)
+        elif st.startswith("#"):
+            out.append(l.replace("#", "", 1).lstrip() if st != "#" else "")
+        else:
+            out.append(l)
+    out.extend(lines[end:])
+    return "\n".join(out)
+
+
+def _fn_body(cmds, empty=": # (nothing to do in this phase)"):
+    """A command block as a function body.  NOT indented: the book is full of
+    heredocs, and an indented terminator is no terminator.  A body of comments
+    alone is a syntax error to bash, so it gets a command."""
+    if not cmds or not cmds.strip():
+        return empty
+    body = cmds.strip("\n")
+    if not any(ln.strip() and not ln.lstrip().startswith("#")
+               for ln in body.split("\n")):
+        body += "\n:"
+    return body
+
+
+def render_script(data, source_url, book_version=""):
+    """Turn cached package data into an install_<name-version> script: the
+    book's variables at the top, its commands in build_pkg / install_pkg /
+    configure_pkg, and one line at the end that hands over to the shared
+    runner (lfs-phases), which does the rest -- fetch, unpack, run each phase
+    as its own process, resume in the build dir, the dispatcher.  A failed
+    install can be fixed and re-run WITHOUT recompiling:
+        bash install_<pkg> install"""
     name_version = data["name_version"]
     pkg = data["pkg"]
     build_cmds = data.get("build_cmds") or data["install_cmds"]
@@ -1482,6 +3118,97 @@ def render_script(data, source_url):
                       lambda m: m.group(0) + ' ${PM_REINSTALL:+--force-reinstall}',
                       cmds or "")
     build_cmds = _pip_reinstall(build_cmds)
+    build_cmds = _comment_own_program_demos(build_cmds,
+                                            data.get("installed_content"))
+    build_cmds = _unwrap_interactive_subshell(build_cmds)
+    install_root = _unwrap_interactive_subshell(install_root)
+    build_cmds = _use_wrapped_tools(build_cmds)
+    install_root = _use_wrapped_tools(install_root)
+    build_cmds = _define_as_root(build_cmds)
+    install_root = _define_as_root(install_root)
+    build_cmds = _comment_typeset_doc_builds(build_cmds)
+    install_root = _comment_typeset_doc_builds(install_root)
+    config_cmds = _comment_profile_sourcing(data.get("config_cmds") or "")
+    config_cmds = _comment_bootscript_installs(config_cmds, data.get("name"))
+    config_cmds = _comment_config_tests(config_cmds)
+    data["config_cmds"] = config_cmds
+    build_cmds = _comment_profile_sourcing(build_cmds)
+    install_root = _comment_profile_sourcing(install_root)
+    # each block is judged with the other in view: they run in one directory,
+    # one after the other, and a wheel built by one is installed by the next
+    build_cmds = _comment_orphan_pip_installs(build_cmds, install_root)
+    install_root = _comment_orphan_pip_installs(install_root, build_cmds)
+    # LAST: whatever the filters above commented, the command before it must
+    # not be left ending in `&&`.
+    build_cmds = _comment_orphan_doc_installs(build_cmds, install_root)
+    install_root = _comment_orphan_doc_installs(install_root, build_cmds)
+    build_cmds = _comment_orphan_tree_shuffles(build_cmds)
+    install_root = _comment_orphan_tree_shuffles(install_root)
+    build_cmds = _guard_list_loops(build_cmds)
+    install_root = _guard_list_loops(install_root)
+    build_cmds = _comment_test_runs(build_cmds)
+    install_root = _comment_test_runs(install_root)
+    build_cmds = _comment_typeset_blocks(build_cmds)
+    install_root = _comment_typeset_blocks(install_root)
+    build_cmds = _comment_doc_format_builds(build_cmds)
+    install_root = _comment_doc_format_builds(install_root)
+    build_cmds = _comment_orphan_log_readers(build_cmds)
+    install_root = _comment_orphan_log_readers(install_root)
+    build_cmds = _no_vendored_subprojects(build_cmds)
+    install_root = _no_vendored_subprojects(install_root)
+    build_cmds = _allow_missing_subprojects(build_cmds, data.get("name"))
+    install_root = _allow_missing_subprojects(install_root, data.get("name"))
+    # LAST, once, after EVERY filter that comments a line: a command left
+    # ending in `&&` with nothing active after it is a syntax error.  It ran
+    # before five of them, and the old scaffolding line that followed each
+    # phase body absorbed the dangling operator -- except in install_pkg,
+    # where cachecontrol and 145 others failed `bash -n`.
+    # ...and if every way of building it was skipped, enable one
+    build_cmds = _enable_one_alternative(build_cmds)
+    install_root = _drop_orphaned_variant_install(install_root)
+    build_cmds = _repair_dangling_operators(build_cmds)
+    install_root = _repair_dangling_operators(install_root)
+    config_cmds = _repair_dangling_operators(config_cmds)
+    data["config_cmds"] = config_cmds
+    _known = {"pkg", "link", "name", "name_version", "url", "md5_sum", "info",
+              "git_ref", "installed_program", "BUILD_ROOT"}
+    # Everything the SCRIPT itself sets, anywhere: plain assignments, exports,
+    # `for NAME in ...`, `read NAME`, and assignments inside heredocs.  These
+    # were only scanned in the build text, so a loop variable in the install
+    # section (DOCNAME, PACKAGE_PREFIX_DIR, JT_JAVA...) looked like something
+    # the user had to provide.
+    _alltext = (build_cmds or "") + "\n" + (install_root or "") + "\n" \
+             + (data.get("install_cmds") or "")
+    _setvars = set(re.findall(r"^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=",
+                              _alltext, re.M))
+    _setvars |= set(re.findall(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b", _alltext))
+    _setvars |= set(re.findall(r"\bread\s+(?:-\S+\s+)*([A-Za-z_][A-Za-z0-9_]*)", _alltext))
+    _setvars |= set(re.findall(r"^\s*([A-Za-z_][A-Za-z0-9_]*)=", _alltext, re.M))
+    # what the page itself defines comes first; only what remains is asked of
+    # the user
+    _used = set(re.findall(r"\$\{([A-Z][A-Z0-9_]{2,})\}", build_cmds or "")) \
+          | set(re.findall(r"\$([A-Z][A-Z0-9_]{2,})\b", build_cmds or ""))
+    _defs = {k: v for k, v in (data.get("page_env") or {}).items()
+             if k in (_used - (_known | _setvars))}
+    if _defs:
+        # dependencies first: XORG_PREFIX before XORG_CONFIG, or the second
+        # expands to a flag with an empty --prefix
+        _ordered, _left = [], dict(_defs)
+        for _ in range(len(_defs) + 1):
+            for k in sorted(_left):
+                refs = set(re.findall(r"\$\{?([A-Z][A-Z0-9_]{2,})", _left[k]))
+                if not (refs & set(_left)):
+                    _ordered.append((k, _left.pop(k)))
+                    break
+            else:
+                break
+        _ordered += sorted(_left.items())
+        _pre = "\n".join('\t%s="%s"   # set by the book'
+                          % (k, v.strip('"\''))
+                          for k, v in _ordered)
+        build_cmds = _pre + "\n" + (build_cmds or "")
+        _setvars |= set(_defs)
+    build_cmds = _required_env_guard(build_cmds, _known | _setvars)
     install_root = _pip_reinstall(install_root)
     installed = data["installed_content"]
     unpacks = not re.search(rf"^tar .* {re.escape(pkg)} .*", data["install_cmds"])
@@ -1491,178 +3218,59 @@ def render_script(data, source_url):
     w("#!/bin/bash")
     w("############################################")
     w(f"### {name_version}")
-    w(f"### generated by blfs {BLFS_VERSION} -- script format v{SCRIPT_VERSION}")
-    w("### phased install script -- run a single phase with its name as $1:")
-    w("###   all (default) | unpack | build | install | configure | update")
-    w("###   update = install + reconfigure is SKIPPED (keeps your config)")
+    # 'origin=' is the shared contract: both generators stamp format + origin,
+    # so no tool has to recognise the other's dialect.
+    w(f"### generated by blfs {BLFS_VERSION} -- script format v{SCRIPT_VERSION}"
+      f" origin=blfs")
+    w("### phases: all (default) | unpack | build | test | install | configure | update")
+    w("###   update = install without reconfiguring (keeps your config)")
     w("### re-run just 'install' after fixing permissions, without recompiling.\n")
-    w(f'url="{source_url}"')
-    w(f'name="{data["name"]}"')
-    w(f'name_version="{name_version}"')
-    w(f'link="{data["link"]}"')
-    w(f'pkg="{pkg}"')
-    w(f'md5_sum="{data["md5"]}"')
-    w(f"additional_links={bash_array(data['additional_links'])}")
-    w(f'info="{data["info"]}"')
+    w(f'url={bash_str(source_url)}')
+    w(f'name={bash_str(data["name"])}')
+    w(f'name_version={bash_str(name_version)}')
+    w(f'link={bash_str(data["link"])}')
+    w(f'pkg={bash_str(pkg)}')
+    w(f'md5_sum={bash_str(data["md5"])}')
+    w(f"additional_links={bash_array(_needed_additional_links(data, L))}")
+    w(f'info={bash_str(data["info"])}')
     w(f"required={bash_array(data['required'])}")
     w(f"recommended={bash_array(data['recommended'])}")
     w(f"optional={bash_array(data['optional'])}")
-    w("installed_content=(" + " ".join(f'"{k.rstrip(":")}"' for k in installed) + ")")
+    w("installed_content=(" + " ".join(bash_str(k.rstrip(":")) for k in installed) + ")")
     for k, v in installed.items():
-        w(f'{k}="{v}"')
+        w(f'{k}={bash_str(v)}')
     if data["is_module"] and data["group"]:
         w(f"install_groups={bash_array([data['group']])}")
-
-    # where the source is unpacked/built; kept between phases so 'install' can be
-    # re-run against the already-built tree.
-    w('\nBUILD_ROOT="${BUILD_ROOT:-$PWD}"')
-    w('pkg_dir=""')
+    if not unpacks:
+        w('pkg_unpack="no"     # the page\'s own commands unpack the tarball')
+    # the mirror of last resort keeps most BLFS sources by filename -- the
+    # BOOK's release, not a literal that goes stale with the next one
+    if book_version and book_version != "unknown":
+        w(f'pkgusr_book_mirror={bash_str(f"{SITE}/blfs/downloads/{book_version}")}')
     w("")
-    w("_enter_build() {")
-    w('\t# locate the already-unpacked source directory for build/install phases')
-    w('\tcd "$BUILD_ROOT" || exit 1')
-    if unpacks:
-        w('\tif [ -z "$pkg_dir" ]; then')
-        w('\t\tpkg_dir="$name_version"')
-        w('\t\t[ -d "$pkg_dir" ] || pkg_dir="$(ls -d */ 2>/dev/null | head -n1)"')
-        w('\tfi')
-        w('\tif [ -n "$pkg_dir" ] && [ -d "$pkg_dir" ]; then cd "$pkg_dir" || exit 1')
-        w('\telse echo "no unpacked source in $BUILD_ROOT -- run: $0 unpack" && exit 1; fi')
-    w("}\n")
 
-    # ---- unpack ----
-    w("unpack_pkg() {")
-    w("#### UNPACK ####")
-    w('\tcd "$BUILD_ROOT" || exit 1')
-    if data["between_cmds"] and any(c.strip() for c in data["between_cmds"]):
-        w("\t# before-installation steps")
-        for cmds in data["between_cmds"]:
-            if cmds.strip():
-                w(cmds)
-    w('\t[ -f "$pkg" ] || { [ -n "$link" ] && wget -4 "$link"; }')
-    w('\tif [ -n "$md5_sum" ] && ! grep -wq "$md5_sum" <<< "$(md5sum "$pkg")"; then')
-    w('\t\techo "ERROR: md5sum check failed" && exit 1')
-    w("\tfi")
-    w('\tfor li in "${additional_links[@]}"; do wget -4 "$li"; done')
-    if unpacks:
-        w("\trm -rf tmp && mkdir tmp && cd tmp")
-        if pkg.endswith(".zip"):
-            w('\tunzip ../"$pkg"')
-        else:
-            w('\ttar -xf ../"$pkg"')
-        # move the extracted tree to a clean $pkg_dir in BUILD_ROOT.  Move the
-        # single top-level dir *explicitly* to $pkg_dir -- never `mv tmp/* .`,
-        # which would nest it inside an existing same-named dir.
-        w('\tif [ "$(ls | wc -w)" = "1" ] && [ -d "$(ls)" ]; then')
-        w('\t\tinner="$(ls)"; pkg_dir="$inner"')
-        w('\t\tcd .. && rm -rf "$pkg_dir" && mv "tmp/$inner" "$pkg_dir"')
-        w('\telse')
-        w('\t\tpkg_dir="$name_version"; cd .. && rm -rf "$pkg_dir" && mv tmp "$pkg_dir"')
-        w('\tfi')
-        w('\trm -rf tmp')
-        w('\techo "unpacked into $BUILD_ROOT/$pkg_dir"')
-    w("#### UNPACK DONE ####")
-    w("}\n")
-
-    # ---- build ----
+    # The commands, one function per phase.  NOT indented: the book is full of
+    # heredocs, and an indented terminator is no terminator.
+    between = [c for c in (data["between_cmds"] or []) if c.strip()]
+    if between:
+        w("prepare_pkg() {")
+        w(_fn_body("\n\n".join(between)))
+        w("}\n")
     w("build_pkg() {")
-    w("#### BUILD ####")
-    w("\t_enter_build")
-    w('\t# remove a stale CONFIGURED build dir so re-running "build" works, but')
-    w('\t# never a source dir that merely happens to be named build/ -- only wipe')
-    w('\t# it if it holds build-system artifacts we would have generated.')
-    w('\tfor _d in build builddir _build; do')
-    w('\t\tif [ -d "$_d" ] && { [ -f "$_d/build.ninja" ] || '
-      '[ -f "$_d/CMakeCache.txt" ] || [ -d "$_d/meson-private" ] || '
-      '[ -f "$_d/config.status" ]; }; then rm -rf "$_d"; fi')
-    w('\tdone')
-    w(build_cmds if build_cmds.strip() else '\t: # (no separate build step)')
-    w('\t# remember where the build ended (e.g. a meson "build/" subdir) so the')
-    w('\t# install phase can resume there even when run separately.')
-    w('\tpwd > "$BUILD_ROOT/.pm_build_cwd" 2>/dev/null || true')
-    w("#### BUILD DONE ####")
+    w(_fn_body(build_cmds, ": # (no separate build step)"))
     w("}\n")
-
-    # ---- install ----
     w("install_pkg() {")
-    w("#### INSTALL ####")
-    w("\t_enter_build")
-    w('\t# resume where the build actually happened: prefer the dir the build')
-    w('\t# phase recorded; otherwise auto-detect a meson/cmake build subdir, so')
-    w('\t# "ninja install" / "make install" run in the right place even if the')
-    w('\t# tree was built by an older script.')
-    w('\tif [ -f "$BUILD_ROOT/.pm_build_cwd" ] && '
-      '[ -d "$(cat "$BUILD_ROOT/.pm_build_cwd" 2>/dev/null)" ]; then')
-    w('\t\tcd "$(cat "$BUILD_ROOT/.pm_build_cwd")"')
-    w('\telif [ ! -e build.ninja ] && [ ! -e Makefile ]; then')
-    w('\t\tfor _d in build builddir _build; do')
-    w('\t\t\tif [ -e "$_d/build.ninja" ] || [ -e "$_d/Makefile" ]; then '
-      'cd "$_d"; break; fi')
-    w('\t\tdone')
-    w('\tfi')
-    if install_root.strip():
-        w(install_root)
-    else:
-        w('\t: # (this package installs during the build phase; nothing separate)')
-    w("#### INSTALL DONE ####")
+    w(_fn_body(install_root,
+               ": # (this package installs during the build phase; nothing separate)"))
     w("}\n")
-
-    # ---- configure ----
     if config_cmds.strip():
         w("configure_pkg() {")
-        w("#### CONFIGURE ####")
-        w('\techo "## Configuration"')
-        w(config_cmds)
-        w("#### CONFIGURE DONE ####")
+        w('echo "## Configuration"')
+        w(_fn_body(config_cmds))
         w("}\n")
-    else:
-        w("configure_pkg() { : ; }\n")
-
-    # ---- test (best-effort; edit for package-specific test commands) ----
-    w("test_pkg() {")
-    w("#### TEST ####")
-    w("\t_enter_build")
-    w('\tif [ -f "$BUILD_ROOT/.pm_build_cwd" ] && '
-      '[ -d "$(cat "$BUILD_ROOT/.pm_build_cwd" 2>/dev/null)" ]; then')
-    w('\t\tcd "$(cat "$BUILD_ROOT/.pm_build_cwd")"')
-    w('\telif [ ! -e build.ninja ] && [ ! -e Makefile ]; then')
-    w('\t\tfor _d in build builddir _build; do [ -e "$_d/build.ninja" ] || '
-      '[ -e "$_d/Makefile" ] && cd "$_d" && break; done')
-    w('\tfi')
-    w('\techo "## Running test suite"')
-    w('\tif [ -f build.ninja ]; then meson test || ninja test')
-    w('\telif [ -f Makefile ]; then make check || make test')
-    w('\telse echo "no recognized test target -- edit test_pkg() for this package"; fi')
-    w("#### TEST DONE ####")
-    w("}\n")
-
-    # ---- dispatcher ----
-    w('# run only when executed directly, not when sourced')
-    w('if [ "${BASH_SOURCE[0]}" = "${0}" ]; then')
-    w('case "${1:-all}" in')
-    w('\tall)')
-    w('\t\tunpack_pkg && build_pkg || exit 1')
-    w('\t\t[ "${PM_TEST:-}" = "1" ] && test_pkg')
-    w('\t\tinstall_pkg && configure_pkg ;;')
-    w('\tunpack)    unpack_pkg ;;')
-    w('\tbuild)     build_pkg ;;')
-    w('\ttest)      test_pkg ;;')
-    w('\tinstall)   install_pkg ;;')
-    w('\tconfigure) configure_pkg ;;')
-    w('\tupdate)')
-    w('\t\tunpack_pkg && build_pkg || exit 1')
-    w('\t\t[ "${PM_TEST:-}" = "1" ] && test_pkg')
-    w('\t\tinstall_pkg ;;')
-    w('\t*) echo -e "usage: $0 {all|unpack|build|test|install|configure|update}\\n'
-      '  all       full run (default; set PM_TEST=1 to also run tests)\\n'
-      '  unpack    fetch + extract only\\n'
-      '  build     configure + compile (needs unpack)\\n'
-      '  test      run the test suite (needs build)\\n'
-      '  install   install step only -- re-run this after fixing permissions\\n'
-      '  configure post-install configuration\\n'
-      '  update    unpack + build + install, no reconfigure (keeps your config)" ;;')
-    w("esac")
-    w("fi")
+    # no test_pkg: the runner autodetects `meson test` / `make check`; define
+    # one here to override.
+    w('. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"')
 
     safe = re.sub(r"[^A-Za-z0-9._-]+", "-", name_version).strip("-")
     body = "\n".join(L) + "\n"
@@ -1671,7 +3279,8 @@ def render_script(data, source_url):
     # computed over the body WITHOUT this line, so verification just strips the
     # 'pm_md5' line and recomputes.
     digest = hashlib.md5(body.encode()).hexdigest()
-    stamp = f"### generated by blfs {BLFS_VERSION} -- script format v{SCRIPT_VERSION}"
+    stamp = (f"### generated by blfs {BLFS_VERSION} -- script format "
+             f"v{SCRIPT_VERSION} origin=blfs")
     body = body.replace(stamp, stamp + f"\n### pm_md5={digest}", 1)
     return f"install_{safe}", body
 
@@ -1717,8 +3326,33 @@ def cmd_install(args):
 def cmd_fetch(args):
     """Download (or refresh) a book into the cache."""
     sel = args.selector or DEFAULT_SELECTOR
-    ensure_book(sel)
-    print("cached.")
+    # SAY IT WHEN THERE IS NO SUCH BOOK.
+    #
+    # `blfs fetch stable-sysv` printed the routine "no book matched
+    # 'stable-sysv'; using the cached ...-systemd" note and then "cached." --
+    # so a request that fetched NOTHING reported success, and the user
+    # reasonably believed they now had the sysv book.  There is no 13.0 sysv
+    # book to have: BLFS stopped publishing the sysv edition after 12.4.
+    avail = load_available()
+    if sel not in avail and not sel.startswith(("http://", "https://")) \
+            and not os.path.isfile(sel):
+        try:
+            avail = discover_all() or avail
+        except Exception:
+            pass
+    if sel not in avail and not sel.startswith(("http://", "https://")) \
+            and not os.path.isfile(sel):
+        sys.stderr.write("no book is published as '%s'.\n" % sel)
+        _sysv = sorted((k for k, v in avail.items()
+                        if (v.get("init") or "") == "sysv"),
+                       key=str)
+        if _sysv:
+            sys.stderr.write("  The editions that exist:  blfs books\n")
+            sys.stderr.write("  Newest SysV edition:      %s\n" % _sysv[-1])
+        sys.stderr.write("  Nothing was fetched.\n")
+        sys.exit(1)
+    path = ensure_book(sel)
+    print("cached: %s" % path)
 
 
 def cmd_import(args):
@@ -1740,6 +3374,7 @@ def cmd_sources(args):
     """The download URLs for a package, exactly as the book gives them."""
     book = get_book(args)
     anchor = anchor_from_input(args.package)
+    anchor = resolve_anchor(book, anchor)
     data = book.get(anchor)
     if data is None:
         sys.stderr.write("no package '%s' in the book (try: blfs search %s)\n"
@@ -1754,6 +3389,127 @@ def cmd_sources(args):
         return
     for u in urls:
         print(u)
+
+
+# What makes a difference an INIT difference rather than version churn.
+_INIT_WORDS_RE = re.compile(
+    r"\b(systemd|systemctl|sysv|bootscript|init\.d|rc\.d|tmpfiles|sysusers|"
+    r"unit[-_ ]?dir|--(en|dis)able-systemd|service)\b", re.I)
+
+
+def cmd_diff_init(args):
+    """Show where a SysV book and a systemd book disagree.
+
+    The generated scripts come from ONE book.  Using the systemd book on a
+    SysV system is workable -- a missing systemctl becomes a visible skip --
+    right up to a page whose CONFIGURE line differs, and then it is not:
+
+        BlueZ: configure: error: systemd system unit directory is required
+
+    because the sysv page passes --disable-systemd and the systemd page has
+    no reason to.  Per-package machine.conf entries paper over that one page
+    at a time, and only after each has failed.  This says which pages differ
+    BEFORE any of them are built -- and for one package, exactly how.
+    """
+    import difflib
+    other = args.other
+    if not os.path.isfile(other):
+        url, local, _is_svn, _v = resolve_book(other)
+        if not os.path.isfile(local):
+            ensure_book(other)
+        other = local
+    here = get_book(args)
+    # the same loader the rest of the tool uses: cached if the cache is
+    # current, indexed once otherwise
+    there = get_book(argparse.Namespace(book_file=other, book=None))
+    # NAME BOTH SIDES, AND REFUSE TO COMPARE ONE WITH ITSELF.
+    #
+    # `blfs diff-init 12.4` reported "0 of 947 shared pages differ", which
+    # was true and useless: the default selector (stable-sysv) has no book,
+    # so it fell back to the newest cached one -- 12.4, the very book being
+    # compared against.  A comparison that silently compares a thing with
+    # itself is worse than an error.
+    print("comparing:\n  A  %s\n  B  %s\n" % (here.path, there.path))
+    if os.path.realpath(here.path) == os.path.realpath(there.path):
+        sys.stderr.write("those are the same file -- nothing to compare.\n")
+        sys.stderr.write("  Name the book to compare AGAINST, and make sure a\n")
+        sys.stderr.write("  different one is in use here:\n")
+        sys.stderr.write("    blfs --book-file <this book> diff-init <other>\n")
+        sys.exit(1)
+    names = args.packages or sorted(set(here.packages) & set(there.packages))
+    # ONLY THE PAGES THIS MACHINE WILL EVER BUILD.
+    #
+    # 47 of 929 shared pages differ in their init handling, and most of them
+    # are for software this system does not have and never will (GNOME, samba,
+    # qemu, postgresql...).  The useful question is not "what differs" but
+    # "what differs AND is on my machine", and the answer is on disk: a
+    # package with an account has been built or is about to be.
+    if getattr(args, "installed", False):
+        root = os.environ.get("LFS_PKGUSR_ROOT", "/usr/src/pkgusr")
+        pfx = os.environ.get("LFS_PKGUSR_PREFIX", "p_")
+        try:
+            have = {d[len(pfx):] for d in os.listdir(root) if d.startswith(pfx)}
+        except OSError:
+            have = set()
+        if not have:
+            sys.stderr.write("no package users under %s -- --installed has "
+                             "nothing to filter by.\n" % root)
+            sys.exit(1)
+        names = [n for n in names if n.lower() in {h.lower() for h in have}]
+    shown = 0
+    for anchor in names:
+        a = here.get(resolve_anchor(here, anchor_from_input(anchor)))
+        try:
+            b = there.get(resolve_anchor(there, anchor_from_input(anchor)))
+        except SystemExit:
+            b = None
+        if not a or not b:
+            continue
+        ka = "\n".join([a.get("build_cmds") or "", a.get("install_root_cmds") or ""])
+        kb = "\n".join([b.get("build_cmds") or "", b.get("install_root_cmds") or ""])
+        if ka.strip() == kb.strip():
+            continue
+        # ACROSS VERSIONS, ALMOST EVERYTHING DIFFERS.
+        #
+        # There is no 13.0 sysv book (BLFS stopped after 12.4), so the only
+        # comparison available is 12.4-sysv against 13.0-systemd -- where most
+        # pages differ for version reasons that have nothing to do with init.
+        # Default to the differences that MENTION init, which is what the
+        # question is; --all for the rest.
+        if not getattr(args, "all", False):
+            # A COMMENTED LINE IS NOT A COMMAND -- HERE TOO (1.14.23 again).
+            #
+            # Of eight pages this reported for a real system, four were
+            # nothing: gcc, libxml2 and rust differed only in NOTE prose that
+            # happens to say "systemd journal", "systemctl stop httpd.service"
+            # or a book URL containing "13.0-systemd".  Judge the difference
+            # on lines that RUN.
+            _live = lambda t: [l for l in t.splitlines()
+                               if l.strip() and not l.strip().startswith("#")]
+            _delta = "\n".join(l for l in difflib.ndiff(_live(kb), _live(ka))
+                               if l[:1] in "+-")
+            if not _INIT_WORDS_RE.search(_delta):
+                continue
+        shown += 1
+        if args.packages:
+            print("=== %s ===" % anchor)
+            for line in difflib.unified_diff(
+                    kb.splitlines(), ka.splitlines(),
+                    fromfile="%s (%s)" % (anchor, os.path.basename(other)),
+                    tofile="%s (%s)" % (anchor, os.path.basename(here.path)),
+                    lineterm=""):
+                print(line)
+            print()
+        else:
+            print("  %-28s commands differ" % anchor)
+    if not args.packages:
+        _what = "differ" if getattr(args, "all", False) \
+            else "differ in their init handling"
+        print("\n%d of %d shared pages %s." % (shown, len(names), _what))
+        if not getattr(args, "all", False):
+            print("(--all compares everything, including version churn)")
+        print("For one of them:  blfs diff-init %s <package>" % args.other)
+    return 0
 
 
 def cmd_books(args):
@@ -1781,29 +3537,44 @@ def cmd_books(args):
     if not found:
         print("  (none yet)")
 
-    if args.discover:
-        print("\nAvailable books (from the downloads index):")
-        try:
-            books = discover_all()
-        except Exception as e:
-            print(f"  could not read {downloads_index_url()} ({e})")
-            return
-        if not books:
-            print("  (none found)")
+    # --brief is the wrapper's contract: the Default line and the cached
+    # list, NOTHING live.  packagemanager reads the book name through this,
+    # and the auto-discovery below is for a person at a terminal -- routed
+    # through the wrapper it made every `packagemanager update` probe the
+    # site, twice, and print the probes' notes.
+    if getattr(args, "brief", False):
+        return
+
+    def _print_available(books, note):
+        print(note)
         for sel, rec in sorted(books.items()):
             mark = " (default)" if sel == default else ""
             print(f"  {sel:<22} version {rec['version']:<8} [{rec['init']}]{mark}")
         print(f"\nPick one with:  blfs set-default <selector>")
+
+    # Discovery is automatic: with a connection, the list is live; without
+    # one, the cached list from the last discovery is shown and SAYS it is
+    # cached.  --discover is kept as the explicit refresh (it reports the
+    # failure loudly instead of falling back).
+    if args.discover:
+        try:
+            _print_available(discover_all(),
+                             "\nAvailable books (from the downloads index):")
+        except Exception as e:
+            print(f"  could not read {downloads_index_url()} ({e})")
+            return
     else:
-        avail = load_available()
-        if avail:
-            print("\nAvailable books (cached from last --discover):")
-            for sel, rec in sorted(avail.items()):
-                mark = " (default)" if sel == default else ""
-                print(f"  {sel:<22} version {rec['version']:<8} [{rec['init']}]{mark}")
-            print("\nRe-run with --discover to refresh this list.")
-        else:
-            print("\nRun 'blfs books --discover' to list what the site offers.")
+        try:
+            _print_available(discover_all(),
+                             "\nAvailable books (from the downloads index):")
+        except Exception:
+            avail = load_available()
+            if avail:
+                _print_available(avail, "\nAvailable books (offline -- cached "
+                                        "from the last discovery):")
+            else:
+                print("\n(offline, and no cached discovery yet -- re-run with "
+                      "a connection to list what the site offers)")
 
 
 def cmd_set_default(args):
@@ -1811,6 +3582,19 @@ def cmd_set_default(args):
     cfg["default"] = args.selector
     save_config(cfg)
     print(f"Default book set to: {args.selector}")
+    # A default that is not cached is a decision waiting to be silently
+    # overridden: every lookup would fall back to the closest cached book.
+    # That happened -- set-default 13.0-systemd, and update read 12.4 with
+    # the note swallowed.  So the book is cached NOW, while the person who
+    # made the choice is looking.
+    try:
+        ensure_book(args.selector)
+    except Exception as e:
+        warn(f"note: could not cache '{args.selector}' ({e}).")
+        warn("      Until it is cached, every lookup falls back to the "
+             "closest cached book, and says so.")
+        warn(f"      Fetch it when there is a connection:  blfs fetch "
+             f"{args.selector}")
 
 
 def cmd_search(args):
@@ -1830,31 +3614,52 @@ def cmd_search(args):
 
 
 def cmd_script(args):
+    # `blfs script <name>` has always BEEN fetch; `blfs script fetch <name>`
+    # is accepted so the verb reads the same across lfs, blfs and
+    # packagemanager.
+    _t = list(args.target)
+    if _t and _t[0] == "fetch" and len(_t) > 1:
+        _t = _t[1:]
+    # SEVERAL PACKAGES, ONE BOOK.  The parser has always taken a list and this
+    # used _t[0] and dropped the rest, so packagemanager regenerating a plan
+    # ran one `blfs script` per package -- 151 subprocesses, each loading and
+    # indexing the book again.  Loading it once and writing them all is the
+    # same work minus 150 book loads.
     book = get_book(args)
-    anchor = anchor_from_input(args.target)
-    data = book.get(anchor)
-    if data is None:
-        print(f"ERROR: could not find anchor '{anchor}' in the book.")
-        print("       run:  blfs debug " + args.target)
-        sys.exit(1)
-    src = args.target if args.target.startswith("http") else f"#{anchor}"
-    filename, script = render_script(data, src)
+    ver = _book_version_of(book)
     os.makedirs(args.outdir, exist_ok=True)
-    path = os.path.join(args.outdir, filename)
-    with open(path, "w") as f:
-        f.write(script)
-    print(f"Created {path}")
-    try:
-        subprocess.run(["bash", "-n", path], check=True)
-        print("Bash syntax OK.")
-    except subprocess.CalledProcessError:
-        print("!!! bash syntax error -- review the file")
-    return path
+    written = []
+    for target in _t:
+        anchor = anchor_from_input(target)
+        anchor = resolve_anchor(book, anchor)
+        data = book.get(anchor)
+        if data is None:
+            print(f"ERROR: could not find anchor '{anchor}' in the book.")
+            print("       run:  blfs debug " + target)
+            if len(_t) == 1:
+                sys.exit(1)
+            continue
+        src = target if target.startswith("http") else f"#{anchor}"
+        filename, script = render_script(data, src, ver)
+        path = os.path.join(args.outdir, filename)
+        with open(path, "w") as f:
+            f.write(script)
+        print(f"Created {path}")
+        try:
+            subprocess.run(["bash", "-n", path], check=True)
+            print("Bash syntax OK.")
+        except subprocess.CalledProcessError:
+            print("!!! bash syntax error -- review the file")
+        written.append(path)
+    if not written:
+        sys.exit(1)
+    return written[0] if len(written) == 1 else written
 
 
 def cmd_deps(args):
     book = get_book(args)
     anchor = anchor_from_input(args.name)
+    anchor = resolve_anchor(book, anchor)
     if book.get(anchor) is None:
         print(f"ERROR: '{anchor}' not found.  try: blfs debug {args.name}")
         sys.exit(1)
@@ -1933,6 +3738,7 @@ def cmd_rdeps(args):
                 seen.add(dependent)
                 order.append(dependent)
                 queue.append(dependent)
+    seen_anchors = {a for a in order}
     if getattr(args, "anchors", False):
         for a in order:
             data = book.get(a)
@@ -1947,16 +3753,20 @@ def cmd_rdeps(args):
 def cmd_order(args):
     book = get_book(args)
     anchor = anchor_from_input(args.name)
+    anchor = resolve_anchor(book, anchor)
     if book.get(anchor) is None:
         print(f"ERROR: '{anchor}' not found.  try: blfs debug {args.name}")
         sys.exit(1)
     kinds = selected_kinds(args)
+    _ign = [x for x in (getattr(args, "ignore", "") or "").split(",") if x]
+    _ign = [resolve_anchor(book, anchor_from_input(x)) for x in _ign]
 
-    order, edges, missing, via = walk_deps(book, anchor, kinds)
+    order, edges, missing, via = walk_deps(book, anchor, kinds, ignore=_ign)
 
     # machine-readable mode: one TSV line per package in install order,
     # "anchor<TAB>name_version<TAB>kind<TAB>parent_anchor" (root has empty
     # kind/parent), then "#missing<TAB>name<TAB>kind<TAB>parent".
+    seen_anchors = {a for a in order}
     if getattr(args, "anchors", False):
         for a in order:
             parent, kind = ("", "") if a == anchor else via.get(a, ("", ""))
@@ -1964,6 +3774,14 @@ def cmd_order(args):
         for m in sorted(set(missing)):
             parent, kind = via.get(m, ("", ""))
             print(f"#missing\t{m}\t{kind}\t{parent}")
+        # a dependant built before something it recommends, because a cycle
+        # left no order that satisfies both -- the caller decides what to say
+        for _a, _d in _CYCLE_DROPS:
+            if _a in seen_anchors and _d in seen_anchors:
+                print(f"#cycle\t{_a}\t{_d}")
+        for _parent, _ign in getattr(walk_deps, "ignored_required", ()):
+            if _parent in seen_anchors:
+                print(f"#ignored-required\t{_parent}\t{_ign}")
         return
 
     os.makedirs(args.outdir, exist_ok=True)
@@ -1974,7 +3792,7 @@ def cmd_order(args):
         data = book.get(a)
         lines.append(data["name_version"])
         if args.scripts:
-            fn, script = render_script(data, f"#{a}")
+            fn, script = render_script(data, f"#{a}", _book_version_of(book))
             with open(os.path.join(args.outdir, fn), "w") as f:
                 f.write(script)
 
@@ -1999,6 +3817,7 @@ def cmd_debug(args):
     print(f"input          : {args.target}")
     print(f"anchor         : {anchor}")
 
+    anchor = resolve_anchor(book, anchor)
     data = book.get(anchor)
     if data is None:
         # not a package in the cache -- parse the soup to explain why
@@ -2067,7 +3886,7 @@ def main():
     book_args, remaining = pre.parse_known_args()
 
     ap = argparse.ArgumentParser(prog="blfs", description="BLFS book tool")
-    ap.add_argument("--version", action="version",
+    ap.add_argument("-V", "--version", action="version",
                     version=f"blfs {BLFS_VERSION} (build {_build_id()}, "
                             f"cache v{CACHE_VERSION}, "
                             f"script v{SCRIPT_VERSION})")
@@ -2114,8 +3933,25 @@ def main():
     p.add_argument("package")
     p.set_defaults(func=cmd_sources)
 
+    p = sub.add_parser("diff-init",
+                       help="which pages differ between this book and another "
+                            "(e.g. the sysv book vs the systemd one)")
+    p.add_argument("other", help="selector (stable-sysv) or a book file")
+    p.add_argument("packages", nargs="*",
+                   help="show the command diff for these; omit to list every "
+                        "page that differs")
+    p.add_argument("--all", action="store_true",
+                   help="every difference, not only the init-related ones "
+                        "(across two book VERSIONS most pages differ anyway)")
+    p.add_argument("--installed", action="store_true",
+                   help="only pages this machine has a package user for -- "
+                        "what differs AND concerns you")
+    p.set_defaults(func=cmd_diff_init)
+
     p = sub.add_parser("books", help="list/inspect books")
     p.add_argument("--discover", action="store_true", help="probe the live site")
+    p.add_argument("--brief", action="store_true",
+                   help="default + cached list only, no network (for scripts)")
     p.add_argument("--rebuild-cache", action="store_true",
                    help="re-index the current book (after upgrading blfs)")
     p.set_defaults(func=cmd_books)
@@ -2129,7 +3965,10 @@ def main():
     p.set_defaults(func=cmd_search)
 
     p = sub.add_parser("script", help="write an install_<name-version> script")
-    p.add_argument("target", help="package name, or a BLFS url (optionally #fragment)")
+    p.add_argument("target", nargs="+",
+                   help="package name, or a BLFS url (optionally #fragment); "
+                        "'fetch <name>' is accepted too, matching the other "
+                        "tools' script commands")
     p.add_argument("-o", "--outdir", default=".")
     p.set_defaults(func=cmd_script)
 
@@ -2152,6 +3991,9 @@ def main():
                    help="also follow optional dependencies")
     p.add_argument("--anchors", action="store_true",
                    help="machine-readable: print 'anchor<TAB>name_version' in order")
+    p.add_argument("--ignore", default="",
+                   help="comma-separated packages not to build -- their own "
+                        "dependencies are not walked into either")
     p.set_defaults(func=cmd_order)
 
     p = sub.add_parser("debug", help="explain how an anchor resolves")

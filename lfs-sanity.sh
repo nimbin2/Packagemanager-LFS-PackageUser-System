@@ -25,8 +25,17 @@ PFX="${PFX:-p}"; PFX="${PFX%_}_"
 
 sec() { echo; echo "=============================================================="; \
         echo "== $*"; echo "=============================================================="; }
+# One colour rule, same as every other tool here: red is a problem, green is a
+# clean result, plain is information.  The report is often read in a hurry,
+# scrolled fast, or grepped -- a problem that is not red is a problem missed.
+# Colour only on a terminal, so the saved report file stays clean text.
+if [ -t 1 ]; then
+    _C_ERR=$'\033[0;31m'; _C_OK=$'\033[0;32m'; _C_OFF=$'\033[0m'
+else
+    _C_ERR=""; _C_OK=""; _C_OFF=""
+fi
 note(){ echo "   $*"; }
-hit() { echo "!! $*"; hits=$((hits+1)); }
+hit() { echo "${_C_ERR}!! $*${_C_OFF}"; hits=$((hits+1)); }
 
 echo "lfs-pkgusr sanity report -- $(date '+%Y-%m-%d %H:%M:%S')"
 echo "host: $(uname -srm)"
@@ -35,7 +44,7 @@ echo "roots: PKGROOT=$PKGROOT  CFGROOT=$CFGROOT  STATE=$STATE"
 sec "0. tool versions  (host and chroot copies must MATCH)"
 # A stale chroot copy running old code has cost more debugging time in this
 # project than anything else, which is why each tool prints a build id.
-for t in lfs-helper lfs packagemanager blfs packagemanager_install; do
+for t in lfs-helper lfs packagemanager blfs; do
     if command -v "$t" >/dev/null 2>&1; then
         printf '   %-22s %s\n' "$t" \
             "$("$t" --version 2>/dev/null | head -1 || echo '(no --version)')"
@@ -177,9 +186,17 @@ done
 sec "5. files owned by a uid with NO name"
 # The sharp version of the /sources problem: a uid that resolves to nothing is
 # unambiguous, whereas a uid that resolves to the WRONG name looks fine.
-# /tmp and /build are scratch: nothing there has to have an owner, and both
-# are full of half-unpacked trees mid-build.
-o="$(find / -xdev \( -path /tmp -o -path /build -o -path /sources \) -prune \
+# /tmp, /build, /sources AND every package's unpacked source tree are scratch:
+# nothing there has to have an owner.  Build trees moved from /build into each
+# package user's home, and this scan did not follow -- so a finished tree filled
+# the report with tcl's own documentation:
+#     !! files with no owner (first 40):
+#          /usr/src/pkgusr/p_tcl/src/tcl8.6.16/html/Keywords/Z.htm
+# A tarball can carry any uid it likes.  Unpacked sources are not installed,
+# nothing owns them, and asking who does has no answer.
+o="$(find / -xdev \( -path /tmp -o -path /build -o -path /sources \
+        -o -path "$STATE" \
+        -o -path "$PKGROOT/*/src" -o -path "$CFGROOT/*/src" \) -prune \
      -o -xdev \( -nouser -o -nogroup \) -print 2>/dev/null | head -40)"
 if [ -n "$o" ]; then
     hit "files with no owner (first 40):"; printf '     %s\n' $o
@@ -193,9 +210,19 @@ getent group install 2>/dev/null | sed 's/^/   /' \
 getent group install 2>/dev/null | awk -F: '$3!=9999{print "!! install is gid "$3", want 9999"}'
 c="$(getent group 2>/dev/null | awk -F: '$3>=90000' | wc -l)"
 note "$c collector group(s) in the 90000+ range"
-# same cap as the accounts: nogroup is 65534 and belongs to the system
-getent group 2>/dev/null | awk -F: '$3>=10000 && $3<65000 && $1 !~ /^p_|^u_|^cfg_/ \
-    {print "!! group "$1" (gid "$3") is outside every convention"}'
+# same cap as the accounts: nogroup is 65534 and belongs to the system.
+#
+# COUNTED, not just printed.  This awk wrote its own "!!" line and never
+# touched $hits, so a report that flagged
+#     !! group nimgnu_p_openssl (gid 10093) is outside every convention
+# ended with "no problems found by these checks".  A summary that disagrees
+# with the body teaches you to skip the summary.
+_badgrp="$(getent group 2>/dev/null \
+    | awk -F: '$3>=10000 && $3<65000 && $1 !~ /^p_|^u_|^cfg_/ {print $1" (gid "$3")"}')"
+if [ -n "$_badgrp" ]; then
+    hit "group(s) outside every convention -- collector groups belong at 90000+:"
+    printf '     %s\n' $_badgrp
+fi
 
 sec "7. how much of the tree still belongs to root"
 # Root-owned files under the install dirs are normally the temporary system's,
@@ -214,7 +241,19 @@ sec "8. build state"
 # will never close)` on a tree where adoption had completed perfectly.
 PROG="$STATE/progress"
 [ -f "$PROG/steporder" ] && note "steps in order: $(grep -c . "$PROG/steporder")"
-[ -f "$PROG/steps-built" ] && note "steps built: $(grep -c . "$PROG/steps-built")"
+if [ -f "$PROG/steps-built" ]; then
+    _nb="$(grep -c . "$PROG/steps-built")"
+    _no="$(grep -c . "$PROG/steporder" 2>/dev/null || echo 0)"
+    note "steps built: $_nb"
+    # More built than exist means the progress file remembers steps the current
+    # step order no longer has -- usually one removed from the tools since this
+    # tree was generated (last-step, refind).  Harmless, but it makes "104 of
+    # 105" arithmetic wrong for the rest of the build.
+    if [ "$_nb" -gt "$_no" ] 2>/dev/null; then
+        note "  ($((_nb - _no)) built step(s) are not in the current order --"
+        note "   left over from a step removed since; clear with: lfs-helper undone <name>)"
+    fi
+fi
 [ -d "$STATE/manifests" ] && note "manifests: $(ls -1 "$STATE/manifests"/*.files 2>/dev/null | wc -l)"
 [ -f "$PROG/adopted.list" ] \
     && note "adopted.list: $(grep -c . "$PROG/adopted.list") entries" \
@@ -248,7 +287,15 @@ for m in "$STATE"/manifests/*.files; do
     command -v lfs-helper >/dev/null 2>&1 && [ -e "$_f" ] \
         && _own="$(stat -c %U "$_f" 2>/dev/null)"
     case "$_own" in
-        p_*|cfg_*) note "manifest '$b' -> no account '$a', but its files belong to '$_own'" ;;
+        p_*|cfg_*)
+            note "manifest '$b' -> no account '$a', but its files belong to '$_own'" ;;
+        root)
+            # A configuration step that writes ROOT-owned files.  cfg_clock
+            # writes /etc/adjtime, cfg_hosts writes /etc/hosts: root's files,
+            # by design, and the step has no account because it installs no
+            # software.  There is nothing here that adoption could ever want,
+            # so reporting it listed eleven findings on a perfect tree.
+            : ;;
         *) echo "   ?  manifest '$b' -> no account '$a'" ;;
     esac
 done
@@ -257,9 +304,9 @@ command -v lfs-helper >/dev/null 2>&1 && { echo; echo "--- lfs-helper list ---";
 
 sec "SUMMARY"
 if [ "$hits" -eq 0 ]; then
-    echo "   no problems found by these checks"
+    echo "   ${_C_OK}no problems found by these checks${_C_OFF}"
 else
-    echo "   $hits problem area(s) flagged above -- search this file for '!!'"
+    echo "   ${_C_ERR}$hits problem area(s) flagged above -- search this file for '!!'${_C_OFF}"
 fi
 echo
 echo "Nothing was changed.  This report is read-only."

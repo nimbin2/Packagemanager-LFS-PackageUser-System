@@ -1,0 +1,116 @@
+#!/bin/bash
+############################################
+### mytools -- everything of your own, under one package user
+###
+### One account (p_mytools) owns every script and program you wrote or
+### packaged yourself, so `packagemanager verify` lists them, pkg.lst records
+### every file, and removing them is one command.  Add a line to SOURCES and
+### re-run; nothing else changes.
+###
+### phases: all | unpack | build | install   (see lfs-phases)
+
+# Named after the person whose software this is: the account is p_<user>,
+# so `verify`, pkg.lst and `packagemanager remove` all speak their name.
+name="${MYTOOLS_NAME:-${DESKTOP_USER:-$(cat /etc/pkgusr/desktop-user 2>/dev/null || echo mytools)}}"
+name_version="$name-1"
+url=''
+link=''
+pkg=''
+md5_sum=''
+info='Personal scripts and programs: the seatd-user wrapper, sway_start, the wifi script, and the sway helper programs.'
+installed_content=('installed_programs')
+installed_programs='wifi, sway_start'
+
+# ---------------------------------------------------------------------------
+# SOURCES -- one line per thing.  Fields, separated by '|':
+#     kind   raw   = a single file, installed as-is
+#            tar   = a tarball; unpacked, then BUILD runs in its directory
+#            git   = a repository; cloned, then BUILD runs in it
+#     name   what it is called once installed
+#     url    where it comes from  (a file:// path works offline)
+#     dest   where it goes        (a directory, or empty for /usr/bin)
+#     build  shell run in the source dir; empty for raw files
+# ---------------------------------------------------------------------------
+# SINGLE-quoted, always: a double-quoted element collapses the escapes before
+# eval ever sees them.  The build command is the author's own, verbatim:
+#     u=n76310; gcc seatd-user.c -DSEATD_USER="$u" -o seatd-$u
+# which reaches gcc as -DSEATD_USER=n76310 -- the program stringifies it
+# itself.  (An earlier version passed \"n76310\"; that is a different macro
+# and only one of the two can be right, so copy what works by hand.)
+SOURCES=(
+'raw|wifi|https://git.christianimmanuel.de/scripts/raw/Administration/wifi|/usr/bin|'
+'raw|sway_start|https://git.christianimmanuel.de/scripts/raw/Administration/sway_start|/usr/bin|'
+'tar|seatd-user|https://git.christianimmanuel.de/sway/seatd-user/archive/seatd-user.tar.gz|/usr/bin|gcc seatd-user.c -DSEATD_USER=$DESKTOP_USER -o $OUT/seatd-$DESKTOP_USER'
+# The sway helpers.  They are separate package users today; move them here by
+# uncommenting, then `packagemanager remove swas swov swbr minibrowser`.
+#'git|swas|https://git.christianimmanuel.de/sway/SwAS|/usr/bin|make'
+#'git|swov|https://git.christianimmanuel.de/sway/SWOv|/usr/bin|make'
+#'git|swbr|https://git.christianimmanuel.de/sway/SwBr|/usr/bin|make'
+#'git|browser|https://git.christianimmanuel.de/web-tools/Browser|/usr/bin|make'
+)
+
+# the user seatd-user is compiled for; the desktop-user step records it
+DESKTOP_USER="${DESKTOP_USER:-$(cat /etc/pkgusr/desktop-user 2>/dev/null || true)}"
+
+_srcdir() { printf '%s/src/%s' "$HOME" "$1"; }
+
+build_pkg() {
+    [ -n "$DESKTOP_USER" ] || {
+        echo "!! DESKTOP_USER is not set and /etc/pkgusr/desktop-user is empty."
+        echo "   seatd-user is compiled for ONE username; name it:"
+        echo "     echo <user> > /etc/pkgusr/desktop-user"
+        return 1
+    }
+    mkdir -p "$HOME/src" "$HOME/out"
+    local line kind nm url dest build d OUT
+    OUT="$HOME/out"
+    for line in "${SOURCES[@]}"; do
+        IFS='|' read -r kind nm url dest build <<< "$line"
+        [ -n "$nm" ] || continue
+        d="$(_srcdir "$nm")"
+        echo "== $nm ($kind)"
+        case "$kind" in
+            raw)
+                wget -q -O "$OUT/$nm" "$url" || { echo "!! fetch failed: $url"; return 1; }
+                chmod 755 "$OUT/$nm" ;;
+            tar)
+                rm -rf "$d"; mkdir -p "$d"
+                wget -q -O "$d/pkg.tar.gz" "$url" || { echo "!! fetch failed: $url"; return 1; }
+                ( cd "$d" && tar xf pkg.tar.gz ) || return 1
+                ( cd "$(dirname "$(find "$d" -name '*.c' -print -quit)")" \
+                  && eval "$build" ) || return 1 ;;
+            git)
+                if [ -d "$d/.git" ]; then ( cd "$d" && git pull --ff-only ) || return 1
+                else git clone --depth 1 "$url" "$d" || return 1; fi
+                ( cd "$d" && eval "$build" ) || return 1
+                [ -x "$d/$nm" ] && cp -f "$d/$nm" "$OUT/$nm" ;;
+        esac
+    done
+}
+
+install_pkg() {
+    local line kind nm url dest build f
+    for line in "${SOURCES[@]}"; do
+        IFS='|' read -r kind nm url dest build <<< "$line"
+        [ -n "$nm" ] || continue
+        dest="${dest:-/usr/bin}"
+        install -v -d -m755 "$dest"
+        # ONE ENTRY, ITS OWN ARTIFACT.  This installed both $nm AND the
+        # seatd wrapper on every pass, so the wrapper was written three
+        # times -- harmless until the third try hit a file it no longer
+        # owned.  seatd-user's product is named after the user, not the
+        # entry, which is why it needs the special case.
+        case "$nm" in
+            seatd-user) f="$HOME/out/seatd-$DESKTOP_USER" ;;
+            *)          f="$HOME/out/$nm" ;;
+        esac
+        [ -f "$f" ] || { echo "!! $nm: nothing was built at $f"; return 1; }
+        install -v -m755 "$f" "$dest/$(basename "$f")"
+    done
+    echo
+    echo "## /usr/bin/seatd-$DESKTOP_USER must be setuid root, group $DESKTOP_USER."
+    echo "## A package user cannot set that bit -- the wrapper records the"
+    echo "## request and the build reports it; the mytools step applies it."
+}
+
+. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"

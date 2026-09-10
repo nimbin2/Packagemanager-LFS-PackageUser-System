@@ -1,0 +1,568 @@
+#!/bin/bash
+# lfs-phases -- the shared phase runner sourced by every generated install
+# script.  The script holds what is specific to the package: its variables at
+# the top and its commands in build_pkg / install_pkg / configure_pkg /
+# test_pkg.  Everything the same for every package lives here.
+#
+# A script ends with:
+#     . "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"
+#
+# Variables a script may set (all optional unless noted):
+#   name_version   binutils-2.45                            (required)
+#   pkg_glob       how to find the tarball in the sources store (LFS scripts)
+#   pkg            the tarball's exact filename (BLFS scripts)
+#   link           where to download it when it is not on disk
+#   md5_sum        checksum of $pkg
+#   additional_links=(...)   further files to fetch beside it
+#   is_git=1 git_ref=...     clone $link instead of fetching a tarball
+#   pkg_unpack=no  fetch but do not extract: the page's own commands do that
+#   pkgusr_stage   cross | chroot | (unset = the booted system)
+#
+# Functions a script may define:
+#   prepare_pkg    runs in unpack, before the tarball is fetched
+#   build_pkg      configure + compile                      (required)
+#   install_pkg    the step that writes into system directories (required)
+#   configure_pkg  post-install configuration
+#   test_pkg       the test suite; runs only when PKGUSR_TESTS=1
+#   unpack_pkg     replaces the built-in unpack entirely (rare)
+#
+# Environment the runner passes (all optional):
+#   PKGUSR_LIB, LFS_BUILD_ROOT, LFS_SOURCES_DIR, PKGUSR_TESTS (=1),
+#   PM_SKIP_MD5 (=1), PKGUSR_PHASE (internal: this process runs one phase)
+#
+# Every function and variable here carries a pkgusr_ / _pp_ prefix, because
+# scripts are also SOURCED by lfs-helper to read their metadata, and this file
+# comes along -- it must not shadow anything in the sourcing shell.
+
+PKGUSR_LIB_VERSION="1.14.146"
+
+_pp_build_id() {
+    local f="${BASH_SOURCE[0]}"
+    [ -r "$f" ] && md5sum "$f" 2>/dev/null | cut -c1-7
+}
+
+# ----------------------------------------------------------------- output ----
+_pp_say()  { echo "$*"; }
+_pp_note() { echo "note: $*" >&2; }
+_pp_fail() { echo "!! $*" >&2; }
+
+# ---------------------------------------------------------------- layout ----
+# Where the sources are and where this package builds.  Decided per process,
+# from the environment the runner passed; nothing here is exported, because
+# BUILD_ROOT is a name packages use (libvpx's Makefile has `BUILD_ROOT?=.`).
+_pp_layout() {
+    # THE PACKAGE'S NAME, NOT THE FILE'S.
+    #
+    # The same script is run under several filenames by design -- the book
+    # copy (install_util-macros-1.20.2), the staged copy (install_util-macros)
+    # and the account's copy (install_p_util-macros) -- so a marker named
+    # after $0 was written by unpack under one name and looked for by install
+    # under another:
+    #     !! no unpacked source in /usr/src/pkgusr/p_util-macros/src
+    # while the source sat right there.  name_version is the package, and it
+    # is the same in every copy of the script.
+    _pp_step="${name_version:-${0##*/}}"; _pp_step="${_pp_step%.sh}"
+    if [ "${pkgusr_stage:-}" = "cross" ]; then
+        # chapters 5-6, as the lfs user on the host: the tree is $LFS
+        if [ -z "${LFS:-}" ]; then
+            _pp_fail '$LFS is not set -- refusing to guess. export LFS=/mnt/lfs (see book 2.6) and re-run.'
+            exit 2
+        fi
+        export LFS
+        if [ -z "${LFS_TGT:-}" ]; then
+            LFS_TGT="$(uname -m)-lfs-linux-gnu"; export LFS_TGT
+            _pp_note "\$LFS_TGT was unset -- defaulting to $LFS_TGT (book 4.4)"
+        fi
+        case ":$PATH:" in
+            *":$LFS/tools/bin:"*) ;;
+            *) PATH="$LFS/tools/bin:$PATH"; export PATH
+               _pp_note "added $LFS/tools/bin to \$PATH (book 4.4)" ;;
+        esac
+    elif [ "${pkgusr_stage:-}" = "chroot" ]; then
+        # chapters 7-10, inside the chroot: the tree is /
+        export LFS="${LFS:-/}"
+    fi
+    if [ -z "${MAKEFLAGS:-}" ]; then
+        export MAKEFLAGS="-j$(nproc)"
+    fi
+    if [ -n "${LFS_SOURCES_DIR:-}" ]; then SOURCES_DIR="$LFS_SOURCES_DIR"
+    elif [ -n "${SOURCES_DIR:-}" ]; then :
+    elif [ "${pkgusr_stage:-}" = "cross" ]; then SOURCES_DIR="$LFS/sources"
+    else SOURCES_DIR="/sources"; fi
+    if [ -n "${LFS_BUILD_ROOT:-}" ]; then BUILD_ROOT="$LFS_BUILD_ROOT"
+    elif [ -n "${BUILD_ROOT:-}" ]; then :
+    elif [ "${pkgusr_stage:-}" = "cross" ]; then BUILD_ROOT="$LFS/build"
+    elif [ -d "$HOME/src" ]; then BUILD_ROOT="$HOME/src"
+    elif [ "${pkgusr_stage:-}" = "chroot" ]; then BUILD_ROOT="/build"
+    else BUILD_ROOT="$PWD"; fi
+    _pp_dir_marker="$BUILD_ROOT/.pkgusr-$_pp_step.dir"
+    _pp_cwd_marker="$BUILD_ROOT/.pkgusr-$_pp_step.cwd"
+    _pp_built_marker="$BUILD_ROOT/.pkgusr-$_pp_step.built"
+}
+
+# A systemd book on a SysV system: the book's commands call systemctl and its
+# family, and a missing command aborts the phase.  Shim each one that is
+# absent; on a systemd system nothing changes.
+_pp_systemd_shims() {
+    local c
+    for c in systemctl systemd-run systemd-tmpfiles systemd-sysusers \
+             systemd-machine-id-setup systemd-hwdb loginctl busctl journalctl \
+             timedatectl hostnamectl localectl udevadm; do
+        command -v "$c" >/dev/null 2>&1 && continue
+        eval "$c() { echo \"# skipped (no $c on this system): $c \$*\"; }"
+    done
+}
+
+# --------------------------------------------------------------- sources ----
+# Make BUILD_ROOT look like the sources directory to anything that walks up
+# out of an unpacked tree: the LFS book writes
+#     tar -xf ../tcl8.6.16-html.tar.gz --strip-components=1
+# from INSIDE the unpacked directory.  Every downloaded file is linked, not a
+# known list -- a list would be wrong the first time a new book adds one.
+_pp_link_sources() {
+    [ -d "$SOURCES_DIR" ] || return 0
+    local f b
+    for b in "$BUILD_ROOT"/*; do
+        [ -L "$b" ] && [ ! -e "$b" ] && rm -f "$b"
+    done
+    for f in "$SOURCES_DIR"/*; do
+        [ -f "$f" ] || continue
+        b="$BUILD_ROOT/${f##*/}"
+        # never shadow real content: an unpacked tree wins over a link
+        [ -e "$b" ] && [ ! -L "$b" ] && continue
+        ln -sfn "$f" "$b" 2>/dev/null || true
+    done
+}
+
+# Put one file into BUILD_ROOT from wherever it already is on disk.  Prints
+# nothing; returns 1 when it is nowhere.
+_pp_stage_file() {
+    local f="$1" d
+    [ -f "$BUILD_ROOT/$f" ] && return 0
+    for d in "$HOME" "$SOURCES_DIR" /sources; do
+        [ -f "$d/$f" ] || continue
+        ln -sfn "$d/$f" "$BUILD_ROOT/$f" 2>/dev/null \
+            || cp -p "$d/$f" "$BUILD_ROOT/$f" 2>/dev/null \
+            || { cat "$d/$f" > "$BUILD_ROOT/$f" || rm -f "$BUILD_ROOT/$f"; }
+        [ -f "$BUILD_ROOT/$f" ] && return 0
+    done
+    return 1
+}
+
+# Pick the tarball a glob names in the sources store.  Two traps: patterns
+# that match nothing must not swallow the one that did, and several packages
+# ship docs beside the source (tcl8.6.16-html.tar.gz sorts before
+# tcl8.6.16-src.tar.gz) -- prefer an explicit -src archive, never a doc one.
+_pp_pick_glob() {
+    local _c
+    cd "$SOURCES_DIR" 2>/dev/null || return 1
+    for _c in $pkg_glob; do
+        [ -e "$_c" ] || continue
+        case "$_c" in *-src.*|*-source.*) echo "$_c"; return 0 ;; esac
+    done
+    for _c in $pkg_glob; do
+        [ -e "$_c" ] || continue
+        case "$_c" in
+            *-html.*|*-doc.*|*-docs.*|*-man.*|*-manual.*|*-tests.*) continue ;;
+            *-doc-*|*-docs-*|*-html-*|*-man-pages-*|*-tests-*) continue ;;
+        esac
+        echo "$_c"; return 0
+    done
+    return 1
+}
+
+# The GNU ftpmirror answers 502 more often than not, and a dead mirror asked
+# three times is not a retry -- so the fallbacks are tried before giving up.
+_pp_mirrors_for() {
+    local u="$1" f="${1##*/}" rest
+    printf '%s\n' "$u"
+    case "$u" in
+        *ftpmirror.gnu.org/*|*ftp.gnu.org/*)
+            rest="${u#*gnu.org/}"; rest="${rest#gnu/}"
+            printf '%s\n' "https://ftp.gnu.org/gnu/$rest" \
+                "https://mirrors.kernel.org/gnu/$rest" \
+                "https://mirror.csclub.uwaterloo.ca/gnu/$rest" ;;
+    esac
+    # the LFS mirror of last resort keeps most BLFS sources by filename
+    [ -n "${pkgusr_book_mirror:-}" ] && printf '%s\n' "${pkgusr_book_mirror%/}/$f"
+    return 0
+}
+
+_pp_fetch() {
+    local url="$1" try u
+    for try in 1 2 3; do
+        while IFS= read -r u; do
+            [ -n "$u" ] || continue
+            [ "$u" = "$url" ] || _pp_say "trying mirror: $u"
+            wget -4 -c "$u" && return 0
+        done <<< "$(_pp_mirrors_for "$url" | awk '!seen[$0]++')"
+        [ "$try" = 3 ] && break
+        _pp_say "every mirror failed (try $try/3) -- retrying in $((try * 15))s"
+        sleep $((try * 15))
+    done
+    return 1
+}
+
+_pp_check_md5() {
+    [ -n "${md5_sum:-}" ] || return 0
+    grep -wq "$md5_sum" <<< "$(md5sum "$pkg")" && return 0
+    if [ "${PM_SKIP_MD5:-0}" = 1 ]; then
+        _pp_fail "md5sum does NOT match, and PM_SKIP_MD5=1 -- continuing anyway"
+        return 0
+    fi
+    _pp_fail "md5sum check failed for $pkg"
+    echo "   expected $md5_sum" >&2
+    echo "   got      $(set -- $(md5sum "$pkg" 2>/dev/null); echo "${1:-<no file>}")" >&2
+    echo "   To accept a mismatch on purpose:  PM_SKIP_MD5=1 $0 unpack" >&2
+    return 1
+}
+
+# ---------------------------------------------------------------- unpack ----
+_pp_unpack() {
+    mkdir -p "$BUILD_ROOT" 2>/dev/null
+    cd "$BUILD_ROOT" || { _pp_fail "no build scratch at $BUILD_ROOT and cannot create it"; return 1; }
+    rm -f "$_pp_dir_marker" "$_pp_cwd_marker"
+    case "${pkgusr_stage:-}" in cross|chroot) _pp_link_sources ;; esac
+    if declare -F prepare_pkg >/dev/null; then
+        prepare_pkg
+        # WHERE THE PAGE'S OWN COMMANDS LEFT OFF.
+        #
+        # Xorg Libraries writes lib-7.md5 in the build root, then `mkdir lib
+        # && cd lib` and downloads into it -- and the build loop reads
+        # `../lib-7.md5`, which only resolves from INSIDE lib.  Returning to
+        # the build root here threw that away, so the build started one level
+        # too high and stopped on
+        #     the list this build loops over is missing or empty: ../lib-7.md5
+        # after downloading all thirty-two tarballs successfully.
+        _pp_prepared_in="$PWD"
+        cd "$BUILD_ROOT" || return 1
+    fi
+
+    if [ "${is_git:-}" = 1 ]; then
+        pkg_dir="$name_version"
+        if [ -d "$pkg_dir/.git" ]; then
+            git -C "$pkg_dir" fetch --all --tags --prune
+        else
+            rm -rf "$pkg_dir" && git clone --recurse-submodules "$link" "$pkg_dir"
+        fi
+        # A REF THAT DOES NOT EXIST IS A TYPO IN THE STACK, NOT A BUILD ERROR.
+        #
+        # git says only
+        #     error: pathspec '1.0.0' did not match any file(s) known to git
+        # which reads like a build failure and sends people to the log.  The
+        # repository is right here and knows what it does have; show it, and
+        # say where the wrong value came from.
+        if [ -n "${git_ref:-}" ] && ! git -C "$pkg_dir" checkout "$git_ref"; then
+            _pp_fail "'$git_ref' is not a tag, branch or commit in $link"
+            echo "   The stack entry (or this script) asks for a ref the" >&2
+            echo "   repository does not have.  Recent tags:" >&2
+            git -C "$pkg_dir" tag --sort=-v:refname 2>/dev/null | head -8 \
+                | sed 's/^/     /' >&2
+            echo "   Branches:" >&2
+            git -C "$pkg_dir" branch -r --format='%(refname:short)' 2>/dev/null \
+                | head -5 | sed 's/^/     /' >&2
+            echo "   Fix ref= in the stack entry for '${name:-$name_version}'," >&2
+            echo "   or set git_ref= in this script, then run it again." >&2
+            return 1
+        fi
+        git -C "$pkg_dir" submodule update --init --recursive
+        echo "$pkg_dir" > "$_pp_dir_marker"
+        _pp_say "checked out into $BUILD_ROOT/$pkg_dir"
+        return 0
+    fi
+
+    # the tarball: by exact name, by glob in the store, or downloaded
+    if [ -z "${pkg:-}" ] && [ -n "${pkg_glob:-}" ]; then
+        pkg="$(_pp_pick_glob)" || pkg=""
+        cd "$BUILD_ROOT" || return 1
+        [ -n "$pkg" ] || { _pp_fail "no $pkg_glob in $SOURCES_DIR -- run: lfs build-system get-sources --run"; return 1; }
+    fi
+    if [ -z "${pkg:-}" ]; then
+        # a meta page: it builds a list of packages and its own commands fetch
+        # them.  Remember where they left off -- Xorg Libraries does
+        # `mkdir lib && cd lib` and its build loop reads ../lib-7.md5 from there.
+        _pp_say "no single tarball -- this page builds a list of packages; its own commands fetch them"
+        printf '%s\n' "${_pp_prepared_in:-$PWD}" > "$_pp_cwd_marker" 2>/dev/null || true
+        [ -n "${_pp_prepared_in:-}" ] && [ "$_pp_prepared_in" != "$PWD" ] \
+            && _pp_say "# the build resumes in $_pp_prepared_in"
+        return 0
+    fi
+    _pp_stage_file "$pkg" || { [ -n "${link:-}" ] && _pp_fetch "$link"; }
+    [ -f "$pkg" ] || { _pp_fail "no $pkg in $BUILD_ROOT and nowhere to fetch it from"; return 1; }
+    _pp_check_md5 || return 1
+    local li f
+    for li in "${additional_links[@]}"; do
+        f="${li##*/}"
+        _pp_stage_file "$f" || _pp_fetch "$li" || return 1
+    done
+    if [ "${pkg_unpack:-yes}" = "no" ]; then
+        _pp_say "fetched $pkg (the page's own commands unpack it)"
+        printf '%s\n' "${_pp_prepared_in:-$PWD}" > "$_pp_cwd_marker" 2>/dev/null || true
+        return 0
+    fi
+
+    # Extract into a scratch dir, then move the ONE top-level directory to
+    # its name -- never `mv tmp/* .`, which nests it inside an existing
+    # same-named dir.  --no-same-owner: as root, tar would restore the uids
+    # recorded in the archive.
+    rm -rf .pkgusr-tmp && mkdir .pkgusr-tmp && cd .pkgusr-tmp || return 1
+    case "$pkg" in
+        *.zip) unzip -q ../"$pkg" ;;
+        *)     tar --no-same-owner -xf ../"$pkg" ;;
+    esac || { cd ..; rm -rf .pkgusr-tmp; return 1; }
+    local n; n="$(ls -A | wc -l)"
+    if [ "$n" = 1 ] && [ -d "$(ls -A)" ]; then
+        pkg_dir="$(ls -A)"
+        cd .. && rm -rf "$pkg_dir" && mv ".pkgusr-tmp/$pkg_dir" "$pkg_dir"
+    else
+        pkg_dir="$name_version"
+        cd .. && rm -rf "$pkg_dir" && mv .pkgusr-tmp "$pkg_dir"
+    fi
+    rm -rf .pkgusr-tmp
+    echo "$pkg_dir" > "$_pp_dir_marker"
+    _pp_say "unpacked into $BUILD_ROOT/$pkg_dir"
+}
+
+# ---------------------------------------------------------------- enter ----
+# The unpacked source directory, for build/install/configure/test.
+_pp_enter_source() {
+    cd "$BUILD_ROOT" || return 1
+    local d="" pkgdir=""
+    [ -f "$_pp_dir_marker" ] && pkgdir="$(cat "$_pp_dir_marker" 2>/dev/null)"
+    if [ -n "$pkgdir" ] && [ -d "$pkgdir" ]; then
+        cd "$pkgdir" || return 1
+        return 0
+    fi
+    # No marker, but the tree may still be here: one written by an older
+    # version of this runner, or by a copy of the script under another name.
+    # Look before giving up -- "run unpack" is the wrong answer when the
+    # unpacked source is sitting in front of us, and for a big package it
+    # throws away a compile that succeeded.
+    if [ -n "${name_version:-}" ] && [ -d "$name_version" ]; then
+        _pp_say "# found $BUILD_ROOT/$name_version (no marker) -- using it"
+        echo "$name_version" > "$_pp_dir_marker" 2>/dev/null || true
+        cd "$name_version" || return 1
+        return 0
+    fi
+    if [ -n "${pkg:-}${pkg_glob:-}" ]; then
+        local _only="" _c _n=0
+        for _c in */; do
+            [ -d "$_c" ] || continue
+            _n=$((_n + 1)); _only="${_c%/}"
+        done
+        if [ "$_n" = 1 ]; then
+            _pp_say "# found $BUILD_ROOT/$_only (no marker) -- using it"
+            echo "$_only" > "$_pp_dir_marker" 2>/dev/null || true
+            cd "$_only" || return 1
+            return 0
+        fi
+    fi
+    if [ "${pkg_unpack:-yes}" = "no" ] \
+       || { [ -z "${pkg:-}" ] && [ -z "${pkg_glob:-}" ] && [ "${is_git:-}" != 1 ]; }; then
+        # a meta page has nothing to enter; resume where its commands left off
+        [ -f "$_pp_cwd_marker" ] && d="$(cat "$_pp_cwd_marker" 2>/dev/null)"
+        [ -n "$d" ] && [ -d "$d" ] && cd "$d"
+        return 0
+    fi
+    _pp_fail "no unpacked source in $BUILD_ROOT -- run: $0 unpack"
+    return 1
+}
+
+# Resume in the SAME subdir the build finished in (pkg_dir/build for meson,
+# an out-of-tree build/ for glibc) -- the book's install commands assume it.
+# A build that died part-way may have left no record: fall back to the usual
+# out-of-tree layouts.
+_pp_enter_build() {
+    _pp_enter_source || return 1
+    local d
+    if [ -f "$_pp_cwd_marker" ]; then
+        d="$(cat "$_pp_cwd_marker" 2>/dev/null)"
+        [ -n "$d" ] && [ -d "$d" ] && { cd "$d"; return 0; }
+    fi
+    [ -e build.ninja ] || [ -e Makefile ] && return 0
+    for d in build builddir _build obj; do
+        if [ -d "$d" ] && { [ -f "$d/Makefile" ] || [ -f "$d/build.ninja" ] \
+                            || [ -f "$d/config.status" ]; }; then
+            _pp_say "# resuming in ./$d (no build marker was recorded)"
+            cd "$d"; return 0
+        fi
+    done
+    return 0
+}
+
+# ----------------------------------------------------------------- phases ----
+# Each phase runs as its OWN process: bash disables `set -e` inside any
+# function reached from a tested context (an && chain, an || handler), and
+# that suppression is inherited by subshells -- so a failing make would be
+# silently ignored.  A separate process has its own -e state that nothing
+# upstream can suppress.  The process is this script again, with
+# PKGUSR_PHASE naming the one phase to run, and stdin closed so a book command
+# that reads stdin (Expect's PTY check) cannot swallow anything.
+_pp_child() {
+    PKGUSR_PHASE="$1" bash "$_pp_self" </dev/null
+}
+
+_pp_phase_unpack() {
+    if declare -F unpack_pkg >/dev/null; then unpack_pkg; else _pp_unpack; fi
+}
+
+_pp_phase_build() {
+    _pp_enter_source || return 1
+    # remove a stale CONFIGURED build dir so re-running "build" works, but
+    # never a source dir that merely happens to be named build/: only the one
+    # the last build attempt recorded, or one holding build-system artifacts
+    local d here; here="$PWD"
+    if [ -f "$_pp_cwd_marker" ]; then
+        d="$(cat "$_pp_cwd_marker" 2>/dev/null)"
+        case "$d" in "$here"/?*) [ -d "$d" ] && rm -rf "$d" ;; esac
+    fi
+    for d in build builddir _build; do
+        if [ -d "$d" ] && { [ -f "$d/build.ninja" ] || [ -f "$d/CMakeCache.txt" ] \
+                            || [ -d "$d/meson-private" ] || [ -f "$d/config.status" ]; }; then
+            rm -rf "$d"
+        fi
+    done
+    # Record where the build ends -- even when it fails part-way, so install
+    # and configure can still find it.  A failure that never left the source
+    # dir keeps the previous record: that is where the build subdir is.
+    #
+    # And record SEPARATELY that the build actually finished.  Without that,
+    # running a later phase on a source tree whose build never completed dies
+    # inside the package instead of here:
+    #     make: *** No rule to make target 'install'.  Stop.
+    # -- which says nothing about the real problem, that there is no Makefile
+    # because configure never ran.
+    rm -f "$_pp_built_marker" 2>/dev/null
+    _pp_here="$PWD"
+    trap '_pp_build_exit' EXIT
+    build_pkg
+}
+
+_pp_build_exit() {
+    local rc=$?
+    if [ "$rc" = 0 ] || [ "$PWD" != "$_pp_here" ]; then
+        pwd > "$_pp_cwd_marker" 2>/dev/null || true
+    fi
+    [ "$rc" = 0 ] && { : > "$_pp_built_marker" 2>/dev/null || true; }
+    return 0
+}
+
+# Say it BEFORE the package's own tools fail in their own words.  A warning,
+# not a refusal: a tree built by an older runner has no record either, and
+# refusing there would be wrong.
+_pp_warn_unbuilt() {
+    [ -f "$_pp_built_marker" ] && return 0
+    [ -f "$_pp_cwd_marker" ] && return 0
+    _pp_fail "nothing here recorded a finished build phase for $name_version."
+    echo "   If the next lines are 'No rule to make target' or a missing" >&2
+    echo "   Makefile, the build never completed and no later phase can" >&2
+    echo "   stand in for it.  Run it first:" >&2
+    echo "       $0 build" >&2
+    return 0
+}
+
+_pp_phase_install() {
+    _pp_enter_build || return 1
+    _pp_warn_unbuilt
+    install_pkg
+}
+
+_pp_phase_configure() {
+    declare -F configure_pkg >/dev/null || return 0
+    _pp_enter_build || return 1
+    configure_pkg
+}
+
+_pp_phase_test() {
+    _pp_enter_build || return 1
+    if declare -F test_pkg >/dev/null; then
+        test_pkg
+    elif [ -f build.ninja ]; then meson test || ninja test
+    elif [ -f Makefile ]; then make check || make test
+    else _pp_say "no recognized test target -- define test_pkg() for this package"
+    fi
+}
+
+_pp_run_tests() {
+    case "${PKGUSR_TESTS:-${LFS_RUN_TESTS:-${PM_TEST:-0}}}" in 1) return 0 ;; esac
+    return 1
+}
+
+# The books expect some tests to fail, so the result is reported, not fatal:
+# read the summary and judge for yourself.
+_pp_test_step() {
+    local rc=0
+    _pp_child test || rc=$?
+    if [ $rc -ne 0 ]; then
+        _pp_fail "test suite exited $rc -- check the summary above."
+        echo "   Some failures are normal (the book lists the usual suspects);" >&2
+        echo "   this does NOT stop the install." >&2
+    fi
+    return 0
+}
+
+_pp_phase_fail() {
+    echo "!! phase '$1' FAILED (exit $2)" >&2
+    exit "$2"
+}
+
+_pp_usage() {
+    cat <<EOF
+usage: $0 {all|unpack|build|test|install|configure|update}
+  all        full run (default); set PKGUSR_TESTS=1 to also run tests
+  unpack     find or fetch the tarball and extract it
+  build      configure + compile (needs unpack)
+  test       run the test suite (needs build)
+  install    install step only -- re-run after fixing a failure, without recompiling
+  configure  post-install configuration
+  update     unpack + build + install, no reconfigure (keeps your config)
+EOF
+}
+
+# The entry point a script calls last.  Does nothing when the script was only
+# SOURCED (lfs-helper reads the variables that way).
+pkgusr_run() {
+    if [ "${#BASH_SOURCE[@]}" -lt 2 ]; then
+        # piped on stdin or bash -c: each phase re-runs the script as a file,
+        # so it must BE a file
+        _pp_fail "run an install script by path (bash install_x all), not on stdin"
+        exit 2
+    fi
+    [ "${BASH_SOURCE[1]}" = "$0" ] || return 0          # sourced: metadata only
+    [ -n "${name_version:-}" ] || { _pp_fail "$0 sets no name_version"; exit 2; }
+    _pp_self="$(readlink -f "$0")"
+    _pp_layout
+    _pp_systemd_shims
+    if [ -n "${PKGUSR_PHASE:-}" ]; then
+        # the child process: one phase, at top level, under set -e
+        set -e
+        "_pp_phase_$PKGUSR_PHASE"
+        exit $?
+    fi
+    local phase="${1:-all}" p rc
+    case "$phase" in
+        all|update)
+            for p in unpack build; do
+                _pp_child "$p" || _pp_phase_fail "$p" $?
+            done
+            _pp_run_tests && _pp_test_step
+            _pp_child install || _pp_phase_fail install $?
+            [ "$phase" = all ] && { _pp_child configure || _pp_phase_fail configure $?; }
+            ;;
+        unpack|build|install|configure)
+            _pp_child "$phase" || _pp_phase_fail "$phase" $? ;;
+        test)
+            _pp_test_step ;;
+        *)  _pp_usage; exit 2 ;;
+    esac
+    return 0
+}
+
+# Run directly, this file only identifies itself.
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    case "${1:-}" in
+        --version) echo "lfs-phases $PKGUSR_LIB_VERSION (build $(_pp_build_id))" ;;
+        *) sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' ;;
+    esac
+    exit 0
+fi

@@ -1,0 +1,641 @@
+#!/usr/bin/env python3
+# lfs-sysvbook -- graft the SysV init flavour onto a systemd-only LFS book.
+#
+# LFS 13.0 dropped the SysV edition.  The difference between the two flavours
+# was never the 80+ packages -- it is five SysV-only sections, two
+# systemd-only sections, chapter 9, the fstab, and a handful of configure
+# flags.  This tool takes the last SysV book (the DONOR, e.g. 12.4) and a new
+# systemd book (the TARGET, e.g. 13.0-systemd) and produces a hybrid book
+# plus its wget-list and md5sums, stored under a new version label so the
+# `lfs` tool builds from it like any other book:
+#
+#   lfs fetch 12.4
+#   lfs fetch 13.0-systemd
+#   lfs-sysvbook make                      # -> 13.0-sysv in the lfs store
+#   lfs-sysvbook check --book 13.0-sysv
+#   lfs --book 13.0-sysv run
+#
+# What `make` does to the target book:
+#   ch8: Systemd section  -> donor "Udev from Systemd" (pinned donor version)
+#        D-Bus section    -> removed (BLFS provides it on SysV)
+#        Sysklogd,SysVinit-> inserted after E2fsprogs, from the donor
+#   ch9: replaced wholesale with the donor's (bootscripts, sysv network, ...)
+#   10.2 fstab            -> donor's (SysV mounts /proc, /sys, ... via fstab)
+#   7.6  passwd/group     -> systemd-* account lines filtered out
+#   flags: Man-DB, Procps-ng, Util-linux get their SysV configure flags
+#   wget-list/md5sums: target's, minus removed sections' files, plus the
+#        donor files the transplanted sections reference (URLs and MD5s are
+#        read from each book's own chapter 3, so no network is needed)
+#
+# Transplanted sections keep the DONOR's package versions (e.g. udev from
+# systemd-257.8) -- those are the instructions that are known to work.
+# Everything else builds at the target's versions.
+
+import argparse
+import hashlib
+import os
+import re
+import sys
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    sys.stderr.write(
+        "lfs-sysvbook needs beautifulsoup4 (same as the lfs tool):\n"
+        "      pip install beautifulsoup4\n"
+        "  or on the built system:\n"
+        "      packagemanager pip install beautifulsoup4\n")
+    sys.exit(2)
+
+VERSION = "1.0.0"
+
+
+def _build_id():
+    """Fingerprint of this file's own contents -- cannot go stale."""
+    try:
+        with open(os.path.abspath(__file__), "rb") as fh:
+            return hashlib.md5(fh.read()).hexdigest()[:7]
+    except OSError:
+        return "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# the store -- same layout as the lfs tool
+# --------------------------------------------------------------------------- #
+def store_dir():
+    return os.environ.get("LFS_STORE") or "/usr/share/lfs"
+
+
+def books_dir():
+    return os.path.join(store_dir(), "books")
+
+
+def book_path(ver):
+    return os.path.join(books_dir(), f"LFS-BOOK-{ver}-NOCHUNKS.html")
+
+
+def wget_list_path(ver):
+    return os.path.join(books_dir(), f"wget-list-{ver}.txt")
+
+
+def md5sums_path(ver):
+    return os.path.join(books_dir(), f"md5sums-{ver}.txt")
+
+
+def load_soup(path):
+    with open(path, "rb") as f:
+        html = f.read()
+    for parser in ("lxml", "html.parser"):
+        try:
+            return BeautifulSoup(html, parser)
+        except Exception:
+            continue
+    return BeautifulSoup(html, "html.parser")
+
+
+# --------------------------------------------------------------------------- #
+# what makes a SysV book a SysV book -- all flavour knowledge lives here
+# --------------------------------------------------------------------------- #
+# Sections removed from the target (systemd-only), by anchor id.
+REMOVE = ["ch-system-dbus"]
+
+# Target section replaced by a donor section: (target id, donor id).
+REPLACE = [
+    ("ch-system-systemd", "ch-system-udev"),      # udev built from systemd src
+    ("chapter-config",    "chapter-config"),      # whole chapter 9
+    ("ch-bootable-fstab", "ch-bootable-fstab"),   # SysV mounts via fstab
+]
+
+# Donor sections inserted after a target section: (after-target-id, [donor ids]).
+INSERT_AFTER = [
+    ("ch-system-e2fsprogs", ["ch-system-sysklogd", "ch-system-sysvinit"]),
+]
+
+# Configure-flag edits inside target sections that exist in both flavours:
+# (anchor id, description, pattern, replacement, done-marker).
+# The marker makes each rule idempotent and lets `check` verify it took.
+FLAG_PATCHES = [
+    ("ch-system-procps",
+     "Procps-ng: drop --with-systemd",
+     r"[ \t]*\\\n[ \t]*--with-systemd\b",
+     "",
+     None),          # done when the pattern no longer matches
+    ("ch-system-man-db",
+     "Man-DB: do not install systemd units/tmpfiles",
+     r"(--with-grap=\S+)",
+     r"\1             \\\n"
+     r"            --with-systemdtmpfilesdir=            \\\n"
+     r"            --with-systemdsystemunitdir=",
+     "--with-systemdtmpfilesdir"),
+    ("ch-system-util-linux",
+     "Util-linux: build without systemd support",
+     r"(?m)^([ \t]*)(ADJTIME_PATH=)",
+     r"\1--without-systemd     \\\n"
+     r"\1--without-systemdsystemunitdir        \\\n"
+     r"\1\2",
+     "--without-systemd"),
+]
+
+# 7.6: account lines that only a systemd system needs.
+CREATEFILES_ID = "ch-tools-createfiles"
+SYSTEMD_ACCOUNT_LINE = re.compile(r"(?m)^systemd-[^\n]*\n?")
+
+FILE_TOKEN = re.compile(r"([A-Za-z0-9_.+-]+\.(?:tar\.[a-z0-9]+|tgz|patch))")
+
+
+# --------------------------------------------------------------------------- #
+# DOM helpers -- a "unit" is a section's titlepage div + its content div
+# --------------------------------------------------------------------------- #
+def unit(soup, anchor_id, book_label):
+    """(titlepage div, content div) of the section whose heading carries
+    <a id=anchor_id>.  In NOCHUNKS books these are two sibling divs."""
+    a = soup.find("a", id=anchor_id)
+    if a is None:
+        raise SystemExit(f"! section '{anchor_id}' not found in {book_label}.\n"
+                         f"  The book layout changed -- this tool needs an "
+                         f"update for it.")
+    tp = None
+    for p in a.parents:
+        if p.name == "div" and "titlepage" in (p.get("class") or []):
+            tp = p
+            break
+    if tp is None:
+        raise SystemExit(f"! '{anchor_id}' in {book_label} has no titlepage "
+                         f"div -- unexpected book layout.")
+    content = tp.find_next_sibling("div")
+    if content is None or "titlepage" in (content.get("class") or []):
+        raise SystemExit(f"! '{anchor_id}' in {book_label} has no content "
+                         f"div -- unexpected book layout.")
+    return tp, content
+
+
+def unit_text(tp, content):
+    return tp.get_text(" ", strip=True) + "\n" + content.get_text("\n")
+
+
+def title_of(tp):
+    return re.sub(r"\s+", " ",
+                  tp.get_text(" ", strip=True)).replace("\u00a0", " ")
+
+
+def _title_token(tp):
+    """Name-Version token from the section heading, same rule as `lfs`:
+    first whitespace token that ends in -<digits...>."""
+    t = tp.get_text(" ", strip=True).replace("\u00a0", " ")
+    t = re.sub(r"^\d+(\.\d+)*\.\s*", "", t.strip())
+    tok_re = re.compile(r"^[A-Za-z][A-Za-z0-9+_.]*"
+                        r"(?:(?:::|[-_])[A-Za-z][A-Za-z0-9+_.]*)*"
+                        r"[-_][0-9][0-9.]*(?:-[0-9]+)*$")
+    for tok in t.split():
+        if tok_re.match(tok):
+            return tok
+    return None
+
+
+def files_of(tp, content):
+    """Tarballs/patches a section needs: its title token, the title tokens of
+    any sections inside it (a transplanted chapter 9 carries LFS-Bootscripts
+    only in a heading), and every file name its text mentions."""
+    toks = set()
+    t = _title_token(tp)
+    if t:
+        toks.add(("token", t))
+    for h in content.find_all(re.compile(r"^h\d$")):
+        t = _title_token(h)
+        if t:
+            toks.add(("token", t))
+    for f in FILE_TOKEN.findall(unit_text(tp, content)):
+        toks.add(("file", os.path.basename(f)))
+    return toks
+
+
+def _norm(s):
+    return re.sub(r"[^a-z0-9]", "", s.lower())
+
+
+def match_urls(url_map, wanted, label):
+    """URLs from {basename: (url, md5)} that a section's tokens refer to.
+    A 'file' token matches its exact basename; a 'token' (Name-Version)
+    matches a basename whose stem normalises to the same string."""
+    def stem(name):
+        s = re.sub(r"\.(tar\.[a-z0-9]+|tgz|patch)$", "", name)
+        return _norm(re.sub(r"-src$", "", s))
+
+    out, missing = {}, []
+    for kind, val in sorted(wanted):
+        hit = None
+        if kind == "file" and val in url_map:
+            hit = val
+        else:
+            # a title token, or prose naming the tarball with the wrong
+            # compression suffix (12.4 prose says .tar.xz, github ships .gz)
+            for base in url_map:
+                if stem(base) == stem(val):
+                    hit = base
+                    break
+        if hit:
+            out[hit] = url_map[hit]
+        elif kind == "file":
+            missing.append((val, label))
+    return out, missing
+
+
+# --------------------------------------------------------------------------- #
+# chapter 3 of each book carries every download URL and MD5 -- no network
+# --------------------------------------------------------------------------- #
+def url_map_from_book(path):
+    """{basename: (url, md5)} from the book's own package/patch lists."""
+    with open(path, encoding="utf-8", errors="replace") as f:
+        html = f.read()
+    urls = [(m.start(), m.group(1)) for m in
+            re.finditer(r'href=\s*"(https?://[^"]+?'
+                        r'\.(?:tar\.[a-z0-9]+|tgz|patch))"', html)]
+    md5s = [(m.start(), m.group(1)) for m in
+            re.finditer(r'MD5 sum:\s*(?:<[^>]+>\s*)*([0-9a-f]{32})', html)]
+    out, mi = {}, 0
+    for i, (upos, url) in enumerate(urls):
+        nxt = urls[i + 1][0] if i + 1 < len(urls) else len(html)
+        while mi < len(md5s) and md5s[mi][0] < upos:
+            mi += 1
+        md5 = md5s[mi][1] if mi < len(md5s) and md5s[mi][0] < nxt else None
+        out.setdefault(os.path.basename(url), (url, md5))
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# mini command parser -- same rules as `lfs` (for check + patching)
+# --------------------------------------------------------------------------- #
+def _is_admonition(tag):
+    cls = set(getattr(tag, "get", lambda _k: None)("class") or [])
+    return bool({"admon", "note", "tip", "caution", "warning",
+                 "important"} & cls)
+
+
+def runnable_commands(scope):
+    """Command blocks the lfs tool would execute from this tag's subtree."""
+    out = []
+    for pre in scope.find_all("pre"):
+        classes = pre.get("class") or []
+        if not any(c in classes for c in ("userinput", "root", "install")):
+            continue
+        if any(_is_admonition(p) for p in pre.parents):
+            continue
+        out.append(pre.get_text("").replace("\u00a0", " ").rstrip())
+    return out
+
+
+def patch_pre_text(scope, pattern, repl):
+    """Apply a regex to the text nodes of runnable command blocks."""
+    n = 0
+    for pre in scope.find_all("pre"):
+        classes = pre.get("class") or []
+        if not any(c in classes for c in ("userinput", "root", "install")):
+            continue
+        for node in list(pre.find_all(string=True)):
+            new = re.sub(pattern, repl, str(node))
+            if new != str(node):
+                node.replace_with(new)
+                n += 1
+    return n
+
+
+# --------------------------------------------------------------------------- #
+# make
+# --------------------------------------------------------------------------- #
+def resolve_input(ver, file_arg, what):
+    if file_arg:
+        if not os.path.isfile(file_arg):
+            raise SystemExit(f"! {what} file not found: {file_arg}")
+        return os.path.basename(file_arg), file_arg
+    p = book_path(ver)
+    if not os.path.isfile(p):
+        raise SystemExit(f"! {what} book {ver} is not in the store.\n"
+                         f"      lfs fetch {ver}\n"
+                         f"  or pass a local file with --{what}-file.")
+    return ver, p
+
+
+def cmd_make(args):
+    d_label, d_path = resolve_input(args.donor, args.donor_file, "donor")
+    t_label, t_path = resolve_input(args.target, args.target_file, "target")
+    out_ver = args.out or (t_label.replace("-systemd", "") + "-sysv"
+                           if "-systemd" in t_label else t_label + "-sysv")
+    print(f"donor : {d_label}  ({d_path})")
+    print(f"target: {t_label}  ({t_path})")
+    print(f"out   : {out_ver}")
+
+    donor = load_soup(d_path)
+    target = load_soup(t_path)
+    warnings = []
+
+    # -- collect the file needs BEFORE surgery moves nodes around ----------- #
+    donor_urls = url_map_from_book(d_path)
+    target_urls = url_map_from_book(t_path)
+
+    drop_files = set()
+    for tid in REMOVE + [t for t, _d in REPLACE if t != "chapter-config"]:
+        # chapter-config (ch9) references no downloads in the systemd book
+        drop_files |= files_of(*unit(target, tid, t_label))
+    dropped, _ = match_urls(target_urls, drop_files, t_label)
+
+    add_files = set()
+    for _tid, did in REPLACE:
+        add_files |= files_of(*unit(donor, did, d_label))
+    for _after, dids in INSERT_AFTER:
+        for did in dids:
+            add_files |= files_of(*unit(donor, did, d_label))
+    added, missing = match_urls(donor_urls, add_files, d_label)
+    added = {b: v for b, v in added.items()
+             if b not in target_urls or b in dropped}
+
+    # -- surgery ------------------------------------------------------------ #
+    print("\nsections:")
+    for tid in REMOVE:
+        tp, content = unit(target, tid, t_label)
+        title = title_of(tp)
+        tp.decompose()
+        content.decompose()
+        print(f"  removed   {title}   [{tid}]")
+
+    for tid, did in REPLACE:
+        t_tp, t_content = unit(target, tid, t_label)
+        d_tp, d_content = unit(donor, did, d_label)
+        title_old = title_of(t_tp)
+        title_new = title_of(d_tp)
+        t_tp.replace_with(d_tp.extract())
+        t_content.replace_with(d_content.extract())
+        print(f"  replaced  {title_old}\n"
+              f"        ->  {title_new}   [{tid}]")
+
+    for after_id, dids in INSERT_AFTER:
+        _tp, anchor_content = unit(target, after_id, t_label)
+        at = anchor_content
+        for did in dids:
+            d_tp, d_content = unit(donor, did, d_label)
+            title = title_of(d_tp)
+            at.insert_after(d_content.extract())
+            at.insert_after(d_tp.extract())
+            at = d_content
+            print(f"  inserted  {title}   [after {after_id}]")
+
+    # -- 7.6: filter systemd account lines out of /etc/passwd, /etc/group -- #
+    _tp, cf = unit(target, CREATEFILES_ID, t_label)
+    n = patch_pre_text(cf, SYSTEMD_ACCOUNT_LINE, "")
+    print(f"\n7.6 passwd/group: systemd-* account lines removed "
+          f"({n} heredoc(s) touched)" if n else
+          "\n7.6 passwd/group: nothing to remove")
+    if not n:
+        warnings.append("7.6: no systemd-* account lines found -- "
+                        "book layout may have changed")
+
+    # -- configure-flag patches --------------------------------------------- #
+    print("flags:")
+    for aid, desc, pat, repl, marker in FLAG_PATCHES:
+        _tp, content = unit(target, aid, t_label)
+        text = "\n".join(runnable_commands(content))
+        if marker and marker in text:
+            print(f"  ok        {desc} (already applied)")
+            continue
+        n = patch_pre_text(content, pat, repl)
+        if n:
+            print(f"  patched   {desc}")
+        else:
+            print(f"  !! NOT applied: {desc}")
+            warnings.append(f"flag patch did nothing: {desc} -- check the "
+                            f"section by hand")
+
+    # -- stale TOC entries pointing at removed sections --------------------- #
+    ids = {t.get("id") for t in target.find_all(id=True)}
+    pruned = 0
+    for a in target.find_all("a", href=True):
+        href = a["href"]
+        if href.startswith("#") and href[1:] not in ids:
+            dt = a.find_parent("dt")
+            if dt is not None:
+                dt.decompose()
+                pruned += 1
+    if pruned:
+        print(f"toc: {pruned} entries for removed sections pruned")
+
+    # -- serialize + relabel ------------------------------------------------ #
+    # The target's release label is read from the book itself (the
+    # `echo <label> > /etc/lfs-release` command), so a --target-file with any
+    # filename still gets /etc/lfs-release, os-release and the titles renamed.
+    html = str(target)
+    m = re.search(r"echo\s+([0-9][\w.+-]*)\s*(?:&gt;|>)\s*/etc/lfs-release",
+                  html)
+    if m and m.group(1) != out_ver:
+        html = html.replace(m.group(1), out_ver)
+        print(f"relabelled: {m.group(1)} -> {out_ver}")
+    elif not m:
+        warnings.append("could not find the release label in the target "
+                        "book -- titles and /etc/lfs-release keep its name")
+
+    # -- wget-list + md5sums ------------------------------------------------ #
+    # Chapter 3 sometimes offers an alternative download (linux-6.18.tar.xz +
+    # patch instead of linux-6.18.10.tar.xz); alternatives carry no MD5.  Keep
+    # an MD5-less entry only when no checksummed entry for the same package
+    # exists.
+    def name_stem(base):
+        return re.match(r"[A-Za-z_+-]+", base).group(0).lower()
+
+    entries = [(b, u, m) for b, (u, m) in target_urls.items()
+               if b not in dropped]
+    entries += [(b, u, m) for b, (u, m) in added.items()]
+    with_md5 = {name_stem(b) for b, _u, m in entries if m}
+    wget, md5 = [], []
+    for base, url, m in entries:
+        if not m and name_stem(base) in with_md5:
+            print(f"  (skipped alternative download: {base})")
+            continue
+        wget.append(url)
+        if m:
+            md5.append(f"{m}  {base}")
+
+    print("\ndownloads:")
+    for b in sorted(dropped):
+        print(f"  -  {b}")
+    for b in sorted(added):
+        print(f"  +  {b}")
+    for f, where in missing:
+        warnings.append(f"'{f}' is referenced but has no download URL in "
+                        f"{where} -- add it to the wget-list by hand if the "
+                        f"build asks for it")
+
+    # -- write -------------------------------------------------------------- #
+    outdir = args.outdir or books_dir()
+    try:
+        os.makedirs(outdir, exist_ok=True)
+    except PermissionError:
+        raise SystemExit(f"! cannot create {outdir} -- run as root or pass "
+                         f"--outdir somewhere writable.")
+    paths = {
+        "book":      os.path.join(outdir, f"LFS-BOOK-{out_ver}-NOCHUNKS.html"),
+        "wget-list": os.path.join(outdir, f"wget-list-{out_ver}.txt"),
+        "md5sums":   os.path.join(outdir, f"md5sums-{out_ver}.txt"),
+    }
+    try:
+        with open(paths["book"], "w", encoding="utf-8") as f:
+            f.write(html)
+        with open(paths["wget-list"], "w") as f:
+            f.write("\n".join(wget) + "\n")
+        with open(paths["md5sums"], "w") as f:
+            f.write("\n".join(md5) + "\n")
+    except PermissionError:
+        raise SystemExit(f"! cannot write into {outdir} -- run as root or "
+                         f"pass --outdir somewhere writable.")
+    for k, p in paths.items():
+        os.chmod(p, 0o644)
+        print(f"  {k:9s} -> {p}")
+
+    if warnings:
+        print("\nwarnings:")
+        for w in warnings:
+            print(f"  ! {w}")
+    print(f"\nverify it:   lfs-sysvbook check --book {out_ver}"
+          + ("" if not args.outdir else f" --file {paths['book']}"))
+    if not args.outdir:
+        print(f"build it:    lfs --book {out_ver} run")
+    return 0
+
+
+# --------------------------------------------------------------------------- #
+# check
+# --------------------------------------------------------------------------- #
+def cmd_check(args):
+    if args.file:
+        path, label = args.file, os.path.basename(args.file)
+        wl = args.wget_list
+    else:
+        ver = args.book
+        if not ver:
+            raise SystemExit("! pass --book <version> or --file <html>")
+        path, label, wl = book_path(ver), ver, wget_list_path(ver)
+    if not os.path.isfile(path):
+        raise SystemExit(f"! no book at {path}")
+    soup = load_soup(path)
+    ok = True
+
+    def result(good, msg):
+        nonlocal ok
+        print(("  ok   " if good else "  FAIL ") + msg)
+        ok = ok and good
+
+    print(f"checking {label}:")
+
+    ids = {t.get("id") for t in soup.find_all(id=True)}
+    for aid in ("ch-system-udev", "ch-system-sysklogd", "ch-system-sysvinit",
+                "ch-config-bootscripts", "ch-config-usage"):
+        result(aid in ids, f"SysV section present: {aid}")
+    for aid in ("ch-system-dbus", "ch-config-systemd-custom"):
+        result(aid not in ids, f"systemd section absent: {aid}")
+    # ch-system-systemd must now be udev's heading, not a Systemd build
+    a = soup.find("a", id="ch-system-systemd")
+    if a is not None:
+        h = a.find_parent(re.compile(r"^h\d$"))
+        result(h is not None and "Udev" in h.get_text(),
+               "no Systemd package section")
+
+    # no runnable command may use systemd machinery
+    bad = []
+    for pre in soup.find_all("pre"):
+        classes = pre.get("class") or []
+        if not any(c in classes for c in ("userinput", "root", "install")):
+            continue
+        if any(_is_admonition(p) for p in pre.parents):
+            continue
+        text = pre.get_text("")
+        for pat in (r"\bsystemctl\b", r"--with-systemd(?![a-z-])",
+                    r"\bsystemd-analyze\b"):
+            if re.search(pat, text):
+                bad.append((pat, text.strip().splitlines()[0][:60]))
+    result(not bad, "no systemd commands in runnable blocks"
+           + ("" if not bad else "  " + "; ".join(f"{t} in '{l}...'"
+                                                  for t, l in bad[:3])))
+
+    # flag patches took
+    for aid, desc, _pat, _repl, marker in FLAG_PATCHES:
+        if not marker:
+            continue
+        a = soup.find("a", id=aid)
+        if a is None:
+            result(False, f"section {aid} missing")
+            continue
+        tp = next(p for p in a.parents
+                  if p.name == "div" and "titlepage" in (p.get("class") or []))
+        content = tp.find_next_sibling("div")
+        result(marker in "\n".join(runnable_commands(content)), desc)
+
+    # 7.6 heredocs carry no systemd accounts
+    a = soup.find("a", id=CREATEFILES_ID)
+    if a is not None:
+        tp = next(p for p in a.parents
+                  if p.name == "div" and "titlepage" in (p.get("class") or []))
+        content = tp.find_next_sibling("div")
+        result(not SYSTEMD_ACCOUNT_LINE.search(
+                   "\n".join(runnable_commands(content))),
+               "7.6: no systemd accounts in /etc/passwd and /etc/group")
+
+    # every file a runnable command references is downloadable
+    if wl and os.path.isfile(wl):
+        with open(wl) as f:
+            have = {os.path.basename(u.strip()) for u in f if u.strip()}
+        need = set()
+        for pre in soup.find_all("pre"):
+            classes = pre.get("class") or []
+            if not any(c in classes for c in ("userinput", "root", "install")):
+                continue
+            if any(_is_admonition(p) for p in pre.parents):
+                continue
+            for tok in FILE_TOKEN.findall(pre.get_text("")):
+                need.add(os.path.basename(tok))
+        # names a build creates itself are not downloads
+        miss = {n for n in need if n not in have
+                and not n.startswith("lfs-temp-tools-")   # 7.13 creates it
+                and not any(h.startswith(n.split(".tar")[0]) for h in have)}
+        result(not miss, "wget-list covers every file the commands reference"
+               + ("" if not miss else ": missing " + ", ".join(sorted(miss))))
+    else:
+        print(f"  (no wget-list at {wl} -- file coverage not checked)")
+
+    print("PASS" if ok else "FAIL")
+    return 0 if ok else 1
+
+
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(
+        prog="lfs-sysvbook",
+        description="Graft the SysV flavour of an old LFS book onto a new "
+                    "systemd-only release.")
+    ap.add_argument("--version", action="version",
+                    version=f"lfs-sysvbook {VERSION} (build {_build_id()})")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("make", help="produce the hybrid book + wget-list + "
+                                    "md5sums")
+    p.add_argument("--donor", default="12.4",
+                   help="cached SysV book version (default: 12.4, the last "
+                        "SysV release)")
+    p.add_argument("--target", default="13.0-systemd",
+                   help="cached systemd book version (default: 13.0-systemd)")
+    p.add_argument("--donor-file", help="local donor html instead of the store")
+    p.add_argument("--target-file", help="local target html instead of the store")
+    p.add_argument("--out", help="version label for the result "
+                                 "(default: target with -systemd -> -sysv)")
+    p.add_argument("--outdir", help="write here instead of the lfs store")
+    p.set_defaults(func=cmd_make)
+
+    p = sub.add_parser("check", help="verify a hybrid book is SysV-clean")
+    p.add_argument("--book", help="version label in the lfs store")
+    p.add_argument("--file", help="local html file instead")
+    p.add_argument("--wget-list", help="wget-list to check coverage against "
+                                       "(with --file)")
+    p.set_defaults(func=cmd_check)
+
+    args = ap.parse_args()
+    sys.exit(args.func(args))
+
+
+if __name__ == "__main__":
+    main()

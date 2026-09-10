@@ -1,0 +1,42 @@
+# network.stack -- wired and wireless networking, for a SysV system.
+#
+# The sway stack builds a desktop; nothing in it brings up a network.  This is
+# what `wifi` (wpa_cli / wpa_supplicant / ifup) needs, plus a firewall.
+#
+#   packagemanager stack network --check-refs     # verify before building
+#   packagemanager stack network --yes --run
+#
+# Every entry here is a BLFS package, checked against the book.
+
+book   libnl                    # netlink, what wpa_supplicant talks to the kernel with
+book   wpa_supplicant           # wpa_supplicant, wpa_cli, wpa_passphrase
+book   wireless_tools           # iwconfig/iwlist, if you want them
+
+book   libmnl                   # minimal netlink library; libnftnl needs it
+
+# libnftnl is NOT a BLFS package -- the nf_tables netlink API that the nft
+# backend of iptables is built on.  Version 1.3.2 is what netfilter.org's
+# own news page lists as current (released 2026-08-31); check the tarball
+# against the .sha256 beside it before trusting this line, and bump it when
+# upstream moves -- `--check-refs` asks git remotes and cannot see a tar url.
+tar    libnftnl url=https://www.netfilter.org/pub/libnftnl/libnftnl-1.3.2.tar.xz pkg=libnftnl-1.3.2.tar.xz have=/usr/lib/libnftnl.so build="./configure --prefix=/usr --disable-static; make" install="make install"
+
+book   iptables                 # nft backend, via machine.conf (see below)
+
+book   net-tools                # ifconfig, route, netstat
+
+# ---------------------------------------------------------------------------
+# iptables-nft
+#
+# The book's iptables page configures --disable-nftables, so the flag has to
+# come from machine.conf.  The shipped stacks/machine.conf carries it:
+#
+#       [iptables]
+#       configure_args = --enable-nftables
+#
+# Your /etc/pkgusr/stacks/machine.conf is never overwritten (1.14.58), so if
+# it predates this, take that section from machine.conf.new beside it.
+#
+# The legacy backend is being retired upstream; iptables-nft keeps the
+# familiar rule syntax on top of nf_tables.
+# ---------------------------------------------------------------------------
