@@ -1,0 +1,88 @@
+# vision.stack -- computer vision, kept out of the desktop stack.
+# stack-version: 1.14.320
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
+# here: the exclusions are a property of the machine, not of one stack.
+# Without it a dependency plan walks into systemd, qt6, cups and texlive.
+include avoid
+
+#
+# Replay with:  packagemanager stack vision --run
+#
+# WHY ITS OWN STACK.  OpenCV is hours of compiling, it is nobody's
+# dependency here, and a desktop works perfectly without it -- so it has no
+# business in sway.stack, where every entry is something the desktop needs.
+# Anything else of this shape (a big optional toolkit, built because you use
+# it rather than because something requires it) belongs here too.
+#
+# None of this is in the BLFS book.  That means the ref, the build line and
+# the probe are ours to keep true, and the entry says what was checked.
+
+# opencv 5.
+#
+# CHECKED: `git ls-remote` lists branch 5.x and tag 5.0.0 (and a
+# 5.0.0-alpha).  The tag is pinned rather than the branch -- 5.x moves, and
+# a build that worked is worth being able to repeat.  To follow development
+# instead, ref=5.x, and then write down the commit that built.
+#
+# The build is the same one you would run by hand:
+#
+#     cmake -DOPENCV_GENERATE_PKGCONFIG=ON -DCMAKE_INSTALL_PREFIX=/usr ../opencv
+#     make -j16 && make install
+#
+# ...with two differences, both deliberate:
+#
+#   * `cmake -S . -B build` instead of a sibling build directory.  The
+#     clone lands in opencv-git and the phases resume inside it, so the
+#     build directory has to be under it -- a `../opencv` layout would put
+#     it outside the tree the package user owns.
+#   * `cmake --build build` instead of `make -j16`.  It reads
+#     CMAKE_BUILD_PARALLEL_LEVEL, which lfs-helper exports from `jobs` in
+#     machine.conf or from --jobs, so the count lives in one place instead
+#     of being typed into this line.
+#
+# OPENCV_GENERATE_PKGCONFIG=ON is kept: upstream stopped generating the .pc
+# file by default at 4.x, and everything that links OpenCV outside cmake
+# needs it.
+#
+# Expect it to want collector groups on the way: the python bindings go into
+# python's site-packages and the .pc into pkgconfig's directory, both owned
+# by other packages.  The repair asks which group to share and retries.
+git    opencv \
+       url=https://github.com/opencv/opencv.git \
+       ref=5.0.0 \
+       prog=opencv_version \
+       have=/usr/bin/opencv_version \
+       build="cmake -S . -B build -D OPENCV_GENERATE_PKGCONFIG=ON -D CMAKE_INSTALL_PREFIX=/usr -D CMAKE_BUILD_TYPE=Release -D CMAKE_SKIP_INSTALL_RPATH=ON; cmake --build build" \
+       install="cmake --install build" \
+       expect="opencv_version | grep -q '^5'"
+
+# WHAT THE FIRST REAL BUILD SHOWED (5.0.0, this machine):
+#
+#   Unavailable: java python3          <- no numpy, so no cv2 for python
+#   Eigen: NO                          <- Posegraph optimization stays off
+#   OpenEXR: NO
+#   Lapack: built-in libclapack        <- no system BLAS/LAPACK
+#   FFMPEG: YES, GStreamer: YES, v4l2: YES, GTK3 highgui, OpenCL: YES
+#
+# The python bindings are the one most people miss: cmake reports
+#     ModuleNotFoundError: No module named 'numpy'
+# and then lists python3 as Unavailable -- a full build with no cv2 at the
+# end of it.  If you want them, numpy first -- WITH --recursive, because
+# numpy's own Required is `cython, meson_python` and a plain install builds
+# one package:
+#     packagemanager install numpy --run --recursive
+# ...then rebuild opencv, because bindings are decided at configure time.
+#
+# It also DOWNLOADS during configure: ippicv (Intel IPP) and a unicode font,
+# from raw.githubusercontent.com.  So this entry needs the network at build
+# time, not just at fetch time, and a machine with no route to github cannot
+# configure it at all.
+#
+# opencv_contrib is a SECOND repository whose modules are built by pointing
+# opencv's OPENCV_EXTRA_MODULES_PATH at it, not by building it on its own.
+# Nothing here needs it, so it is not an entry: if you want it, clone it
+# beside opencv and add
+#     -D OPENCV_EXTRA_MODULES_PATH=<path>/modules
+# to the build line above.  Written down rather than added, because an entry
+# that builds nothing on its own would be a lie about how that repo works.

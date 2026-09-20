@@ -1,0 +1,170 @@
+# avoid.stack -- what no stack on this machine builds, and why.
+# stack-version: 1.14.320
+#
+# An `avoid` entry does not build anything: it tells a dependency plan that
+# this machine will not have that package, so the plan stops walking into it
+# and its own dependencies never appear either.  87 entries here keep a
+# desktop build from dragging in qt6, cups, texlive, openjdk, systemd and
+# the rest of two other desktop environments.
+#
+# WHY A FILE OF ITS OWN.  These lived in sway.stack, and when the media
+# chain moved into media.stack it lost all of them -- so
+# `packagemanager stack media --status` planned 274 packages including
+# systemd, polkit, linux-pam, qt6 and cups, on a SysV machine that must
+# never have systemd.  The exclusions are a property of the MACHINE, not of
+# one stack, so every stack includes this file:
+#
+#     include avoid
+#
+# Nothing here is ever built, so including it costs nothing and forgetting
+# it costs an afternoon.
+#
+# DUPLICATES REMOVED when this was split out: libkexiv2, libfm-qt,
+# xdg-desktop-portal-lxqt and xdg-desktop-portal-gnome were each listed
+# twice, which is why `stack sway` used to print some names twice in its
+# "never built by this stack" line.  Harmless, and it made the composed plan
+# impossible to check against, so now one entry per package.
+
+# Never built by this stack, however they are reached.  harfbuzz RECOMMENDS
+# texlive and LibreOffice; a sway desktop with a webkit browser wants
+# neither, and texlive alone is hours of build time and a /opt tree.
+# NOT BUILT BY THIS STACK.  The book's recommendations are followed --
+# a recommendation the build actually needs (curl for cmake, icu for
+# libxml2) must not be dropped by a blanket rule.  These are the branches
+# this desktop does not want, named one at a time, and everything they alone
+# pull in goes with them.
+avoid  libreoffice
+avoid  asymptote
+avoid  biber
+avoid  qt6
+avoid  okular
+avoid  phonon
+avoid  phonon-backend-vlc
+avoid  vlc
+avoid  cups
+avoid  openjdk
+avoid  java
+avoid  apache-ant
+avoid  postgresql
+avoid  openldap
+avoid  unixodbc
+avoid  graphviz
+avoid  gegl
+
+# the KDE leaves okular pulls in: named individually, because a package can
+# have several parents and pruning by one of them drops shared dependencies
+# (graphite2 was lost that way)
+avoid  plasma-activities
+avoid  libkexiv2
+avoid  kwindowsystem
+avoid  libfm-qt
+avoid  xdg-desktop-portal-lxqt
+avoid  xdg-desktop-portal-gnome
+avoid  gnome-desktop
+
+# The desktop-portal tail.  The book makes xdg-desktop-portal REQUIRE all
+# four backends -- gtk, wlr, gnome AND lxqt -- so one recommendation from
+# gtk4 drags in the whole of xfce and lxqt, gnome-desktop and libfm-qt.
+# Sway needs none of it to run; screen sharing wants xdg-desktop-portal-wlr,
+# which can be built on its own later:
+#     packagemanager install xdg-desktop-portal-wlr --run
+avoid  xdg-desktop-portal
+avoid  xdg-desktop-portal-gtk
+avoid  xdg-desktop-portal-wlr
+avoid  xfce4-panel
+avoid  xfce4-notifyd
+avoid  xfce4-dev-tools
+avoid  xfconf
+avoid  libxfce4util
+avoid  libxfce4ui
+avoid  libxfce4windowing
+avoid  exo
+avoid  garcon
+avoid  liblxqt
+avoid  lxqt-build-tools
+avoid  lxqt-notificationd
+avoid  lxqt-kwindowsystem
+avoid  libqtxdg
+avoid  polkit-qt
+avoid  menu-cache
+avoid  libwnck
+avoid  notification-daemon
+
+# Not this desktop either: a systemd package on a SysV system, phone modem
+# stacks, a mail/ssh server, spell-checking dictionaries.
+avoid  systemd
+avoid  ModemManager
+avoid  libmbim
+avoid  libqmi
+avoid  geoclue2
+
+# openssh is AVOIDED here and INSTALLED by network.stack, where it belongs:
+# it is networking, not desktop.  Letting a dependency plan pull it in
+# mid-sway would put its system-account question in the middle of a graphics
+# build.
+# openssh WAS avoided here.  network.stack BUILDS it (with the install-sshd
+# bootscript), so the two files contradicted each other: an `avoid` entry
+# and a `book` entry for one package, and whichever a plan saw first won.
+# Removed in 1.14.241 -- it is wanted.
+avoid  ruby
+avoid  aspell
+avoid  enchant
+avoid  gnome-keyring
+avoid  gcr
+avoid  startup-notification
+
+# Tails of things already avoided.  Each of these is in the plan ONLY to
+# serve a package this stack does not build, and the tools cannot yet work
+# that out for themselves (see 1.12.83: pruning by the single parent that
+# `blfs order` reports dropped shared dependencies, and broke harfbuzz).
+# Checked one by one against the plan's parent column:
+avoid  libcupsfilters        # cups   (avoided)
+avoid  libppd                # cups
+avoid  cups-filters          # cups
+avoid  exiv2                 # libkexiv2
+avoid  clucene               # libreoffice (avoided)
+avoid  redland               # libreoffice
+avoid  rasqal                # redland
+avoid  raptor                # rasqal
+avoid  jasper                # qt6    (avoided)
+avoid  libmng                # qt6
+avoid  double-conversion     # qt6
+# poppler WAS avoided here (libcupsfilters was its only parent, and that is
+# avoided).  It moved to sway.stack in 1.14.241: zathura's PDF backend needs
+# it, so it is now something this machine WANTS rather than something it is
+# dragged into.  mupdf below stays avoided -- it is the OTHER backend and
+# one is enough.
+avoid  mupdf                 # libcupsfilters
+avoid  gs                    # libcupsfilters
+avoid  qpdf                  # libcupsfilters
+avoid  nss                   # poppler
+avoid  boost                 # poppler
+avoid  pdfio                 # libcupsfilters
+avoid  gpgmepp               # poppler
+
+# Checked against EVERY parent, not just the one the plan prints: these have
+# no parent left in the plan at all.
+avoid  colord                # cups (avoided) -- no live parent
+# linux-pam WAS avoided here: it only ever arrived as systemd's dependency,
+# and systemd is avoided.  It moved to services.stack in 1.14.235 because
+# passwordless `su - u_<app>` needs pam_exec, which needs pam -- so it is
+# now something this machine WANTS rather than something it is dragged into.
+# (Left as a comment rather than deleted: the reason it was here is the
+# reason it must not come back by accident.)
+avoid  xdg-utils             # cups -- no live parent
+avoid  freeglut              # mupdf (avoided) -- no live parent
+avoid  polkit                # colord + systemd (both avoided) -- no live parent
+avoid  libgusb               # colord
+
+
+# TeX is NOT built by this stack.
+#
+# Putting `book texlive` last only moved the ENTRY: texlive is harfbuzz's
+# recommendation, so it was still pulled into an early entry's plan and
+# failed there (its configure wants freetype-config, which FreeType removed
+# years ago -- an upstream problem, not this desktop's).  Nothing here needs
+# TeX: the book's `make ... pdf ps` manual builds are commented out (1.12.87)
+# and asymptote/biber are avoided.
+#
+# To build it later, on its own:  packagemanager install texlive --run
+avoid  texlive

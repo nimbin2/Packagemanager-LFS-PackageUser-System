@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.146"
+LFS_VERSION = "1.14.321"
 
 
 def _build_id():
@@ -235,11 +235,11 @@ LAYOUT_DEFAULTS = {
     # the system being built
     "target_pkgusr_home":  "/usr/src/pkgusr",
     "target_cfguser_home": "/usr/src/cfg",
-    "target_appuser_home": "/usr/src",              # or /home/shared_users
+    "target_appuser_home": "/home/shared_user",     # one subdir, not /home itself
     # this machine
     "pkgusr_home":         "/usr/src/pkgusr",
     "cfguser_home":        "/usr/src/cfg",
-    "appuser_home":        "/usr/src",
+    "appuser_home":        "/home/shared_user",
 }
 
 
@@ -266,7 +266,10 @@ def _accounts_root(kind):
                   target=True).rstrip("/")
     _c = {}
     try:
-        _c = read_config() or {}
+        # load_config, the function that exists: `read_config` did not, and
+        # the NameError was swallowed below -- a configured pkgusr_subdir /
+        # cfguser_subdir was silently ignored in favour of the default
+        _c = load_config() or {}
     except Exception:
         _c = {}
     sub = str(_c.get("pkgusr_subdir" if kind == "pkgusr" else "cfguser_subdir")
@@ -1477,7 +1480,7 @@ _SESSION_KEYS = [
                          "/usr/src"),
     ("target_appuser_home",
                          "where application users live on the BUILT system",
-                         "/usr/src"),
+                         "/home/shared_user"),
     ("locale",           "system locale (see 'locale -a')", "en_US.UTF-8"),
     ("paper_size",       "paper size for groff: A4 or letter", "A4"),
     # Everything below is a decision the build used to discover halfway
@@ -3295,6 +3298,38 @@ def _handover_build_user_only(lfs, run=True):
     """
     uid = _build_user_uid()
     if uid is None:
+        return 0
+    # THE HOST'S lfs UID CAN BE A PACKAGE USER'S UID IN THE TREE.
+    #
+    # This selects files by NUMBER, because that is the only thing that means
+    # the same on both sides of the chroot.  Book 4.3 pins no uid for `lfs`,
+    # so the host's is whatever was free -- 10753 on one machine -- and
+    # package users here are created in the 10000-20000 range.  If those
+    # numbers ever meet, this hands a package user's files to root and the
+    # package silently loses every one of them.
+    #
+    # Ask the tree's own passwd before touching anything.
+    _clash = []
+    _pw = os.path.join(lfs, "etc", "passwd")
+    try:
+        with open(_pw, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) > 2 and parts[2].strip() == str(uid):
+                    _clash.append(parts[0])
+    except OSError:
+        pass
+    if _clash:
+        warn("REFUSING to hand files back: the host's build user is uid %d,"
+             % uid)
+        warn("and that is also %s in %s." % (", ".join(_clash), _pw))
+        note("  Selecting by uid cannot tell them apart, so this would give")
+        note("  that account's files to root and the package would lose them.")
+        note("  See what it owns:")
+        note("    find %s -xdev -uid %d | head" % (lfs, uid))
+        note("  Then renumber the HOST's lfs account -- it exists only to")
+        note("  build, so nothing of yours depends on its number:")
+        note("    usermod -u <free-uid> lfs      # on the host, then retry")
         return 0
     dirs = [os.path.join(lfs, d) for d in LFS_HANDOVER_DIRS
             if os.path.exists(os.path.join(lfs, d))]
@@ -5689,7 +5724,12 @@ def cmd_bs_gen_chroot_scripts(args):
         for nm, left in unresolved:
             sys.stderr.write("    %-18s %s\n"
                              % (nm, ", ".join("<%s>" % x for x in left)))
-    print(f"# step order -> {pkgusr_state(lfs, "progress", "steporder")}")
+    # SINGLE QUOTES INSIDE THE BRACES.  Reusing the f-string's own quote
+    # character is legal only from Python 3.12, and `lfs` is the one tool that
+    # runs on the HOST -- where Python is whatever the distribution ships
+    # (Debian 12: 3.11).  There it did not fail at this line, it failed to
+    # start at all, with a SyntaxError pointing at a debug print.
+    print(f"# step order -> {pkgusr_state(lfs, 'progress', 'steporder')}")
     write_chroot_env(lfs)
     install_helper(lfs)
     _install_collector_groups(lfs)

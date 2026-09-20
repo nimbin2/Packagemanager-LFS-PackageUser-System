@@ -1,0 +1,694 @@
+#!/bin/bash
+# lfs-backup -- back up the configuration files you changed, and put them on
+# another system without overwriting anything there.
+#
+#   lfs-backup list                      what the config names, and what exists
+#   lfs-backup create [--run] [ARCHIVE]  write the archive (root; secrets inside)
+#   lfs-backup show ARCHIVE              what an archive holds
+#   lfs-backup restore ARCHIVE [--run]   put it on THIS system:
+#                                          missing file   -> created
+#                                          same content   -> left alone
+#                                          different      -> <file>.new, listed
+#   lfs-backup clean ARCHIVE [--run]     remove the .new files restore left,
+#                                        unless you edited one (kept, listed)
+#   lfs-backup merge ARCHIVE             go through those .new files one by
+#                                        one: diff, then keep live / take new /
+#                                        edit both / skip
+#   lfs-backup sections [ARCHIVE]        the section names to pick from
+#   lfs-backup plan ARCHIVE [FILE]       write a restore plan to edit: one
+#                                        line per file, restore or skip, and
+#                                        where it goes
+#   lfs-backup restore ARCHIVE --plan FILE [--run]   restore by that plan
+#
+#   --only a,b   restore/create/clean just these sections
+#   --skip a,b   everything except these
+#
+# Without --run, create, restore and clean only print what they would do.
+#
+# THE CONFIG: /etc/pkgusr/backup.conf (LFS_BACKUP_CONF overrides).  Sections,
+# one path per line, shell globs allowed:
+#     [user]  or [user:NAME]     ~ is the main user's home (PKGUSR_SYS_MAIN_USER)
+#     [root]  or [root:NAME]     ~ is root's home
+#     [system] or [system:NAME]  absolute paths
+# NAME is what --only/--skip select ("accounts", "ssh", "vim" ...); a section
+# without one is named after its kind.  A directory entry takes every file
+# below it.  A line starting with ! excludes what matches it, anywhere in the
+# config (* crosses /):  !~/.vim/pack/*/.git/*   !*~
+#
+# WHAT IS STORED IS THE FILE, NOT THE LINK.  A path that is a symlink is
+# backed up as the file it points to, under the path you named.
+#
+# OWNERSHIP GOES BY NAME, NOT NUMBER.  Ids differ between two systems; the
+# archive records owner and group names and the mode.  The old main user's
+# name becomes this system's main user on restore; a name this system does
+# not have becomes root, and is reported.
+#
+# NOTHING IS REPLACED.  An existing file with different content gets a .new
+# beside it, with the backed-up mode and owner, and the end of the run lists
+# every one of them to merge by hand.  /etc/passwd, group, shadow and gshadow
+# ALWAYS go to .new, even when the file is missing -- a restored account
+# database that does not match this system locks you out.
+#
+# THE ARCHIVE HOLDS SECRETS (shadow, wpa_supplicant keys): created 0600, root.
+set -u
+
+VERSION="1.3.0"
+PROG="lfs-backup"
+CONF="${LFS_BACKUP_CONF:-/etc/pkgusr/backup.conf}"
+# ROOT: the tree to read from (create) and write to (restore).  / on a
+# running system; a mounted new system's root when restoring into it.
+ROOT="${LFS_BACKUP_ROOT:-/}"
+ROOT="${ROOT%/}"
+RUN=0
+PLAN=""
+ONLY=""
+SKIP=""
+TMPD=""
+trap '[ -n "$TMPD" ] && rm -rf "$TMPD"' EXIT
+
+# SECRETS ARE RESTORED FOR THEIR OWNER ONLY, whatever mode they had.  The
+# first real backup recorded /etc/gshadow 644 and most Wi-Fi keys 664; a
+# restore that copies those modes spreads the mistake to the new system.
+# Group and other bits are dropped (a 664 key becomes 600).
+SECRET_RE='^/etc/(shadow|gshadow)$|^/etc/sysconfig/wpa_supplicant/|^/etc/ssh/ssh_host_.*_key$|^~/\.ssh/id_[^./]*$|^~/\.ssh/authorized_keys$'
+
+# always .new: account databases are merged, never dropped in
+ALWAYS_NEW='^/etc/(passwd|group|shadow|gshadow)$'
+
+say()  { printf '%s\n' "$*"; }
+note() { printf '#  %s\n' "$*"; }
+warn() { printf '!! %s\n' "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+
+usage() { sed -n '2,/^set -u/p' "$0" | sed '/^set -u/d; s/^# \{0,1\}//'; }
+
+need_root() { [ "$(id -u)" = 0 ] || die "$PROG $1 needs root (root's files, /etc/shadow)"; }
+
+# THE MAIN USER, FROM WHAT THE SYSTEM ALREADY SAYS.  packagemanager writes
+# PKGUSR_SYS_MAIN_USER to /etc/profile.d/pkgusr-system.sh; a root shell that
+# did not source it still gets the answer from the file itself.
+main_user() {
+    local u="${PKGUSR_SYS_MAIN_USER:-}"
+    if [ -z "$u" ] && [ -r "$ROOT/etc/profile.d/pkgusr-system.sh" ]; then
+        u="$(sed -n "s/^export PKGUSR_SYS_MAIN_USER=['\"]\{0,1\}\([^'\"]*\).*/\1/p" \
+             "$ROOT/etc/profile.d/pkgusr-system.sh" | head -n1)"
+    fi
+    printf '%s' "$u"
+}
+home_of() {   # home_of <user>  -- from THIS tree's passwd
+    awk -F: -v u="$1" '$1 == u { print $6; exit }' "$ROOT/etc/passwd" 2>/dev/null
+}
+# NAMES AND IDS FROM THE TREE'S OWN FILES.  With LFS_BACKUP_ROOT pointing at a
+# mounted system, the host's accounts are the wrong ones to ask.
+_name_in() { # _name_in <file> <id> -- the name, or the id itself when unknown
+    if [ -r "$1" ]; then
+        awk -F: -v i="$2" '$3 == i { print $1; f = 1; exit } END { if (!f) print i }' "$1"
+    else
+        printf '%s\n' "$2"
+    fi
+}
+uname_of() { _name_in "$ROOT/etc/passwd" "$1"; }
+gname_of() { _name_in "$ROOT/etc/group" "$1"; }
+uid_of()   { awk -F: -v u="$1" '$1 == u { print $3; exit }' "$ROOT/etc/passwd" 2>/dev/null; }
+gid_of()   { awk -F: -v u="$1" '$1 == u { print $3; exit }' "$ROOT/etc/group" 2>/dev/null; }
+
+# SELECTION.  A section matches --only/--skip by its name or its kind, so
+# `--skip accounts` and `--only user` both do what they read like.
+selected() {   # selected <scope> <label>
+    local s="$1" l="$2" x
+    if [ -n "$ONLY" ]; then
+        local hit=0
+        for x in ${ONLY//,/ }; do [ "$x" = "$l" ] || [ "$x" = "$s" ] && hit=1; done
+        [ "$hit" = 1 ] || return 1
+    fi
+    for x in ${SKIP//,/ }; do [ "$x" = "$l" ] || [ "$x" = "$s" ] && return 1; done
+    return 0
+}
+
+# ---- config -> one resolved file per line: scope<TAB>name<TAB>source<TAB>label
+#   name   what is recorded: ~/rel for user/root, the absolute path for system
+#   source where it is read on this system
+resolve() {
+    [ -r "$CONF" ] || die "no config: $CONF"
+    local mu uhome rhome scope="" label="" line pat base rel f
+    # EXCLUDES FIRST, from the whole file: they apply to every section
+    EXCLUDES=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="$(printf '%s' "${line%%#*}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        case "$line" in '!'?*) EXCLUDES+=("${line#!}") ;; esac
+    done < "$CONF"
+    mu="$(main_user)"
+    uhome="$([ -n "$mu" ] && home_of "$mu")"
+    rhome="$(home_of root)"; rhome="${rhome:-/root}"
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%%#*}"
+        line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:],]*$//')"
+        [ -n "$line" ] || continue
+        case "$line" in '!'*) continue ;; esac
+        case "$line" in
+            \[*\])
+                local sec="${line#[}"; sec="${sec%]}"
+                scope="${sec%%:*}"; label="${sec#*:}"
+                [ "$label" = "$sec" ] && label="$scope"
+                case "$scope" in
+                    user|root|system) ;;
+                    *) warn "$CONF: unknown section $line (user, root or system)"; scope="" ;;
+                esac
+                continue ;;
+        esac
+        [ -n "$scope" ] || { warn "$CONF: '$line' is outside a section"; continue; }
+        [ "${ALL_SECTIONS:-0}" = 1 ] || selected "$scope" "$label" || continue
+        case "$scope" in
+            user)
+                [ -n "$uhome" ] || { warn "no main user (PKGUSR_SYS_MAIN_USER) -- [user] '$line' skipped"; continue; }
+                base="$uhome" ;;
+            root)   base="$rhome" ;;
+            system) base="" ;;
+        esac
+        if [ "$scope" = system ]; then
+            case "$line" in /*) ;; *) warn "[system] '$line' is not absolute -- skipped"; continue ;; esac
+            pat="$ROOT$line"
+        else
+            case "$line" in "~/"*) rel="${line#\~/}" ;; *) warn "[$scope] '$line' does not start with ~/ -- skipped"; continue ;; esac
+            pat="$ROOT$base/$rel"
+        fi
+        local matched=0
+        # the glob is expanded here, unquoted on purpose; no match stays literal
+        for f in $pat; do
+            if [ -d "$f" ]; then
+                while IFS= read -r g; do
+                    matched=1
+                    emit "$scope" "$base" "$g" "$label"
+                done < <(find -L "$f" -type f 2>/dev/null | sort)
+            elif [ -e "$f" ]; then
+                matched=1
+                emit "$scope" "$base" "$f" "$label"
+            fi
+        done
+        [ "$matched" = 1 ] || printf 'missing\t%s\t%s\t%s\n' "$scope" "$line" "$label"
+    done < "$CONF"
+}
+emit() {   # emit <scope> <home> <path-in-ROOT> <label>
+    local scope="$1" base="$2" src="$3" name="${3#$ROOT}" label="$4"
+    case "$name" in *$'\t'*|*$'\n'*|*' | '*) warn "a tab, newline or ' | ' in '$name' -- skipped"; return ;; esac
+    [ "$scope" = system ] || name="~/${name#$base/}"
+    local x
+    for x in "${EXCLUDES[@]+"${EXCLUDES[@]}"}"; do
+        # shellcheck disable=SC2053 -- a pattern, on purpose
+        [[ "$name" == $x ]] && return
+    done
+    printf '%s\t%s\t%s\t%s\n' "$scope" "$name" "$src" "$label"
+}
+
+# ---- list ---------------------------------------------------------------
+do_list() {
+    local scope name src label n=0 m=0
+    while IFS=$'\t' read -r scope name src label; do
+        if [ "$scope" = missing ]; then
+            printf '  %-9s %-48s (not there)\n' "$label" "$src"; m=$((m + 1)); continue
+        fi
+        n=$((n + 1))
+        if [ -L "$src" ]; then
+            printf '  %-9s %-48s -> %s\n' "$label" "$name" "$(readlink -f "$src")"
+        else
+            printf '  %-9s %s\n' "$label" "$name"
+        fi
+    done < <(resolve)
+    say ""
+    note "$n file(s) to back up, $m entr(y/ies) with nothing there  (config: $CONF)"
+}
+
+# ---- create -------------------------------------------------------------
+do_create() {
+    need_root create
+    local out="${1:-}" host stage scope name src mode owner group n=0 m=0 link label
+    host="$(cat "$ROOT/etc/hostname" 2>/dev/null || hostname 2>/dev/null || echo lfs)"
+    [ -n "$out" ] || out="/root/lfs-backup-${host}-$(date +%Y%m%d-%H%M%S).tar.gz"
+    stage="$(mktemp -d)" || die "no temporary directory"
+    TMPD="$stage"; chmod 700 "$stage"
+    mkdir -p "$stage/files"
+    {
+        printf '# lfs-backup %s manifest\n' "$VERSION"
+        printf '# host=%s main_user=%s created=%s\n' "$host" "$(main_user)" "$(date -Iseconds)"
+        printf '# scope\tname\tmode\towner\tgroup\twas_link_to\tsection\n'
+    } > "$stage/manifest"
+    while IFS=$'\t' read -r scope name src label; do
+        if [ "$scope" = missing ]; then
+            note "not there: [$label] $src"; m=$((m + 1)); continue
+        fi
+        # the FILE: stat -L and cp -L read through a symlink
+        mode="$(stat -L -c %a "$src")" && owner="$(uname_of "$(stat -L -c %u "$src")")" \
+            && group="$(gname_of "$(stat -L -c %g "$src")")" || { warn "cannot stat $src"; continue; }
+        link="-"; [ -L "$src" ] && link="$(readlink -f "$src")"
+        say "  $label  $name$([ "$link" != - ] && printf '   (link -> %s: the file is stored)' "$link")"
+        [ "$RUN" = 1 ] || { n=$((n + 1)); continue; }
+        mkdir -p "$stage/files/$scope/$(dirname "${name#\~/}")"
+        cp -L --preserve=mode,timestamps "$src" "$stage/files/$scope/${name#\~/}" \
+            || { warn "could not copy $src"; continue; }
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$scope" "$name" "$mode" "$owner" "$group" "$link" "$label" >> "$stage/manifest"
+        n=$((n + 1))
+    done < <(resolve)
+    say ""
+    if [ "$RUN" != 1 ]; then
+        note "dry run: $n file(s) would go into $out ($m entr(y/ies) with nothing there)"
+        note "   write it:  $PROG create --run${1:+ $1}"
+        return 0
+    fi
+    ( umask 077; tar -C "$stage" -czf "$out" manifest files ) || die "could not write $out"
+    chown root:root "$out" && chmod 600 "$out"
+    note "wrote $out  ($n file(s), mode 600: it holds secrets)"
+    [ "$m" -gt 0 ] && note "$m config entr(y/ies) had nothing to back up (listed above)"
+    return 0
+}
+
+# ---- show ---------------------------------------------------------------
+do_show() {
+    local a="${1:-}"
+    [ -r "$a" ] || die "no archive: ${a:-(none given)}"
+    tar -xzOf "$a" manifest | awk -F'\t' '
+        /^#/ { if (NR < 3) print; next }
+        { printf "  %-9s %-48s %4s %s:%s%s\n", ($7 != "" ? $7 : $1), $2, $3, $4, $5, ($6 != "-" ? "   (was a link)" : "") }'
+}
+
+# ---- restore ------------------------------------------------------------
+map_owner() {   # map_owner <name> <old-main> <new-main>  -> a name this system has
+    local o="$1"
+    [ -n "$2" ] && [ "$o" = "$2" ] && o="$3"
+    if awk -F: -v u="$o" '$1 == u { f = 1 } END { exit !f }' "$ROOT/etc/passwd" 2>/dev/null; then
+        printf '%s' "$o"
+    else
+        printf 'root'
+    fi
+}
+map_group() {
+    local g="$1"
+    [ -n "$2" ] && [ "$g" = "$2" ] && g="$3"
+    if awk -F: -v u="$g" '$1 == u { f = 1 } END { exit !f }' "$ROOT/etc/group" 2>/dev/null; then
+        printf '%s' "$g"
+    else
+        printf 'root'
+    fi
+}
+
+# WHO OWNS A RESTORED FILE.
+#
+# By kind first, names second.  The host's root dotfiles were links into the
+# main user's old config repo, so they were recorded as n76310's -- restored
+# by name that is a /root/.bashrc the main user can edit, which root runs.
+#   [root]    root, always
+#   [user]    the main user; the group too, unless the file had another
+#             group that exists here
+#   [system]  the recorded names where they exist here, else root -- but
+#             never the main user (an /etc file owned by a login is a mistake)
+owner_for() {   # owner_for <scope> <owner> <group> -> "owner group"
+    local scope="$1" o="$2" g="$3"
+    case "$scope" in
+        root) printf 'root root' ;;
+        user)
+            local ng="$new_main"
+            if [ "$g" != "$old_main" ] && [ "$g" != "$o" ] && [ "$g" != root ] \
+               && awk -F: -v u="$g" '$1 == u { f = 1 } END { exit !f }' "$ROOT/etc/group" 2>/dev/null; then
+                ng="$g"
+            fi
+            printf '%s %s' "$new_main" "$ng" ;;
+        *)
+            [ "$o" = "$old_main" ] && o=root
+            [ "$g" = "$old_main" ] && g=root
+            printf '%s %s' "$(map_owner "$o" "" "")" "$(map_group "$g" "" "")" ;;
+    esac
+}
+target_for() {  # target_for <scope> <name-or-planned-path> -> path in ROOT, or empty
+    local scope="$1" n="$2"
+    case "$n" in
+        "~/"*)
+            case "$scope" in
+                root) printf '%s' "$ROOT$rhome/${n#\~/}" ;;
+                *)    [ -n "$uhome" ] && printf '%s' "$ROOT$uhome/${n#\~/}" ;;
+            esac ;;
+        /*) printf '%s' "$ROOT$n" ;;
+    esac
+}
+
+# ---- plan -----------------------------------------------------------------
+# ONE LINE PER FILE, TO EDIT.  The plan is how a restore is chosen file by
+# file: change `restore` to `skip`, or change the target -- `~/` is the home
+# of the section's kind on THIS system, anything else is an absolute path.
+#   action  | state   | section | name in the archive | target
+do_plan() {
+    local a="${1:-}" out="${2:-lfs-backup-restore.plan}" tmp scope name mode owner group link label t state act
+    [ -r "$a" ] || die "no archive: ${a:-(none given)}"
+    [ -e "$out" ] && die "$out exists -- edit it, or remove it for a fresh plan"
+    tmp="$(mktemp -d)" || die "no temporary directory"
+    TMPD="$tmp"; chmod 700 "$tmp"
+    tar -C "$tmp" -xzf "$a" manifest files || die "cannot read $a"
+    old_main="$(sed -n 's/^# host=.* main_user=\([^ ]*\) .*/\1/p' "$tmp/manifest" | head -n1)"
+    new_main="$(main_user)"
+    uhome="$([ -n "$new_main" ] && home_of "$new_main")"
+    rhome="$(home_of root)"; rhome="${rhome:-/root}"
+    local n=0 k=0
+    {
+        printf '# lfs-backup restore plan for %s\n' "$a"
+        printf '# written %s on %s -- archive main user %s, this system %s\n' \
+            "$(date -Iseconds)" "$(cat "$ROOT/etc/hostname" 2>/dev/null || echo ?)" "${old_main:-?}" "${new_main:-?}"
+        printf '#\n'
+        printf '# action: restore or skip.  target: where it goes on this system (an\n'
+        printf '# absolute path; ~/ also works: the home of that line'"'"'s kind).\n'
+        printf '# state is what restore would find NOW: new, differs (-> .new), same.\n'
+        printf '# Apply:  lfs-backup restore %s --plan %s        (add --run)\n' "$a" "$out"
+        printf '#\n# action  | state   | kind:section   | name in the archive | target\n'
+        while IFS=$'\t' read -r scope name mode owner group link label; do
+            case "$scope" in ''|\#*) continue ;; esac
+            label="${label:-$scope}"
+            selected "$scope" "$label" || continue
+            t="$(target_for "$scope" "$name")"
+            if [ -z "$t" ]; then state="no-home"; act=skip
+            elif [ ! -e "$t" ] && [ ! -L "$t" ]; then state="new"; act=restore
+            elif cmp -s "$tmp/files/$scope/${name#\~/}" "$t"; then state="same"; act=skip
+            else state="differs"; act=restore
+            fi
+            [ "$act" = restore ] && k=$((k + 1))
+            # KIND:SECTION AND AN ABSOLUTE TARGET.  `~/.bashrc` is in both
+            # [user] and [root]: the plan named them identically, restore looked
+            # a name up and took the FIRST line -- root's file followed the
+            # user's decision.  And a `~/` target read as root's home to anyone
+            # checking as root.  The kind is part of the key; the target is
+            # the real path on this system (still editable, ~/ still accepted).
+            printf '%-7s | %-7s | %-14s | %s | %s\n' "$act" "$state" "$scope:$label" "$name" "${t#$ROOT}"
+            n=$((n + 1))
+        done < "$tmp/manifest"
+    } > "$out"
+    note "wrote $out: $n file(s), $k set to restore (identical ones are set to skip)"
+    note "   edit it, then:  $PROG restore $a --plan $out"
+}
+
+# PLAN LOOKUP: name -> "action<TAB>target" for the files of this archive
+load_plan() {   # load_plan <file>
+    [ -r "$1" ] || die "no plan: $1"
+    PLAN_MAP="$(awk -F' [|] ' '
+        /^[[:space:]]*(#|$)/ { next }
+        NF < 5 { printf "bad\t%d\n", NR; next }
+        { a = $1; gsub(/[[:space:]]/, "", a); k = $3; gsub(/[[:space:]]/, "", k)
+          if (k !~ /^(user|root|system):/) { printf "bad\t%d\n", NR; next }
+          sub(/:.*/, "", k)
+          printf "%s:%s\t%s\t%s\n", k, $4, a, $5 }' "$1")"
+    local bad
+    bad="$(printf '%s\n' "$PLAN_MAP" | awk -F'\t' '$1 == "bad" { printf "%s ", $2 }')"
+    [ -z "$bad" ] || die "$1: lines $bad are not  action | state | kind:section | name | target  (a plan from lfs-backup 1.2.1 or older: write a new one)"
+    bad="$(printf '%s\n' "$PLAN_MAP" | awk -F'\t' '$2 != "restore" && $2 != "skip" { printf "%s ", $1 }')"
+    [ -z "$bad" ] || die "$1: an action is neither restore nor skip for: $bad"
+}
+
+do_restore() {
+    need_root restore
+    local a="${1:-}" tmp old_main new_main uhome rhome
+    [ -r "$a" ] || die "no archive: ${a:-(none given)}"
+    tmp="$(mktemp -d)" || die "no temporary directory"
+    TMPD="$tmp"; chmod 700 "$tmp"
+    tar -C "$tmp" -xzf "$a" || die "cannot read $a"
+    [ -f "$tmp/manifest" ] || die "$a has no manifest -- not an $PROG archive"
+    old_main="$(sed -n 's/^# host=.* main_user=\([^ ]*\) .*/\1/p' "$tmp/manifest" | head -n1)"
+    new_main="$(main_user)"
+    uhome="$([ -n "$new_main" ] && home_of "$new_main")"
+    rhome="$(home_of root)"; rhome="${rhome:-/root}"
+    note "archive main user: ${old_main:-?}   this system's: ${new_main:-?} ($uhome)"
+    [ "$ROOT" = "" ] || note "restoring into $ROOT"
+
+    local scope name mode owner group link label rel target o g planned
+    local created=() same=() news=() skipped=() modediff=() unselected=0 planskip=0 unplanned=0
+    [ -n "$PLAN" ] && { load_plan "$PLAN"; note "restoring by plan $PLAN"; }
+    while IFS=$'\t' read -r scope name mode owner group link label; do
+        case "$scope" in ''|\#*) continue ;; esac
+        label="${label:-$scope}"
+        selected "$scope" "$label" || { unselected=$((unselected + 1)); continue; }
+        rel="${name#\~/}"
+        case "$scope" in user|root|system) ;; *) skipped+=("$name (unknown scope $scope)"); continue ;; esac
+        planned="$name"
+        if [ -n "$PLAN" ]; then
+            local line
+            line="$(printf '%s\n' "$PLAN_MAP" | awk -F'\t' -v n="$scope:$name" '$1 == n { print; exit }')"
+            if [ -z "$line" ]; then unplanned=$((unplanned + 1)); continue; fi
+            [ "$(printf '%s' "$line" | cut -f2)" = restore ] || { planskip=$((planskip + 1)); continue; }
+            planned="$(printf '%s' "$line" | cut -f3-)"
+        fi
+        target="$(target_for "$scope" "$planned")"
+        if [ -z "$target" ]; then
+            skipped+=("$name ($([ -z "$uhome" ] && echo "no main user here" || echo "target '$planned' is neither ~/... nor absolute"))")
+            continue
+        fi
+        read -r o g <<< "$(owner_for "$scope" "$owner" "$group")"
+        if printf '%s' "$name" | grep -qE "$SECRET_RE"; then
+            local m2; m2="$(printf '%o' $(( 8#$mode & 8#700 )))"
+            if [ "$m2" != "$mode" ]; then
+                note "$name: a secret recorded $mode -- restored $m2"
+                mode="$m2"
+            fi
+        fi
+        [ "$scope" != system ] || [ "$o" = "$owner" ] \
+            || note "$name: owner '$owner' -> $o"
+        local src="$tmp/files/$scope/$rel" dest="$target" why=""
+        if [ ! -e "$target" ] && [ ! -L "$target" ]; then
+            if [ "$scope" = system ] && printf '%s' "$name" | grep -qE "$ALWAYS_NEW"; then
+                dest="$target.new"; why="account database: always merged"
+            else
+                why="new"
+            fi
+        elif cmp -s "$src" "$target"; then
+            same+=("$target")
+            [ "$(stat -L -c %a "$target")" = "$mode" ] \
+                || modediff+=("$target is $(stat -L -c %a "$target"), backup had $mode")
+            continue
+        else
+            dest="$target.new"; why="differs"
+        fi
+        if [ "$dest" != "$target" ] && [ -f "$dest" ] && cmp -s "$src" "$dest"; then
+            news+=("$dest  ($why; already there from an earlier run)")
+            continue
+        fi
+        if [ "$RUN" = 1 ]; then
+            if [ "$dest" = "$target" ]; then
+                # parents that do not exist yet: under a home they belong to its user
+                local d="$(dirname "$target")" missing_dirs=()
+                while [ ! -d "$d" ]; do missing_dirs=("$d" "${missing_dirs[@]}"); d="$(dirname "$d")"; done
+                for d in "${missing_dirs[@]}"; do
+                    mkdir "$d" || { warn "cannot create $d"; continue 2; }
+                    case "$d" in "$ROOT$uhome"/*) [ -n "$uhome" ] && chown "$(uid_of "$new_main"):$(gid_of "$new_main")" "$d" 2>/dev/null ;; esac
+                done
+            fi
+            install -m "$mode" -o "$(uid_of "$o")" -g "$(gid_of "$g")" "$src" "$dest" \
+                || { warn "could not write $dest"; continue; }
+        fi
+        if [ "$dest" = "$target" ]; then
+            created+=("$target  ($mode $o:$g)")
+        else
+            news+=("$dest  ($why)")
+        fi
+    done < "$tmp/manifest"
+
+    say ""
+    local verb; [ "$RUN" = 1 ] && verb="" || verb="would be "
+    say "${verb}created: ${#created[@]}"
+    for x in "${created[@]}"; do say "    $x"; done
+    say "identical, left alone: ${#same[@]}"
+    for x in "${modediff[@]}"; do say "    mode only: $x"; done
+    [ "${#skipped[@]}" -gt 0 ] && { say "skipped: ${#skipped[@]}"; for x in "${skipped[@]}"; do say "    $x"; done; }
+    [ "$unselected" -gt 0 ] && say "not selected (--only/--skip): $unselected"
+    [ "$planskip" -gt 0 ] && say "skip in the plan: $planskip"
+    [ "$unplanned" -gt 0 ] && say "not in the plan: $unplanned  (left alone)"
+    say ""
+    if [ "${#news[@]}" -gt 0 ]; then
+        say "TO MERGE BY HAND -- ${verb}written as .new, the live file untouched: ${#news[@]}"
+        for x in "${news[@]}"; do say "    $x"; done
+        say ""
+        note "compare:  diff -u <file> <file>.new     then keep what you want and rm the .new"
+    else
+        note "nothing to merge"
+    fi
+    [ "$RUN" = 1 ] || note "dry run -- nothing written.  Apply:  $PROG restore $a$([ -n "$PLAN" ] && printf ' --plan %s' "$PLAN") --run$(sel_args)"
+    [ "${#news[@]}" -gt 0 ] && note "merged everything?  $PROG clean $a$(sel_args)  removes the .new files"
+    return 0
+}
+
+sel_args() { [ -n "$ONLY" ] && printf ' --only %s' "$ONLY"; [ -n "$SKIP" ] && printf ' --skip %s' "$SKIP"; }
+
+# ---- sections -----------------------------------------------------------
+do_sections() {
+    local a="${1:-}"
+    if [ -n "$a" ]; then
+        [ -r "$a" ] || die "no archive: $a"
+        tar -xzOf "$a" manifest | awk -F'\t' '!/^#/ { l = ($7 != "" ? $7 : $1); n[l]++; k[l] = $1 }
+            END { for (l in n) printf "  %-12s %-7s %d file(s)\n", l, k[l], n[l] }' | sort
+    else
+        ALL_SECTIONS=1 resolve | awk -F'\t' '$1 != "missing" { n[$4]++; k[$4] = $1 }
+            END { for (l in n) printf "  %-12s %-7s %d file(s)\n", l, k[l], n[l] }' | sort
+    fi
+}
+
+# ---- merge --------------------------------------------------------------
+# ONE .new AT A TIME, WITH THE DIFF IN FRONT OF YOU.
+#   k  keep the live file        -> the .new is removed
+#   n  take the backed-up file   -> its CONTENT replaces the live file's;
+#                                   the live owner and mode stay (they are
+#                                   this system's), then the .new is removed
+#   e  edit: vimdiff live .new (MERGE_TOOL overrides), then ask again
+#   s  skip, decide later        q  stop here
+# The account databases (passwd, group, shadow, gshadow) cannot be taken
+# whole: an old system's copy locks out this one's accounts.  Edit them.
+do_merge() {
+    need_root merge
+    local a="${1:-}" tmp new_main uhome rhome scope name mode owner group link label target
+    local kept=0 took=0 skipped=0 ans tool
+    [ -r "$a" ] || die "no archive: ${a:-(none given)}"
+    tmp="$(mktemp -d)" || die "no temporary directory"
+    TMPD="$tmp"; chmod 700 "$tmp"
+    tar -C "$tmp" -xzf "$a" manifest || die "cannot read $a"
+    new_main="$(main_user)"
+    uhome="$([ -n "$new_main" ] && home_of "$new_main")"
+    rhome="$(home_of root)"; rhome="${rhome:-/root}"
+    [ -n "$PLAN" ] && load_plan "$PLAN"
+    tool="${MERGE_TOOL:-}"
+    [ -n "$tool" ] || { command -v vimdiff >/dev/null 2>&1 && tool=vimdiff; }
+    # answers from the terminal, or from stdin when there is none
+    { exec 3</dev/tty; } 2>/dev/null || exec 3<&0
+    local list=() t
+    while IFS=$'\t' read -r scope name mode owner group link label; do
+        case "$scope" in ''|\#*) continue ;; esac
+        selected "$scope" "${label:-$scope}" || continue
+        local planned="$name"
+        if [ -n "$PLAN" ]; then
+            local line
+            line="$(printf '%s\n' "$PLAN_MAP" | awk -F'\t' -v n="$scope:$name" '$1 == n { print; exit }')"
+            [ -n "$line" ] && [ "$(printf '%s' "$line" | cut -f2)" = restore ] || continue
+            planned="$(printf '%s' "$line" | cut -f3-)"
+        fi
+        t="$(target_for "$scope" "$planned")"
+        [ -n "$t" ] && [ -f "$t.new" ] && list+=("$t")
+    done < "$tmp/manifest"
+    [ "${#list[@]}" -gt 0 ] || { note "no .new files from this archive -- nothing to merge"; return 0; }
+    local i=0 total="${#list[@]}"
+    for target in "${list[@]}"; do
+        i=$((i + 1))
+        while :; do
+            say ""
+            say "=== [$i/$total] $target"
+            if [ ! -e "$target" ]; then
+                say "    (no live file: only the .new exists)"
+            else
+                diff -u --label "live: $target" --label "backup: $target.new" \
+                    "$target" "$target.new" | sed 's/^/    /' | head -n "${MERGE_LINES:-60}"
+                local nl; nl="$(diff "$target" "$target.new" | wc -l)"
+                [ "$nl" -gt "${MERGE_LINES:-60}" ] && say "    ... ($nl diff lines; e shows all)"
+            fi
+            local takeable=1
+            printf '%s' "$target" | sed "s#^$ROOT##" | grep -qE "$ALWAYS_NEW" && takeable=0
+            if [ "$takeable" = 1 ]; then
+                printf '  [k]eep live  [n] take backup  [e]dit  [s]kip  [q]uit: '
+            else
+                printf '  [k]eep live  [e]dit  [s]kip  [q]uit   (account database: no whole take): '
+            fi
+            read -r ans <&3 || ans=q
+            case "$ans" in
+                k)  rm -f "$target.new"; note "kept the live file; removed the .new"; kept=$((kept + 1)); break ;;
+                n)  if [ "$takeable" != 1 ]; then warn "not for an account database -- edit it"; continue; fi
+                    if [ -e "$target" ]; then
+                        cat "$target.new" > "$target" || { warn "could not write $target"; continue; }
+                    else
+                        mv "$target.new" "$target" || { warn "could not move it into place"; continue; }
+                    fi
+                    rm -f "$target.new"
+                    note "took the backup's content (the live owner and mode stay)"; took=$((took + 1)); break ;;
+                e)  if [ -n "$tool" ] && [ -e "$target" ]; then
+                        $tool "$target" "$target.new" <&3
+                    else
+                        ${EDITOR:-vi} "$target.new" <&3
+                    fi ;;
+                s)  skipped=$((skipped + 1)); break ;;
+                q)  say ""; note "stopped at $target"; break 2 ;;
+                *)  ;;
+            esac
+        done
+    done
+    exec 3<&-
+    say ""
+    note "kept live: $kept   took backup: $took   left for later: $((total - kept - took))"
+    return 0
+}
+
+# ---- clean --------------------------------------------------------------
+# THE .new FILES OF THIS ARCHIVE, AND ONLY THOSE.  For each file the archive
+# holds, <target>.new is removed when its content is still exactly what
+# restore wrote.  A .new you edited while merging differs from the archive
+# and is kept, and so is any .new this archive did not produce (a package's
+# config, `make install`'s).
+do_clean() {
+    need_root clean
+    local a="${1:-}" tmp new_main uhome rhome scope name mode owner group link label rel target
+    local removed=() kept=() gone=0
+    [ -r "$a" ] || die "no archive: ${a:-(none given)}"
+    tmp="$(mktemp -d)" || die "no temporary directory"
+    TMPD="$tmp"; chmod 700 "$tmp"
+    tar -C "$tmp" -xzf "$a" || die "cannot read $a"
+    new_main="$(main_user)"
+    uhome="$([ -n "$new_main" ] && home_of "$new_main")"
+    rhome="$(home_of root)"; rhome="${rhome:-/root}"
+    [ -n "$PLAN" ] && load_plan "$PLAN"
+    while IFS=$'\t' read -r scope name mode owner group link label; do
+        case "$scope" in ''|\#*) continue ;; esac
+        selected "$scope" "${label:-$scope}" || continue
+        rel="${name#\~/}"
+        local planned="$name"
+        if [ -n "$PLAN" ]; then
+            local line
+            line="$(printf '%s\n' "$PLAN_MAP" | awk -F'\t' -v n="$scope:$name" '$1 == n { print; exit }')"
+            [ -n "$line" ] && [ "$(printf '%s' "$line" | cut -f2)" = restore ] || continue
+            planned="$(printf '%s' "$line" | cut -f3-)"
+        fi
+        target="$(target_for "$scope" "$planned")"
+        [ -n "$target" ] || continue
+        [ -f "$target.new" ] || { gone=$((gone + 1)); continue; }
+        if cmp -s "$tmp/files/$scope/$rel" "$target.new"; then
+            [ "$RUN" = 1 ] && rm -f "$target.new"
+            removed+=("$target.new")
+        else
+            kept+=("$target.new  (edited since restore -- yours to delete)")
+        fi
+    done < "$tmp/manifest"
+    local verb; [ "$RUN" = 1 ] && verb="removed" || verb="would remove"
+    say "$verb: ${#removed[@]}"
+    for x in "${removed[@]}"; do say "    $x"; done
+    if [ "${#kept[@]}" -gt 0 ]; then
+        say "kept: ${#kept[@]}"
+        for x in "${kept[@]}"; do say "    $x"; done
+    fi
+    [ "$RUN" = 1 ] || note "dry run -- nothing removed.  Remove:  $PROG clean $a --run$(sel_args)"
+    return 0
+}
+
+# ---- main -----------------------------------------------------------------
+cmd="${1:-}"; [ $# -gt 0 ] && shift
+args=()
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --run)    RUN=1 ;;
+        --plan)   PLAN="${2:?--plan needs a file}"; shift ;;
+        --plan=*) PLAN="${1#--plan=}" ;;
+        --only)   ONLY="${2:?--only needs section names}"; shift ;;
+        --only=*) ONLY="${1#--only=}" ;;
+        --skip)   SKIP="${2:?--skip needs section names}"; shift ;;
+        --skip=*) SKIP="${1#--skip=}" ;;
+        *) args+=("$1") ;;
+    esac
+    shift
+done
+case "$cmd" in
+    list)             do_list ;;
+    create)           do_create "${args[@]+"${args[@]}"}" ;;
+    show)             do_show "${args[@]+"${args[@]}"}" ;;
+    restore)          do_restore "${args[@]+"${args[@]}"}" ;;
+    clean)            do_clean "${args[@]+"${args[@]}"}" ;;
+    plan)             do_plan "${args[@]+"${args[@]}"}" ;;
+    merge)            do_merge "${args[@]+"${args[@]}"}" ;;
+    sections)         do_sections "${args[@]+"${args[@]}"}" ;;
+    --version|version) say "$PROG $VERSION (build $(md5sum "$0" 2>/dev/null | cut -c1-7))" ;;
+    ""|-h|--help|help) usage ;;
+    *) die "unknown command '$cmd' -- $PROG --help" ;;
+esac

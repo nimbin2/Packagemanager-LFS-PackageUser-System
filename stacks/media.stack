@@ -1,0 +1,258 @@
+# media.stack -- codecs, gstreamer, the WebRTC chain, webkitgtk, mpv, yt-dlp.
+# stack-version: 1.14.321
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
+# here: the exclusions are a property of the machine, not of one stack.
+# Without it, `stack media` planned 274 packages -- systemd, polkit, qt6,
+# cups -- because those exclusions lived in sway.stack alone.
+include avoid
+
+# THE DEVELOPMENT BOOK.  Codecs, gstreamer and webkitgtk move faster than a
+# stable book, so the book entries below read svn: versions, dependencies,
+# scripts.  Dependencies OUTSIDE this file stay on the default book (built if
+# missing, never upgraded to svn's page).  Per entry: from-book=default.
+# `packagemanager stack media` refreshes the svn book once per run.
+from-book svn
+
+#
+# Everything that decides whether a browser can PLAY and PUBLISH: audio and
+# video codecs, the gstreamer plugin sets, the four WebRTC pieces from git,
+# H.264 both ways, the fonts webkit needs, and mpv.
+#
+#     packagemanager stack media --run      # just this chain
+#     packagemanager probe                  # did the features land
+#
+# WHY IT IS SEPARATE.  This is the part that gets rebuilt: a codec appears,
+# a plugin set was configured without a feature, webkitgtk moves a version.
+# Replaying the whole desktop to redo it is an afternoon; replaying this is
+# an evening at most, and usually minutes.
+#
+# ORDER MATTERS, AND THIS IS NOT THE FIRST STACK.  It needs, from
+# wayland.stack: alsa-lib and ffmpeg (entry 1b -- the audio floor and the
+# codecs), llvm and mesa, wayland, and gtk4 with pango and libsoup3.
+# webkitgtk links all of them.  sway.stack pulls this file in with
+# `include media` at exactly the right point, so the full desktop build is
+# still one command and this list exists only once.
+#
+# WHAT IS *NOT* HERE, deliberately:
+#   * ffmpeg, alsa-lib -- the audio and codec floor: too many things below
+#     them in wayland.stack depend on them being early.
+#   * x264, x265, dav1d, libaom, svt-av1, fdk-aac, lame -- they arrive as
+#     ffmpeg's own dependencies, so the book's plan builds them.  x264enc
+#     (the ELEMENT) comes from gst10-plugins-ugly, which IS here.
+#   * mesa, gtk4, wayland -- graphics and toolkit, not media.  A codec
+#     rebuild should not touch them.
+#   * pipewire, wireplumber, alsa-utils, v4l-utils -- the audio SERVER and
+#     the camera tools.  They are in sway.stack's section 7, and rebuilding
+#     a codec has no reason to restart your sound daemon.
+
+book   opus
+book   libvpx
+# openh264: NOT in the BLFS book (checked against 13.1), so this entry is
+# ours.  Cisco's H.264 codec, and the only source of openh264enc/openh264dec
+# in gst-plugins-bad -- which autodetects it, so it must be installed BEFORE
+# -bad, and a -bad built earlier needs rebuilding to pick it up.
+#
+# Tag v2.6.0 and the tarball were verified; the meson path was NOT built
+# here (no meson in the authoring sandbox), only read out of its meson.build,
+# which does generate the .pc file -bad looks for.  It also ships a plain
+# Makefile (PREFIX=/usr/local by default) if meson ever disappoints.
+tar    openh264 \
+       url=https://github.com/cisco/openh264/archive/refs/tags/v2.6.0.tar.gz \
+       pkg=openh264-2.6.0.tar.gz \
+       have=/usr/lib/pkgconfig/openh264.pc \
+       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
+       install="ninja -C build install"
+
+book   gstreamer10
+# A PLUGIN IS NOT THE SAME THING AS A LIBRARY.  gst-plugins-bad always
+# builds libgstwebrtc-1.0.so; the webrtcbin ELEMENT is compiled only if
+# libnice was there at configure time, and its absence shows up months later
+# as a browser saying "GstWebRTC plugin not found".  gst-inspect-1.0 answers
+# it in one call, so each entry proves its own elements.
+book   gst10-plugins-base expect="gst-inspect-1.0 opusenc >/dev/null 2>&1"
+book   gst10-plugins-good expect="gst-inspect-1.0 v4l2src >/dev/null 2>&1 && gst-inspect-1.0 vp8enc >/dev/null 2>&1"
+# ---------------------------------------------------------------------
+# WebRTC and camera streaming.
+#
+# BLFS 13.0 carries NONE of these, so they are git entries.  They must be
+# built BEFORE gst10-plugins-bad and webkitgtk, because webrtcbin -- the
+# element a browser uses for WebRTC -- is compiled into gst-plugins-bad only
+# if libnice is present, and webkitgtk links the result.  Adding them later
+# means recompiling both (hours).
+#
+# What each is for:
+#   libnice                 ICE: the NAT traversal WebRTC cannot work without
+#   libsrtp                 the encrypted media transport
+#   usrsctp                 WebRTC data channels
+#   webrtc-audio-processing echo cancellation for a microphone (the log's
+#                           "webrtc-audio-processing-2 found: NO")
+#
+# The camera side is already in this stack: v4l-utils for the device and
+# pipewire for routing it.
+#
+# UNTESTED -- the build lines follow each project's README, and none of these
+# has been built here.  Expect to adjust them; that is what the stack file is
+# for.
+git    libnice url=https://gitlab.freedesktop.org/libnice/libnice.git ref=0.1.22 have=/usr/lib/pkgconfig/nice.pc build="meson setup build --prefix=/usr --buildtype=release -Dgtk_doc=disabled; ninja -C build" install="ninja -C build install"
+git    libsrtp url=https://github.com/cisco/libsrtp.git ref=v2.6.0 have=/usr/lib/pkgconfig/libsrtp2.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+# ref: 1.0.0 does not exist upstream (checked: the tags are 0.9.3.0, 0.9.4.0,
+# 0.9.5.0).  0.9.5.0 has meson.build, so the build line below still applies.
+git    usrsctp url=https://github.com/sctplab/usrsctp.git ref=0.9.5.0 have=/usr/lib/pkgconfig/usrsctp.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+git    webrtc-audio-processing url=https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git ref=v2.1 have=/usr/lib/pkgconfig/webrtc-audio-processing-2.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+
+book   gst10-plugins-bad \
+       expect="gst-inspect-1.0 webrtcbin >/dev/null 2>&1 && gst-inspect-1.0 dtlssrtpenc >/dev/null 2>&1 && gst-inspect-1.0 srtpenc >/dev/null 2>&1"
+
+# gst10-libav: the ffmpeg-backed decoders (avdec_h264, avdec_aac and the
+# rest).  Without it a browser and mpv fall back to whatever else can decode
+# the stream, which for H.264 video is usually nothing -- and the failure is
+# a black frame, not an error.
+#
+# AFTER ffmpeg (entry 1b) and gst10-plugins-base, which it needs, and it is
+# named here rather than left to a dependency plan so that stays true.  The
+# probe is an element again: the package installs libgstlibav.so either way,
+# and whether avdec_h264 registers depends on what ffmpeg was built with --
+# which is exactly the thing that was wrong about ffmpeg and ALSA.
+book   gst10-libav expect="gst-inspect-1.0 avdec_h264 >/dev/null 2>&1"
+
+# gst-plugins-rs: the Rust plugin set.  NOT a BLFS page, so this entry is
+# ours -- which means the ref and the build line are ours to keep true.
+#
+# Worth having here for webrtcsink/webrtcsrc (the newer WebRTC senders, used
+# by anything that publishes rather than just receives) and
+# gtk4paintablesink.  cargo-c is already installed, as a dependency of
+# librsvg.
+#
+# THREE THINGS TO KNOW BEFORE RUNNING IT:
+#   - it downloads crates at build time; there is no offline mode.
+#   - --library-type cdylib.  Without it cargo-c also installs a STATIC
+#     libgstrs*.a into /usr/lib/gstreamer-1.0, which nothing loads and which
+#     is what the first run died on.  A plugin is a shared object.
+#   - the plugin list is a CHOICE.  Building all of gst-plugins-rs is enormous
+#     and most of it is irrelevant here, so five are named.  Add with another
+#     -p; the package names are the directory names under the checkout's
+#     audio/, video/, net/ and generic/ -- `ls */*/Cargo.toml` lists them, and
+#     a wrong one fails loudly ("package(s) not found") before anything builds.
+#   - audiornnoise (RNNoise suppression, for a microphone in a call) is in
+#     gst-plugin-AUDIOFX, not a plugin of its own.  Its noise model is the
+#     nnnoiseless crate, vendored by cargo, so there is no system library to
+#     install first.
+#   - ref=main is not a pin.  Upstream tags 0.14.x for GStreamer 1.28, but
+#     that pairing is unverified here, so this follows main rather than
+#     claiming a tag that may not match.  Pin it once a build succeeds:
+#     the ref that worked is the one to write down.
+git    gst-plugins-rs \
+       url=https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git \
+       ref=main \
+       have=/usr/lib/gstreamer-1.0/libgstrswebrtc.so \
+       build="cargo cbuild --release --library-type cdylib --prefix=/usr --libdir=/usr/lib -p gst-plugin-webrtc -p gst-plugin-rtp -p gst-plugin-dav1d -p gst-plugin-gtk4 -p gst-plugin-audiofx" \
+       install="cargo cinstall --release --library-type cdylib --prefix=/usr --libdir=/usr/lib -p gst-plugin-webrtc -p gst-plugin-rtp -p gst-plugin-dav1d -p gst-plugin-gtk4 -p gst-plugin-audiofx" \
+       expect="gst-inspect-1.0 webrtcsink >/dev/null 2>&1 && gst-inspect-1.0 audiornnoise >/dev/null 2>&1"
+
+# H.264 ENCODING, WHICH IS A DIFFERENT PACKAGE FROM DECODING.
+#
+# avdec_h264 (decode) comes from gst10-libav above.  Nothing in this stack
+# produced an ENCODER, and every camera site that publishes video wants one:
+# x264enc lives in gst-plugins-UGLY, openh264enc/dec in -bad but only if
+# libopenh264 was there when -bad configured.
+#
+# The book's own words on the switch this needs: "Without this switch,
+# plugins with dependencies on (A)GPL licensed libraries are not built" --
+# so `[gst10-plugins-ugly] gpl = enabled` in machine.conf is not optional
+# here, it is the difference between having x264enc and not.
+book   gst10-plugins-ugly expect="gst-inspect-1.0 x264enc >/dev/null 2>&1"
+
+# 6b. does the whole chain actually exist?  (reports, builds nothing)
+check  webrtc
+
+# No exclusions.  The book's dependency graph is built as the book states
+# it, recommendations included: a recommendation is there for a reason, and
+# skipping one is how texlive came to build before FreeType.  This costs
+# build time (texlive, LibreOffice and their tails are hours) and buys a
+# system that matches the book.
+# librice, BEFORE webkitgtk.  NOT a BLFS page (the 13.1 book does not
+# mention it -- checked, zero occurrences).
+#
+# webkitgtk 2.52 takes its ICE from librice rather than libnice when
+# USE_GSTREAMER_WEBRTC=ON, and says so:
+#     Checking for module 'rice-proto' -- Package 'rice-proto' not found
+#     librice-{io,proto} is needed for USE_LIBRICE.
+#
+# EVERYTHING BELOW WAS CHECKED against the repository, after a first attempt
+# that guessed all three and got all three wrong:
+#   * the repo is github.com/ystreet/librice (the author's).
+#     gitlab.freedesktop.org/gstreamer/librice answers 401 -- it is not
+#     there -- which is what the failed clone was telling us.
+#   * newest tag v0.4.3 (0.3.1, 0.4.0-0.4.2 also exist).  Pinned, not main.
+#   * the workspace members are **rice-proto** and **rice-io**, not
+#     librice-proto/librice-io.  `-p librice-proto` would have failed after
+#     the clone finally worked.
+#   * both declare [package.metadata.capi], so cargo-c is the right tool and
+#     the .pc files it installs are rice-proto.pc and rice-io.pc -- exactly
+#     the modules webkit looks for.
+#
+# Why not `cargo install`: that builds BINARIES into ~/.cargo/bin.  What
+# webkit needs is a C library with a pkg-config file, which is what
+# `cargo cinstall` (cargo-c) produces -- the same tool gst-plugins-rs uses
+# here.  A crates.io tarball would work too, but its API is unreachable from
+# where this was written, so the git tag is the verifiable source.
+git    librice \
+       url=https://github.com/ystreet/librice.git \
+       ref=v0.4.3 \
+       have=/usr/lib/pkgconfig/rice-proto.pc \
+       build="cargo cbuild --release --library-type cdylib --prefix=/usr --libdir=/usr/lib -p rice-proto -p rice-io" \
+       install="cargo cinstall --release --library-type cdylib --prefix=/usr --libdir=/usr/lib -p rice-proto -p rice-io" \
+       expect="pkg-config --exists rice-proto && pkg-config --exists rice-io"
+
+# woff2, BEFORE webkitgtk.  The book's webkitgtk page passes
+# `-D USE_WOFF2=OFF` and that is what a plain build gets -- so an icon font
+# served as .woff2, which is most of them, renders as nothing.  The symptom
+# is a blank square where a glyph should be, with no error anywhere.
+#
+# woff2 IS a book page (woff2-1.0.2), so its generated script carries the
+# two fixes the page documents: a `#include <cstdint>` sed for gcc-15 and
+# CMAKE_POLICY_VERSION_MINIMUM=3.5 for cmake 4.  brotli is its required
+# dependency and is already in this tree.
+#
+# Then `[webkitgtk] USE_WOFF2 = ON` in machine.conf, or this changes nothing.
+book   woff2
+
+book   webkitgtk \
+       expect="ldd /usr/lib/libwebkitgtk-6.0.so.4 2>/dev/null | grep -q woff2"
+book   mpv
+
+
+# yt-dlp -- NOT a BLFS page; upstream's release tarball.
+#
+# The RELEASE ASSET, not the git tree and not the GitHub "source code"
+# archive: those lack what the wheel's shared-data section names (the man
+# page, README.txt, the shell completions, lazy_extractors.py), all
+# generated at release time -- hatchling stops on the first one missing.
+# Checked here: this tarball builds with the book's own wheel recipe and
+# `yt-dlp --version` answers 2026.08.19.
+#
+# hatchling is the build backend (>= 1.27) and is NOT an entry here.  It is
+# already on a machine that has built any python module, and a `book
+# hatchling` line does not mean "make sure it is there": it asked the book,
+# planned a chain of newer python modules (vcs_versioning, which wants a
+# newer `packaging`) and stopped before yt-dlp ever started (1.14.314).  If
+# it IS missing, the build stops on `BackendUnavailable: Cannot import
+# 'hatchling.build'`, which lfs-helper recognises and names the page for.
+# ffmpeg is
+# not a build dependency but yt-dlp needs it at RUNTIME to merge separate
+# video and audio streams -- it comes from wayland.stack.  With yt-dlp on PATH,
+# mpv plays a URL directly:  mpv https://www.youtube.com/watch?v=...
+#
+# YOUTUBE BREAKS OLD VERSIONS WITHIN WEEKS.  A tag is pinned so a replay
+# builds what was tested; move it when downloads start failing:
+#     git ls-remote --tags https://github.com/yt-dlp/yt-dlp | tail -3
+# then edit the two version strings below and
+#     packagemanager stack media --only yt-dlp --run
+tar    yt-dlp \
+       url=https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.tar.gz \
+       pkg=yt-dlp-2026.08.19.tar.gz \
+       have=/usr/bin/yt-dlp \
+       build="pip3 wheel -w dist --no-build-isolation --no-deps --no-cache-dir ." \
+       install="pip3 install --no-index --find-links=dist --no-cache-dir --no-user --no-deps --force-reinstall yt-dlp" \
+       expect="yt-dlp --version >/dev/null 2>&1"

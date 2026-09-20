@@ -1,0 +1,94 @@
+# apps.stack -- desktop applications: a document viewer and an image viewer.
+# stack-version: 1.14.320
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
+# here: the exclusions are a property of the machine, not of one stack.
+include avoid
+
+#   packagemanager stack apps --run
+#
+# Programs you open, not the desktop they open on.  Run it AFTER sway.stack:
+# they need GTK and wayland from it, and nothing there needs them.  They
+# were the tail of sway.stack until 1.14.320.
+
+# VIEWERS: a document one and an image one.  Neither is in the BLFS book.
+#
+# CHECKED with git ls-remote, all four at once: girara, zathura and
+# zathura-pdf-poppler share the release tag **2026.07.18** (they are one
+# project, released together -- mixing tags is the usual way to get a
+# zathura that cannot open a PDF), and imv's newest is **v4.3.0**.
+# imv's repo answers on both github.com/exec64/imv and .../eXeC64/imv; the
+# lowercase spelling is used here.
+#
+# zathura is THREE packages: girara is its widget library, the core opens no
+# file formats at all, and the backend is a separate plugin.  A zathura with
+# no plugin starts, shows a grey window and says nothing -- which is what
+# the expect= below is for: it looks for the PLUGIN, not the binary.
+#
+# poppler (the backend's dependency) is a book page.  It was in avoid.stack
+# as libcupsfilters' child; it is wanted now.  mupdf stays avoided -- it is
+# the other backend and one is enough.
+book   poppler
+
+# girara installs **girara.pc**, not girara-gtk3.pc: its meson.build says
+# `pkg.generate(name: 'girara', ...)`.  The old guess made the stack refuse
+# to record a girara that had installed perfectly -- "finished, but
+# /usr/lib/pkgconfig/girara-gtk3.pc is still missing", which is the have=
+# check doing its job on a wrong have=.
+git    girara url=https://github.com/pwmt/girara.git ref=2026.07.18 \
+       have=/usr/lib/pkgconfig/girara.pc \
+       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
+       install="ninja -C build install"
+
+# xxHash, BEFORE zathura.  Mentioned eight times in the BLFS book and given
+# no page of its own, so this entry is ours.
+#
+# zathura 2026.07.18 takes it as a hard dependency:
+#     Run-time dependency libxxhash found: NO (tried pkgconfig and cmake)
+#     meson.build:57:9: ERROR: Dependency "libxxhash" not found
+#
+# CHECKED in the checkout: newest tag v0.8.3; it ships libxxhash.pc.in, so
+# the pkg-config module really is `libxxhash` -- the name meson asks for --
+# and `make install` runs install_libxxhash.pc among its targets.  A plain
+# Makefile, no cmake or meson: PREFIX and LIBDIR are what it takes.
+git    xxhash url=https://github.com/Cyan4973/xxHash.git ref=v0.8.3 \
+       have=/usr/lib/pkgconfig/libxxhash.pc \
+       build="make PREFIX=/usr LIBDIR=/usr/lib" \
+       install="make PREFIX=/usr LIBDIR=/usr/lib install" \
+       expect="pkg-config --exists libxxhash"
+
+# NO -Dsqlite: zathura has no such option.  Its meson.build takes sqlite as
+# an unconditional dependency -- `dependency('sqlite3', version: '>=3.35.0')`
+# -- and its only options are synctex, seccomp, landlock, manpages,
+# tests-x11, tests-wayland and convert-icon.  `-Dsqlite=enabled` stopped
+# meson dead with `Unknown option: "sqlite"`, which is what guessing an
+# option name earns.  sqlite3 is already installed here (p_sqlite).
+git    zathura url=https://github.com/pwmt/zathura.git ref=2026.07.18 \
+       prog=zathura \
+       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
+       install="ninja -C build install"
+
+git    zathura-pdf-poppler url=https://github.com/pwmt/zathura-pdf-poppler.git \
+       ref=2026.07.18 \
+       have=/usr/lib/zathura/libpdf-poppler.so \
+       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
+       install="ninja -C build install" \
+       expect="test -e /usr/lib/zathura/libpdf-poppler.so"
+
+# imv: wayland image viewer.  The binary is `imv`, which dispatches to
+# imv-wayland or imv-x11 -- so the probe wants the wayland one, or on this
+# machine it would pass on an imv that can only open windows under X.
+# -licuuc: imv links libicuio and CALLS libicuuc (ubrk_close), and its
+# link line carries -Wl,--no-undefined, so the indirect dependency is an
+# error rather than a warning:
+#     undefined reference to symbol 'ubrk_close_78'
+#     /lib/libicuuc.so.78: error adding symbols: DSO missing from command line
+# icu splits its API across libicuuc (common), libicui18n and libicuio;
+# imv's meson names only the one it uses directly.  Naming the other on the
+# link line is the whole fix -- nothing is patched.
+git    imv url=https://github.com/exec64/imv.git ref=v4.3.0 \
+       prog=imv \
+       build="meson setup build --prefix=/usr --buildtype=release -D c_link_args=-licuuc; ninja -C build" \
+       install="ninja -C build install" \
+       expect="command -v imv-wayland >/dev/null 2>&1 || ldd /usr/bin/imv 2>/dev/null | grep -q wayland"
+

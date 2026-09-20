@@ -1,0 +1,54 @@
+# tools.stack -- command-line tools for everyday use.
+# stack-version: 1.14.320
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
+# here: the exclusions are a property of the machine, not of one stack.
+include avoid
+
+#
+#   packagemanager stack tools --run
+#
+# WHY ITS OWN STACK.  Every stack here answers one question (see dev.stack).
+# This one is "the small programs you type": nothing boots with them, the
+# desktop does not need them, and nothing depends on them -- safe to build
+# last, safe to leave out.
+
+# TRANSLATE SHELL (`trans`): Google, Bing, Yandex and others from a terminal.
+#     trans :de "good evening"          -> German
+#     trans -b en:de "text"             just the translation
+#     trans -shell                      interactive
+#
+# Not a BLFS page; upstream's tag.  v0.9.7.1 is the newest (checked with git
+# ls-remote); built and installed here with the two lines below: `make`
+# runs gawk over the sources and writes ONE script, build/trans, and
+# `make PREFIX=/usr install` copies it and trans.1.  Nothing is compiled.
+#
+# gawk is its interpreter (LFS has it).  curl is what it fetches with -- it
+# warns "curl is not found" and returns nothing without it -- hence needs=.
+# Optional at runtime: mpv for -speak (media.stack), rlwrap for -shell history.
+git    translate-shell \
+       url=https://github.com/soimort/translate-shell \
+       ref=v0.9.7.1 \
+       prog=trans \
+       needs=curl \
+       build="make" \
+       install="make PREFIX=/usr install" \
+       expect="test -x /usr/bin/trans"
+
+# jq -- moved here from sway.stack in 1.14.320.  Not in the book, so this entry is ours -- and it was BUILT to write
+# it, not guessed:
+#
+#   - jq-1.8.2 is the newest tag (jq-1.8.2rc1 exists too; the release
+#     tarball is the non-rc one), md5 e288a84cf2957ea2cfc643aa9e59b473
+#   - the release tarball ships `configure`, so no autogen.sh step
+#   - oniguruma is NOT on the system and does not need to be: configure says
+#     "Oniguruma was not found.  Will use the packaged oniguruma", builds the
+#     copy in vendor/, and `jq -n '"abc"|test("b")'` answers true.  That is
+#     the probe below -- `jq --version` would pass on a jq with no regex,
+#     which is the half of jq most scripts use.
+tar    jq url=https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-1.8.2.tar.gz \
+       pkg=jq-1.8.2.tar.gz prog=jq \
+       build="./configure --prefix=/usr; make" \
+       install="make install" \
+       expect="jq -n '\"abc\" | test(\"b\")' >/dev/null 2>&1"
+

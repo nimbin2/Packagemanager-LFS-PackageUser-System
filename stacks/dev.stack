@@ -1,0 +1,43 @@
+# dev.stack -- the tools for looking at a program that has gone wrong.
+# stack-version: 1.14.320
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
+# here: the exclusions are a property of the machine, not of one stack.
+include avoid
+
+#
+#   packagemanager stack dev --run
+#
+# WHY ITS OWN STACK, and not one of the others.  Every stack here answers one
+# question.  services = what starts at boot; network = how the machine gets an
+# address; sway = the desktop; diag = is the GPU doing what I think; media =
+# what plays.  A debugger is none of those, and putting it in the nearest one
+# would be the start of a stack that means nothing.  This is the one that
+# means "the program crashed and I want to know why".
+#
+# Nothing depends on these.  They are safe to build last, and safe not to
+# build at all -- which is the other reason they are not in a stack whose
+# entries the desktop needs.
+
+# GDB.  The book's page takes --with-system-readline, --with-system-zlib and
+# --with-python=/usr/bin/python3, and installs gdb, gdbserver, gcore, gstack
+# and gdb-add-index; the generated script comes from that page, so none of it
+# is repeated here.
+#
+# Its only "required" dependency is the python module `six`, and that is for
+# gdb's own Python scripting at RUNTIME -- gdb builds and debugs without it.
+# The rest of the book's list (guile, doxygen, valgrind, rustc, SystemTap) is
+# for gdb's test suite, not for gdb.
+#
+# On a package-user system the thing to remember is the OTHER half of
+# debugging: a binary built by a package user carries whatever debug
+# information its own build left in, and `packagemanager` does not strip
+# anything.  If a backtrace is all `??`, the package was built without -g and
+# has to be rebuilt, not re-debugged:
+#     packagemanager update <pkg> --reinstall --regenerate --run
+# with `[<pkg>] cflags = -g` in machine.conf.
+book   gdb expect="test -x /usr/bin/gdb"
+
+# Room here, deliberately: strace, ltrace and valgrind are the obvious
+# neighbours and each is a BLFS page.  They are not added unasked -- an entry
+# in a stack is a package that gets built on every replay of it.

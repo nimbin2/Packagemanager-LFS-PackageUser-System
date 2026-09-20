@@ -1,4 +1,11 @@
 # network.stack -- wired and wireless networking, for a SysV system.
+# stack-version: 1.14.320
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
+# here: the exclusions are a property of the machine, not of one stack.
+# Without it a dependency plan walks into systemd, qt6, cups and texlive.
+include avoid
+
 #
 # The sway stack builds a desktop; nothing in it brings up a network.  This is
 # what `wifi` (wpa_cli / wpa_supplicant / ifup) needs, plus a firewall.
@@ -7,6 +14,15 @@
 #   packagemanager stack network --yes --run
 #
 # Every entry here is a BLFS package, checked against the book.
+
+# THE SYSTEM ACCOUNTS THIS MACHINE NEEDS, DECLARED ONCE.
+#
+# A package user cannot create an account, so every book "Configuring"
+# section that says `useradd` is refused and recorded -- correctly, and then
+# somebody types it from the failure box hours later, from memory, with the
+# uid it happened to suggest.  accounts.conf is where they are written down
+# instead, and this step creates them BEFORE the package that wants them.
+cfg    accounts
 
 book   libnl                    # netlink, what wpa_supplicant talks to the kernel with
 book   wpa_supplicant           # wpa_supplicant, wpa_cli, wpa_passphrase
@@ -21,9 +37,42 @@ book   libmnl                   # minimal netlink library; libnftnl needs it
 # upstream moves -- `--check-refs` asks git remotes and cannot see a tar url.
 tar    libnftnl url=https://www.netfilter.org/pub/libnftnl/libnftnl-1.3.2.tar.xz pkg=libnftnl-1.3.2.tar.xz have=/usr/lib/libnftnl.so build="./configure --prefix=/usr --disable-static; make" install="make install"
 
-book   iptables                 # nft backend, via machine.conf (see below)
+# THE BOOK DISABLES NFTABLES; THIS MACHINE'S KERNEL HAS NOTHING ELSE.
+#
+# BLFS configures iptables with --disable-nftables, so you get the legacy
+# binaries only -- and a kernel built without CONFIG_IP_NF_IPTABLES answers
+#     modprobe: FATAL: Module ip_tables not found
+#     iptables: can't initialize iptables table `filter'
+# for every rule.  `[iptables] configure_args = --enable-nftables` in
+# machine.conf fixes it (the merge drops the book's --disable-nftables when
+# it adds the opposite), and the probe makes sure: with nftables support
+# `iptables --version` says (nf_tables), without it (legacy).
+book   iptables expect="test -x /usr/sbin/xtables-nft-multi"
+
+# ...AND THEN SWITCH TO IT.  `--enable-nftables` builds both backends and
+# upstream's install leaves the plain names on the legacy one, so
+# `iptables --version` still says (legacy) after a build whose log says
+# "nftables support: yes".  This step points iptables/ip6tables and their
+# save/restore at xtables-nft-multi, and the probe checks the result rather
+# than the build.
+cfg    iptables-nft                 # nft backend, via machine.conf (see below)
 
 book   net-tools                # ifconfig, route, netstat
+
+# THE ADDRESS HAS TO COME FROM SOMEWHERE.  `lfs config network dhcp` writes
+# no static interface files on purpose and says a DHCP client comes from BLFS
+# afterwards -- and this stack did not have one, so a joined wireless link sat
+# there with no address and `ifup` had no service to hand off to.
+book   dhcpcd                   # the DHCP client; SERVICE=dhcpcd in ifconfig.*
+
+# openssh lives HERE, not in services.stack and not anywhere near sway: it
+# is networking.  Its bootscript comes from blfs-bootscripts
+# (install-sshd), which the services stack installs afterwards -- so sshd is
+# startable once both stacks have run, and `expect` below checks only what
+# this entry can be responsible for.
+book   openssh expect="test -x /usr/sbin/sshd"
+
+check  net-wifi                 # what is still missing to bring a link up
 
 # ---------------------------------------------------------------------------
 # iptables-nft

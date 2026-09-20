@@ -1,0 +1,112 @@
+# diag.stack -- GPU diagnostic tools: glxinfo, eglinfo, vulkaninfo, vainfo, nvtop.
+# stack-version: 1.14.320
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack.
+include avoid
+
+#
+# Replay with:  packagemanager stack diag --run
+#
+# WHY ITS OWN STACK.  Nothing needs these; they answer "is the GPU doing
+# what I think?"  None of the four is a BLFS page (mesa-demos is only an
+# optional link on the Mesa page), so the refs, build lines and probes are
+# ours to keep true.  Each entry says what was checked.
+#
+# Probes check the programs exist, not that they talk to a GPU: the stack
+# may run in a chroot with no display and no /dev/dri.  On the running
+# desktop, try:
+#     glxinfo -B          eglinfo -B        (Mesa renderer, e.g. radeonsi)
+#     vulkaninfo --summary                  (RADV on AMD)
+#     vainfo                                (needs Mesa built with VA-API)
+#     nvtop
+
+# ===========================================================================
+#  GPU VENDOR -- the only choice in this file.  THIS MACHINE: AMD (onboard).
+# ===========================================================================
+#
+#  Only nvtop is vendor-specific; the other three work for any Mesa driver.
+#  To change vendor, edit the -D..._SUPPORT flags in the nvtop entry:
+#
+#     AMD      -DAMDGPU_SUPPORT=ON     (amdgpu kernel driver, libdrm)
+#     Intel    -DINTEL_SUPPORT=ON      (i915 / xe kernel driver, libdrm)
+#     NVIDIA   -DNVIDIA_SUPPORT=ON     (proprietary driver: loads libnvidia-ml
+#                                       at runtime; nouveau is NOT supported)
+#
+#  More than one may be ON (a laptop with two GPUs).  Then rebuild it:
+#     packagemanager stack diag --only nvtop --run --force
+#
+#  vainfo on NVIDIA needs a VA-API driver that is not Mesa (nvidia-vaapi-
+#  driver); vainfo itself is unchanged.
+
+# mesa-demos -> glxinfo, glxgears, eglinfo (and ~300 GL demos)
+#
+# NOT CHECKED from here: gitlab.freedesktop.org is unreachable where this
+# was written.  mesa-demos-9.0.0 is the release BLFS pointed at; check for
+# a newer one before trusting the pin:
+#     git ls-remote --tags https://gitlab.freedesktop.org/mesa/demos.git
+# glut=disabled: freeglut is in avoid.stack, and only a few demos use it.
+# If meson rejects an option name, the tag's meson_options.txt has the
+# real ones.
+#
+# libdecor-0:demo=false.  The wayland demos pull libdecor in as a meson
+# subproject, and its OWN demo needs pkg-config `opengl` (libglvnd's).  That
+# failed here once, before Mesa was switched to glvnd -- now it would build,
+# but nobody runs libdecor's demo, so it stays off.
+#
+# `rm -rf build` first: a failed `meson setup` leaves a half-configured
+# build directory, and the retry then stops on "already configured".
+git    mesa-demos \
+       url=https://gitlab.freedesktop.org/mesa/demos.git \
+       ref=mesa-demos-9.0.0 \
+       needs=mesa,glu,wayland-protocols \
+       have=/usr/bin/eglinfo \
+       build="rm -rf build; meson setup build --prefix=/usr --buildtype=release -Dglut=disabled -Dgles1=disabled -Dosmesa=disabled -Dlibdecor-0:demo=false; ninja -C build" \
+       install="ninja -C build install" \
+       expect="test -x /usr/bin/glxinfo && test -x /usr/bin/eglinfo"
+
+# vulkan-tools -> vulkaninfo, vkcube
+#
+# CHECKED: github KhronosGroup/Vulkan-Tools tags are vulkan-sdk-1.4.N.M, up
+# to vulkan-sdk-1.4.357.0.  Its CMake asks for VulkanHeaders of ITS OWN
+# version, so a fixed pin breaks the first time the book moves the headers.
+# The clone is full (tags included), so the build checks out the newest tag
+# for the INSTALLED loader's version -- nothing to edit on an update.
+# BUILD_ICD=OFF: the mock driver is for testing the loader, not a GPU.
+git    vulkan-tools \
+       url=https://github.com/KhronosGroup/Vulkan-Tools.git \
+       ref=main \
+       needs=vulkan-loader,glslang,wayland-protocols \
+       have=/usr/bin/vulkaninfo \
+       build='v=$(pkg-config --modversion vulkan); t=$(git tag -l "vulkan-sdk-$v.*" | sort -V | tail -1); test -n "$t" || { echo "no Vulkan-Tools tag for vulkan $v"; exit 1; }; git checkout -q "$t" && cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DBUILD_ICD=OFF -DBUILD_TESTS=OFF && cmake --build build' \
+       install="cmake --install build" \
+       expect="test -x /usr/bin/vulkaninfo"
+
+# libva-utils -> vainfo
+#
+# CHECKED: github intel/libva-utils tags 2.20.1 ... 2.24.0.  Its minor
+# follows libva's (libva 2.24 = VA-API 1.24, whose .pc reports 1.24.x), so
+# the build picks the newest 2.<that minor>.* tag.  On AMD, vainfo lists
+# profiles only if Mesa was built with its VA-API driver (radeonsi).
+git    libva-utils \
+       url=https://github.com/intel/libva-utils.git \
+       ref=master \
+       needs=libva \
+       have=/usr/bin/vainfo \
+       build='m=$(pkg-config --modversion libva | cut -d. -f2); t=$(git tag -l "2.$m.*" | sort -V | tail -1); test -n "$t" || { echo "no libva-utils tag for libva 2.$m"; exit 1; }; git checkout -q "$t" && rm -rf build && meson setup build --prefix=/usr --buildtype=release -Dx11=false -Dwayland=true -Ddrm=true && ninja -C build' \
+       install="ninja -C build install" \
+       expect="test -x /usr/bin/vainfo"
+
+# nvtop -> nvtop (GPU load, memory, processes)
+#
+# CHECKED: github Syllo/nvtop, newest tag 3.3.2; option names from its
+# CMakeLists.txt.  On x86 Linux EVERY backend defaults ON, so all are named
+# here -- ON only for this machine's GPU (see GPU VENDOR above).
+# USE_LIBUDEV_OVER_LIBSYSTEMD: this is a SysV system; libudev comes from udev.
+git    nvtop \
+       url=https://github.com/Syllo/nvtop.git \
+       ref=3.3.2 \
+       needs=libdrm \
+       have=/usr/bin/nvtop \
+       build="cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DUSE_LIBUDEV_OVER_LIBSYSTEMD=ON -DAMDGPU_SUPPORT=ON -DINTEL_SUPPORT=OFF -DNVIDIA_SUPPORT=OFF -DMSM_SUPPORT=OFF -DPANFROST_SUPPORT=OFF -DPANTHOR_SUPPORT=OFF -DV3D_SUPPORT=OFF -DMETAX_SUPPORT=OFF -DTPU_SUPPORT=OFF -DENFLAME_SUPPORT=OFF && cmake --build build" \
+       install="cmake --install build" \
+       expect="nvtop --version >/dev/null"
