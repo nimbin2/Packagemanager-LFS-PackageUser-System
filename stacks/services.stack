@@ -1,5 +1,5 @@
 # services.stack -- the boot-time services a SysV desktop needs.
-# stack-version: 1.14.320
+# stack-version: 1.14.330
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -51,6 +51,39 @@ git    bash-completion url=https://github.com/scop/bash-completion ref=2.18.0 \
 # saying `'C' is not a UTF-8 locale`, with nothing to say why.
 cfg    shell-env \
        expect='test -f /etc/bashrc && test -f /etc/locale.conf && { test ! -d /etc/profile.d || test -f /etc/profile.d/i18n.sh; }'
+
+# BTRFS, ON A BTRFS MACHINE ONLY.  `btrfs check`, `scrub`, `balance`,
+# subvolumes and snapshots all come from btrfs-progs, and without it a btrfs
+# root can be mounted and nothing else -- no repair, no snapshot, and
+# mkinitramfs/fsck have no helper.  when= asks the machine: a filesystem
+# mounted now, or a partition on any disk (so it is also right in a chroot
+# whose target is btrfs and in the installer, before the mount).
+book   btrfs-progs \
+       when="grep -qw btrfs /proc/mounts || lsblk -no FSTYPE 2>/dev/null | grep -qx btrfs || blkid -t TYPE=btrfs >/dev/null 2>&1" \
+       expect="command -v btrfs >/dev/null && btrfs --version >/dev/null"
+
+# EXFAT, WHICH ARRIVES IN A POCKET.  mkfs.exfat / fsck.exfat / exfatlabel
+# for the cards and sticks that come formatted that way -- no when= test,
+# because the medium is not in the machine when the stack runs.
+#
+# NOT A BLFS PAGE.  The book carries no exFAT package at all (checked
+# against the stable index, 1.14.330); what it links to in passing is
+# relan/exfat, the FUSE implementation -- a different thing.  This is the
+# userspace for the KERNEL driver, which is the modern path and the one
+# this machine uses:
+#     lfs-kernel enable exfat        # EXFAT_FS=m, then lfs-kernel --run
+# relan/exfat (mount.exfat-fuse) is only worth having on a kernel without
+# that driver.
+#
+# The release tarball is an autotools dist, so ./configure is in it; the
+# build line falls back to autogen.sh if a future tarball is a bare export.
+tar    exfatprogs \
+       url=https://github.com/exfatprogs/exfatprogs/releases/download/1.4.2/exfatprogs-1.4.2.tar.xz \
+       pkg=exfatprogs-1.4.2.tar.xz \
+       prog=mkfs.exfat \
+       build="test -x ./configure || ./autogen.sh; ./configure --prefix=/usr --sbindir=/usr/sbin; make" \
+       install="make install" \
+       expect="command -v mkfs.exfat >/dev/null && command -v fsck.exfat >/dev/null"
 
 book   acpid                    # power/lid/button events -- what a laptop needs
 

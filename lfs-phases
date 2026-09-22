@@ -34,7 +34,7 @@
 # scripts are also SOURCED by lfs-helper to read their metadata, and this file
 # comes along -- it must not shadow anything in the sourcing shell.
 
-PKGUSR_LIB_VERSION="1.14.321"
+PKGUSR_LIB_VERSION="1.14.340"
 
 _pp_build_id() {
     local f="${BASH_SOURCE[0]}"
@@ -570,9 +570,66 @@ _pp_warn_unbuilt() {
     return 0
 }
 
+# DOCUMENTATION THAT WAS NEVER BUILT IS NOT A FAILED INSTALL.
+#
+# parted's page ends with the book's doc block:
+#     install -v -m644 doc/{FAT,API,parted.{html,txt,pdf,ps,dvi}} \
+#             /usr/share/doc/parted-3.7
+# parted.pdf, parted.ps, parted.dvi and API are built only when texlive is
+# installed, and texlive is in avoid.stack.  So `install` stopped on
+#     install: cannot stat 'doc/parted.pdf': No such file or directory
+# after the package itself -- 97 files, every binary and library -- was
+# already on disk.  A missing PDF is not a failed install.
+#
+# Only for a destination under share/doc, only after the command has been
+# tried EXACTLY as the book wrote it, and only for sources that are not
+# there: everything else is passed through to /usr/bin/install untouched.
+# The function is defined inside this phase, which runs in a child process
+# of its own, so nothing outside it ever sees an `install` that is not the
+# real one.
+_pp_install_docs() {
+    local last="" a; for a in "$@"; do last="$a"; done
+    case "$last" in
+        */share/doc/*|*/share/doc|*/share/gtk-doc/*) ;;
+        *) command install "$@"; return $? ;;
+    esac
+    command install "$@" 2>/dev/null && return 0
+    local rc=$?
+    local keep=() prev="" i=0 n=$# missing="" have=0
+    for a in "$@"; do
+        i=$((i + 1))
+        if [ "$i" -eq "$n" ]; then keep+=("$a"); continue; fi
+        case "$prev" in
+            -m|-o|-g|-t|--mode|--owner|--group|--target-directory)
+                keep+=("$a"); prev=""; continue ;;
+        esac
+        case "$a" in -*) keep+=("$a"); prev="$a"; continue ;; esac
+        prev=""
+        if [ -e "$a" ] || [ -L "$a" ]; then
+            keep+=("$a"); have=$((have + 1))
+        else
+            missing="$missing $a"
+        fi
+    done
+    # nothing missing -> the failure is a real one, and it is the book's
+    # command that must be reported, not ours
+    if [ -z "$missing" ]; then
+        command install "$@"
+        return $?
+    fi
+    if [ "$have" -gt 0 ]; then
+        command install "${keep[@]}" || { command install "$@"; return $?; }
+    fi
+    _pp_note "not installed, because this build did not produce them:$missing"
+    _pp_note "   they are documentation (the book's doc block builds them"
+    _pp_note "   only with texlive and friends); the package itself is in."
+    return 0
+}
+
 _pp_phase_install() {
     _pp_enter_build || return 1
     _pp_warn_unbuilt
+    install() { _pp_install_docs "$@"; }
     install_pkg
 }
 

@@ -129,7 +129,7 @@ CACHE_VERSION = 56   # v56: a skipped build variant does not keep its install st
 # tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
 # of generated install scripts changes (phases, dispatcher, ...), and
 # CACHE_VERSION when the parsed/cached data structure changes.
-BLFS_VERSION = "1.14.321"
+BLFS_VERSION = "1.14.340"
 
 
 def _build_id():
@@ -147,7 +147,7 @@ def _build_id():
     except OSError:
         return "unknown"
 
-SCRIPT_VERSION = 17   # v17: the runner moved out into lfs-phases
+SCRIPT_VERSION = 19   # v19: a test line chained into the build block is dropped
 
 
 def _tty_out():
@@ -1490,7 +1490,13 @@ def _emit_command_elements(elements, out, nested):
                     out.append(SKIP_MARK + _g)
                     out.append(_commented(text))
                 else:
-                    out.append(text)
+                    text, _dropped = _strip_test_lines(text)
+                    if _dropped:
+                        out.append(SKIP_MARK + "the test suite, chained into "
+                                   "this block -- `--test` runs it")
+                        out.append(_commented("\n".join(_dropped)))
+                    if text.strip():
+                        out.append(text)
         elif name == "div":
             classes = list(el.get("class", []))
             if "admon" in classes:
@@ -1556,7 +1562,13 @@ _COND_GUARD_RE = re.compile(r"^(if\b|optionally\b|should you\b)", re.I)
 _TEST_BLOCK_RE = re.compile(
     r"^(to test\b|to check\b|the test suite\b|tests? (can|may) be run\b)"
     r"|\bcan be tested\b|\bto test the (results|installation|build)\b"
-    r"|\bto run the test", re.I)
+    r"|\bto run the test"
+    # LVM2 13.0: "If you wish to run the tests, install a minimal set of
+    # ... first" -- an INSTALL command that is part of the test suite, and
+    # the only thing marking it as such is the sentence above it.
+    r"|\bif you (wish|want) to run the test"
+    r"|\bbefore running the test"
+    r"|\bfor the test suite\b", re.I)
 
 # THE COMMANDS SAY WHAT THEY ARE, AND PROSE IS A SECOND-HAND ACCOUNT.
 #
@@ -1571,7 +1583,17 @@ _TEST_BLOCK_RE = re.compile(
 # commands, so a rewording upstream cannot bring the bug back.
 _TEST_CONTENT_RE = re.compile(
     r"""(?mx)
-      ^\s*(make|ninja)\s+(-\w+\s+)*(check|test)\b   # make check / ninja test
+      ^\s*(\w+=\S*\s+)*(make|ninja)\s+(-\w+\s+)*(check|test)\b
+                                                    # make check / ninja test
+    | ^\s*(\w+=\S*\s+)*(make|ninja)\s+(-\w+\s+)*(check|test)[_-]\w+
+                                                    # LC_ALL=... make check_local
+                                                    # (the old pattern needed a
+                                                    #  word boundary after
+                                                    #  "check", which
+                                                    #  "check_local" has not --
+                                                    #  and no env assignment in
+                                                    #  front, which LVM2's page
+                                                    #  has)
     | ^\s*meson\s+test\b
     | ^\s*ctest\b
     | ^\s*py\.test\b | ^\s*pytest\b
@@ -1580,6 +1602,84 @@ _TEST_CONTENT_RE = re.compile(
     | ^\s*python3?\s+-m\s+venv\b                    # a throwaway test venv
     | ^\s*source\s+\S*testenv/bin/activate
     """)
+
+
+# A COMMAND THAT ONLY ROOT CAN RUN IS NOT AN INSTALL STEP.
+#
+# LVM2's page (13.0) puts three blocks between the build and the install:
+# a partial install for the test suite, then
+#     mount -o remount,dev /tmp
+# and then `make check_local`.  The middle one is not about installing
+# anything -- it prepares /tmp so the tests may create device nodes -- and
+# it ran in the install phase, as the package user:
+#     mount: /tmp: must be superuser to use mount.
+#     !! phase 'install' FAILED (exit 32)
+# A package user cannot mount, load a module or make a device node, and no
+# BLFS page needs it to: those commands belong to the system, not to the
+# package.  (`make check_local` was missed too -- the test pattern required
+# a word boundary after "check", and "check_local" has none.)
+_ROOT_ONLY_RE = re.compile(
+    r"""(?mx)
+      ^\s*mount\b | ^\s*umount\b
+    | ^\s*modprobe\b | ^\s*insmod\b
+    | ^\s*mknod\b
+    | ^\s*swapon\b | ^\s*swapoff\b
+    """)
+
+
+def _root_only_reason(pre):
+    """Why this block cannot run as the package user, or None."""
+    m = _ROOT_ONLY_RE.search(pre.get_text())
+    if not m:
+        return None
+    hit = " ".join(m.group(0).split())
+    return ("it needs root and the system, not this package (`%s`) -- run it "
+            "yourself if you want it" % hit)
+
+
+# A TEST COMMAND CHAINED INTO THE BUILD BLOCK.
+#
+# Every Perl module in BLFS uses "the standard build and installation
+# instructions", which are ONE block:
+#     perl Makefile.PL &&
+#     make &&
+#     make test
+# So the test suite is not a block to skip -- it is the last line of the
+# block that builds the package, joined with &&.  XML::Parser's tests fail
+# on this machine (62 files, 60 of them cannot even load the module) and
+# took the whole gparted chain down in the BUILD phase; Class::Inspector's
+# passed, which is why nobody noticed the tests were running at all.
+#
+# Tests run here only when they are asked for (PKGUSR_TESTS=1, which is
+# `--test`), and then the runner runs them ITSELF, in the test phase.  So
+# the line comes out of the build, with the book's own text left in a
+# comment, and the trailing && of the line before it goes too.
+_TEST_LINE_RE = re.compile(
+    r"""^\s*(\w+=\S*\s+)*(make|ninja|meson|ctest|py\.test|pytest)\b[^&|;]*?
+         \b(check|test)([_-]\w+)?\b[^&|;]*$""", re.X)
+
+
+def _strip_test_lines(text):
+    """Drop `make test` / `make check` lines from a block that also builds.
+
+    Returns (text, dropped-lines).  A block that is ONLY tests comes back
+    empty and its caller keeps treating it as a test block."""
+    lines = text.splitlines()
+    keep, dropped = [], []
+    for ln in lines:
+        if _TEST_LINE_RE.match(ln.strip()) and not re.search(r"\binstall\b", ln):
+            dropped.append(ln.strip())
+            continue
+        keep.append(ln)
+    if not dropped:
+        return text, []
+    # the line before a dropped last line ends in `&&` (or `;`) that now
+    # chains to nothing -- and `make &&` on its own is a syntax error
+    while keep and not keep[-1].strip():
+        keep.pop()
+    if keep:
+        keep[-1] = re.sub(r"\s*(&&|\|\||;)\s*$", "", keep[-1])
+    return "\n".join(keep), dropped
 
 
 def _test_content_reason(pre):
@@ -1609,7 +1709,7 @@ def _conditional_guard(pre):
     "optional" wins over both: an optional tool is exactly what we do not
     install."""
     # content first: it does not depend on the book's wording or nesting
-    _by_content = _test_content_reason(pre)
+    _by_content = _root_only_reason(pre) or _test_content_reason(pre)
     if _by_content:
         return _by_content
     prev = pre.find_previous(["p", "pre", "h3", "h4"])
@@ -1710,6 +1810,14 @@ def extract_commands_phased(sec):
             if guard:
                 stream.append(SKIP_MARK + guard)
                 stream.append(_commented(text))
+                continue
+            text, _dropped = _strip_test_lines(text)
+            if _dropped:
+                stream.append(SKIP_MARK + "the test suite, chained into this "
+                              "block with && -- run it with `--test`, which "
+                              "runs it in the test phase")
+                stream.append(_commented("\n".join(_dropped)))
+            if not text.strip():
                 continue
             stream.append(text)
         else:                                            # h3 / h4

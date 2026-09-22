@@ -1,9 +1,11 @@
-# apps.stack -- desktop applications: a document viewer and an image viewer.
-# stack-version: 1.14.320
+# apps.stack -- desktop applications: a document viewer, an image viewer and
+# a partition editor.
+# stack-version: 1.14.334
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
 include avoid
+
 
 #   packagemanager stack apps --run
 #
@@ -92,3 +94,27 @@ git    imv url=https://github.com/exec64/imv.git ref=v4.3.0 \
        install="ninja -C build install" \
        expect="command -v imv-wayland >/dev/null 2>&1 || ldd /usr/bin/imv 2>/dev/null | grep -q wayland"
 
+# GPARTED -- partitions, with a window.  It is a BLFS page (Gparted-1.7.0),
+# so the planner brings gtkmm3 and parted with it; both are C++/GTK builds
+# and this is not a five-minute entry.
+#
+# IT RUNS AS ROOT, FROM A TERMINAL.  The book's page uses polkit for the
+# graphical "type your password" step, and polkit is in avoid.stack (it
+# arrives only through colord and systemd, which this machine does not
+# have).  Without it there is no menu entry that can ask: start it from a
+# root shell.  `gparted` alone then works; it needs $DISPLAY/$WAYLAND_DISPLAY,
+# so run it from a terminal inside the session.
+#
+# The partition TOOLS it drives are separate packages -- exfatprogs and
+# btrfs-progs are in services.stack; what is missing shows up greyed out in
+# gparted's filesystem menu, not as an error.
+# LVM2 IS NOT PART OF A PARTITION EDITOR.  The book RECOMMENDS it for
+# parted, so the planner pulls it in -- and on this machine, which has no
+# logical volumes, it is an hour of build and a package whose install wants
+# root (13.0's page puts `mount -o remount,dev /tmp` in the middle of it).
+# ignore= keeps it out of this entry's plan only; install it deliberately
+# the day this laptop grows an LVM volume:
+#     packagemanager install lvm2 --run --recursive
+book   gparted \
+       ignore=lvm2 \
+       expect="command -v gparted >/dev/null"

@@ -72,11 +72,14 @@ lfs-helper build-all          # inside: chapters 7-9
 packagemanager bootstrap --run   # wget, Python modules, BLFS book, certificates
 packagemanager stack            # list the stacks
 packagemanager stack sway --run  # then network, services; apps and tools when wanted
-lfs-kernel                    # the kernel, from /etc/pkgusr/kernel.conf
+lfs-kernel --run              # the kernel, from /etc/pkgusr/kernel.conf
 ```
 
 `lfs run` and `build-all` continue from wherever they stopped. Run them again
 after a reboot, a failure, or a cancel.
+
+An entry can carry `when="<shell>"`: it is built only where that command
+succeeds. `btrfs-progs` in services.stack is built on btrfs machines only.
 
 A stack can read its packages from another book. `from-book svn` in a stack
 file puts every book entry below it on the development book. Dependencies
@@ -175,7 +178,7 @@ dependency failed is skipped, not attempted. Run it again after fixing
 anything; it does only what is left.
 
 ```sh
-packagemanager install <pkg> --recursive --run
+packagemanager install <pkg> --recursive --run   # missing deps only; installed ones are left alone
 packagemanager update <pkg> --run
 packagemanager install <gitpkg> --reinstall --clean --run   # git packages: no book lookup
 packagemanager which-package /usr/bin/foo
@@ -223,6 +226,18 @@ only, so a terminal opened inside your session shows what it inherited at
 login. The step also sources the fragment from `/etc/bashrc`; any shell can
 refresh itself with `. /etc/profile.d/shared-dirs.sh`, which also drops the
 variables whose directory is gone.
+
+### Wireless
+
+`packagemanager stack network --only net-wifi --run` reports what a wireless
+link still needs and, with `WRITE=yes` in
+`/etc/pkgusr/stacks/net-wifi.conf`, writes the parts that hold no secret: an
+`/etc/sysconfig/ifconfig.<iface>` per wireless interface, and a udev rule
+that gives a USB adapter the same name in every port. `PREFER` names the
+interfaces best first — the first one present gets the low route metric, so
+an external antenna is used while it is plugged in. The wpa_supplicant
+config is never written (it holds your passphrase), but an existing one is
+copied to a new interface when `COPY_WPA=yes`.
 
 ---
 
@@ -357,11 +372,29 @@ own package (`p_linux-firmware`) and the headers update the package that owns
 
 ```sh
 lfs-kernel list          # what kernel.org offers
-lfs-kernel               # build the version in /etc/pkgusr/kernel.conf
-lfs-kernel 6.12.40       # that version, once
+lfs-kernel               # what a build would do (nothing is built)
+lfs-kernel --run         # build the version in /etc/pkgusr/kernel.conf
+lfs-kernel 6.12.40 --run # that version, once
+lfs-kernel load ath9k_htc --boot        # load a module now and at every boot
 lfs-kernel verify        # is everything installed?
 lfs-kernel firmware --missing [--fix]   # firmware this machine wants and lacks
+lfs-kernel status               # how far the last build got, what is installed
+lfs-kernel enable --list        # hardware this tool knows by name
+lfs-kernel enable ath9k-htc     # its symbols into CONFIG_SET, its firmware
+                                # into FIRMWARE_ONLY -- kernel.conf, backed up
+lfs-kernel modules [text]       # what this kernel has, and what is loaded
+lfs-kernel config               # where the next .config comes from
+lfs-kernel config search atheros           # symbols by name or prompt
+lfs-kernel config save --good   # keep the running config as a known-good one
+lfs-kernel config from last-good           # build from it, not from /proc
+lfs-kernel config diff          # prev-good -> last-good
 ```
+
+Every config the tool builds with is copied to `/etc/pkgusr/kernel-configs`,
+outside the source tree, so removing the package cannot take it: the last
+`CONFIG_KEEP` builds, plus
+`last-good.config` and `prev-good.config` — the two that booted.
+`CONFIG_FROM=last-good` starts from one of them.
 
 Everything it does is configured in `/etc/pkgusr/kernel.conf`, which is
 installed rather than generated so it can be edited first. `ESP` and

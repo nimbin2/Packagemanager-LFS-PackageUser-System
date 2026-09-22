@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.321"
+TOOL_VERSION = "1.14.340"
 
 
 def _build_id():
@@ -4619,6 +4619,32 @@ def _explain_not_in_book(target):
         printInfo(f"  Nothing similar found either.  Try: blfs search {target}")
 
 
+def _install_finished(u):
+    """Positive evidence that an install FINISHED -- not that one started.
+
+    THIS IS WHY THE STACK NEEDED HAND-HOLDING.  `install_last` is copied
+    into the package home BEFORE the build runs (lfs-helper: "RECORD WHAT
+    IS INSTALLED BEFORE OVERWRITING THE RECORD"), so a build that dies at
+    configure leaves one behind.  For a package whose page declares no
+    programs or libraries to check -- cairomm is one -- `state` then has
+    nothing else to go on and answers "installed".
+
+    cairomm-1.0 failed at configure with 0 files tracked, was recorded
+    installed by that rule, and every later plan SKIPPED it as a dependency
+    that was already there.  pangomm found out the hard way:
+        Run-time dependency cairomm-1.0 found: NO
+    and the person had to name it by hand to get the chain moving.
+
+    A manifest with real paths, or the marker the runner writes after a
+    SUCCESSFUL install, is evidence.  A script that was copied in before
+    the build is not.
+    """
+    if getattr(u, "pkg_list", None):
+        return True
+    home = getattr(u, "home", "") or ""
+    return bool(home) and os.path.isfile(os.path.join(home, ".pkgusr-installed"))
+
+
 def build_install_plan(args):
     """Return (plan, missing, why).  plan = [(anchor, name_version, reason)] in
     install order (deps first); reason in {new, update, reinstall}.  why maps
@@ -4657,6 +4683,8 @@ def build_install_plan(args):
     # plan that has shrunk 181 -> 151 -> 135 across three runs reads as three
     # identical fresh starts.  The progress was real and invisible.
     build_install_plan.already = set()
+    build_install_plan.behind = []          # installed deps the book has moved past
+    build_install_plan.unproven = []       # "installed", with nothing to show for it
     _not_found = []
     # Reading the book can take many seconds the first time (it is indexed
     # once per version).  Without a word on screen that looks like a hang, so
@@ -4676,10 +4704,33 @@ def build_install_plan(args):
         if _PLAN_BOOK and _book_override(anchor) != _PLAN_BOOK:
             nv = default_book_version(anchor) or nv
         u = gather_user(anchor)
-        up_to_date = (u.state == "installed"
-                      and (not u.version or u.version == nv))
+        _done = u.state == "installed" and _install_finished(u)
+        if u.state == "installed" and not _done:
+            # recorded, but nothing says the install ever finished
+            build_install_plan.unproven.append(anchor)
+        up_to_date = (_done and (not u.version or u.version == nv))
         if up_to_date:
             build_install_plan.already.add(anchor)
+        # AN INSTALLED DEPENDENCY IS NOT A THING TO UPGRADE.
+        #
+        # `install gparted --recursive` planned 53 packages: gparted, its
+        # real missing dependencies -- and UPDATES of bubblewrap, alsa-lib,
+        # gtk3, gtk4, librsvg, glycin and thirty others that are installed
+        # and working, purely because the book has moved on since they were
+        # built.  Asking for one program is not asking to rebuild the
+        # desktop, and each of those rebuilds is a chance to break a
+        # machine that was fine.
+        #
+        # So: a DEPENDENCY that is installed is left alone, whatever version
+        # it is.  A package NAMED on the command line still goes through
+        # (that is an instruction), --update-deps restores the old
+        # behaviour, and `update --stack <name>` is the deliberate way to
+        # move a whole chain forward.
+        elif (_done and anchor not in _named
+              and not getattr(args, "update_deps", False)):
+            build_install_plan.already.add(anchor)
+            build_install_plan.behind.append((anchor, u.version or "?", nv))
+            return
         if args.reinstall:
             plan.append((anchor, nv, "reinstall" if up_to_date else
                          ("update" if u.state == "installed" else "new")))
@@ -4951,6 +5002,29 @@ def cmd_install(args, _replanned=False):
             return f"depends on {parent}"
         return f"{kind} by {parent}"
 
+    _unproven = getattr(build_install_plan, "unproven", []) or []
+    if _unproven:
+        printWarning("  %d package(s) are recorded as installed but have no"
+                     " finished-install record:" % len(_unproven))
+        printWarning("    " + ", ".join(sorted(set(_unproven))[:8])
+                     + (" ..." if len(set(_unproven)) > 8 else ""))
+        printInfo("    Their install_last was written before a build that did"
+                  " not finish, so they")
+        printInfo("    are in this plan rather than skipped -- which is what"
+                  " lets the stack run")
+        printInfo("    through without naming them by hand.")
+    _behind = getattr(build_install_plan, "behind", []) or []
+    if _behind:
+        printInfo("  %d installed dependency(ies) are older than the book and"
+                  " are NOT touched:" % len(_behind))
+        printInfo("    " + ", ".join("%s (%s -> %s)" % (a, iv, bv)
+                                     for a, iv, bv in _behind[:6])
+                  + (" ..." if len(_behind) > 6 else ""))
+        printInfo("    that is deliberate: one program is not a reason to"
+                  " rebuild what works.")
+        printInfo("    move them forward on purpose:  packagemanager update"
+                  " <name> --run")
+        printInfo("    or build this plan against them: add --update-deps")
     if getattr(args, "select", False):
         plan = _select_plan_rows(
             plan, lambda r: f"{r[1]:<30} {r[2]:<10} {why_str(r[0])}")
@@ -7916,7 +7990,32 @@ def _python_module_here(name):
         return False
 
 
-def write_pkg_list(user, background=True):
+# WHAT A MANIFEST SCAN MUST NOT WALK.
+#
+# `reload-pkg-list p_linux` took minutes, and the time went nowhere near the
+# installed files: the scan walked /usr/src/pkgusr -- every package user's
+# unpacked source tree, the kernel's own quarter-million files among them --
+# plus /proc, /sys, the snapshots and the caches.  None of it can contain an
+# INSTALLED file by definition: a package's home is excluded from its own
+# manifest, and no package installs into another's source tree.
+_SCAN_SKIP = ["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp",
+              "/var/cache", "/mnt", "/media", "/lost+found",
+              "/.snapshots", "/snapshots", "/sources", "/build"]
+
+
+def _scan_prune_args():
+    """find(1) arguments that skip those directories (and stay on one fs)."""
+    skips = list(_SCAN_SKIP) + [d.rstrip("/") for d in pkgusr_roots()]
+    out = ["-xdev", "("]
+    for i, d in enumerate(skips):
+        if i:
+            out.append("-o")
+        out += ["-path", d]
+    out += [")", "-prune", "-o"]
+    return out
+
+
+def write_pkg_list(user, background=True, as_root=False):
     """Regenerate /usr/src/<user>/pkg.lst.  Runs list_package AS the package
     user (su -) when possible, so it only scans directories that user owns --
     much faster than scanning the whole filesystem as root."""
@@ -7970,16 +8069,29 @@ def write_pkg_list(user, background=True):
                " /\\/lib\\/modules\\/[^/]+\\/source\\// { next } "
                " { print }'"
                % shlex.quote(home.rstrip("/") + "/"))
-    if _can_su(user):
+    # THE SCAN ITSELF, PRUNED.  `list_package` is the hint's script and walks
+    # everything; this is the same question asked of the same filesystem
+    # without the directories that cannot hold an installed file.  It is run
+    # AS the package user, which also skips every directory that account
+    # cannot read -- and that is the difference between minutes and seconds
+    # on a machine with 90 source trees.  --root scans as root instead: it
+    # reaches directories the account cannot enter (0700 dirs owned by
+    # somebody else), and takes the long way round.
+    _find = " ".join(shlex.quote(x) for x in
+                     ["find", "/"] + _scan_prune_args()
+                     + ["-user", user, "-print"])
+    _scan = f"{_find} 2>/dev/null | LC_ALL=C sort -u"
+    if _can_su(user) and not as_root:
         # su - starts in the user's home, so pkg.lst.new/pkg.lst are ~/...
-        inner = (f"{lp} {quser} 2>/dev/null | {_filter} > pkg.lst.new"
+        inner = (f"{_scan} | {_filter} > pkg.lst.new"
                  f" && mv pkg.lst.new pkg.lst")
         cmd = ["su", "-", user, "-c", inner]
     else:
         tmp = shlex.quote(os.path.join(home, "pkg.lst.new"))
         dst = shlex.quote(os.path.join(home, "pkg.lst"))
-        cmd = ["sh", "-c", f"{lp} {quser} 2>/dev/null | {_filter} > {tmp}"
-                           f" && mv {tmp} {dst}"]
+        cmd = ["sh", "-c", f"{_scan} | {_filter} > {tmp}"
+                           f" && mv {tmp} {dst}"
+                           f" && chown {quser} {dst} 2>/dev/null; true"]
 
     if background:                                    # detached / disowned
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -8004,8 +8116,12 @@ def cmd_reload_pkg_list(args):
                 printInfo(f"{acct}: pkg.lst regeneration started"
                           f" (disowned background task).")
             continue
-        printInfo(f"{acct}: scanning for files it owns ...")
-        if not write_pkg_list(user, background=False):
+        _as_root = getattr(args, "root", False)
+        printInfo(f"{acct}: scanning for files it owns "
+                  + ("as root (every directory) ..." if _as_root
+                     else f"as {acct} ..."))
+        _t0 = time.time()
+        if not write_pkg_list(user, background=False, as_root=_as_root):
             printError(f"{acct}: could not regenerate pkg.lst")
             rc = 1
             continue
@@ -8016,7 +8132,18 @@ def cmd_reload_pkg_list(args):
         except OSError:
             n = 0
         if n:
-            printSuccess(f"{acct}: {n} file(s) recorded in {manifest}")
+            printSuccess(f"{acct}: {n} file(s) recorded in {manifest}"
+                         f"  ({time.time() - _t0:.0f}s)")
+            if not _as_root:
+                # SAY WHAT THE FAST SCAN CANNOT SEE.  A file this package
+                # owns inside a directory it may not read is not in this
+                # list, and nothing else would ever say so.
+                printInfo(f"  scanned as {acct}: directories it cannot enter"
+                          f" were skipped, and so were")
+                printInfo(f"  {', '.join(_SCAN_SKIP[:6])} ... and the package"
+                          f" source roots.")
+                printInfo(f"  If something is missing:  packagemanager"
+                          f" reload-pkg-list {user} --root")
         else:
             printWarning(f"{acct}: no files found -- it owns nothing on disk.")
             printInfo("  Either it was never installed, or its files ended up"
@@ -12437,6 +12564,10 @@ def cmd_env(args):
 #
 # File format, one entry per line:
 #     book   <target> [key=value ...]      a BLFS book package (deps resolved)
+#     <any>  ... when="<shell>"            only when that command succeeds --
+#                                          a package this machine needs only
+#                                          sometimes (btrfs-progs on a btrfs
+#                                          system).  It is asked every run.
 #     git    <name> url=<repo> [ref=<ref>] [prog=<installed-program>]
 #     tar    <name> url=<tarball-url> pkg=<filename> [prog=|have=] [build=|install=]
 #     check  <name>                        root script <stackdir>/<name>.sh;
@@ -13173,6 +13304,28 @@ def cmd_stack(args):
         entries = [e for e in entries if e["target"] in _only]
         printInfo("running only: %s" % ", ".join(e["target"] for e in entries))
         print()
+    # WHEN=: AN ENTRY THIS MACHINE DOES NOT NEED.
+    #
+    # btrfs-progs belongs in the stack of a btrfs machine and nowhere else,
+    # and a second stack file per filesystem is not an answer.  The test is
+    # a shell command, run here, every time -- so a disk added later is
+    # picked up without editing anything.
+    _when_out = []
+    _kept = []
+    for e in entries:
+        _w = e["opts"].get("when")
+        if _w and subprocess.run(["/bin/bash", "-c", _w],
+                                 stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL).returncode != 0:
+            _when_out.append((e["target"], _w))
+            continue
+        _kept.append(e)
+    entries = _kept
+    if _when_out and not getattr(args, "status", False):
+        for _t, _w in _when_out:
+            printInfo("  %s: not for this machine -- when=%s" % (_t, _w))
+        print()
+
     rows = []
     for e in entries:
         e["_key"] = "%s %s" % (e["kind"], e["target"])
@@ -14682,6 +14835,9 @@ def main():
     p.add_argument("--recursive", action="store_true",
                    help="also resolve and build the package's dependencies "
                         "(default: just the named package(s))")
+    p.add_argument("--update-deps", action="store_true",
+                   help="also rebuild dependencies that are installed but "
+                        "older than the book (default: leave them alone)")
     p.add_argument("-f", "--force", action="store_true",
                    help="(deprecated: non-recursive is now the default; kept for "
                         "compatibility)")
@@ -14800,6 +14956,9 @@ def main():
     p.set_defaults(func=cmd_remove)
 
     p = sub.add_parser("reload-pkg-list", help="regenerate /usr/src/<name>/pkg.lst")
+    p.add_argument("--root", action="store_true",
+                   help="scan as root: slower, but reaches directories the "
+                        "package user cannot enter")
     p.add_argument("packages", nargs="+")
     p.add_argument("--background", action="store_true",
                    help="run detached and return at once (the old default)")

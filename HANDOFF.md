@@ -7,13 +7,13 @@ account per package, so every file on the system has an owner, and
 Written for a **SysV** system (no systemd) built from the **systemd** BLFS
 book, because BLFS stopped publishing a SysV edition after 12.4.
 
-    all six tools at 1.14.321  (lfs-backup has its own: 1.3.0)
-    lfs               cb920be
-    lfs-helper        3422951
-    packagemanager    3517a41
-    blfs              f8ce360
-    lfs-phases        2c5f6a3
-    lfs-kernel        219215c   (no version line of its own)
+    all six tools at 1.14.340  (lfs-backup has its own: 1.3.0)
+    lfs               2f1eb17
+    lfs-helper        db72098
+    packagemanager    8265dde
+    blfs              80426a3
+    lfs-phases        026ca06
+    lfs-kernel        fce4ce0   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
 
@@ -3776,6 +3776,438 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.340 -- a man page with colons in its name
+
+XML::Parser: six repair rounds, all of them granting directories, and the
+install still failed.  The report said
+
+    /usr/share/man/man3/XML   missing; parent /usr/share/man/man3 is drwxrwxr-t
+
+-- a file that has never existed.  The real name is
+`/usr/share/man/man3/XML::Parser.3`, and both path extractors cut it at the
+first colon: their character class was `[A-Za-z0-9._/+-]`.  So every Perl
+man page has been reported under a truncated name, and the file that
+actually blocked the install was never named.  A trailing colon (from the
+message's own "path: Permission denied") is stripped now.
+
+- THE STICKY BIT IS THE POINT.  /usr/share/man/man3 is drwxrwxr-t, so only
+  a file's OWNER may replace it -- and ExtUtils::Install replaces by
+  unlinking first.  The file belongs to p_xml-parser, an older account for
+  the same module (this one is p_perl-xml-parser, a different book anchor).
+  No directory grant can ever fix that, which is why six rounds did not.
+- takeover_files_from_log now reads perl's wording -- `Cannot forceunlink
+  <path>`, `Can't unlink/remove/rename <path>` -- as a whole token, colons
+  and all.  The file is handed to the package that is installing it.
+- When two or more files move from an account whose name is this one's
+  minus a language prefix (xml-parser <- perl-xml-parser), the box says
+  they are one upstream module under two anchors and offers
+  `packagemanager remove xml-parser --purge --run` for afterwards.
+- Tested: both wordings extracted with their colons intact.
+
+## 1.14.339 -- install_last is written BEFORE the build
+
+The answer to 1.14.338's open question, and the reason the stack needed a
+package named by hand.
+
+- lfs-helper copies the script to `install_last` BEFORE running it ("RECORD
+  WHAT IS INSTALLED BEFORE OVERWRITING THE RECORD").  So a build that dies
+  at configure leaves one behind.  `User.state`, with no manifest and a page
+  that declares no programs or libraries to check -- cairomm is exactly that
+  -- then falls through to `if self.meta.get("name_version"): installed`.
+- cairomm-1.0 failed at configure with 0 files tracked, was recorded
+  installed by that rule, and every later plan skipped it as a dependency
+  that was already there.  pangomm then failed on
+      Run-time dependency cairomm-1.0 found: NO
+  and only naming cairomm by hand got the chain moving.
+- `_install_finished(u)`: a manifest with real paths, or `.pkgusr-installed`
+  (the marker the runner writes AFTER a successful install), is evidence.
+  A script copied in before the build is not.  The planner skips a
+  dependency only with that evidence; without it the package goes into the
+  plan, and the plan says so:
+      N package(s) are recorded as installed but have no finished-install
+      record: cairomm-1.0
+- Tested end to end with three shapes: install_last only (planned),
+  .pkgusr-installed (skipped), a manifest (skipped).
+- NOT changed: `state` itself, which many commands read.  The rule here is
+  the PLANNER's, where a wrong "installed" costs a broken chain and a
+  needless rebuild costs minutes.
+
+## 1.14.338 -- "recorded as installed" is not "on disk"
+
+pangomm could not find cairomm-1.0, and the box said cairomm "IS installed
+here ... if the .pc is absent, it installed without it".  Two very
+different things hide behind that: a package that installed and later lost
+a file, and one that is RECORDED as installed and put nothing on disk (a
+build that failed after its account and home were made).  The manifest
+answers it in one read, so the box now reads it:
+
+  * manifest empty        -> "nothing of it is on disk.  Its last build did
+                             not finish, and whatever marked it installed
+                             was wrong."
+  * manifest, but no .pc  -> "records N file(s), and NONE of them is a .pc"
+  * manifest with .pc     -> each one printed, "(on disk)" or "MISSING from
+                             disk", and both the rebuild and the
+                             pkg-config-path checks
+
+Tested against all three shapes.
+
+STILL OPEN on that machine: why cairomm-1.0 was skipped as installed at
+all.  Its previous build failed in the BUILD phase with 0 files tracked,
+which `state` should read as "not installed" (no manifest, no
+install_last).  Either something wrote install_last for a build that never
+installed, or a DIFFERENT cairomm (the 1.16 API is its own package) is
+being mistaken for it.  The next run's box will say which.
+
+## 1.14.337 -- the build named the option; now the tool reads it
+
+    Run-time dependency Boost found: NO (tried system)
+    ERROR: Building the test programs requires Boost Test ... and Fontconfig.
+    Install them or use -Dbuild-tests=false or -Dbuild-tests=if-dependencies-found
+
+- cairomm stops at configure over TEST programs, which want Boost -- and
+  Boost is in avoid.stack on purpose.  The dependency is never coming; the
+  option meson prints is the whole answer, and it was on the screen while
+  the chain sat stopped.
+- `_meson_opt_from_log` takes the FIRST `use -D<opt>=<value>` the build
+  suggested, adds it to the script's `meson setup` line (old script kept as
+  .bak-<date>) and the retry loop runs the phase again.  Only an option the
+  build itself named, only one that turns something OFF (=false, =disabled,
+  =no, =if-dependencies-found), only once.  The gate lets such a failure
+  reach the loop, and the "no repair attempted" line no longer claims the
+  only repairs are permissions.
+- A regenerated script loses the edit, so the note prints the machine.conf
+  section to make it permanent -- and machine.conf now ships
+  build-tests = false for cairomm-1.0, pangomm-2.48 and glibmm-2.68, which
+  are the three in this chain with the same Boost test dependency.
+- Tested: the option is added once, the second call is a no-op, and a
+  suggestion that turns something ON is refused.
+
+## 1.14.336 -- the test suite was in the BUILD block all along
+
+XML::Parser died in the BUILD phase:
+
+    make: *** [Makefile:1005: test_dynamic] Error 2
+    Failed 60/62 test programs.
+
+- Every Perl module in BLFS uses "the standard build and installation
+  instructions", which are ONE block:
+      perl Makefile.PL &&
+      make &&
+      make test
+  The test suite is not a block to skip -- it is the last LINE of the block
+  that builds the package, joined with &&.  So the block-level test filter
+  could never see it, and every perl module on this machine has been
+  running its test suite inside the build.  Class::Inspector's passed,
+  which is why nobody noticed; XML::Parser's fail (60 of 62 files cannot
+  load the module) and took the gparted chain with them.
+- _strip_test_lines drops such a line, leaves the book's own text in a
+  comment above it, and removes the now-dangling `&&` from the line before.
+  A block that is ONLY tests still goes through the block-level guard with
+  its reason.  `--test` (PKGUSR_TESTS=1) still runs the suite -- in the
+  TEST phase, where a failure is reported and not fatal.
+- Checked against seven blocks: the perl one, a plain configure+make, a
+  bare `make check`, `make && LC_ALL=... make check_local`, `make install`,
+  LVM2's two-target install, and meson+ninja+`ninja test`.
+- Script format v19, so every generated script is rebuilt from the book.
+
+Worth knowing: XML::Parser's tests failing to LOAD the module may mean its
+Expat binding is not linking to the installed expat.  It is not in the way
+of the build any more; after the install, check it:
+    perl -MXML::Parser -e 'print "ok\n"'
+
+## 1.14.335 -- a PDF that was never built is not a failed install
+
+- parted installed 97 files -- every binary, every library -- and then
+  failed:
+      install: cannot stat 'doc/parted.pdf': No such file or directory
+  The book's last line is
+      install -v -m644 doc/{FAT,API,parted.{html,txt,pdf,ps,dvi}} \
+              /usr/share/doc/parted-3.7
+  and parted.pdf/ps/dvi and API exist only when texlive built them.
+  texlive is in avoid.stack, so they never exist here -- for parted, and
+  for every other page with a doc block like it.
+- The install PHASE now defines an `install` function (and only that phase,
+  which runs in a child process of its own -- nothing outside ever sees
+  it).  For a destination under share/doc it runs the book's command
+  unchanged first; only if that fails does it retry without the sources
+  that are not there, and say which they were.  Everything else goes
+  straight to /usr/bin/install.  A doc command that fails for any OTHER
+  reason is re-run and its real error reported.
+- Tested: the book's block with two files missing (installs the two that
+  exist, rc 0, names the others), all sources missing, `-m 644` as two
+  words, `install -dm755` on a doc directory, and a non-doc destination.
+- kernel.conf ships CONFIG_SET="LEGACY_TIOCSTI=n EXFAT_FS=m" -- the kernel
+  half of exfatprogs, and what this machine already has.  (It was the only
+  difference left in kernel.conf.new.)
+
+## 1.14.334 -- `mount -o remount,dev /tmp` in an install phase
+
+LVM2 stopped the gparted chain with
+
+    mount: /tmp: must be superuser to use mount.
+    !! phase 'install' FAILED (exit 32)
+
+and the report said "no line matched the usual error patterns".
+
+- WHERE IT CAME FROM.  BLFS 13.0's LVM2 page has three blocks between the
+  build and the install: a partial install for the test suite, then
+  `mount -o remount,dev /tmp`, then `LC_ALL=... make check_local`.  The
+  middle one prepares /tmp so the TESTS may create device nodes.  All three
+  went into the install phase.
+- `make check_local` was missed by the test filter for two reasons, both
+  now fixed: the pattern wanted a word boundary after "check" (and
+  "check_local" has none), and it did not allow the `LC_ALL=...` in front.
+- A new rule, judged on the commands and not on the prose: a block
+  containing mount, umount, modprobe, insmod, mknod, swapon or swapoff is
+  never part of installing a package.  A package user cannot run those and
+  no collector group can grant them; they are the system's business.  The
+  script says so where the block would have been.
+- lfs-helper recognises "must be superuser" and the like: it names the line
+  and says the step wanted something root-only, instead of falling through
+  to "no pattern matched".
+- apps.stack: `book gparted ignore=lvm2`.  LVM2 is only RECOMMENDED by
+  parted, and this laptop has no logical volumes.
+- Tested: the block classifier against all seven blocks of the LVM2 page
+  (mount -> root-only, check_local -> test, install/configure -> kept).
+
+## 1.14.333 -- the wpa service reads one directory; we wrote the other
+
+The boot log, not dhcpcd:
+
+    Starting dhcpcd on the wlp3s0 interface...                      FAIL
+    wpa_supplicant configuration file
+      /etc/sysconfig/wpa_supplicant-wlan0.conf not present          FAIL
+    Bringing up the eth0 interface... Interface eth0 doesn't exist. FAIL
+
+- THE PATH.  This machine's wpa service reads
+  /etc/sysconfig/wpa_supplicant-<iface>.conf; net-wifi wrote and looked in
+  /etc/sysconfig/wpa_supplicant/ -- the subdirectory other bootscript
+  releases use.  So wpa_supplicant never started, nothing associated, and
+  dhcpcd had no link to ask on.  The path is now READ out of $svcdir/wpa
+  ("the wpa service reads: ...") and used for the check and for COPY_WPA;
+  a config in either layout is found and copied to the one that is read.
+- Per interface, the step now says whether the config the service will look
+  for exists, and prints the one-line copy when it does not.
+- DHCP_START without -b is reported: dhcpcd in the foreground waits for a
+  lease on a wireless link that is not associated yet, which is the
+  "Starting dhcpcd ... FAIL" line.  Our writer has always used -b.
+- A config for an interface the kernel does not have is a FAIL line at
+  every boot.  It is reported with the sed that turns ONBOOT off, and
+  DISABLE_MISSING=yes in net-wifi.conf does it for all of them (backed up;
+  nothing is deleted -- the card may be back tomorrow).
+- Tested in a sandbox with a fake service script, a fake /sys/class/net and
+  a temporary /etc/sysconfig: the path is detected, the copy lands where
+  the service reads, and a stale eth0 file is reported.
+
+## 1.14.332 -- ExtUtils::Install says it in its own words
+
+- File::ShareDir stopped the plan with
+      ERROR: Can't create '/usr/lib/perl5/5.42/site_perl/File'
+      Do not have write permissions on '/usr/lib/perl5/5.42/site_perl/File'
+  and the box said "no automatic repair attempted: the failure does not
+  look like a permission or missing-directory problem".  It is exactly a
+  permission problem; ExtUtils::Install simply never writes the words
+  "Permission denied" for it.  Two greps were blind to it:
+    * the _perm_ish gate (so zero rounds ran), and
+    * unwritable_dirs_from_log's tail filter (so even a round would have
+      had nothing to grant).
+  Both now know `Can't create '<path>'`, `Do not have write permissions`
+  and `Cannot mkdir`.  Checked against the real log text: the gate fires
+  and the extractor yields /usr/lib/perl5/5.42/site_perl, the directory
+  the grant needs.
+- Round two of the same lesson as 1.14.331: a Perl module's install writes
+  into three trees owned by three different packages, and every one of them
+  reports the refusal differently.
+
+## 1.14.331 -- perllocal.pod is the info/dir of the perl tree
+
+- `perl-class-inspector` installed both its modules and both its man pages
+  and was then reported FAILED, for a line make itself had marked
+  "(ignored)":
+      /usr/lib/perl5/5.42/core_perl/perllocal.pod: Permission denied
+  Every Perl module APPENDS to that file in its doc_install step, so it
+  belongs to whichever module was installed first (p_xml-parser, 664, group
+  p_xml-parser) and every module after that cannot write it.  Granting the
+  DIRECTORY to the perl collector group -- which the auto-repair did --
+  cannot help: the file's own group is one package's.
+- It is in shared_files_list now, with the info/dir family: written by many
+  packages, installed by none.  share_shared_files makes it root:install
+  664, which every package user can append to.  The version is globbed
+  (/usr/lib/perl5/*/*/perllocal.pod).
+- shared_file_dirs SKIPS the perl directories: the file is shared, the
+  directory is not -- /usr/lib/perl5/<ver>/core_perl is p_perl's install
+  directory and is in its manifest.  Handing it to root:install would make
+  `verify` right to complain.
+- The "exited 0 but the log says otherwise" gate no longer fails a phase
+  for a shared registry file it could not update.  It says so, runs
+  share_shared_files, and lets the package's own files stand.  A real
+  `install: cannot create ...: Permission denied` still fails, tested
+  against both logs.
+
+## 1.14.330 -- an installed dependency is not a thing to upgrade
+
+- `install gparted --run --recursive` planned FIFTY-THREE packages: gparted,
+  its missing dependencies -- and updates of bubblewrap, alsa-lib, gtk3,
+  gtk4, librsvg, glycin, GnuTLS and thirty more that were installed and
+  working, purely because the book had moved on.  Asking for one program is
+  not asking to rebuild the desktop, and each rebuild is a chance to break
+  a machine that was fine.  A DEPENDENCY that is installed is now left
+  alone whatever its version; a package NAMED on the command line is
+  unchanged; `--update-deps` restores the old behaviour.  The plan says how
+  many it left and how to move them on purpose.
+  (Unit-tested: gparted with gtk3 installed-but-behind plans 2 packages,
+  and 3 with --update-deps.)
+- exfatprogs is a `tar` entry now, not `book`: the BLFS index carries no
+  exFAT package at all (checked).  1.4.2 from the project's release
+  tarball, ./configure with an autogen.sh fallback.  The relan/exfat the
+  book mentions is the FUSE implementation -- a different thing, and only
+  for a kernel without EXFAT_FS.
+
+## 1.14.329 -- gparted
+
+- apps.stack: `book gparted`, last in the file (it is the heaviest entry --
+  the planner brings gtkmm3 and parted).  Confirmed a BLFS page against the
+  stable index: Gparted-1.7.0.
+- It has no graphical privilege step here: the book's page uses polkit and
+  polkit is avoided on this machine (it arrives only through colord and
+  systemd).  So: run `gparted` from a ROOT terminal inside the session.
+  The comment in the stack says so.
+- The filesystem tools it drives are their own packages; exfatprogs and
+  btrfs-progs (services.stack) are what stop entries being greyed out.
+
+## 1.14.328 -- exfatprogs
+
+- services.stack: `book exfatprogs` (mkfs.exfat, fsck.exfat, exfatlabel),
+  beside btrfs-progs.  No `when=`: the card that needs it is not in the
+  machine when the stack runs.  The kernel side stays separate --
+  `lfs-kernel enable exfat` sets EXFAT_FS=m.
+- Not tested against the book here: if the page's anchor is not
+  `exfatprogs`, the stack says NOT IN BOOK and `blfs search exfat` gives
+  the real one.
+
+## 1.14.327 -- net-wifi writes what holds no secret, and prefers an antenna
+
+- `cfg net-wifi` reported and wrote nothing, so a deleted
+  /etc/sysconfig/ifconfig.<iface> meant pasting a file out of its output.
+  It now reads stacks/net-wifi.conf and, with WRITE=yes, writes that file
+  for every wireless interface that has none -- marked as ours, never over
+  one of yours.  The wpa config is still never written: it holds the key.
+- PREFER (patterns, best first) decides the dhcpcd route metric: the first
+  interface PRESENT gets METRIC_PREFERRED, the rest METRIC_OTHER, so a USB
+  antenna takes over while it is plugged in and the built-in card carries
+  on when it is gone.  A file the step wrote is re-metered when PREFER
+  changes (backed up); one of yours is reported, not edited.
+- USB_RENAME writes a udev rule naming an adapter by its USB ids
+  (0cf3:9271 -> wl-ext), because its bus name changes with the socket and
+  ifconfig.<name> cannot follow.  It applies when the device next appears.
+- COPY_WPA copies an existing wpa_supplicant-<iface>.conf to an interface
+  that has none (chmod 600), and says so every time -- a key is duplicated.
+- A config naming an interface the kernel does not have is now reported.
+- diag.stack: usbutils and pciutils (lsusb, lspci) -- the first commands
+  for a device that did not appear.
+- Tested with a fake /sys/class/net (NET_WIFI_SYSFS) and a temporary
+  /etc/sysconfig: first write, the metric flip when the preferred interface
+  appears, the wpa copy, the orphan-config note, the udev rule text.
+
+## 1.14.326 -- a build needs --run, a module can be loaded, a scan is pruned
+
+- `lfs-kernel` alone no longer builds.  It prints what a build WOULD do --
+  version, tree state (fetch / continue / already built), config source and
+  CONFIG_SET, where the image and modules go, firmware, headers,
+  v4l2loopback -- and says `--run`.  `--run` is taken from anywhere on the
+  line.  An hour of compiling that replaces the booting kernel should not
+  start from a bare word; every other tool here already waited.
+- `lfs-kernel load <module> [--boot]` / `unload`: modprobe, confirm it in
+  /proc/modules (and say when a symbol is built IN rather than missing),
+  show the dmesg lines that mention it or firmware, and with --boot add it
+  to /etc/sysconfig/modules (backed up, no duplicates).  `modules` points at
+  it instead of telling people to type modprobe themselves.
+- `reload-pkg-list` scans with its own pruned find instead of the hint's
+  `list_package`: -xdev, and never /proc, /sys, /dev, /run, /tmp, /var/tmp,
+  /var/cache, /mnt, /media, the snapshots, /sources, /build or the PACKAGE
+  SOURCE ROOTS.  That last one is where the time went -- ninety unpacked
+  source trees, the kernel's own among them.  Still run as the package user
+  (so unreadable directories are skipped), with a line saying so and
+  `--root` for the thorough scan.  The seconds are now printed.
+- Tested: the plan for an already-built tree, load/unload with a stub
+  modprobe and the boot file, the pruned find, py_compile / bash -n.
+
+## 1.14.325 -- where are we, and a firmware report that needs no network
+
+- `lfs-kernel status`: what is running and what is known to boot, whether
+  the tree's .config carries every CONFIG_SET entry, whether the build is
+  FINISHED / UNFINISHED (object files, no current image) / not started, how
+  many modules are in the tree and in /lib/modules, what the ESP holds, and
+  whether the installed config differs from the tree's.  Reads only; no
+  network; works with the ESP unmounted.  Written because an interrupted
+  build leaves nothing on the machine that says how far it got.
+- `firmware --missing` asked kernel.org which kernel is newest, for a
+  question /lib/modules and the boot log answer -- and EXITED on a machine
+  with no network.  It uses the running kernel's version now.
+- Tested: status against a tree with objects only and with a bzImage,
+  CONFIG_SET read-back, the unmounted-ESP path.
+
+## 1.14.324 -- a typo built a kernel, and the command line lost to the file
+
+Two bugs in lfs-kernel's argument handling, both old, both found by one
+paste: `lfs-kernel search AR9271` rebuilt and reinstalled 7.2.6.
+
+- ANY unrecognised word became VERSION.  It is now refused, with the
+  command list and a did-you-mean; only `latest` or something shaped like
+  7.2.6 is a version.  `search` and `set` became real top-level commands
+  (they are what a person types) and go to `config search` / `config set`.
+- WORSE: `VERSION="$1"` was set BEFORE `. "$CONF"`, and kernel.conf's own
+  VERSION= then overwrote it.  So `lfs-kernel 6.12.40` built whatever the
+  file said (latest, here) and `lfs-kernel verify 7.2.4` reported on another
+  kernel -- both documented, neither working, since the config file grew a
+  VERSION line.  The command line is re-applied after the source now.
+- `lfs-kernel prune` is named in two comments and has never existed; the
+  comments are corrected rather than the command invented.
+- Tested: unknown word refused, search alias, an explicit version surviving
+  the config file.
+
+## 1.14.323 -- hardware by name, and the modules a kernel really has
+
+- `lfs-kernel enable <name>`: a table of hardware (ath9k-htc, ath9k, ath10k,
+  ath11k, alx, atl1c, iwlwifi, rtl8xxxu, bluetooth-usb, btrfs, exfat, ntfs3,
+  nvme, usb-serial, v4l2-usb) -> the symbols AND the firmware it needs,
+  written into CONFIG_SET and FIRMWARE_ONLY.  A bare symbol works too: the
+  tree says whether it is tristate (=m) or bool (=y).  `--list` shows them.
+- `lfs-kernel modules [text]` -- what /lib/modules holds for this kernel,
+  what is built in, what is loaded, with each module's description.
+- `config search` now matches a symbol's NAME or its PROMPT and prints the
+  prompt.  It used to list every symbol of every Kconfig file that merely
+  mentioned the word: 40 lines of MIPS console options for "atheros".
+- `config save [--good]` seeds the archive from the running kernel without a
+  build -- what CONFIG_FROM=last-good needs before the first build ever runs.
+  `config from <source>` sets CONFIG_FROM and refuses last-good when there
+  is none.  One writer (`_conf_set_var`) for every kernel.conf edit.
+- Tested: enable (name, bare symbol, unknown), search prompts, save/from,
+  modules against a fake /lib/modules.  No kernel built here.
+
+## 1.14.322 -- btrfs-progs when it applies, and the kernel configs are kept
+
+- Stack entries take `when="<shell>"`: judged and run only where that
+  command succeeds.  `book btrfs-progs when=...` is in services.stack --
+  mounted btrfs, or a btrfs partition on any disk (so it is right in a
+  chroot too).
+- lfs-kernel keeps every config it builds with in /etc/pkgusr/kernel-configs
+  (root's, outside the tree, so `prune` and `packagemanager remove linux`
+  cannot take it): `config-<ver>-<date>` (newest CONFIG_KEEP=5),
+  `last-good.config` and `prev-good.config` -- the last two that BOOTED,
+  rotated where last-good is written, i.e. only from a kernel that ran.
+  The archive is written BEFORE the compile, so a build that dies keeps its
+  answers.
+- CONFIG_FROM takes last-good | prev-good | saved, and `running` falls back
+  to last-good instead of exiting when /proc/config.gz is unreadable.
+- `lfs-kernel config` -- show | list | diff | search <text> | set SYM=VAL |
+  unset SYM.  set/unset edit CONFIG_SET in kernel.conf with a backup;
+  search reads the current config and the tree's Kconfig files and says
+  that a NET_VENDOR_*/WLAN_VENDOR_* symbol alone builds no driver.
+- Tested: the config subcommands against a fake tree and config directory
+  (show/list/diff/search/set/unset), stack parse of the when= entry,
+  py_compile / bash -n.  No kernel was built here.
 
 ## 1.14.321 -- git reinstall, a stack on the svn book, @setup
 

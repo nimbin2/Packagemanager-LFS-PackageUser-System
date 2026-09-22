@@ -300,7 +300,8 @@ generated, so it can be edited before the first build.
 | `HEADERS`, `V4L2LOOPBACK`, `BOOTLOGO` | as you like |
 
 ```sh
-lfs-kernel                         # build, install, record as p_linux
+lfs-kernel                         # the plan; nothing is built
+lfs-kernel --run                   # build, install, record as p_linux
 lfs-kernel verify                  # image, modules, depmod, headers, firmware
 ```
 
@@ -402,7 +403,7 @@ packagemanager update <pkg> --run            # what the book has newer
 packagemanager which-package /usr/bin/foo
 packagemanager reclaim <pkg> --run           # give files back another package took
 packagemanager user create firefox --shared --share-dir --launcher   # an app account
-lfs-kernel latest                            # try a newer kernel beside this one
+lfs-kernel latest --run                      # try a newer kernel beside this one
 ```
 
 A new BLFS release: `blfs fetch`, `packagemanager blfs set-default`,

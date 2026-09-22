@@ -49,7 +49,7 @@ set -u
 # Bump on every change that alters behaviour.  `lfs-helper --version` makes it
 # possible to tell at a glance whether the copy inside the chroot is the one
 # that was just fixed -- guessing at that has wasted a lot of time.
-LFS_HELPER_VERSION="1.14.321"
+LFS_HELPER_VERSION="1.14.340"
 
 # A fingerprint of this file's own contents.  A hand-maintained version number
 # goes stale the moment someone forgets to bump it -- and the reason for
@@ -1157,9 +1157,33 @@ PHASES="$STATE_PROGRESS/phases"
 # job's message can be thousands of lines above the end, so showing the tail
 # (what you see on screen) is usually useless.
 show_build_errors() {
-    local log="$1" hits=""
+    local log="$1" hits="" _rootline=""
     [ -f "$log" ] || return 0
     say ""
+    # A COMMAND ONLY ROOT CAN RUN, IN A BUILD THAT IS NOT ROOT.
+    #
+    #     mount: /tmp: must be superuser to use mount.
+    #     !! phase 'install' FAILED (exit 32)
+    # ...and the report said "no line matched the usual error patterns",
+    # because nothing here looks like a compiler error.  It is not a
+    # permission to GRANT either: no collector group makes mount work.  The
+    # command does not belong in a package's install at all (it was LVM2's
+    # "remount /tmp so the TESTS can make device nodes"), so say exactly
+    # that and name the line.
+    _rootline="$(grep -m1 -E "must be superuser|only root can|Operation not permitted \(are you root|must be run as root|requires root privileges" \
+                 "$log" 2>/dev/null)"
+    if [ -n "$_rootline" ]; then
+        fail "--- this step tried to do something only root may do ---"
+        say  "  $_rootline"
+        say  "  A package builds and installs as its own user.  Mounting a"
+        say  "  filesystem, loading a module or making a device node is the"
+        say  "  system's business, not a package's -- and no collector group"
+        say  "  can grant it.  Such a command usually comes from a book block"
+        say  "  that belongs to the TEST suite (blfs 1.14.334 drops those)."
+        say  "  Regenerate the script, and run the command yourself if you"
+        say  "  actually want what it does:"
+        say  "      packagemanager update <pkg> --reinstall --regenerate --run"
+    fi
     hits="$(grep -nE "(^|[^-])\\berror\\b:|\\*\\*\\* \\[|Error [0-9]+|No such file or directory|command not found|undefined reference" \
         "$log" 2>/dev/null | grep -vE "Error 1$|Error 2$" | head -12)"
     if [ -n "$hits" ]; then
@@ -2455,8 +2479,12 @@ unwritable_dirs_from_log() {
     # of it and then running `su ... test -w` on each is minutes of CPU for an
     # answer that is always in the last few lines.
     local _tail
+    # The same three wordings as the gate above: ExtUtils::Install's
+    # "Can't create '<dir>'" / "Do not have write permissions on '<dir>'"
+    # and tar's "Cannot mkdir".  Without them this list came back EMPTY for
+    # every Perl module, and the repair had nothing to grant.
     _tail="$(tail -c 524288 "$log" 2>/dev/null \
-             | grep -aE "Permission denied|Operation not permitted|cannot (create|remove|touch|open)|couldn't copy|No such file or directory" \
+             | grep -aE "Permission denied|Operation not permitted|cannot (create|remove|touch|open)|[Cc]an'?t create|[Dd]o not have write permissions|[Cc]annot mkdir|couldn't copy|No such file or directory" \
              | grep -avE "^[[:space:]]*(File \"|Traceback|at .* line )" \
              | head -n 100)"
     # A RELATIVE PATH NEEDS THE `cd` THAT PRECEDED IT.
@@ -2575,7 +2603,7 @@ unwritable_dirs_from_log() {
       printf '%s\n' "$_cmakedirs"
       printf '%s\n' "$_cdpaths"
       printf '%s\n' "$_tail" | grep -aoE "'[^']+'|\"[^\"]+\"" | tr -d "'\""
-      printf '%s\n' "$_tail" | grep -aoE "/[A-Za-z0-9._/+-]{6,}"; } \
+      printf '%s\n' "$_tail" | grep -aoE "/[A-Za-z0-9._/+:-]{6,}" | sed 's/:*$//'; } \
       | while IFS= read -r p; do
             case "$p" in /*) ;; *) continue ;; esac
             if ! under_dir "$p" "$SNAP_ROOT"; then
@@ -2592,6 +2620,44 @@ unwritable_dirs_from_log() {
             su -s /bin/bash "$user" -c "test -w '$d'" 2>/dev/null && continue
             echo "$d"
         done
+}
+
+# A BUILD OPTION THE BUILD ITSELF NAMES.
+#
+# cairomm 1.14.6 stops at configure:
+#     Run-time dependency Boost found: NO (tried system)
+#     ERROR: Building the test programs requires Boost Test ... and Fontconfig.
+#     Install them or use -Dbuild-tests=false or -Dbuild-tests=if-dependencies-found
+# Boost is in avoid.stack -- deliberately, it is an hour of build and this
+# desktop wants none of it -- so the dependency is never coming, and the
+# option meson prints is the whole answer.  A gparted chain that stops for
+# an hour on a TEST program nobody asked for is the failure; the fix was on
+# the screen the whole time.
+#
+# Only an option the tool suggested, only one that turns something OFF, only
+# if it is not already there, and the old script is kept beside it.
+_meson_opt_from_log() {   # <log> <script> <name>
+    local log="$1" script="$2" pkg="${3:-}" opt
+    [ -f "$log" ] && [ -f "$script" ] || return 1
+    opt="$(grep -ohE "use -D[A-Za-z0-9_.-]+=[A-Za-z0-9_.-]+" "$log" 2>/dev/null \
+           | head -n1 | sed 's/^use //')"
+    [ -n "$opt" ] || return 1
+    case "$opt" in
+        *=false|*=disabled|*=no|*=if-dependencies-found) ;;
+        *) return 1 ;;                       # never turn something ON
+    esac
+    grep -qF -- "$opt" "$script" && return 1
+    grep -q "meson setup" "$script" || return 1
+    cp -p "$script" "$script.bak-$(date +%Y%m%d-%H%M%S)" || return 1
+    sed -i "s|meson setup|meson setup $opt|" "$script" || return 1
+    note "# the build named the option itself -- adding it and trying again:"
+    note "#     $opt"
+    note "#   in $script (the old one is beside it as .bak-<date>)"
+    note "#   A REGENERATED SCRIPT LOSES IT.  To keep it, put it in"
+    note "#   /etc/pkgusr/stacks/machine.conf:"
+    note "#     [${pkg:-<package>}]"
+    note "#     ${opt#-D}" | sed 's/=/ = /'
+    return 0
 }
 
 # Grant <user> access to everything in the log it could not write, and say
@@ -2716,6 +2782,7 @@ takeover_files_from_log() {
         user_exists "$owner" || continue
         if real_chown -h "$user:$user" "$f" 2>/dev/null; then
             warn "!! $f belonged to $owner -- given to $user, which is installing it"
+            LAST_TAKEOVER_OWNER="$owner"
             n=$((n + 1))
         fi
     done <<< "$(
@@ -2723,7 +2790,39 @@ takeover_files_from_log() {
           grep -oE "cannot create regular file '[^']+'" "$log" 2>/dev/null | cut -d"'" -f2
           grep -oE "cannot unlink '[^']+'" "$log" 2>/dev/null | cut -d"'" -f2
           grep -oE "cannot overwrite '[^']+'" "$log" 2>/dev/null | cut -d"'" -f2
+          # PERL SAYS IT WITHOUT QUOTES, AND THE PATH CONTAINS COLONS.
+          #
+          #   Cannot forceunlink /usr/share/man/man3/XML::Parser.3: Permission denied
+          #
+          # ExtUtils::Install replaces a file by unlinking it first, and in a
+          # STICKY directory (/usr/share/man/man3 is drwxrwxr-t) only the
+          # file's owner may do that -- so granting the directory, which the
+          # repair did six times, can never help.  The file belongs to an
+          # older account for the same module (p_xml-parser; this one is
+          # p_perl-xml-parser), and handing it over is the fix.
+          # The path is taken as a whole token: XML::Parser.3 has colons in
+          # it, so splitting on ":" loses it.
+          grep -oE "[Cc]annot forceunlink [^ ]+" "$log" 2>/dev/null \
+              | sed 's/^[Cc]annot forceunlink //; s/:$//'
+          grep -oE "[Cc]an'?t (unlink|remove|rename) [^ ]+" "$log" 2>/dev/null \
+              | sed -E "s/^[Cc]an'?t (unlink|remove|rename) //; s/:\$//"
         } | sort -u)"
+    # AN OLDER ACCOUNT FOR THE SAME PACKAGE.  When several files move from
+    # one package user whose name is this one's with a language prefix
+    # dropped (xml-parser <- perl-xml-parser), the two are the same upstream
+    # module installed twice under two book anchors.  Taking the files is
+    # right; leaving the old account to claim them in `verify` is not.
+    if [ "$n" -ge 2 ] && [ -n "${LAST_TAKEOVER_OWNER:-}" ]; then
+        local _a="${user#p_}" _b="${LAST_TAKEOVER_OWNER#p_}"
+        case "$_a" in
+            perl-"$_b"|python-"$_b"|"$_b"-perl|"$_b"|py-"$_b")
+                warn "!! $LAST_TAKEOVER_OWNER looks like an older account for the same"
+                warn "   module as $user -- two book anchors, one upstream package."
+                warn "   The files are $user's now.  The old account still claims"
+                warn "   them; when this build is done, take it out of the way:"
+                warn "     packagemanager remove ${_b} --purge --run" ;;
+        esac
+    fi
     [ "$n" -gt 0 ]
 }
 
@@ -4493,7 +4592,16 @@ diagnose_paths_from_log() {
     [ -f "$log" ] || return 0
     local paths
     # tail only, and cap the results: see unwritable_dirs_from_log for why
-    paths="$(tail -c 524288 "$log" 2>/dev/null | grep -aoE "/[A-Za-z0-9._/+-]{6,}" \
+    # A PERL MAN PAGE HAS COLONS IN ITS NAME.
+    #
+    # /usr/share/man/man3/XML::Parser.3 was reported as
+    #     /usr/share/man/man3/XML   missing; parent ... is drwxrwxr-t
+    # -- the class below had no ":" in it, so the name was cut at the first
+    # one, and the report named a file that has never existed while the one
+    # that could not be replaced went unmentioned.  A trailing colon (the
+    # message's own "path: Permission denied") is stripped afterwards.
+    paths="$(tail -c 524288 "$log" 2>/dev/null | grep -aoE "/[A-Za-z0-9._/+:-]{6,}" \
+             | sed 's/:*$//' \
              | grep -vE "^/(proc|sys|dev|tmp)/" | sort -u \
              | while IFS= read -r p; do
                    case "$p" in
@@ -5907,8 +6015,34 @@ run_phase_as() {
         # ninja prints `ninja: build stopped: subcommand failed.` with no
         # `***`, so it needs its own branch -- the one place this check was
         # supposed to work, and did not.
-        _swallowed="$(grep -m1 -E "^(make(\[[0-9]+\])?|ninja): \*\*\* .*(Error [0-9]+|build stopped)|^ninja: build stopped|^install: cannot create|: Permission denied$|^CMake Error|^-- Configuring incomplete|^configure: error:|^meson\.build:[0-9]+:[0-9]+: ERROR:|^ERROR: Unhandled python|^error: could not compile|^fatal: could not read Username|^fatal: repository .* not found|^fatal: Authentication failed|BackendUnavailable: Cannot import|^ModuleNotFoundError: No module named" \
-                      "$log" 2>/dev/null)"
+        # A SHARED REGISTRY IS NOT THE PACKAGE.
+        #
+        # perl-class-inspector installed both its modules and both its man
+        # pages, and was then failed for this line:
+        #     .../core_perl/perllocal.pod: Permission denied
+        # which make itself had already marked "(ignored)".  perllocal.pod
+        # is a list of what has been installed, written by every module and
+        # owned by the first one; not updating it loses a paragraph of
+        # bookkeeping, not a file of this package's.  The same is true of
+        # every entry in shared_files_list.  They are excluded from this
+        # test -- and reported, because the reason they cannot be written
+        # is worth fixing (share_shared_files does it on the next repair).
+        local _ign _shared_hit=""
+        _ign="$(mktemp)"
+        { shared_files_list; printf '%s\n' perllocal.pod; } > "$_ign" 2>/dev/null
+        _shared_hit="$(grep -Ff "$_ign" "$log" 2>/dev/null \
+                       | grep -m1 -E ": Permission denied$|Operation not permitted")"
+        _swallowed="$(grep -vFf "$_ign" "$log" 2>/dev/null \
+                      | grep -m1 -E "^(make(\[[0-9]+\])?|ninja): \*\*\* .*(Error [0-9]+|build stopped)|^ninja: build stopped|^install: cannot create|: Permission denied$|^CMake Error|^-- Configuring incomplete|^configure: error:|^meson\.build:[0-9]+:[0-9]+: ERROR:|^ERROR: Unhandled python|^error: could not compile|^fatal: could not read Username|^fatal: repository .* not found|^fatal: Authentication failed|BackendUnavailable: Cannot import|^ModuleNotFoundError: No module named")"
+        rm -f "$_ign"
+        if [ -z "$_swallowed" ] && [ -n "$_shared_hit" ]; then
+            warn "a shared registry file could not be updated:"
+            warn "    $_shared_hit"
+            note "   that file is written by every package of its family and"
+            note "   owned by the first one; this package's OWN files installed."
+            note "   Fixed for the next one:  lfs-helper fix-perms $name --run"
+            share_shared_files
+        fi
         if [ -n "$_swallowed" ]; then
             warn "!! this phase exited 0, but its log says otherwise:"
             warn "     $_swallowed"
@@ -6987,7 +7121,16 @@ cmd_build() {
     # Partition first" -- must never be answered by handing directories away.
     local _perm_ish=0
     # "file INSTALL cannot": CMake wraps "Permission denied" over two lines.
-    grep -qiE "permission denied|operation not permitted|cannot (create|make|remove|change|touch)|couldn't copy|read-only file system|file INSTALL cannot" \
+    # PERL SAYS IT IN ITS OWN WORDS, AND THEY MATCHED NOTHING.
+    #
+    #   ERROR: Can't create '/usr/lib/perl5/5.42/site_perl/File'
+    #   Do not have write permissions on '/usr/lib/perl5/5.42/site_perl/File'
+    #   make: *** [Makefile:777: pure_site_install] Error 13
+    #
+    # ExtUtils::Install never writes "Permission denied" for this case, so
+    # the gate said "the failure does not look like a permission problem",
+    # ran zero rounds, and stopped a plan whose fix is one group.
+    grep -qiE "permission denied|operation not permitted|cannot (create|make|remove|change|touch)|can(no|')?t (create|make|mkdir)|do not have write permissions|couldn't copy|read-only file system|file INSTALL cannot" \
          "$log" 2>/dev/null && _perm_ish=1
     # A BOOK COMMAND THAT WORKS ONCE.
     #
@@ -7015,13 +7158,17 @@ cmd_build() {
     # permission problem and granting will never fix it -- but it IS
     # automatically fixable, so it must reach the retry loop.
     [ -n "$(missing_dirs_from_log "$log")" ] && _perm_ish=1
+    # ...and neither is "use -Dbuild-tests=false", which is the build telling
+    # us how to finish without a dependency this machine does not have.
+    grep -qE "use -D[A-Za-z0-9_.-]+=" "$log" 2>/dev/null && _perm_ish=1
     # SAY WHY THERE WAS NO RETRY.  cmake failed twice on the same missing
     # directory with no attempt and no explanation, which left the only
     # evidence -- "did the loop run?" -- invisible.  A decision not to act is
     # a decision, and it has to be reviewable.
     if [ "$rc" != 0 ] && [ "$auto_fix" = 1 ] && [ "$_perm_ish" != 1 ]; then
-        detail "# no automatic repair attempted: the failure does not look like"
-        detail "#   a permission or missing-directory problem"
+        detail "# no automatic repair attempted: the failure is not one this"
+        detail "#   tool knows how to fix (a permission, a missing directory,"
+        detail "#   or a build option the build itself names)"
     fi
 
     # Grants are per-directory now (a collector group is permission to install
@@ -7053,6 +7200,7 @@ cmd_build() {
                 && _fixed_something=1
         fi
         create_missing_dirs_from_log "$log" "$owner" && _fixed_something=1
+        _meson_opt_from_log "$log" "$s" "$name" && _fixed_something=1
         # the package's own leftovers from a previous install of the same
         # version: removing them IS the fix, and it counts as one, so the
         # phase is retried
@@ -7700,13 +7848,47 @@ cmd_build() {
             fail "!"
             if [ -n "$_dep_provider" ]; then
                 fail "! '$_dep' is the pkg-config name of '$_dep_provider',"
-                fail "! which IS installed here.  So this is a pkg-config"
-                fail "! problem, not a missing package:"
-                fail "!   pkg-config --exists --print-errors '$_dep'"
-                fail "!   ls /usr/lib/pkgconfig/$_dep.pc"
-                fail "! If the .pc is absent, $_dep_provider installed without it"
-                fail "! -- rebuild it:"
-                fail "!   packagemanager install $_dep_provider --run --reinstall"
+                fail "! which is RECORDED as installed here."
+                # ASK THE MANIFEST, DO NOT GUESS.
+                #
+                # "If the .pc is absent, it installed without it" left the
+                # reader to find out which of two very different things had
+                # happened: a package that installed and then lost a file,
+                # or one that is recorded as installed and put nothing on
+                # disk at all (a build that failed after its account and
+                # home were made).  The manifest says which, in one read.
+                local _php _plst _pn=0 _ppc=""
+                _php="$(pkgusr_home_for "$_dep_provider" 2>/dev/null)"
+                _plst="$_php/pkg.lst"
+                if [ -s "$_plst" ]; then
+                    _pn="$(grep -c . "$_plst" 2>/dev/null || echo 0)"
+                    _ppc="$(grep -E '\.pc$' "$_plst" 2>/dev/null | head -n3)"
+                fi
+                if [ "${_pn:-0}" -eq 0 ]; then
+                    fail "! ...but its manifest is EMPTY: nothing of it is on"
+                    fail "! disk.  Its last build did not finish, and whatever"
+                    fail "! marked it installed was wrong.  Build it again:"
+                    fail "!   packagemanager install $_dep_provider --run --reinstall"
+                elif [ -z "$_ppc" ]; then
+                    fail "! It records $_pn file(s), and NONE of them is a .pc"
+                    fail "! -- so it installed without the pkg-config file this"
+                    fail "! build needs.  Rebuild it:"
+                    fail "!   packagemanager install $_dep_provider --run --reinstall"
+                else
+                    fail "! It records $_pn file(s), including:"
+                    printf '%s\n' "$_ppc" | while IFS= read -r _l; do
+                        if [ -e "$_l" ]; then
+                            fail "!   $_l  (on disk)"
+                        else
+                            fail "!   $_l  -- MISSING from disk"
+                        fi
+                    done
+                    fail "! If the one this build wants is missing, rebuild it;"
+                    fail "! if it is there, the build did not look where it is:"
+                    fail "!   pkg-config --exists --print-errors '$_dep'"
+                    fail "!   pkg-config --variable pc_path pkg-config"
+                    fail "!   packagemanager install $_dep_provider --run --reinstall"
+                fi
             fi
             _pcdir="$(timeout 10 find "${SNAP_ROOT%/}/usr/lib" "${SNAP_ROOT%/}/usr/share" \
                         -maxdepth 3 -name "$_dep.pc" 2>/dev/null | head -1)"
@@ -11440,6 +11622,22 @@ EOF
 # the people who must update it.  A shared directory is root:install and
 # group-writable; a shared file is the same rule, one level down.
 shared_files_list() {
+    # perllocal.pod IS THE info/dir OF THE PERL TREE.
+    #
+    # Every Perl module's `make install` runs doc_install, which APPENDS a
+    # paragraph to /usr/lib/perl5/<ver>/core_perl/perllocal.pod.  So the
+    # file belongs to whichever module was installed first -- here
+    # p_xml-parser, mode 664, group p_xml-parser -- and every module after
+    # that fails on it:
+    #     /usr/lib/perl5/5.42/core_perl/perllocal.pod: Permission denied
+    # Granting the DIRECTORY to the perl collector group does not help: the
+    # file's own group is one package's.  It is rewritten by many packages
+    # and installed by none, which is exactly this list's rule.
+    # The version is in the path, so it is globbed rather than spelled.
+    local _p
+    for _p in "${SNAP_ROOT%/}"/usr/lib/perl5/*/*/perllocal.pod; do
+        [ -e "$_p" ] && printf '%s\n' "$_p"
+    done
     printf '%s\n' \
         "${SNAP_ROOT%/}/usr/share/info/dir" \
         "${SNAP_ROOT%/}/etc/xml/catalog" \
@@ -11474,9 +11672,19 @@ shared_files_list() {
 
 # The directories those files live in.  They may NOT be sticky -- see below.
 shared_file_dirs() {
-    local f
+    local f d
     while IFS= read -r f; do
-        [ -n "$f" ] && dirname "$f"
+        [ -n "$f" ] || continue
+        d="$(dirname "$f")"
+        # THE FILE IS SHARED; THE DIRECTORY IS NOT.
+        #
+        # /usr/lib/perl5/<ver>/core_perl holds perl's OWN modules and is
+        # p_perl's install directory, recorded in its manifest.  Only
+        # perllocal.pod inside it is written by everyone.  Handing the whole
+        # directory to root:install would take a directory away from the
+        # package that installed it and make `verify` right to complain.
+        case "$d" in */usr/lib/perl5/*) continue ;; esac
+        printf '%s\n' "$d"
     done < <(shared_files_list) | sort -u
 }
 
