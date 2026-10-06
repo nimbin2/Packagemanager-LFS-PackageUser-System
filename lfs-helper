@@ -49,7 +49,7 @@ set -u
 # Bump on every change that alters behaviour.  `lfs-helper --version` makes it
 # possible to tell at a glance whether the copy inside the chroot is the one
 # that was just fixed -- guessing at that has wasted a lot of time.
-LFS_HELPER_VERSION="1.14.340"
+LFS_HELPER_VERSION="1.14.299"
 
 # A fingerprint of this file's own contents.  A hand-maintained version number
 # goes stale the moment someone forgets to bump it -- and the reason for
@@ -1157,33 +1157,9 @@ PHASES="$STATE_PROGRESS/phases"
 # job's message can be thousands of lines above the end, so showing the tail
 # (what you see on screen) is usually useless.
 show_build_errors() {
-    local log="$1" hits="" _rootline=""
+    local log="$1" hits=""
     [ -f "$log" ] || return 0
     say ""
-    # A COMMAND ONLY ROOT CAN RUN, IN A BUILD THAT IS NOT ROOT.
-    #
-    #     mount: /tmp: must be superuser to use mount.
-    #     !! phase 'install' FAILED (exit 32)
-    # ...and the report said "no line matched the usual error patterns",
-    # because nothing here looks like a compiler error.  It is not a
-    # permission to GRANT either: no collector group makes mount work.  The
-    # command does not belong in a package's install at all (it was LVM2's
-    # "remount /tmp so the TESTS can make device nodes"), so say exactly
-    # that and name the line.
-    _rootline="$(grep -m1 -E "must be superuser|only root can|Operation not permitted \(are you root|must be run as root|requires root privileges" \
-                 "$log" 2>/dev/null)"
-    if [ -n "$_rootline" ]; then
-        fail "--- this step tried to do something only root may do ---"
-        say  "  $_rootline"
-        say  "  A package builds and installs as its own user.  Mounting a"
-        say  "  filesystem, loading a module or making a device node is the"
-        say  "  system's business, not a package's -- and no collector group"
-        say  "  can grant it.  Such a command usually comes from a book block"
-        say  "  that belongs to the TEST suite (blfs 1.14.334 drops those)."
-        say  "  Regenerate the script, and run the command yourself if you"
-        say  "  actually want what it does:"
-        say  "      packagemanager update <pkg> --reinstall --regenerate --run"
-    fi
     hits="$(grep -nE "(^|[^-])\\berror\\b:|\\*\\*\\* \\[|Error [0-9]+|No such file or directory|command not found|undefined reference" \
         "$log" 2>/dev/null | grep -vE "Error 1$|Error 2$" | head -12)"
     if [ -n "$hits" ]; then
@@ -2479,12 +2455,8 @@ unwritable_dirs_from_log() {
     # of it and then running `su ... test -w` on each is minutes of CPU for an
     # answer that is always in the last few lines.
     local _tail
-    # The same three wordings as the gate above: ExtUtils::Install's
-    # "Can't create '<dir>'" / "Do not have write permissions on '<dir>'"
-    # and tar's "Cannot mkdir".  Without them this list came back EMPTY for
-    # every Perl module, and the repair had nothing to grant.
     _tail="$(tail -c 524288 "$log" 2>/dev/null \
-             | grep -aE "Permission denied|Operation not permitted|cannot (create|remove|touch|open)|[Cc]an'?t create|[Dd]o not have write permissions|[Cc]annot mkdir|couldn't copy|No such file or directory" \
+             | grep -aE "Permission denied|Operation not permitted|cannot (create|remove|touch|open)|couldn't copy|No such file or directory" \
              | grep -avE "^[[:space:]]*(File \"|Traceback|at .* line )" \
              | head -n 100)"
     # A RELATIVE PATH NEEDS THE `cd` THAT PRECEDED IT.
@@ -2603,7 +2575,7 @@ unwritable_dirs_from_log() {
       printf '%s\n' "$_cmakedirs"
       printf '%s\n' "$_cdpaths"
       printf '%s\n' "$_tail" | grep -aoE "'[^']+'|\"[^\"]+\"" | tr -d "'\""
-      printf '%s\n' "$_tail" | grep -aoE "/[A-Za-z0-9._/+:-]{6,}" | sed 's/:*$//'; } \
+      printf '%s\n' "$_tail" | grep -aoE "/[A-Za-z0-9._/+-]{6,}"; } \
       | while IFS= read -r p; do
             case "$p" in /*) ;; *) continue ;; esac
             if ! under_dir "$p" "$SNAP_ROOT"; then
@@ -2620,44 +2592,6 @@ unwritable_dirs_from_log() {
             su -s /bin/bash "$user" -c "test -w '$d'" 2>/dev/null && continue
             echo "$d"
         done
-}
-
-# A BUILD OPTION THE BUILD ITSELF NAMES.
-#
-# cairomm 1.14.6 stops at configure:
-#     Run-time dependency Boost found: NO (tried system)
-#     ERROR: Building the test programs requires Boost Test ... and Fontconfig.
-#     Install them or use -Dbuild-tests=false or -Dbuild-tests=if-dependencies-found
-# Boost is in avoid.stack -- deliberately, it is an hour of build and this
-# desktop wants none of it -- so the dependency is never coming, and the
-# option meson prints is the whole answer.  A gparted chain that stops for
-# an hour on a TEST program nobody asked for is the failure; the fix was on
-# the screen the whole time.
-#
-# Only an option the tool suggested, only one that turns something OFF, only
-# if it is not already there, and the old script is kept beside it.
-_meson_opt_from_log() {   # <log> <script> <name>
-    local log="$1" script="$2" pkg="${3:-}" opt
-    [ -f "$log" ] && [ -f "$script" ] || return 1
-    opt="$(grep -ohE "use -D[A-Za-z0-9_.-]+=[A-Za-z0-9_.-]+" "$log" 2>/dev/null \
-           | head -n1 | sed 's/^use //')"
-    [ -n "$opt" ] || return 1
-    case "$opt" in
-        *=false|*=disabled|*=no|*=if-dependencies-found) ;;
-        *) return 1 ;;                       # never turn something ON
-    esac
-    grep -qF -- "$opt" "$script" && return 1
-    grep -q "meson setup" "$script" || return 1
-    cp -p "$script" "$script.bak-$(date +%Y%m%d-%H%M%S)" || return 1
-    sed -i "s|meson setup|meson setup $opt|" "$script" || return 1
-    note "# the build named the option itself -- adding it and trying again:"
-    note "#     $opt"
-    note "#   in $script (the old one is beside it as .bak-<date>)"
-    note "#   A REGENERATED SCRIPT LOSES IT.  To keep it, put it in"
-    note "#   /etc/pkgusr/stacks/machine.conf:"
-    note "#     [${pkg:-<package>}]"
-    note "#     ${opt#-D}" | sed 's/=/ = /'
-    return 0
 }
 
 # Grant <user> access to everything in the log it could not write, and say
@@ -2782,7 +2716,6 @@ takeover_files_from_log() {
         user_exists "$owner" || continue
         if real_chown -h "$user:$user" "$f" 2>/dev/null; then
             warn "!! $f belonged to $owner -- given to $user, which is installing it"
-            LAST_TAKEOVER_OWNER="$owner"
             n=$((n + 1))
         fi
     done <<< "$(
@@ -2790,39 +2723,7 @@ takeover_files_from_log() {
           grep -oE "cannot create regular file '[^']+'" "$log" 2>/dev/null | cut -d"'" -f2
           grep -oE "cannot unlink '[^']+'" "$log" 2>/dev/null | cut -d"'" -f2
           grep -oE "cannot overwrite '[^']+'" "$log" 2>/dev/null | cut -d"'" -f2
-          # PERL SAYS IT WITHOUT QUOTES, AND THE PATH CONTAINS COLONS.
-          #
-          #   Cannot forceunlink /usr/share/man/man3/XML::Parser.3: Permission denied
-          #
-          # ExtUtils::Install replaces a file by unlinking it first, and in a
-          # STICKY directory (/usr/share/man/man3 is drwxrwxr-t) only the
-          # file's owner may do that -- so granting the directory, which the
-          # repair did six times, can never help.  The file belongs to an
-          # older account for the same module (p_xml-parser; this one is
-          # p_perl-xml-parser), and handing it over is the fix.
-          # The path is taken as a whole token: XML::Parser.3 has colons in
-          # it, so splitting on ":" loses it.
-          grep -oE "[Cc]annot forceunlink [^ ]+" "$log" 2>/dev/null \
-              | sed 's/^[Cc]annot forceunlink //; s/:$//'
-          grep -oE "[Cc]an'?t (unlink|remove|rename) [^ ]+" "$log" 2>/dev/null \
-              | sed -E "s/^[Cc]an'?t (unlink|remove|rename) //; s/:\$//"
         } | sort -u)"
-    # AN OLDER ACCOUNT FOR THE SAME PACKAGE.  When several files move from
-    # one package user whose name is this one's with a language prefix
-    # dropped (xml-parser <- perl-xml-parser), the two are the same upstream
-    # module installed twice under two book anchors.  Taking the files is
-    # right; leaving the old account to claim them in `verify` is not.
-    if [ "$n" -ge 2 ] && [ -n "${LAST_TAKEOVER_OWNER:-}" ]; then
-        local _a="${user#p_}" _b="${LAST_TAKEOVER_OWNER#p_}"
-        case "$_a" in
-            perl-"$_b"|python-"$_b"|"$_b"-perl|"$_b"|py-"$_b")
-                warn "!! $LAST_TAKEOVER_OWNER looks like an older account for the same"
-                warn "   module as $user -- two book anchors, one upstream package."
-                warn "   The files are $user's now.  The old account still claims"
-                warn "   them; when this build is done, take it out of the way:"
-                warn "     packagemanager remove ${_b} --purge --run" ;;
-        esac
-    fi
     [ "$n" -gt 0 ]
 }
 
@@ -4592,16 +4493,7 @@ diagnose_paths_from_log() {
     [ -f "$log" ] || return 0
     local paths
     # tail only, and cap the results: see unwritable_dirs_from_log for why
-    # A PERL MAN PAGE HAS COLONS IN ITS NAME.
-    #
-    # /usr/share/man/man3/XML::Parser.3 was reported as
-    #     /usr/share/man/man3/XML   missing; parent ... is drwxrwxr-t
-    # -- the class below had no ":" in it, so the name was cut at the first
-    # one, and the report named a file that has never existed while the one
-    # that could not be replaced went unmentioned.  A trailing colon (the
-    # message's own "path: Permission denied") is stripped afterwards.
-    paths="$(tail -c 524288 "$log" 2>/dev/null | grep -aoE "/[A-Za-z0-9._/+:-]{6,}" \
-             | sed 's/:*$//' \
+    paths="$(tail -c 524288 "$log" 2>/dev/null | grep -aoE "/[A-Za-z0-9._/+-]{6,}" \
              | grep -vE "^/(proc|sys|dev|tmp)/" | sort -u \
              | while IFS= read -r p; do
                    case "$p" in
@@ -4878,7 +4770,7 @@ is_never_claimed() {
 }
 
 _drop_other_packages_files() {
-    local owner="$1" p cur _sp _tgt _to
+    local owner="$1" p cur
     while IFS= read -r p; do
         [ -n "$p" ] || continue
         # a shared index or a generated cache is nobody's file
@@ -4887,32 +4779,6 @@ _drop_other_packages_files() {
         if [ -n "$cur" ] && [ "$cur" != "$owner" ] && [ "$cur" != root ] \
            && [ "$cur" != UNKNOWN ] && user_exists "$cur"; then
             continue                      # another package installed this
-        fi
-        # CURRENT OWNERSHIP IS NOT PROOF OF PROVENANCE (1.14.310).
-        #
-        # The test above asks who owns the file NOW, and that is circular:
-        # once the lease had handed /usr/bin/su and six /usr/sbin/iptables*
-        # links to p_webkitgtk, they read as "the owner's own" and stayed in
-        # its manifest -- which is the list the NEXT lease reads.  The
-        # manifest fed the lease and the lease fed the manifest, and the
-        # damage repeated on every rebuild.  Two facts break the loop, and
-        # neither depends on who holds the file today:
-        #
-        #   * setid.conf names the package that installs a setid file.
-        #   * a symlink is installed by whoever installed its target.
-        if _sp="$(_setid_pkg_for "$p" 2>/dev/null)" \
-           && [ -n "$_sp" ] && [ "$_sp" != "$(unprefix_pkg_user "$owner")" ]; then
-            continue
-        fi
-        if [ -L "$p" ]; then
-            _tgt="$(readlink -f "$p" 2>/dev/null)"
-            if [ -n "$_tgt" ] && [ "$_tgt" != "$p" ]; then
-                _to="$(stat -c %U "$_tgt" 2>/dev/null)"
-                if [ -n "$_to" ] && [ "$_to" != "$owner" ] && [ "$_to" != root ] \
-                   && [ "$_to" != UNKNOWN ] && user_exists "$_to"; then
-                    continue
-                fi
-            fi
         fi
         printf '%s\n' "$p"
     done
@@ -5592,29 +5458,6 @@ _setid_policy_for() {
         END { exit !found }' "$conf"
 }
 
-# _setid_pkg_for <path>  -> the PACKAGE setid.conf names as the file's
-# provider (the optional 5th column), or nothing.
-#
-# WHY A SETID FILE NEEDS AN OWNER'S NAME.  The lease hands a root-owned file
-# to a package user for the length of a phase, and one of the doors it may
-# come through is "the file carries a setid bit".  That door had no lock:
-# ANY package whose time-window manifest happened to list /usr/bin/su -- and
-# a webkitgtk build runs for hours, so its manifest listed whatever root
-# wrote meanwhile -- was handed su, 0711 and no longer setuid, until its
-# phase ended.  `su` is broken for those hours and, if the build is
-# interrupted, for good.
-#
-# Only shadow installs su.  With the provider written down, the lease can
-# say so: shadow may reclaim it, nobody else may borrow it.
-_setid_pkg_for() {
-    local conf; conf="$(_setid_conf)" || return 1
-    awk -F'|' -v p="$1" '
-        /^[[:space:]]*(#|$)/ { next }
-        { f = $1; gsub(/[[:space:]]/, "", f)
-          if (f == p) { k = $5; gsub(/[[:space:]]/, "", k); print k; found = 1; exit } }
-        END { exit !found }' "$conf"
-}
-
 _lease_dir() { printf '%s/%s\n' "$LEASES" "$(unprefix_pkg_user "$1")"; }
 
 # _lease_candidates <owner> <script> <phase>
@@ -5643,7 +5486,7 @@ _lease_candidates() {
 
 # lease_files <owner> <script> <phase>   (root; before the phase)
 lease_files() {
-    local owner="$1" script="$2" phase="$3" dir ledger n=0 p u g m accounts _sp _lt
+    local owner="$1" script="$2" phase="$3" dir ledger n=0 p u g m accounts
     [ "$(id -u)" = 0 ] || return 0
     case "$phase" in install|configure|all|update) ;; *) return 0 ;; esac
     user_exists "$owner" || return 0
@@ -5691,28 +5534,8 @@ lease_files() {
             # package's file is root's for two reasons only: a setid bit
             # (the policy put it there) or its own configure commands write
             # it.  Anything else root owns is not the package's to borrow.
-            if [ -u "$p" ] || [ -g "$p" ] || _setid_policy_for "$p" >/dev/null 2>&1; then
-                # ...AND "IT IS SETID" IS NOT A REASON EITHER, unless the
-                # package is the one that installs it (1.14.310).
-                #
-                # This was the widest door in the lease and it had no lock.
-                # /usr/bin/su is root 4711; any package whose time-window
-                # manifest listed it -- webkitgtk's did, because `cfg
-                # shadow-pam` ran during its build -- came through here, and
-                # `chown` to the package user clears the setuid bit as a
-                # side effect the kernel never reports.  Three times over
-                # three months the answer to "why is su owned by
-                # p_webkitgtk and 0711" was this line.
-                #
-                # setid.conf names the provider (5th column).  shadow may
-                # reclaim its own su; for anyone else a setid file is the
-                # system's, not a package's.
-                _sp="$(_setid_pkg_for "$p" 2>/dev/null)"
-                if [ -z "$_sp" ] || [ "$_sp" != "$(unprefix_pkg_user "$owner")" ]; then
-                    warn "#   $p is setuid/setgid and ${_sp:-no package} installs it -- not leasing it to $owner"
-                    continue
-                fi
-            elif ! printf '%s\n' "$_cfg_targets" | grep -qxF "$p"; then
+            if ! { [ -u "$p" ] || [ -g "$p" ] || _setid_policy_for "$p" >/dev/null 2>&1 \
+                   || printf '%s\n' "$_cfg_targets" | grep -qxF "$p"; }; then
                 detail "#   $p is root's, not setid and not written by $owner's configure -- left alone"
                 continue
             fi
@@ -5785,20 +5608,7 @@ lease_settle() {
                 continue
             fi
         fi
-        # A SYMLINK IS COMPARED BY WHERE IT POINTS, NOT BY `cmp` (1.14.310).
-        #
-        # `cp -a` copies a symlink AS a symlink, so the copy in the lease
-        # directory carries the same *relative* target -- and relative to
-        # $LEASES/<pkg>/files, not to /usr/sbin.  /usr/sbin/iptables ->
-        # xtables-nft-multi copied aside is a dangling link, `cmp` cannot
-        # open it, and a failed compare reads here as "the phase rewrote
-        # it".  So every leased symlink was declared the package's own and
-        # kept -- which is how six /usr/sbin/iptables* links, made by `cfg
-        # iptables-nft`, ended up owned by p_webkitgtk and written into its
-        # pkg.lst.  lease_restore already compared links with readlink; this
-        # is the same test, on the other side of the branch.
-        if { [ -L "$p" ] && [ "$(readlink "$p")" = "$(readlink "$dir/files/$n")" ]; } \
-           || { [ ! -L "$p" ] && cmp -s "$dir/files/$n" "$p" 2>/dev/null; }; then
+        if cmp -s "$dir/files/$n" "$p" 2>/dev/null; then
             # the phase did not change it: the lease was not needed
             chown -h "$u:$g" "$p" 2>/dev/null
             [ -L "$p" ] || chmod "$m" "$p" 2>/dev/null
@@ -6015,34 +5825,8 @@ run_phase_as() {
         # ninja prints `ninja: build stopped: subcommand failed.` with no
         # `***`, so it needs its own branch -- the one place this check was
         # supposed to work, and did not.
-        # A SHARED REGISTRY IS NOT THE PACKAGE.
-        #
-        # perl-class-inspector installed both its modules and both its man
-        # pages, and was then failed for this line:
-        #     .../core_perl/perllocal.pod: Permission denied
-        # which make itself had already marked "(ignored)".  perllocal.pod
-        # is a list of what has been installed, written by every module and
-        # owned by the first one; not updating it loses a paragraph of
-        # bookkeeping, not a file of this package's.  The same is true of
-        # every entry in shared_files_list.  They are excluded from this
-        # test -- and reported, because the reason they cannot be written
-        # is worth fixing (share_shared_files does it on the next repair).
-        local _ign _shared_hit=""
-        _ign="$(mktemp)"
-        { shared_files_list; printf '%s\n' perllocal.pod; } > "$_ign" 2>/dev/null
-        _shared_hit="$(grep -Ff "$_ign" "$log" 2>/dev/null \
-                       | grep -m1 -E ": Permission denied$|Operation not permitted")"
-        _swallowed="$(grep -vFf "$_ign" "$log" 2>/dev/null \
-                      | grep -m1 -E "^(make(\[[0-9]+\])?|ninja): \*\*\* .*(Error [0-9]+|build stopped)|^ninja: build stopped|^install: cannot create|: Permission denied$|^CMake Error|^-- Configuring incomplete|^configure: error:|^meson\.build:[0-9]+:[0-9]+: ERROR:|^ERROR: Unhandled python|^error: could not compile|^fatal: could not read Username|^fatal: repository .* not found|^fatal: Authentication failed|BackendUnavailable: Cannot import|^ModuleNotFoundError: No module named")"
-        rm -f "$_ign"
-        if [ -z "$_swallowed" ] && [ -n "$_shared_hit" ]; then
-            warn "a shared registry file could not be updated:"
-            warn "    $_shared_hit"
-            note "   that file is written by every package of its family and"
-            note "   owned by the first one; this package's OWN files installed."
-            note "   Fixed for the next one:  lfs-helper fix-perms $name --run"
-            share_shared_files
-        fi
+        _swallowed="$(grep -m1 -E "^(make(\[[0-9]+\])?|ninja): \*\*\* .*(Error [0-9]+|build stopped)|^ninja: build stopped|^install: cannot create|: Permission denied$|^CMake Error|^-- Configuring incomplete|^configure: error:|^meson\.build:[0-9]+:[0-9]+: ERROR:|^ERROR: Unhandled python|^error: could not compile|^fatal: could not read Username|^fatal: repository .* not found|^fatal: Authentication failed|BackendUnavailable: Cannot import|^ModuleNotFoundError: No module named" \
+                      "$log" 2>/dev/null)"
         if [ -n "$_swallowed" ]; then
             warn "!! this phase exited 0, but its log says otherwise:"
             warn "     $_swallowed"
@@ -7009,7 +6793,7 @@ cmd_build() {
         # Directories that belong to the install group are shared infrastructure
         # (root:install) and must stay that way -- only take the ones this
         # package created itself.
-        local n=0 p cur skipped_foreign=0 _sp _lt _lo
+        local n=0 p cur skipped_foreign=0
         while IFS= read -r p; do
             [ -n "$p" ] || continue
             # NEVER take a file that already belongs to another package user.
@@ -7027,61 +6811,6 @@ cmd_build() {
                && [ "$cur" != "UNKNOWN" ] && user_exists "$cur"; then
                 skipped_foreign=$((skipped_foreign+1))
                 continue
-            fi
-            # A PACKAGE USER CANNOT HAVE WRITTEN A ROOT-OWNED FILE -- HERE TOO.
-            #
-            # The manifest above already drops root-owned paths when the phase
-            # ran AS the package user (_root_ok).  This loop did not: it walked
-            # the RAW lists again, so a file the manifest correctly refused was
-            # chowned anyway.  One rule, applied in one of the two places that
-            # needed it.
-            if [ "$_root_ok" != 1 ] && [ "$cur" = root ]; then
-                skipped_foreign=$((skipped_foreign+1))
-                continue
-            fi
-            # CHOWN DESTROYS A SETUID BIT, AND NOTHING SAYS SO.
-            #
-            # Attribution is by TIME WINDOW, and a webkitgtk build runs for
-            # hours.  Anything that touched /usr/bin/su in that window --
-            # `lfs-helper setid`, a shadow reinstall, `cfg shadow-pam` -- made
-            # it "newer than the stamp", so this loop took a root-owned file
-            # that was fair game by every rule above and chowned it:
-            #     -rwx--x--x 1 p_webkitgtk p_webkitgtk /bin/su
-            # The kernel clears setuid/setgid on chown, so one command changed
-            # the owner AND removed the bit that makes su work.  A file
-            # carrying either bit is never this sweep's to take, whoever ran
-            # the phase: the modes in setid.conf are the system's, not a
-            # package's.
-            case "$(stat -c %a "$p" 2>/dev/null)" in
-                [1-7][0-7][0-7][0-7])
-                    warn "#   not taking $p -- it is setuid/setgid ($(stat -c %a "$p")); chown would clear that"
-                    skipped_foreign=$((skipped_foreign+1))
-                    continue ;;
-            esac
-            # ...AND THE SAME TWO PROVENANCE RULES THE MANIFEST USES
-            # (1.14.310): a setid file belongs to the package setid.conf
-            # names, and a symlink belongs to whoever owns its target.  The
-            # mode test above cannot see either -- `stat -c %a` on a symlink
-            # reports the link's own 777, so no link has ever looked setuid
-            # to it, and a file whose setuid bit a previous chown already
-            # cleared does not look setuid either.
-            if _sp="$(_setid_pkg_for "$p" 2>/dev/null)" \
-               && [ -n "$_sp" ] && [ "$_sp" != "$name" ]; then
-                warn "#   not taking $p -- setid.conf says $_sp installs it"
-                skipped_foreign=$((skipped_foreign+1))
-                continue
-            fi
-            if [ -L "$p" ]; then
-                _lt="$(readlink -f "$p" 2>/dev/null)"
-                if [ -n "$_lt" ] && [ "$_lt" != "$p" ]; then
-                    _lo="$(stat -c %U "$_lt" 2>/dev/null)"
-                    if [ -n "$_lo" ] && [ "$_lo" != "$owner" ] && [ "$_lo" != root ] \
-                       && [ "$_lo" != UNKNOWN ] && user_exists "$_lo"; then
-                        warn "#   not taking $p -- it points at $_lo's $_lt"
-                        skipped_foreign=$((skipped_foreign+1))
-                        continue
-                    fi
-                fi
             fi
             real_chown -h "$owner:$owner" "$p" 2>/dev/null && n=$((n+1))
         done <<< "$(printf '%s\n%s\n' "$newfiles" "$touched" | grep -v '^$' | sort -u)"
@@ -7121,16 +6850,7 @@ cmd_build() {
     # Partition first" -- must never be answered by handing directories away.
     local _perm_ish=0
     # "file INSTALL cannot": CMake wraps "Permission denied" over two lines.
-    # PERL SAYS IT IN ITS OWN WORDS, AND THEY MATCHED NOTHING.
-    #
-    #   ERROR: Can't create '/usr/lib/perl5/5.42/site_perl/File'
-    #   Do not have write permissions on '/usr/lib/perl5/5.42/site_perl/File'
-    #   make: *** [Makefile:777: pure_site_install] Error 13
-    #
-    # ExtUtils::Install never writes "Permission denied" for this case, so
-    # the gate said "the failure does not look like a permission problem",
-    # ran zero rounds, and stopped a plan whose fix is one group.
-    grep -qiE "permission denied|operation not permitted|cannot (create|make|remove|change|touch)|can(no|')?t (create|make|mkdir)|do not have write permissions|couldn't copy|read-only file system|file INSTALL cannot" \
+    grep -qiE "permission denied|operation not permitted|cannot (create|make|remove|change|touch)|couldn't copy|read-only file system|file INSTALL cannot" \
          "$log" 2>/dev/null && _perm_ish=1
     # A BOOK COMMAND THAT WORKS ONCE.
     #
@@ -7158,17 +6878,13 @@ cmd_build() {
     # permission problem and granting will never fix it -- but it IS
     # automatically fixable, so it must reach the retry loop.
     [ -n "$(missing_dirs_from_log "$log")" ] && _perm_ish=1
-    # ...and neither is "use -Dbuild-tests=false", which is the build telling
-    # us how to finish without a dependency this machine does not have.
-    grep -qE "use -D[A-Za-z0-9_.-]+=" "$log" 2>/dev/null && _perm_ish=1
     # SAY WHY THERE WAS NO RETRY.  cmake failed twice on the same missing
     # directory with no attempt and no explanation, which left the only
     # evidence -- "did the loop run?" -- invisible.  A decision not to act is
     # a decision, and it has to be reviewable.
     if [ "$rc" != 0 ] && [ "$auto_fix" = 1 ] && [ "$_perm_ish" != 1 ]; then
-        detail "# no automatic repair attempted: the failure is not one this"
-        detail "#   tool knows how to fix (a permission, a missing directory,"
-        detail "#   or a build option the build itself names)"
+        detail "# no automatic repair attempted: the failure does not look like"
+        detail "#   a permission or missing-directory problem"
     fi
 
     # Grants are per-directory now (a collector group is permission to install
@@ -7200,7 +6916,6 @@ cmd_build() {
                 && _fixed_something=1
         fi
         create_missing_dirs_from_log "$log" "$owner" && _fixed_something=1
-        _meson_opt_from_log "$log" "$s" "$name" && _fixed_something=1
         # the package's own leftovers from a previous install of the same
         # version: removing them IS the fix, and it counts as one, so the
         # phase is retried
@@ -7848,47 +7563,13 @@ cmd_build() {
             fail "!"
             if [ -n "$_dep_provider" ]; then
                 fail "! '$_dep' is the pkg-config name of '$_dep_provider',"
-                fail "! which is RECORDED as installed here."
-                # ASK THE MANIFEST, DO NOT GUESS.
-                #
-                # "If the .pc is absent, it installed without it" left the
-                # reader to find out which of two very different things had
-                # happened: a package that installed and then lost a file,
-                # or one that is recorded as installed and put nothing on
-                # disk at all (a build that failed after its account and
-                # home were made).  The manifest says which, in one read.
-                local _php _plst _pn=0 _ppc=""
-                _php="$(pkgusr_home_for "$_dep_provider" 2>/dev/null)"
-                _plst="$_php/pkg.lst"
-                if [ -s "$_plst" ]; then
-                    _pn="$(grep -c . "$_plst" 2>/dev/null || echo 0)"
-                    _ppc="$(grep -E '\.pc$' "$_plst" 2>/dev/null | head -n3)"
-                fi
-                if [ "${_pn:-0}" -eq 0 ]; then
-                    fail "! ...but its manifest is EMPTY: nothing of it is on"
-                    fail "! disk.  Its last build did not finish, and whatever"
-                    fail "! marked it installed was wrong.  Build it again:"
-                    fail "!   packagemanager install $_dep_provider --run --reinstall"
-                elif [ -z "$_ppc" ]; then
-                    fail "! It records $_pn file(s), and NONE of them is a .pc"
-                    fail "! -- so it installed without the pkg-config file this"
-                    fail "! build needs.  Rebuild it:"
-                    fail "!   packagemanager install $_dep_provider --run --reinstall"
-                else
-                    fail "! It records $_pn file(s), including:"
-                    printf '%s\n' "$_ppc" | while IFS= read -r _l; do
-                        if [ -e "$_l" ]; then
-                            fail "!   $_l  (on disk)"
-                        else
-                            fail "!   $_l  -- MISSING from disk"
-                        fi
-                    done
-                    fail "! If the one this build wants is missing, rebuild it;"
-                    fail "! if it is there, the build did not look where it is:"
-                    fail "!   pkg-config --exists --print-errors '$_dep'"
-                    fail "!   pkg-config --variable pc_path pkg-config"
-                    fail "!   packagemanager install $_dep_provider --run --reinstall"
-                fi
+                fail "! which IS installed here.  So this is a pkg-config"
+                fail "! problem, not a missing package:"
+                fail "!   pkg-config --exists --print-errors '$_dep'"
+                fail "!   ls /usr/lib/pkgconfig/$_dep.pc"
+                fail "! If the .pc is absent, $_dep_provider installed without it"
+                fail "! -- rebuild it:"
+                fail "!   packagemanager install $_dep_provider --run --reinstall"
             fi
             _pcdir="$(timeout 10 find "${SNAP_ROOT%/}/usr/lib" "${SNAP_ROOT%/}/usr/share" \
                         -maxdepth 3 -name "$_dep.pc" 2>/dev/null | head -1)"
@@ -10506,28 +10187,12 @@ cmd_pm_install() {
     say "Install $user_name"
     say "-------------------------------"
     say "install file: $install_script"
-    # "CHECK THAT THIS IS THE RIGHT ACCOUNT" IS A FIRST-INSTALL QUESTION.
-    #
-    # It is worth asking once: a typo in the account name on a FIRST install
-    # scatters a package across the wrong home and is tedious to undo.  It is
-    # worth nothing on an update -- the account exists, it already owns this
-    # package's files, and the answer was settled the day it was installed.
-    # Asking anyway turned every `update <pkg> --run` into a keypress, and a
-    # prompt people press through is a prompt that has stopped protecting
-    # anything.
-    local _known=0
-    if user_exists "$user_name"; then
-        [ -s "$(pkgusr_home_for "$user_name")/pkg.lst" ] && _known=1
-        [ -f "$(pkgusr_home_for "$user_name")/.pkgusr-installed" ] && _known=1
-    fi
-    if ! assume_yes && [ "$_known" != 1 ]; then
+    if ! assume_yes; then
         warn "First check the install file for: link, name, wrong commands"
         warn "check that \"$user_name\" is the right account"
         printf 'Press enter to continue '
         read -r -n1 _
         say ""
-    elif [ "$_known" = 1 ]; then
-        say "# $user_name is an existing package with files recorded -- not asking"
     fi
 
     # Phased scripts carry their metadata (install_groups, nimgnu_groups_dir,
@@ -11622,22 +11287,6 @@ EOF
 # the people who must update it.  A shared directory is root:install and
 # group-writable; a shared file is the same rule, one level down.
 shared_files_list() {
-    # perllocal.pod IS THE info/dir OF THE PERL TREE.
-    #
-    # Every Perl module's `make install` runs doc_install, which APPENDS a
-    # paragraph to /usr/lib/perl5/<ver>/core_perl/perllocal.pod.  So the
-    # file belongs to whichever module was installed first -- here
-    # p_xml-parser, mode 664, group p_xml-parser -- and every module after
-    # that fails on it:
-    #     /usr/lib/perl5/5.42/core_perl/perllocal.pod: Permission denied
-    # Granting the DIRECTORY to the perl collector group does not help: the
-    # file's own group is one package's.  It is rewritten by many packages
-    # and installed by none, which is exactly this list's rule.
-    # The version is in the path, so it is globbed rather than spelled.
-    local _p
-    for _p in "${SNAP_ROOT%/}"/usr/lib/perl5/*/*/perllocal.pod; do
-        [ -e "$_p" ] && printf '%s\n' "$_p"
-    done
     printf '%s\n' \
         "${SNAP_ROOT%/}/usr/share/info/dir" \
         "${SNAP_ROOT%/}/etc/xml/catalog" \
@@ -11672,19 +11321,9 @@ shared_files_list() {
 
 # The directories those files live in.  They may NOT be sticky -- see below.
 shared_file_dirs() {
-    local f d
+    local f
     while IFS= read -r f; do
-        [ -n "$f" ] || continue
-        d="$(dirname "$f")"
-        # THE FILE IS SHARED; THE DIRECTORY IS NOT.
-        #
-        # /usr/lib/perl5/<ver>/core_perl holds perl's OWN modules and is
-        # p_perl's install directory, recorded in its manifest.  Only
-        # perllocal.pod inside it is written by everyone.  Handing the whole
-        # directory to root:install would take a directory away from the
-        # package that installed it and make `verify` right to complain.
-        case "$d" in */usr/lib/perl5/*) continue ;; esac
-        printf '%s\n' "$d"
+        [ -n "$f" ] && dirname "$f"
     done < <(shared_files_list) | sort -u
 }
 

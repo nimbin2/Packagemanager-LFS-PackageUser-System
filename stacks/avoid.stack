@@ -1,5 +1,5 @@
 # avoid.stack -- what no stack on this machine builds, and why.
-# stack-version: 1.14.320
+# stack-version: 1.14.292
 #
 # An `avoid` entry does not build anything: it tells a dependency plan that
 # this machine will not have that package, so the plan stops walking into it
@@ -24,6 +24,13 @@
 # twice, which is why `stack sway` used to print some names twice in its
 # "never built by this stack" line.  Harmless, and it made the composed plan
 # impossible to check against, so now one entry per package.
+
+# sway.stack -- a working Sway desktop with a minimal WebKit browser.
+# stack-version: 1.14.292
+# Replay with:  packagemanager stack sway --run
+# Entries run top to bottom; book deps are resolved from the BLFS book,
+# installed entries are skipped, the first failure stops the run.
+# git refs are pinned to releases -- true them up if a clone fails.
 
 # Never built by this stack, however they are reached.  harfbuzz RECOMMENDS
 # texlive and LibreOffice; a sway desktop with a webkit browser wants
@@ -155,6 +162,10 @@ avoid  xdg-utils             # cups -- no live parent
 avoid  freeglut              # mupdf (avoided) -- no live parent
 avoid  polkit                # colord + systemd (both avoided) -- no live parent
 avoid  libgusb               # colord
+
+# 9. the nimbin2 family: make all && make PREFIX=/usr install
+
+# 10. wire the session together (root step)
 
 
 # TeX is NOT built by this stack.

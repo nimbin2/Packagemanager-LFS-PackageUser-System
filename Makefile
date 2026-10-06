@@ -39,7 +39,7 @@ INSTALL     ?= install
 # mkdir -p leaves an existing directory exactly as it is.
 MKDIR       ?= mkdir -p
 
-.PHONY: all install uninstall check stamp clean help
+.PHONY: all install uninstall check clean help
 
 all: help
 
@@ -47,7 +47,6 @@ help:
 	@echo "make install [PREFIX=...] [DESTDIR=...]   install the tools"
 	@echo "make uninstall [PREFIX=...]               remove them"
 	@echo "make check                                 run the tests"
-	@echo "make stamp                                 stamp the stack files with the tools' version"
 	@echo "make clean                                 remove scratch files"
 	@echo ""
 	@echo "installs into: $(PREFIX)/bin"
@@ -214,21 +213,6 @@ uninstall:
 
 check:
 	@bash $(TESTS) ./lfs
-
-# ONE ARTIFACT, ONE NUMBER -- and a rule a human has to remember is a rule
-# that drifts.  The stack files each carry `# stack-version:`, the suite
-# asserts it equals the tools' version, and it was ten releases stale before
-# anyone ran the suite.  This stamps them from `lfs --version`, so cutting a
-# release is `make stamp` rather than seven sed commands.
-stamp:
-	@v=$$(./lfs --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1); \
-	[ -n "$$v" ] || { echo "cannot read a version from ./lfs"; exit 1; }; \
-	for f in stacks/*.stack; do \
-	    grep -q '^# stack-version:' "$$f" \
-	        || { echo "$$f has no stack-version line -- add one"; exit 1; }; \
-	    sed -i "s/^# stack-version: .*/# stack-version: $$v/" "$$f"; \
-	done; \
-	echo "stamped $$(ls stacks/*.stack | wc -l) stack file(s) with $$v"
 
 # Nothing here is compiled, so clean removes only what running the tools here
 # leaves behind: Python bytecode and the test suite's scratch directories.

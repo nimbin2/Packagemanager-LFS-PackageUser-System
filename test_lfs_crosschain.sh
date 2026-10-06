@@ -185,15 +185,6 @@ LFS_BOOK="${2:-$(_find_book)}"
 PHASES_LIB="$(cd "$(dirname "$LFS_TOOL")" && pwd)/lfs-phases"
 export PKGUSR_LIB="$PHASES_LIB"
 T=$(mktemp -d /tmp/lfstest.XXXXXX)
-# THE DESKTOP IS FIVE FILES (1.14.320): wayland, media and sway build as one
-# (sway.stack includes the other two), apps and tools beside them.  A check
-# for an ENTRY reads them all, in build order, with the include lines taken
-# out so the concatenation parses on its own in $T.
-_DESKTOP_STACK="$T/desktop-all.stack"
-for _dsf in wayland media sway apps tools; do
-    [ -f "$(dirname "${LFS_TOOL:-$0}")/stacks/$_dsf.stack" ] \
-        && grep -vE '^include ' "$(dirname "${LFS_TOOL:-$0}")/stacks/$_dsf.stack"
-done > "$_DESKTOP_STACK" 2>/dev/null
 PASS=0; FAIL=0
 # Count in FILES, not shell variables.
 #
@@ -202,26 +193,19 @@ PASS=0; FAIL=0
 # incremented there dies with the subshell, so the suite printed 446 PASS
 # lines and reported 433.  A wrong count is worse than no count: it can hide a
 # regression behind a number that still looks healthy.
-# ...AND IT MUST NOT BE NAMED LIKE THE THING THAT GETS SWEPT UP.  This was
-# ${TMPDIR:-/tmp}/lfstest-count.$$, beside the /tmp/lfstest.$$ trees the suite
-# builds -- and something a block runs sweeps `lfstest*`, so the counters
-# vanished mid-run: every later ok() printed a shell error instead of counting,
-# and the final line read "PASS:   FAIL:   SKIP:  (final)".  A name nothing
-# globs for, and a mkdir before each write so a sweep cannot silence it again.
-_COUNTDIR="$(mktemp -d "${TMPDIR:-/tmp}/lfscount.XXXXXX")"
+_COUNTDIR="${TMPDIR:-/tmp}/lfstest-count.$$"
 mkdir -p "$_COUNTDIR"
 : > "$_COUNTDIR/pass"
 : > "$_COUNTDIR/fail"
 : > "$_COUNTDIR/skip"
 
-_tick() { [ -d "$_COUNTDIR" ] || mkdir -p "$_COUNTDIR"; echo x >> "$_COUNTDIR/$1"; }
-ok()  { echo "  PASS  $1"; _tick pass; }
-bad() { echo "  FAIL  $1"; _tick fail; }
+ok()  { echo "  PASS  $1"; echo x >> "$_COUNTDIR/pass"; }
+bad() { echo "  FAIL  $1"; echo x >> "$_COUNTDIR/fail"; }
 # A check whose PRECONDITION is absent is neither pass nor fail.  The rc.site
 # check needs a SysV book on disk and reported FAIL without one, so a clean
 # run looked like a broken one and the real failures had to be counted by
 # hand every time.
-skip() { echo "  SKIP  $1"; _tick skip; }
+skip() { echo "  SKIP  $1"; echo x >> "$_COUNTDIR/skip"; }
 
 # Lift ONE function out of a bash source file, to exercise it in isolation.
 #
@@ -270,28 +254,16 @@ _slice_def() {   # _slice_def <file> <python def>
 # the python-heredoc blocks report their own verdict; fold them in the same way
 # (77 = the block printed SKIP: its precondition is not on this machine)
 _count_rc() {
-    if [ "$1" -eq 0 ]; then _tick pass
-    elif [ "$1" -eq 77 ]; then _tick skip
-    else _tick fail; fi
+    if [ "$1" -eq 0 ]; then echo x >> "$_COUNTDIR/pass"
+    elif [ "$1" -eq 77 ]; then echo x >> "$_COUNTDIR/skip"
+    else echo x >> "$_COUNTDIR/fail"; fi
 }
 
-_pass_total() { wc -l < "$_COUNTDIR/pass" 2>/dev/null | tr -d ' ' || echo 0; }
-_fail_total() { wc -l < "$_COUNTDIR/fail" 2>/dev/null | tr -d ' ' || echo 0; }
-_skip_total() { wc -l < "$_COUNTDIR/skip" 2>/dev/null | tr -d ' ' || echo 0; }
+_pass_total() { wc -l < "$_COUNTDIR/pass" | tr -d ' '; }
+_fail_total() { wc -l < "$_COUNTDIR/fail" | tr -d ' '; }
+_skip_total() { wc -l < "$_COUNTDIR/skip" | tr -d ' '; }
 
-# ONLY THE SHELL THAT SET IT MAY CLEAN UP.
-#
-# `trap cleanup EXIT` is inherited by every SUBSHELL, and this suite runs
-# blocks inside ( ... ) and $( ... ) constantly.  Each of those exits, fires
-# the trap, and removes $T and the counters out from under the run that is
-# still going: from that point every ok() printed a shell error instead of
-# counting and the final line read "PASS:   FAIL:   SKIP:  (final)".  $$ is
-# the same in a subshell; $BASHPID is not.
-_MAIN_PID="${BASHPID:-$$}"
-cleanup() {
-    [ "${BASHPID:-$$}" = "$_MAIN_PID" ] || return 0
-    rm -rf "$T" "$_COUNTDIR"
-}
+cleanup() { rm -rf "$T" "$_COUNTDIR"; }
 trap cleanup EXIT
 
 export LFS="$T/lfs"
@@ -3755,8 +3727,7 @@ elif [ -f "$_hlL" ]; then
         _b="$(awk -F: '$3>0 && $3<1000 {print $1}' /etc/passwd | sed -n 2p)"
         pkg_users_list() { printf '%s\n%s\n' "$_a" "$_b"; }
         STATE="$R/state"; MANIFESTS="$R/state/manifests"; LEASES="$R/state/leases"
-        for _f in script_write_targets _setid_conf _setid_policy_for _setid_pkg_for \
-                  _lease_dir \
+        for _f in script_write_targets _setid_conf _setid_policy_for _lease_dir \
                   _lease_candidates lease_files lease_restore lease_settle \
                   _setid_state _setid_apply; do
             eval "$(_slice_fn "$_hlL" "$_f")"
@@ -3765,9 +3736,7 @@ elif [ -f "$_hlL" ]; then
         printf 'other\n' > "$R/etc/shared"; chown "$_b:$_b" "$R/etc/shared"; chmod 644 "$R/etc/shared"
         printf 'secret\n' > "$R/etc/rootonly"; chmod 600 "$R/etc/rootonly"
         printf '%s\n' "$R/sbin/tool" > "$MANIFESTS/$_a.files"
-        # the 5th column is the package that installs it (1.14.310): without
-        # it the lease refuses, which is the point of the column
-        printf '%s | 4711 | root | - | %s\n' "$R/sbin/tool" "$_a" > "$R/setid.conf"
+        printf '%s | 4711 | root | -\n' "$R/sbin/tool" > "$R/setid.conf"
         export SETID_CONF="$R/setid.conf"
         printf 'configure_pkg() {\ncat > %s << "X"\nnew\nX\necho x >> %s\n}\n' \
             "$R/etc/shared" "$R/etc/rootonly" > "$R/script"
@@ -3820,59 +3789,6 @@ elif [ -f "$_hlL" ]; then
         [ "$(stat -c %U "$R/etc/rootonly")" = root ] \
             || out="$out;a root file that is neither setid nor configured was leased"
         lease_restore "$_a" 2>/dev/null
-        # 8. A SETUID FILE IS LEASED ONLY TO THE PACKAGE THAT INSTALLS IT
-        #    (1.14.310).  /usr/bin/su landed in webkitgtk's time-window
-        #    manifest because `cfg shadow-pam` ran during its build; the
-        #    lease then chowned it, which clears the setuid bit, and `su`
-        #    was p_webkitgtk 0711 until the phase ended.  Three times.
-        printf 'x\n' > "$R/sbin/theirs"; chown root:root "$R/sbin/theirs"; chmod 4711 "$R/sbin/theirs"
-        printf '%s | 4711 | root | - | %s\n' "$R/sbin/tool" "$_a" > "$R/setid.conf"
-        printf '%s | 4711 | root | - | someone-else\n' "$R/sbin/theirs" >> "$R/setid.conf"
-        printf '%s\n' "$R/sbin/theirs" > "$MANIFESTS/$_a.files"
-        lease_files "$_a" "$R/script" install
-        [ "$(stat -c '%a %U' "$R/sbin/theirs")" = "4711 root" ] \
-            || out="$out;another package's setuid file was leased ($(stat -c '%a %U' "$R/sbin/theirs"))"
-        lease_restore "$_a" 2>/dev/null
-        # ...and a setid line with NO package is leased to nobody
-        printf '%s | 4711 | root | -\n' "$R/sbin/theirs" > "$R/setid.conf"
-        lease_files "$_a" "$R/script" install
-        [ "$(stat -c '%a %U' "$R/sbin/theirs")" = "4711 root" ] \
-            || out="$out;a setuid file with no package in setid.conf was leased"
-        lease_restore "$_a" 2>/dev/null
-        printf '%s | 4711 | root | - | %s\n' "$R/sbin/tool" "$_a" > "$R/setid.conf"
-        # 9. A LEASED SYMLINK THE PHASE DID NOT TOUCH GOES BACK (1.14.310).
-        #    `cp -a` copies a RELATIVE link as a relative link, so the copy
-        #    in the lease directory dangles, `cmp` cannot open it, and the
-        #    failed compare read as "the phase rewrote it".  Six
-        #    /usr/sbin/iptables* links ended up owned by p_webkitgtk and
-        #    written into its pkg.lst that way.
-        printf 'real\n' > "$R/sbin/xtables-nft-multi"; chown "$_b:$_b" "$R/sbin/xtables-nft-multi"
-        ln -sf xtables-nft-multi "$R/sbin/iptables"; chown -h "$_b:$_b" "$R/sbin/iptables"
-        printf '%s\n' "$R/sbin/iptables" > "$MANIFESTS/$_a.files"
-        lease_files "$_a" "$R/script" install
-        [ "$(stat -c %U "$R/sbin/iptables")" = "$_a" ] \
-            || out="$out;a manifest symlink another package holds was not leased"
-        lease_settle "$_a"
-        [ "$(stat -c %U "$R/sbin/iptables")" = "$_b" ] \
-            || out="$out;an untouched symlink was kept by the installer ($(stat -c %U "$R/sbin/iptables"))"
-        # ...and one the phase DID repoint stays with the installer
-        lease_files "$_a" "$R/script" install
-        ln -sfn xtables-legacy-multi "$R/sbin/iptables"; chown -h "$_a:$_a" "$R/sbin/iptables"
-        lease_settle "$_a"
-        [ "$(stat -c %U "$R/sbin/iptables")" = "$_b" ] \
-            && out="$out;a repointed symlink was given back to the old owner"
-        # 10. the manifest filter drops what provenance says is not ours
-        eval "$(_slice_fn "$_hlL" _drop_other_packages_files)"
-        is_never_claimed() { return 1; }
-        printf '%s | 4711 | root | - | someone-else\n' "$R/sbin/theirs" >> "$R/setid.conf"
-        ln -sfn xtables-nft-multi "$R/sbin/iptables"; chown -h "$_a:$_a" "$R/sbin/iptables"
-        _kept="$(printf '%s\n%s\n%s\n' "$R/sbin/theirs" "$R/sbin/iptables" "$R/sbin/plainfile" \
-                 | _drop_other_packages_files "$_a")"
-        printf '%s\n' "$_kept" | grep -qxF "$R/sbin/theirs" \
-            && out="$out;the manifest kept a setuid file setid.conf gives to another package"
-        printf '%s\n' "$_kept" | grep -qxF "$R/sbin/iptables" \
-            && out="$out;the manifest kept a symlink into another package's file"
-        chown -h "$_b:$_b" "$R/sbin/iptables"
         # 6. the earlier-stages claim must not strip a setuid bit (1.14.265)
         eval "$(_slice_fn "$_hlL" _claim_candidates)"
         printf 'x\n' > "$R/sbin/suid"; chmod 4711 "$R/sbin/suid"
@@ -4498,7 +4414,7 @@ if [ -f "$_au" ] && [ -f "$_ac2" ]; then
         echo '  "user setup")   exit 0;;'
         echo '  "user create")  exit 0;;'
         echo '  "user --help")  exit 0;;'
-        echo '  "env --system") echo "export PKGUSR_SYS_SHARED=\"/zz/hub\""; exit 0;;'
+        echo '  "env --system") exit 0;;'
         echo 'esac'
         echo 'echo "STUB refused: $*" >&2; exit 2'
     } > "$_pr/pm"; chmod 755 "$_pr/pm"
@@ -4522,14 +4438,8 @@ if [ -f "$_au" ] && [ -f "$_ac2" ]; then
     ls "$_pr/etc/pam.d/" | grep -q 'bak-' \
         || _p="$_p;the PAM file was edited with no backup beside it"
     # the env fragment enumerates rather than lists
-    grep -q '"/zz/hub"/\*' "$_pr/etc/profile.d/shared-dirs.sh" 2>/dev/null \
+    grep -q 'HOME"/Shared/\*' "$_pr/etc/profile.d/shared-dirs.sh" 2>/dev/null \
         || _p="$_p;the SHARED_* variables are a fixed list, not what is there"
-    # ...and what it enumerates is THE HUB the tool names, not $HOME/Shared:
-    # in an app account that is its own data directory, and every FILE in it
-    # became a SHARED_* variable (1.14.312)
-    grep -v '^[[:space:]]*#' "$_pr/etc/profile.d/shared-dirs.sh" 2>/dev/null \
-        | grep -q 'HOME/Shared\|HOME"/Shared' \
-        && _p="$_p;the SHARED_* variables are still read from \$HOME/Shared"
 fi
 if [ -n "$_p" ]; then
     printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
@@ -4895,12 +4805,9 @@ PYST
         || _p="$_p;a git-tracked package is compared against a book version"
     printf '%s' "$_cu" | grep -q 'git_tracked.append' \
         || _p="$_p;a git-tracked package is not reported as left alone"
-    # (1.14.307 replaced "left alone" with an answer: a branch is asked
-    # whether it moved, a tag whether a newer one exists.  These two checks
-    # still looked for the old wording until 1.14.313.)
-    grep -q 'follow GIT, not the book' "$pm_src" \
+    grep -q 'follow GIT, not the book -- left alone' "$pm_src" \
         || _p="$_p;nothing says why those packages are not in the plan"
-    grep -q 'behind their branch -- fetch, rebuild, install' "$pm_src" \
+    grep -q 'stack <name> --only <pkg> --run --force' "$pm_src" \
         || _p="$_p;it does not say how to move a git-tracked package"
     # ...and that command really does default to everything
     timeout 60 python3 "$pm_src" update --help 2>&1 \
@@ -5055,7 +4962,7 @@ PYCL
         # GLVND (1.14.270): machine.conf enables it, so libglvnd must come
         # before mesa, and --clean must never delete a file that moved to
         # another package (libGL.so.1 goes from mesa to libglvnd).
-        _swy="$_DESKTOP_STACK"
+        _swy="$(dirname "$LFS_TOOL")/stacks/sway.stack"
         _mcf="$(dirname "$LFS_TOOL")/stacks/machine.conf"
         _l_g="$(grep -nE '^git +libglvnd' "$_swy" | head -1 | cut -d: -f1)"
         _l_m="$(grep -nE '^book +mesa' "$_swy" | head -1 | cut -d: -f1)"
@@ -9075,54 +8982,15 @@ PY
 )"
     _lt="$(printf '%s\n' "$_lt" | tail -1)"
     if [ -f "$_lt/bin/srch" ]; then
-        # NEUTRALISE su BY PATH, NOT BY SED.
-        #
-        # This rewrote the launcher's last line with `sed '/^exec su - /'`,
-        # which assumed the launcher ends in exactly one way.  Since 1.14.295
-        # there are TWO ways out of it -- `exec su` with a terminal, script(1)
-        # with none -- and the `exec su` is indented inside the if, so the sed
-        # matched neither: the REAL su ran and the block failed with "user u_a
-        # does not exist".  A stub first in PATH tests whatever shape the
-        # launcher has, including both of these.
-        #
-        # su's own arguments are `- <user> -c <command> --`, five of them,
-        # and what follows is the argument list the launcher built.
-        mkdir -p "$_lt/fake"
-        printf '#!/bin/bash\nshift 5\nprintf "<%%s>" "$@"\n' > "$_lt/fake/su"
-        chmod 755 "$_lt/fake/su"
-        # a pty turns \n into \r\n; the stub prints none, but strip it anyway
-        _runl() { PATH="$_lt/fake:$PATH" bash "$_lt/bin/$1" "${@:2}" 2>/dev/null | tr -d '\r'; }
-        [ "$(_runl srch a b)" = "<browser-mini><--app-id><srch><https://s.example/r?q=a+b>" ] \
-            && [ "$(_runl srch)" = "<browser-mini><--app-id><srch><https://s.example/r>" ] \
-            && [ "$(_runl fixed extra)" = "<browser-mini><--app-id><fixed><https://fixed.example/>" ] \
+        for _l in srch fixed; do
+            sed 's/^exec su - [^ ]* -c .exec "\$0" "\$@". -- /printf "<%s>" /' "$_lt/bin/$_l" > "$_lt/$_l.t"
+        done
+        [ "$(bash "$_lt/srch.t" a b)" = "<browser-mini><--app-id><srch><https://s.example/r?q=a+b>" ] \
+            && [ "$(bash "$_lt/srch.t")" = "<browser-mini><--app-id><srch><https://s.example/r>" ] \
+            && [ "$(bash "$_lt/fixed.t" extra)" = "<browser-mini><--app-id><fixed><https://fixed.example/>" ] \
             && ok "the launcher passes {} as arguments or a search term, and nothing without {}" \
-            || bad "the launcher's argument handling is wrong: $(_runl srch a b) / $(_runl srch) / $(_runl fixed extra)"
-        # A MENU ENTRY HAS NO TERMINAL (1.14.295).  su fails without one and
-        # its message goes nowhere, so the entry "does nothing".  The launcher
-        # must notice and give it a pty.
-        if grep -q 'if \[ -t 0 \] && \[ -t 1 \]' "$pmt" && grep -q 'script -qec' "$pmt"; then
-            ok "with no terminal the launcher gives su a pty"
-        else
-            bad "the launcher runs su with no pty: every .desktop entry does nothing"
-        fi
-        # ...and a default page for a search launcher that was given nothing
-        # to search for (1.14.293): {https://site/} rather than the URL cut
-        # at its ?
-        _lt2="$( _lh2="$(mktemp -d)"; PKGUSR_CONFIG=/dev/null python3 - "$pmt" "$_lh2" <<'PY' 2>/dev/null
-import types, sys
-m = types.ModuleType("pm"); exec(compile(open(sys.argv[1]).read(), "pm", "exec"), m.__dict__)
-h = sys.argv[2]; m._run = lambda c: True; m._home_of = lambda u: h; m._app_home = lambda u: "/home/x/" + u
-m._write_launcher("me", "u_a", "browser-mini https://s.example/r?q={https://s.example/}", "dflt")
-print(h)
-PY
-)"
-        _lt2="$(printf '%s\n' "$_lt2" | tail -1)"
-        _rund() { PATH="$_lt/fake:$PATH" bash "$_lt2/bin/dflt" "$@" 2>/dev/null | tr -d '\r'; }
-        [ "$(_rund)" = "<browser-mini><--app-id><dflt><https://s.example/>" ] \
-            && [ "$(_rund x)" = "<browser-mini><--app-id><dflt><https://s.example/r?q=x>" ] \
-            && ok "with nothing typed, a {url} default page wins over cutting at the ?" \
-            || bad "the {url} default page is wrong: $(_rund) / $(_rund x)"
-        rm -rf "$_lt" "$_lt2"
+            || bad "the launcher's argument handling is wrong: $(bash "$_lt/srch.t" a b) / $(bash "$_lt/srch.t") / $(bash "$_lt/fixed.t" extra)"
+        rm -rf "$_lt"
     else
         bad "the launcher could not be generated"
     fi
@@ -14202,7 +14070,7 @@ grep -q '"/etc/pkgusr/stacks"' "$LFS_TOOL" \
     || _p="$_p;an installed lfs cannot find the stack files to refresh"
 grep -q 'no stack files found to refresh' "$LFS_TOOL" \
     || _p="$_p;finding no stacks to refresh is silent"
-_stk="$_DESKTOP_STACK"
+_stk="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 if [ -f "$_stk" ]; then
     # The recommendations are FOLLOWED again: a blanket --ignore-recommended
     # dropped things the builds hard-require (curl for cmake, icu for
@@ -18910,7 +18778,7 @@ if command -v git >/dev/null 2>&1; then
         || _p="$_p;a valid ref no longer checks out"
 fi
 # the stack's own pin was the wrong one and is corrected
-_ss="$_DESKTOP_STACK"
+_ss="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 [ -f "$_ss" ] && { grep -q 'usrsctp.git ref=1.0.0' "$_ss" \
     && _p="$_p;the stack still pins a usrsctp tag that does not exist"; }
 if [ -n "$_p" ]; then
@@ -20243,7 +20111,7 @@ fi
 # get their dependencies from the book, git entries got nothing.
 _p=""
 _pmU="$(dirname "$LFS_TOOL")/packagemanager"
-_ssU="$_DESKTOP_STACK"
+_ssU="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 # the stack parser keeps needs=, and the sway entry declares its own
 if [ -f "$_ssU" ]; then
     python3 - "$_pmU" "$_ssU" <<'PYNEEDS' || _p="$_p;needs= is not parsed from a stack entry"
@@ -20341,7 +20209,7 @@ printf '%s' "$_cr" | grep -q 'y pins" if bad == 1 else "ies pin' \
 sed -n '/if getattr(args, "check_refs", False)/,+2p' "$_pmV" | grep -q 'sys.exit' \
     || _p="$_p;--check-refs falls through into building the stack"
 # and the shipped stack no longer pins a ref that never existed
-_ssV="$_DESKTOP_STACK"
+_ssV="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 [ -f "$_ssV" ] && { grep -q 'ref=1.24.1' "$_ssV" \
     && _p="$_p;the stack still pins foot at a tag that does not exist"; }
 if [ -n "$_p" ]; then
@@ -20373,7 +20241,7 @@ printf '%s' "$_nb" | grep -q 'unreachable += 1' \
 printf '%s' "$_nb" | grep -q 'timeout=' \
     || _p="$_p;the no-ref probe can hang"
 # the four local entries point at real repositories, not a placeholder
-_ssW="$_DESKTOP_STACK"
+_ssW="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 if [ -f "$_ssW" ]; then
     grep -qE '^git +(minibrowser|swbr|swov|swas).*github\.com/nimbin2' "$_ssW" \
         && _p="$_p;the local sway tools still point at the old placeholder urls"
@@ -21820,7 +21688,7 @@ if [ -f "$pm_src" ]; then
     # the sdl3 probe must not name one library file: SDL3 installs
     # libSDL3.so.0.<n> and the bare symlink is not always there
     # $_sw belongs to the next block; name the file, do not borrow a variable
-    grep -q 'libSDL3.so\*' "$_DESKTOP_STACK" \
+    grep -q 'libSDL3.so\*' "$(dirname "$LFS_TOOL")/stacks/sway.stack" \
         || _p="$_p;the SDL3 probe names a path that may not exist"
     # AN UNMATCHED DEPENDENCY IS NOT A CLEAN RESULT.  A silent miss would
     # under-report exactly the thing being looked for.
@@ -22091,7 +21959,7 @@ fi
 # book, so the stack carries them -- and everything about them is ours to
 # keep true: refs, URLs, and the archive layouts.
 _p=""
-_sw2="$_DESKTOP_STACK"
+_sw2="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 _fs="$(dirname "$LFS_TOOL")/stacks/fonts.sh"
 if [ -f "$_sw2" ]; then
     # jq is not in the book either, and its probe has to test the half of jq
@@ -22216,10 +22084,8 @@ PYXX
     [ -n "$_aph" ] || _p="$_p;nothing resolves an application user's real home"
     printf '%s' "$_aph" | grep -q '_home_of(u) or' \
         || _p="$_p;a home moved with usermod is ignored"
-    # (1.14.315: the directory lives in the hub, not in any home -- the
-    # account's ~/Shared is a link to it; see the block for 1.14.315)
-    grep -q 'share = os.path.join(_hub, args.name' "$pm_src" \
-        || _p="$_p;the shared directory is not built in the hub"
+    grep -q 'share = os.path.join(_app_home(u), "Shared")' "$pm_src" \
+        || _p="$_p;the shared directory is built from the wrong home"
     _apo="$(PKGUSR_CONFIG=/dev/null python3 - "$pm_src" 2>&1 <<'PYAH'
 import sys, types
 mod = types.ModuleType("pm"); mod.__file__ = sys.argv[1]
@@ -22473,7 +22339,10 @@ _p=""
 # ENTRY has to read both -- eight assertions here failed the moment
 # the split landed, which is the split being noticed rather than a
 # fault in it (1.14.223).
-_sw="$_DESKTOP_STACK"
+_sw="$T/stacks-all.stack"
+cat "$(dirname "$LFS_TOOL")/stacks/sway.stack" \
+    "$(dirname "$LFS_TOOL")/stacks/media.stack" > "$_sw" 2>/dev/null \
+    || _sw="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 if [ -f "$_sw" ] && [ -f "$pm_src" ]; then
     # the order, read out of the stack itself
     _ord="$(python3 - "$pm_src" "$_sw" <<'PYORD'
@@ -22513,11 +22382,7 @@ for r in mod._parse_stack_file(sys.argv[2]):
         # only allowed pipes and grep, so `gst-inspect-1.0 webrtcbin
         # >/dev/null 2>&1` -- a perfectly good probe -- was called thin.)
         _e = r["opts"]["expect"]
-        # (`pkg-config --exists` IS a test -- its exit status is the answer;
-        # librice and xxhash were called thin once the check read every
-        # desktop stack, 1.14.320.)
-        if any(t in _e for t in ("|", "grep", ">/dev/null", "test ", "[ ",
-                                 "--exists")):
+        if any(t in _e for t in ("|", "grep", ">/dev/null", "test ", "[ ")):
             continue
         print("THIN %s" % r["target"])
 print("COUNT %d" % n)
@@ -23651,7 +23516,7 @@ fi
 # what is on PATH; the ENTRY keeps its name because p_minibrowser is the
 # account already on the user's disk.
 _p=""
-_ssZ="$_DESKTOP_STACK"
+_ssZ="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 if [ -f "$_ssZ" ]; then
     grep -qE '^git +wlroots .*have=/usr/lib/pkgconfig/wlroots-0\.19\.pc' "$_ssZ" \
         || _p="$_p;wlroots' have= does not match the version it pins"
@@ -24547,7 +24412,7 @@ fi
 # drm when it is absent, mentions it in a summary line, and builds happily.
 # The cost of that silence is a full desktop that cannot open a screen.
 _p=""
-_ss6="$_DESKTOP_STACK"
+_ss6="$(dirname "$LFS_TOOL")/stacks/sway.stack"
 _pmDR="$(dirname "$LFS_TOOL")/packagemanager"
 grep -qE '^book +libdisplay-info' "$_ss6" \
     || _p="$_p;libdisplay-info is not in the sway stack"
@@ -25565,603 +25430,6 @@ if [ -n "$_p" ]; then
     done
 else
     ok "slow steps announce themselves, and headers install as their own package"
-fi
-
-# ---- a library something still links against is not an orphan  (1.14.304) --- #
-# `update --clean` removes what the OLD version installed and the new one did
-# not rewrite.  webkitgtk rebuilt from the GTK4 port to the GTK3 one leaves
-# libwebkitgtk-6.0.so.4 exactly there: same package, same owner, old mtime,
-# in the old manifest -- an orphan by every test, and deleting it breaks every
-# program built against it with no warning and no way back but a rebuild.
-#
-# Built for real: a library with a soname, a consumer that records it, and the
-# consumer owned by ANOTHER account (a package cleans its own files freely).
-_p=""
-if command -v gcc >/dev/null 2>&1 && command -v readelf >/dev/null 2>&1; then
-    _g="$T/rdep"; rm -rf "$_g"; mkdir -p "$_g/bin" "$_g/lib"
-    printf 'int oldfn(void){return 42;}\n' > "$_g/old.c"
-    printf 'extern int oldfn(void); int main(void){return oldfn();}\n' > "$_g/user.c"
-    if gcc -shared -fPIC -Wl,-soname,libzzold.so.4 -o "$_g/lib/libzzold.so.4.13.8" \
-           "$_g/old.c" 2>/dev/null \
-       && ln -sf libzzold.so.4.13.8 "$_g/lib/libzzold.so.4" \
-       && gcc -o "$_g/bin/consumer" "$_g/user.c" "$_g/lib/libzzold.so.4.13.8" 2>/dev/null; then
-        # linked against the FILE, not -lzzold: that needs a libzzold.so dev
-        # symlink, and DT_NEEDED records the soname either way
-        # another owner, when this suite runs as root; otherwise the guard's
-        # "a package cleans its own files" rule hides the case
-        chown daemon "$_g/bin/consumer" 2>/dev/null || true
-        _rd="$(python3 - "$pm_src" "$_g" <<'PYRD'
-import importlib.machinery as m, os, sys, time
-pm = m.SourceFileLoader("pm", sys.argv[1]).load_module()
-g = sys.argv[2]
-lib, link = g + "/lib/libzzold.so.4.13.8", g + "/lib/libzzold.so.4"
-pm._ELF_SCAN_DIRS = (g + "/bin", g + "/lib")
-gone = []
-pm.remove_paths_as_user = lambda u, paths: gone.extend(paths)
-pm.printInfo = pm.printWarning = lambda *a, **k: None
-own = os.stat(lib).st_uid
-import pwd
-user = pwd.getpwuid(own).pw_name
-pm._orphan_sweep(user, [lib, link], time.time() + 1000)
-print("KEPT" if not gone else "REMOVED")
-os.rename(g + "/bin/consumer", g + "/consumer.parked")
-gone2 = []
-pm.remove_paths_as_user = lambda u, paths: gone2.extend(paths)
-pm._orphan_sweep(user, [lib, link], time.time() + 1000)
-print("SWEPT" if len(gone2) == 2 else "STUCK")
-PYRD
-)"
-        case "$_rd" in
-            *KEPT*) ;;
-            *) _p="$_p;--clean would delete a library another package still links against" ;;
-        esac
-        case "$_rd" in
-            *SWEPT*) ;;
-            *) _p="$_p;a library nothing links against is no longer cleaned up" ;;
-        esac
-    else
-        _p="$_p;the fixture would not build"
-    fi
-    # and the question must be answerable on its own, not only as a side
-    # effect of --clean
-    grep -q '^def cmd_used_by' "$pm_src" \
-        || _p="$_p;there is no way to ask what links against a library"
-    grep -q 'SONAME' "$pm_src" \
-        || _p="$_p;the soname is guessed from the file name rather than read"
-    if [ -n "$_p" ]; then
-        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-            [ -n "$m" ] && bad "$m"
-        done
-    else
-        ok "--clean keeps a library that is still linked against, and sweeps one that is not"
-    fi
-else
-    skip "no gcc/readelf here: the library-still-in-use guard cannot be built"
-fi
-
-# ---- turning the machine off is a membership  (1.14.309) -------------------- #
-# halt/poweroff/reboot are 4550 root:<collector>_power: setuid root so they
-# can do it, executable only by the group so not everyone may.  That is two
-# modes a rebuild or a chown destroys silently, and `cfg power` had no
-# expect=, so once it was cached "done" nothing ever looked again.
-_p=""
-_ss="$(dirname "$LFS_TOOL")/stacks/services.stack"
-_pw="$(dirname "$LFS_TOOL")/stacks/power.sh"
-if [ -f "$_ss" ] && [ -f "$_pw" ]; then
-    _pex="$(awk "/^cfg[[:space:]]+power/,/^\\\$/" "$_ss" | grep -c "expect=")"
-    [ "$_pex" -ge 1 ] || _p="$_p;cfg power has no expect=, so a lost setuid bit is never noticed"
-    grep -q "4550 root:" "$_ss" \
-        || _p="$_p;the expect does not check the mode and owner of halt"
-    grep -q "power-perms" "$_ss" \
-        || _p="$_p;the expect does not check the boot script"
-    # the step itself must still set both halves and re-apply /sys at boot
-    grep -q "chmod 4550" "$_pw" || _p="$_p;power.sh no longer sets 4550"
-    grep -q "sys/power/state" "$_pw" \
-        || _p="$_p;nothing re-applies the group to /sys/power/state at boot"
-    # and the expect must be a runnable shell expression
-    _pexpr="$(sed -n "/^cfg[[:space:]]\+power/,+2p" "$_ss" | sed -n "s/^ *expect='\(.*\)'$/\1/p")"
-    if [ -n "$_pexpr" ]; then
-        bash -n -c "$_pexpr" 2>/dev/null || _p="$_p;the power expect= is not valid shell"
-    else
-        _p="$_p;the power expect= could not be read back out of the stack file"
-    fi
-    if [ -n "$_p" ]; then
-        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-            [ -n "$m" ] && bad "$m"
-        done
-    else
-        ok "poweroff is a group membership, and the stack re-checks the modes that make it one"
-    fi
-else
-    skip "no services.stack or power.sh here"
-fi
-
-# ---- chown destroys a setuid bit  (1.14.308) -------------------------------- #
-# Ownership is attributed BY TIME WINDOW: every file newer than the build
-# stamp.  A webkitgtk build runs for hours, and anything that touched
-# /usr/bin/su in that window -- `lfs-helper setid`, a shadow reinstall, `cfg
-# shadow-pam` -- made su "newer than the stamp".  It is root-owned, which the
-# sweep treated as fair game, so it was chowned to p_webkitgtk:
-#     -rwx--x--x 1 p_webkitgtk p_webkitgtk /bin/su
-# The kernel clears setuid/setgid on chown, so ONE command took the file and
-# removed the bit that makes su work.  Twice, on this machine.
-_p=""
-_hl="$(dirname "$LFS_TOOL")/lfs-helper"
-if [ -f "$_hl" ]; then
-    grep -q 'it is setuid/setgid' "$_hl" \
-        || _p="$_p;a setuid file can still be taken by the ownership sweep"
-    grep -q '\[ "\$_root_ok" != 1 \] && \[ "\$cur" = root \]' "$_hl" \
-        || _p="$_p;the chown pass does not apply the root-owned rule the manifest does"
-    # the mode test itself, against real files
-    _sd="$T/setid"; rm -rf "$_sd"; mkdir -p "$_sd"
-    _bad=""
-    for _m in 4711 2755 6755 0711 0755; do
-        : > "$_sd/f$_m"; chmod "$_m" "$_sd/f$_m"
-        case "$(stat -c %a "$_sd/f$_m" 2>/dev/null)" in
-            [1-7][0-7][0-7][0-7]) _hit=skip ;;
-            *) _hit=take ;;
-        esac
-        case "$_m:$_hit" in
-            4711:skip|2755:skip|6755:skip|0711:take|0755:take) ;;
-            *) _bad="$_bad $_m($_hit)" ;;
-        esac
-    done
-    [ -z "$_bad" ] || _p="$_p;the setuid test judges these wrongly:$_bad"
-    # and the mode that matters is declared, so a repair knows what to restore
-    _si="$(dirname "$LFS_TOOL")/stacks/setid.conf"
-    if [ -f "$_si" ]; then
-        grep -qE '^/usr/bin/su[[:space:]]*\|[[:space:]]*4711' "$_si" \
-            || _p="$_p;setid.conf does not declare su as 4711 root"
-    fi
-    if [ -n "$_p" ]; then
-        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-            [ -n "$m" ] && bad "$m"
-        done
-    else
-        ok "the ownership sweep never takes a setuid file, nor a root file a package user could not have written"
-    fi
-else
-    skip "no lfs-helper here: the ownership sweep cannot be checked"
-fi
-
-# ---- who INSTALLED it, not who holds it  (1.14.310) ------------------------- #
-# The setuid damage came back a third time, and with it six root-owned
-# symlinks:
-#     lrwxrwxrwx 1 p_webkitgtk p_webkitgtk /usr/sbin/iptables -> xtables-nft-multi
-# made by `cfg iptables-nft` on a different day, and recorded in
-# /usr/src/pkgusr/p_webkitgtk/pkg.lst.  Nothing in the sweep or the lease
-# asked WHO INSTALLS a file -- only who owns it now, which is exactly the
-# thing that had gone wrong.  Two facts that do not depend on current
-# ownership: setid.conf names the package behind each setuid file, and a
-# symlink belongs to whoever owns its target.
-_p=""
-_hl3="$(dirname "$LFS_TOOL")/lfs-helper"
-_si3="$(dirname "$LFS_TOOL")/stacks/setid.conf"
-if [ -f "$_hl3" ] && [ -f "$_si3" ]; then
-    grep -qE '^/usr/bin/su[[:space:]]*\|[^|]*\|[^|]*\|[^|]*\|[[:space:]]*shadow[[:space:]]*$' "$_si3" \
-        || _p="$_p;setid.conf does not name shadow as the package that installs su"
-    _nocol="$(awk -F'|' '/^[[:space:]]*(#|$)/ { next }
-                         { n = split($0, c, "|"); k = (n >= 5 ? c[5] : "")
-                           gsub(/[[:space:]]/, "", k)
-                           if (k == "") { f = c[1]; gsub(/[[:space:]]/, "", f); print f } }' "$_si3")"
-    [ -z "$_nocol" ] || _p="$_p;setid.conf lines with no package (leased to nobody): $(echo $_nocol)"
-    # the reader itself
-    ( eval "$(_slice_fn "$_hl3" _setid_conf)"; eval "$(_slice_fn "$_hl3" _setid_pkg_for)"
-      warn() { :; }
-      SETID_CONF="$_si3" _setid_pkg_for /usr/bin/su | grep -qx shadow ) \
-        || _p="$_p;_setid_pkg_for does not read the package column"
-    # ...and the old three-column reader still sees the group
-    ( eval "$(_slice_fn "$_hl3" _setid_conf)"; eval "$(_slice_fn "$_hl3" _setid_policy_for)"
-      SETID_CONF="$_si3" _setid_policy_for /usr/libexec/dbus-daemon-launch-helper \
-        | grep -qx '4750|root|messagebus' ) \
-        || _p="$_p;the 5th column broke _setid_policy_for's group"
-    grep -q 'not taking \$p -- setid.conf says' "$_hl3" \
-        || _p="$_p;the ownership sweep does not consult setid.conf"
-    grep -q 'not taking \$p -- it points at' "$_hl3" \
-        || _p="$_p;the ownership sweep takes a symlink into another package"
-    grep -q 'readlink "\$dir/files/\$n"' "$_hl3" \
-        || _p="$_p;lease_settle still compares symlinks with cmp"
-    if [ -n "$_p" ]; then
-        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-            [ -n "$m" ] && bad "$m"
-        done
-    else
-        ok "provenance beats current ownership: setid.conf's package column and a symlink's target"
-    fi
-else
-    skip "no lfs-helper/setid.conf here: provenance cannot be checked"
-fi
-
-# ---- disown: taking back what a package cannot have installed  (1.14.310) --- #
-# The repair for a machine that already went through those doors.  `reclaim`
-# pushes ownership towards pkg.lst; this one distrusts pkg.lst, because the
-# record is what went wrong.  Real files, real accounts, real chown.
-_p=""
-# self-sufficient: a subset that does not include an earlier block must not
-# inherit its variables (the block runs alone under `--only`)
-pm_src="$(dirname "$LFS_TOOL")/packagemanager"
-if [ "$(id -u)" != 0 ]; then
-    skip "disown (needs root for chown)"
-else
-    _dw="$(python3 - "$pm_src" <<'PYDIS'
-import os, sys, tempfile, pwd, importlib.machinery as m
-
-R = tempfile.mkdtemp(prefix="lfsdisown.", dir="/var/tmp")
-# two real accounts stand in for package users; the prefix is turned off so
-# the account name IS the package name
-accts = [l.pw_name for l in pwd.getpwall() if 0 < l.pw_uid < 1000][:2]
-if len(accts) < 2:
-    print("SKIP no two system accounts"); raise SystemExit
-A, B = accts
-
-os.makedirs(f"{R}/base/pkgusr/{A}")
-os.makedirs(f"{R}/base/pkgusr/{B}")      # the package the symlink really is
-os.makedirs(f"{R}/stacks"); os.makedirs(f"{R}/sbin")
-open(f"{R}/conf", "w").write("pkgusr_prefix=\ncollector_prefix=\n")
-
-# 1. a setuid file setid.conf gives to someone else, already chowned (so its
-#    setuid bit is gone -- that is what chown does)
-open(f"{R}/sbin/su", "w").write("x")
-os.chmod(f"{R}/sbin/su", 0o711)
-os.chown(f"{R}/sbin/su", pwd.getpwnam(A).pw_uid, -1)
-# 2. a symlink whose target belongs to another package
-open(f"{R}/sbin/xtables-nft-multi", "w").write("x")
-os.chown(f"{R}/sbin/xtables-nft-multi", pwd.getpwnam(B).pw_uid, -1)
-os.symlink("xtables-nft-multi", f"{R}/sbin/iptables")
-os.lchown(f"{R}/sbin/iptables", pwd.getpwnam(A).pw_uid, -1)
-# 3. a file that really is this package's, which must be left alone
-open(f"{R}/sbin/mine", "w").write("x")
-os.chown(f"{R}/sbin/mine", pwd.getpwnam(A).pw_uid, -1)
-
-open(f"{R}/stacks/setid.conf", "w").write(
-    f"{R}/sbin/su | 4711 | root | - | shadow\n")
-open(f"{R}/base/pkgusr/{A}/pkg.lst", "w").write(
-    f"{R}/sbin/su\n{R}/sbin/iptables\n{R}/sbin/mine\n")
-os.makedirs(f"{R}/state/manifests")
-open(f"{R}/state/manifests/{A}.files", "w").write(
-    f"{R}/sbin/su\n{R}/sbin/iptables\n{R}/sbin/mine\n")
-
-os.environ.update(PKGUSR_BASE=f"{R}/base", PKGUSR_CONFIG=f"{R}/conf",
-                  PM_STACK_DIR=f"{R}/stacks", LFS_PKGUSR_DIR=f"{R}/state")
-pm = m.SourceFileLoader("pm", sys.argv[1]).load_module()
-
-class Args:
-    packages = [A]; all = False; run = False
-pm.cmd_disown(Args())
-print("DRYRUN-KEPT", pwd.getpwuid(os.lstat(f"{R}/sbin/su").st_uid).pw_name == A)
-
-Args.run = True
-pm.cmd_disown(Args())
-st = os.lstat(f"{R}/sbin/su")
-print("SU-ROOT", st.st_uid == 0)
-print("SU-MODE", oct(st.st_mode & 0o7777) == "0o4711")
-print("LINK-BACK",
-      pwd.getpwuid(os.lstat(f"{R}/sbin/iptables").st_uid).pw_name == B)
-print("KEPT-MINE",
-      pwd.getpwuid(os.lstat(f"{R}/sbin/mine").st_uid).pw_name == A)
-left = open(f"{R}/base/pkgusr/{A}/pkg.lst").read().split()
-print("LST", sorted(left) == [f"{R}/sbin/mine"])
-man = open(f"{R}/state/manifests/{A}.files").read().split()
-print("MAN", sorted(man) == [f"{R}/sbin/mine"])
-import shutil; shutil.rmtree(R, ignore_errors=True)
-PYDIS
-)"
-    case "$_dw" in
-        *"SKIP"*) skip "disown (no two system accounts to stand in for packages)" ;;
-        *)
-        case "$_dw" in *"DRYRUN-KEPT True"*) ;; *) _p="$_p;a dry run changed ownership" ;; esac
-        case "$_dw" in *"SU-ROOT True"*) ;; *) _p="$_p;a setuid file setid.conf gives to another package was not returned to root" ;; esac
-        case "$_dw" in *"SU-MODE True"*) ;; *) _p="$_p;the mode from setid.conf was not put back (su stays broken)" ;; esac
-        case "$_dw" in *"LINK-BACK True"*) ;; *) _p="$_p;a symlink was not given to the owner of its target" ;; esac
-        case "$_dw" in *"KEPT-MINE True"*) ;; *) _p="$_p;a file the package really installed was taken away" ;; esac
-        case "$_dw" in *"LST True"*) ;; *) _p="$_p;pkg.lst still records the paths -- --clean would delete them" ;; esac
-        case "$_dw" in *"MAN True"*) ;; *) _p="$_p;the build manifest still records them -- the next lease re-arms" ;; esac
-        if [ -n "$_p" ]; then
-            printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-                [ -n "$m" ] && bad "$m"
-            done
-        else
-            ok "disown hands back what a package cannot have installed, and clears the record"
-        fi ;;
-    esac
-fi
-
-# ---- --clean: park, reinstall, THEN judge  (1.14.311) ----------------------- #
-# `update webkitgtk --clean --run` ended green and left
-#     jsc/jsc.h:29: fatal error: jsc/JSCOptions.h: No such file or directory
-# CMake skips a file whose content is unchanged, so the jsc headers kept their
-# old mtime and --clean called them orphans.  The reapply meant to repair that
-# ran `bash ~/install_<account>` -- a file 1.14.16 stopped writing -- with its
-# output discarded and its exit status ignored.  It had not worked for
-# ~300 releases.
-_p=""
-pm_src="$(dirname "$LFS_TOOL")/packagemanager"
-_cl="$(python3 - "$pm_src" <<'PYCL'
-import importlib.machinery as m, os, sys, tempfile, time
-pm = m.SourceFileLoader("pm", sys.argv[1]).load_module()
-R = tempfile.mkdtemp(prefix="lfsclean.")
-pm.TMP_DIR = R + "/pmtmp"
-pm.printInfo = pm.printWarning = pm.printError = lambda *a, **k: None
-pm.write_pkg_list = lambda *a, **k: None
-pm.remove_paths_as_user = lambda u, ps: [os.unlink(p) for p in ps
-                                         if os.path.lexists(p) and not os.path.isdir(p)]
-user = __import__("pwd").getpwuid(os.getuid()).pw_name
-same, orphan = R + "/JSCOptions.h", R + "/old-only.h"
-def fixture():
-    for p in (same, orphan):
-        open(p, "w").write("old")
-        os.utime(p, (1, 1))
-since = time.time()
-
-# 1. the install step re-creates the unchanged header, not the orphan
-fixture()
-pm._reapply_install = lambda u: (open(same, "w").write("cur"), True)[1]
-pm._clean_after_install(user, [same, orphan], since)
-print("KEPT", os.path.exists(same))
-print("ORPHAN-GONE", not os.path.exists(orphan))
-print("NO-LITTER", not any(f.endswith(pm._PARK_SUFFIX) for f in os.listdir(R)))
-
-# 2. the install step FAILS: everything is put back, nothing deleted
-fixture()
-pm._reapply_install = lambda u: False
-pm._clean_after_install(user, [same, orphan], since)
-print("RESTORED", os.path.exists(same) and os.path.exists(orphan)
-      and open(same).read() == "old")
-print("NO-LEDGER", not os.path.exists(pm._park_ledger(user)))
-import shutil; shutil.rmtree(R, ignore_errors=True)
-PYCL
-)"
-for _k in KEPT ORPHAN-GONE NO-LITTER RESTORED NO-LEDGER; do
-    case "$_cl" in *"$_k True"*) ;; *) _p="$_p;--clean: $_k failed" ;; esac
-done
-_ra="$(python3 - "$pm_src" <<'PYRA'
-import sys, re
-s = open(sys.argv[1]).read()
-f = s[s.index("def _reapply_install("):]
-f = f[:f.index("\ndef ", 1)]
-print("DEVNULL" if "DEVNULL" in f else "LOGGED")
-print("CHECKED" if "return True" in f and "returncode" in f else "UNCHECKED")
-print("VERSIONED" if "_versioned_script_in" in f else "STALE-NAME")
-PYRA
-)"
-case "$_ra" in *LOGGED*) ;; *) _p="$_p;the reapply still throws its output away" ;; esac
-case "$_ra" in *CHECKED*) ;; *) _p="$_p;the reapply's exit status is still ignored" ;; esac
-case "$_ra" in *VERSIONED*) ;; *) _p="$_p;the reapply still runs install_<account>, which no longer exists" ;; esac
-if [ -n "$_p" ]; then
-    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-        [ -n "$m" ] && bad "$m"
-    done
-else
-    ok "--clean deletes only what a reinstall does not put back, and undoes itself when the reinstall fails"
-fi
-
-# ---- the shared hub is a system path, not a home  (1.14.312) --------------- #
-# The links to every shared directory lived in the main user's ~/Shared, so
-# nothing but that one login could find them by a fixed path, and every
-# login enumerated ITS OWN $HOME/Shared for the SHARED_* variables -- which
-# in an app account is its data directory.  Now: one hub, and ~/Shared is a
-# link to it.  The move keeps anything that is not ours.
-_p=""
-pm_src="$(dirname "$LFS_TOOL")/packagemanager"
-if [ "$(id -u)" != 0 ]; then
-    skip "the shared hub move (needs root for chown)"
-else
-    _hb="$(python3 - "$pm_src" <<'PYHUB'
-import importlib.machinery as m, os, sys, tempfile, pwd, shutil
-R = tempfile.mkdtemp(prefix="lfshub.", dir="/var/tmp")
-open(R + "/conf", "w").write("shared_hub=%s/hub\nmain_user=root\n" % R)
-os.environ["PKGUSR_CONFIG"] = R + "/conf"
-pm = m.SourceFileLoader("pm", sys.argv[1]).load_module()
-pm.printInfo = pm.printWarning = lambda *a, **k: None
-home = R + "/home"
-pm._home_of = lambda u: home
-print("CONFIGURED", pm.shared_hub() == R + "/hub")
-print("ENV", pm._system_env_values().get("PKGUSR_SYS_SHARED") == R + "/hub")
-
-# an old layout: ~/Shared holding one of our links
-os.makedirs(home + "/Shared"); os.makedirs(R + "/u_claude/Shared")
-os.symlink(R + "/u_claude/Shared", home + "/Shared/Claude")
-pm._ensure_shared_hub("root")
-print("MOVED", os.path.islink(R + "/hub/Claude")
-      and os.readlink(R + "/hub/Claude") == R + "/u_claude/Shared")
-print("HOMELINK", os.path.islink(home + "/Shared")
-      and os.path.realpath(home + "/Shared") == os.path.realpath(R + "/hub"))
-print("ROOTOWNED", os.stat(R + "/hub").st_uid == 0)
-# twice is the same as once
-pm._ensure_shared_hub("root")
-print("IDEMPOTENT", sorted(os.listdir(R + "/hub")) == ["Claude"])
-
-# a ~/Shared with a file of YOURS in it stays a directory
-os.unlink(home + "/Shared"); os.makedirs(home + "/Shared")
-open(home + "/Shared/notes.txt", "w").write("mine")
-os.symlink("/nowhere-x", home + "/Shared/Other")
-pm._ensure_shared_hub("root")
-print("KEPT-MINE", os.path.isdir(home + "/Shared") and not os.path.islink(home + "/Shared")
-      and os.path.exists(home + "/Shared/notes.txt"))
-print("MOVED-OURS", os.path.islink(R + "/hub/Other") and not os.path.lexists(home + "/Shared/Other"))
-shutil.rmtree(R, ignore_errors=True)
-PYHUB
-)"
-    for _k in CONFIGURED ENV MOVED HOMELINK ROOTOWNED IDEMPOTENT KEPT-MINE MOVED-OURS; do
-        case "$_hb" in *"$_k True"*) ;; *) _p="$_p;shared hub: $_k failed" ;; esac
-    done
-    _sv="$(dirname "$LFS_TOOL")/stacks/services.stack"
-    grep -q '\[ -L "\$h/Shared" \]' "$_sv" \
-        || _p="$_p;a machine with the old ~/Shared never re-runs cfg app-users"
-    # 1.14.315: the DATA lives in /home/Shared, the homes are 0700.  0750
-    # let the main user -- a member of every account's group, for the
-    # shared directory -- read the account's profile and cookies.
-    grep -q '^SHARED_HUB_DEFAULT = "/home/Shared"$' "$pm_src" \
-        || _p="$_p;the shared directories do not default to /home/Shared"
-    _sau="$(_slice_def "$pm_src" _setup_application_user)"
-    printf '%s' "$_sau" | grep -q '"chmod", "0700", home' \
-        || _p="$_p;an application home is still readable by its group"
-    printf '%s' "$_sau" | grep -q '"chmod", "0750", home' \
-        && _p="$_p;an application home is still made 0750 somewhere"
-    printf '%s' "$_sau" | grep -q 'ln", "-s", share, _in_home' \
-        || _p="$_p;the account's ~/Shared is not linked to its hub directory"
-    printf '%s' "$_sau" | grep -q 'moved (that is yours to do)' \
-        || _p="$_p;a ~/Shared with files in it could be replaced"
-    if [ -n "$_p" ]; then
-        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-            [ -n "$m" ] && bad "$m"
-        done
-    else
-        ok "the shared links live in one system hub; ~/Shared is a link to it, and nothing of yours is moved"
-    fi
-fi
-
-# ---- needs= speaks the package's name; the book files it by anchor  (1.14.317)
-# `needs=libjpeg-turbo` on grim: the book's anchor is `libjpeg`, so the
-# stack tried to INSTALL an installed package and stopped on "not found".
-_p=""
-pm_src="$(dirname "$LFS_TOOL")/packagemanager"
-_rn="$(python3 - "$pm_src" <<'PYRN'
-import importlib.machinery as m, sys
-pm = m.SourceFileLoader("pm", sys.argv[1]).load_module()
-pm.printInfo = lambda *a, **k: None
-out = ("  [package] libjpeg      libjpeg-turbo-3.2.0   installed libjpeg-turbo-3.2.0\n"
-       "  [package] openjpeg2    OpenJPEG-2.5.4\n"
-       "  [package] a1  foo-1.0\n  [package] a2  foo-2.0\n")
-pm.run_blfs = lambda a: (0, out, "")
-print("MAP", pm._resolve_need("libjpeg-turbo") == "libjpeg")
-print("ANCHOR", pm._resolve_need("libjpeg") == "libjpeg")
-print("AMBIG", pm._resolve_need("foo") == "foo")
-print("NONE", pm._resolve_need("nothing") == "nothing")
-PYRN
-)"
-for _k in MAP ANCHOR AMBIG NONE; do
-    case "$_rn" in *"$_k True"*) ;; *) _p="$_p;needs= resolution: $_k failed" ;; esac
-done
-grep -q '_resolve_need(x.strip())' "$pm_src" \
-    || _p="$_p;the stack's needs= loop does not resolve names"
-grep -E '^git +grim ' "$(dirname "$LFS_TOOL")/stacks/sway.stack" | grep -q 'libjpeg-turbo' \
-    && _p="$_p;sway.stack still names libjpeg-turbo instead of the anchor"
-if [ -n "$_p" ]; then
-    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-        [ -n "$m" ] && bad "$m"
-    done
-else
-    ok "needs= accepts a package's own name when the book files it under another anchor"
-fi
-
-# ---- the desktop is three stacks, each entry written once  (1.14.320) ------ #
-# sway.stack had grown to 477 lines answering four questions.  Split:
-# wayland (the base), media (unchanged), sway (compositor + tools + your
-# programs), apps (viewers), tools (CLI).  `stack sway` must still be the
-# whole desktop in one command, and nothing may be written twice.
-_p=""
-_sd="$(dirname "$LFS_TOOL")/stacks"
-grep -nE '^include +(wayland|media)$' "$_sd/sway.stack" | cut -d: -f2 | tr '\n' ' ' \
-    | grep -q '^include wayland include media $' \
-    || _p="$_p;sway.stack does not include wayland, then media"
-for _f in wayland apps tools; do
-    [ -f "$_sd/$_f.stack" ] || _p="$_p;no $_f.stack"
-done
-_dup="$(for _f in wayland media sway apps tools vision diag dev network services; do
-            grep -hoE '^(book|git|tar|cfg|check) +[^ ]+' "$_sd/$_f.stack" 2>/dev/null
-        done | awk '{print $2}' | sort | uniq -d | tr '\n' ' ')"
-[ -z "$_dup" ] || _p="$_p;written in more than one stack: $_dup"
-for _e in "wayland mesa" "wayland wlroots" "wayland gtk4" "sway sway" "sway foot" \
-          "sway grim" "apps zathura" "apps imv" "tools jq" "tools translate-shell"; do
-    set -- $_e
-    grep -qE "^(book|git|tar) +$2( |\$)" "$_sd/$1.stack" \
-        || _p="$_p;$2 is not in $1.stack"
-done
-if [ -n "$_p" ]; then
-    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-        [ -n "$m" ] && bad "$m"
-    done
-else
-    ok "the desktop is wayland + media + sway in one command, apps and tools beside it, each entry once"
-fi
-
-# ---- "phased" means it ends in the runner  (1.14.306) ----------------------- #
-# `update <git-pkg>` warned "git script isn't phased" for a perfectly current
-# script, because it tested for `unpack_pkg` -- the RARE OVERRIDE that replaces
-# the built-in unpack.  A correct script does not define it: the runner's own
-# unpack is what clones git.  The advice that followed (`template --git`)
-# rewrites the file and takes any hand-tuned build_pkg with it -- on this
-# machine that is imv's `-D c_link_args=-licuuc`.
-_p=""
-_ok="$(python3 - "$pm_src" <<'PYPH'
-import importlib.machinery as m, sys
-pm = m.SourceFileLoader("pm", sys.argv[1]).load_module()
-cur = ('#!/bin/bash\n### phases: all\nname="imv"\nis_git="1"\n'
-       'build_pkg() { meson setup build; }\n'
-       '. "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"\n')
-old = ('#!/bin/bash\nname=imv\ngit clone https://x/y.git\n'
-       'cd y && meson setup build && ninja -C build install\n')
-print("CUR", pm._is_phased_script(cur))
-print("OLD", pm._is_phased_script(old))
-print("NOUNPACK", "unpack_pkg" not in cur)
-PYPH
-)"
-case "$_ok" in *"CUR True"*) ;; *) _p="$_p;a current phased script is not recognised as phased" ;; esac
-case "$_ok" in *"OLD False"*) ;; *) _p="$_p;an unphased script passes as phased" ;; esac
-case "$_ok" in *"NOUNPACK True"*) ;; *) _p="$_p;the fixture does not reproduce the case" ;; esac
-grep -q 'unpack_pkg" not in open' "$pm_src" \
-    && _p="$_p;the phased test still asks for the rare unpack_pkg override"
-if [ -n "$_p" ]; then
-    printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-        [ -n "$m" ] && bad "$m"
-    done
-else
-    ok "a script is phased when it ends in the runner, not when it overrides unpack"
-fi
-
-# ---- a branch is not a point in time  (1.14.305) ---------------------------- #
-# `git checkout master` on an ALREADY CLONED tree says "Already on 'master'"
-# and stays exactly where it was -- so a package pinned to a branch fetched
-# the new commits and rebuilt the old ones, for ever, while reporting that it
-# had updated.  A tag must do the opposite and never move.
-_p=""
-_ph="$(dirname "$LFS_TOOL")/lfs-phases"
-if [ -f "$_ph" ] && command -v git >/dev/null 2>&1; then
-    grep -q 'checkout -B "$_pp_ref" "origin/$_pp_ref"' "$_ph" \
-        || _p="$_p;a branch ref is not moved to the remote on a rebuild"
-    grep -q 'checkout --detach' "$_ph" \
-        || _p="$_p;a tag or commit is not checked out detached"
-    grep -q 'symbolic-ref --short refs/remotes/origin/HEAD' "$_ph" \
-        || _p="$_p;with no ref at all nothing follows the default branch"
-    # and the behaviour itself, against a real repository
-    _gr="$T/gitref"; rm -rf "$_gr"; mkdir -p "$_gr/up"
-    ( cd "$_gr/up" && git init -q -b master . \
-      && git config user.email t@t && git config user.name t \
-      && echo one > V && git add -A && git commit -qm one && git tag v1 ) >/dev/null 2>&1
-    git clone -q "$_gr/up" "$_gr/clone" >/dev/null 2>&1
-    ( cd "$_gr/up" && echo two > V && git add -A && git commit -qm two ) >/dev/null 2>&1
-    ( cd "$_gr/clone" && git fetch -q --all --tags --prune ) >/dev/null 2>&1
-    _was="$(git -C "$_gr/clone" rev-parse --short HEAD 2>/dev/null)"
-    git -C "$_gr/clone" checkout -q master >/dev/null 2>&1
-    _plain="$(git -C "$_gr/clone" rev-parse --short HEAD 2>/dev/null)"
-    git -C "$_gr/clone" checkout -q -B master origin/master >/dev/null 2>&1
-    _moved="$(git -C "$_gr/clone" rev-parse --short HEAD 2>/dev/null)"
-    [ "$_plain" = "$_was" ] \
-        || _p="$_p;this git does not reproduce the bug (plain checkout moved)"
-    [ -n "$_moved" ] && [ "$_moved" != "$_was" ] \
-        || _p="$_p;checkout -B did not move the branch to the remote"
-    # the reporting side: branch vs tag, and what is newer
-    _gs="$(python3 - "$pm_src" <<'PYGS'
-import importlib.machinery as m, sys
-pm = m.SourceFileLoader("pm", sys.argv[1]).load_module()
-print("VSORT", pm._vsort_key("1.9.0") < pm._vsort_key("1.10.0"))
-print("VAR", pm._script_var('link="https://x/y"\ngit_ref="2.0.0"\n', "git_ref"))
-print("CMD", hasattr(pm, "cmd_git_status"), hasattr(pm, "cmd_git_ref"))
-PYGS
-)"
-    case "$_gs" in *"VSORT True"*) ;; *) _p="$_p;1.10.0 does not sort after 1.9.0" ;; esac
-    case "$_gs" in *"VAR 2.0.0"*) ;; *) _p="$_p;the ref cannot be read out of an install script" ;; esac
-    case "$_gs" in *"CMD True True"*) ;; *) _p="$_p;there is no way to see or pick a git ref" ;; esac
-    if [ -n "$_p" ]; then
-        printf '%s\n' "${_p#;}" | tr ';' '\n' | while IFS= read -r m; do
-            [ -n "$m" ] && bad "$m"
-        done
-    else
-        ok "a branch ref follows the remote on rebuild; a tag stays put and newer ones are offered"
-    fi
-else
-    skip "no lfs-phases or no git here: the branch-ref check cannot run"
 fi
 
 #@@ SUMMARY @@ -- everything below runs whichever blocks were selected

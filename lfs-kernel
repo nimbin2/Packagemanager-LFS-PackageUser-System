@@ -1,36 +1,13 @@
 #!/bin/bash
 # lfs-kernel -- build and install a kernel.
 #
-#   lfs-kernel                 what a build would do (nothing is built)
-#   lfs-kernel --run           build and install the configured version
-#   lfs-kernel load <module> [--boot]
-#                              load it now, and at every boot with --boot
+#   lfs-kernel                 build and install the configured version
 #   lfs-kernel list            what kernel.org offers right now
-#   lfs-kernel 6.12.40 --run   that version, once (config untouched)
-#   lfs-kernel latest --run    the newest stable, once
+#   lfs-kernel 6.12.40         that version, once (config untouched)
+#   lfs-kernel latest          the newest stable, once
 #   lfs-kernel detect-esp      print the EFI directory this would use
 #   lfs-kernel verify [ver]    check that everything is installed
 #   lfs-kernel firmware        install what FIRMWARE_ONLY names, no kernel build
-#   lfs-kernel status          how far the last build got, what is installed
-#   lfs-kernel enable --list   hardware this tool knows by name
-#   lfs-kernel enable ath9k-htc
-#                              put what that hardware needs into kernel.conf
-#   lfs-kernel modules [text]  what this kernel has, and what is loaded
-#   lfs-kernel config          what the next build's .config comes from
-#   lfs-kernel config list     the saved configs (the last two that BOOTED)
-#   lfs-kernel config diff [a] [b]
-#                              what changed between two saved configs
-#   lfs-kernel config search <text>
-#                              which symbols that text means, and their state
-#   lfs-kernel config set SYM=y|m|n [...]
-#                              add them to CONFIG_SET in kernel.conf
-#   lfs-kernel config save [--good]
-#                              keep the running config; --good: it BOOTS
-#   lfs-kernel config from last-good
-#                              build from that config, not from the running
-#                              kernel
-#   lfs-kernel config unset SYM [...]
-#                              take them out again
 #   lfs-kernel firmware --missing [--fix] [--all]
 #                              firmware this machine asks for and has not got,
 #                              from the boot log, this tree's modules and the
@@ -69,24 +46,6 @@ _detect_esp() {
     findmnt -rn -t vfat,msdos -o TARGET 2>/dev/null | head -n1
 }
 
-# A BUILD IS NOT SOMETHING YOU START BY TYPING FOUR WORDS.
-#
-# `lfs-kernel` alone compiled a kernel, installed it over the one the
-# machine boots, installed the modules, fetched firmware and copied the
-# Documentation -- an hour, from a bare command.  Every other tool here
-# prints the plan and waits for --run; this one now does too.  --run is
-# taken from anywhere on the line, so `lfs-kernel 7.2.6 --run` and
-# `lfs-kernel --run` both read naturally.
-_RUN=0
-_rest=()
-for _a in "$@"; do
-    case "$_a" in
-        --run) _RUN=1 ;;
-        *) _rest+=("$_a") ;;
-    esac
-done
-set -- ${_rest[@]+"${_rest[@]}"}
-
 case "${1:-}" in
     list)
         echo "# kernel.org offers:"
@@ -96,24 +55,7 @@ case "${1:-}" in
     detect-esp)
         printf '%s\n' "$(_detect_esp)"; exit 0 ;;
     verify)
-        shift; _VERIFY=1; _CLI_VERSION="${1:-}" ;;
-    enable)
-        # hardware by name: what symbols it needs, written into kernel.conf
-        shift; _ENABLE=1; _ENARGS=("$@") ;;
-    modules|mods)
-        # what this kernel actually has, and what is loaded
-        shift; _MODCMD=1; _MODARGS=("$@") ;;
-    load|unload)
-        # load a module now, and (--boot) at every boot
-        _LOADCMD="$1"; shift; _LOADARGS=("$@") ;;
-    status|state)
-        # how far the last build got, and what is installed -- reads only
-        shift; _STATUS=1 ;;
-    config)
-        # the config, without building anything: what it will be made of,
-        # what the last two booted kernels used, and the one place this
-        # machine's own answers are written down (CONFIG_SET)
-        shift; _CFGCMD=1; _CFGARGS=("$@") ;;
+        shift; _VERIFY=1; VERSION="${1:-}" ;;
     firmware)
         # firmware alone, with no kernel build: the blobs are a separate
         # package and a missing one is a run-time problem, so fixing it must
@@ -134,37 +76,8 @@ case "${1:-}" in
         # new command silently pushes out of range.
         sed -n '2,/^# Settings:/p' "$0" | sed '$d' | sed 's/^# \?//'; exit 0 ;;
     "") ;;
-    search|find)
-        # `lfs-kernel search AR9271` is what a person types, and it used to
-        # mean "build the kernel called search" -- see the version check
-        # below for what that really did.  It is the config search.
-        shift; _CFGCMD=1; _CFGARGS=("search" "$@") ;;
-    set)
-        shift; _CFGCMD=1; _CFGARGS=("set" "$@") ;;
     -*) echo "!! unknown option: $1  (try: lfs-kernel --help)"; exit 1 ;;
-    *)
-        # A WORD THAT IS NOT A VERSION IS NOT A VERSION.
-        #
-        # Anything unrecognised became the version to build, and the version
-        # from kernel.conf then overwrote it (below) -- so a typo, or a
-        # subcommand this tool does not have, silently started a FULL BUILD
-        # of the configured kernel.  `lfs-kernel search AR9271` rebuilt and
-        # reinstalled 7.2.6, fetched the firmware and said nothing about the
-        # word `search` at all.
-        case "$1" in
-            latest|[0-9]*.[0-9]*) _CLI_VERSION="$1" ;;
-            *)  echo "!! lfs-kernel: '$1' is neither a command nor a version."
-                echo "   commands: status, list, enable, modules, load,"
-                echo "             config, search, firmware, verify, detect-esp"
-                echo "   a version looks like 7.2.6, or the word latest."
-                case "$1" in
-                    conf*|cfg)  echo "   did you mean:  lfs-kernel config" ;;
-                    mod*|lsmod) echo "   did you mean:  lfs-kernel modules" ;;
-                    en*|add)    echo "   did you mean:  lfs-kernel enable --list" ;;
-                    fw|firm*)   echo "   did you mean:  lfs-kernel firmware --missing" ;;
-                esac
-                exit 1 ;;
-        esac ;;
+    *)  VERSION="$1" ;;
 esac
 
 # The config is INSTALLED, not written on first run: it is a file to edit
@@ -177,13 +90,6 @@ if [ ! -f "$CONF" ]; then
     exit 1
 fi
 . "$CONF"
-
-# THE COMMAND LINE WINS.  `lfs-kernel 6.12.40` sets VERSION, and then this
-# file -- sourced after it -- set VERSION=latest straight over the top: the
-# documented "that version, once" built whatever kernel.conf said instead,
-# and `verify 7.2.4` reported on another kernel entirely.  Re-apply it here,
-# where nothing can overwrite it again.
-[ -n "${_CLI_VERSION:-}" ] && VERSION="$_CLI_VERSION"
 
 # A CONFIG FROM AN OLDER RELEASE.
 #
@@ -230,22 +136,8 @@ _latest_stable() { _releases | awk '$1=="stable"{print $2; exit}'; }
 # "latest" would ask kernel.org for a version it is never going to look at,
 # and fail on a machine with no network while reporting on one that is
 # perfectly installed.
-if [ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
-   || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
-   || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ]; then
+if [ "${_VERIFY:-0}" = 1 ]; then
     :
-elif [ "${_FWONLY:-0}" = 1 ] && [ "$VERSION" = latest ]; then
-    # A FIRMWARE REPORT IS ABOUT THIS MACHINE, NOT ABOUT KERNEL.ORG.
-    #
-    # `lfs-kernel firmware --missing` asked the website which kernel is
-    # newest -- for a question answered entirely by /lib/modules and the
-    # boot log -- printed "newest stable on kernel.org", and on a machine
-    # with no network it EXITED instead of reporting.
-    VERSION="$(uname -r | sed "s/-.*//")"
-    if [ ! -d "/lib/modules/$VERSION" ] && [ ! -d "/lib/modules/$(uname -r)" ]; then
-        VERSION="$(_latest_stable)"
-        [ -n "$VERSION" ] || { echo "!! no /lib/modules for the running kernel, and kernel.org is unreachable"; exit 1; }
-    fi
 elif [ "$VERSION" = latest ]; then
     VERSION="$(_latest_stable)"
     [ -n "$VERSION" ] || { echo "!! could not reach $MIRROR_JSON -- set VERSION in $CONF"; exit 1; }
@@ -260,21 +152,12 @@ fi
 acct="p_$PKG"
 # `verify` must not CREATE anything -- a report that makes an account is not
 # a report.  It only reads $acct's home below.
-if [ "${_VERIFY:-0}" != 1 ] && [ "${_CFGCMD:-0}" != 1 ] \
-   && [ "${_ENABLE:-0}" != 1 ] && [ "${_MODCMD:-0}" != 1 ] \
-   && [ "${_STATUS:-0}" != 1 ] && [ -z "${_LOADCMD:-}" ] \
-   && ! id "$acct" >/dev/null 2>&1; then
+if [ "${_VERIFY:-0}" != 1 ] && ! id "$acct" >/dev/null 2>&1; then
     packagemanager add-user "$PKG" || { echo "!! could not create $acct"; exit 1; }
 fi
-[ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
-    || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
-    || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ] \
-    || lfs-helper fix-home "$acct" --run >/dev/null 2>&1 || true
+[ "${_VERIFY:-0}" = 1 ] || lfs-helper fix-home "$acct" --run >/dev/null 2>&1 || true
 SRC="$(getent passwd "$acct" 2>/dev/null | cut -d: -f6)/src"
-[ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
-    || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
-    || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ] \
-    || install -d -o "$acct" -g "$acct" -m 755 "$SRC"
+[ "${_VERIFY:-0}" = 1 ] || install -d -o "$acct" -g "$acct" -m 755 "$SRC"
 
 # Everything that touches the tree runs AS THE PACKAGE USER: a root-owned
 # file left in its home would break the next build and every rule about who
@@ -284,739 +167,6 @@ _as_pkg() { su - "$acct" -c "cd '$tree' 2>/dev/null || cd '$SRC'; $*"; }
 tree="$SRC/linux-$VERSION"
 tarball="$SRC/linux-$VERSION.tar.xz"
 major="${VERSION%%.*}"
-
-# --------------------------------------------------------------------------
-# THE CONFIGS ARE KEPT, OUTSIDE THE TREE.
-#
-# A .config lives in a source tree, and a source tree is deleted by hand or
-# by `packagemanager remove linux`, which takes the account's home,
-# and a failed build can leave one unusable.  What is lost with it is the
-# only record of every answer this machine has ever given -- hours of
-# menuconfig, and the difference between a kernel that boots and one that
-# does not.
-#
-# So every config this tool builds with is copied to $KCFG_DIR, which is
-# root's, small (a config is ~200 kB) and has nothing to do with the tree:
-#
-#     config-<version>-<date>   every build, newest CONFIG_KEEP kept
-#     last-good.config          the config of the kernel that BOOTED
-#     prev-good.config          the one before that
-#
-# The last two are the ones worth having: they are known to work on this
-# hardware.  CONFIG_FROM=last-good starts from one, `config diff` says what
-# changed between them, and `config set` is how an answer is added without
-# hand-editing a file that the next build overwrites.
-# --------------------------------------------------------------------------
-KCFG_DIR="${KCFG_DIR:-/etc/pkgusr/kernel-configs}"
-: "${CONFIG_KEEP:=5}"
-
-_kcfg_readable() {   # a config file with something in it
-    [ -s "$1" ] && grep -q '^CONFIG_' "$1" 2>/dev/null
-}
-
-_kcfg_newest() {     # the newest archived build config, or empty
-    ls -1t "$KCFG_DIR"/config-* 2>/dev/null | head -n1
-}
-
-_kcfg_ver() {        # the kernel version a config file was built for
-    sed -n 's/^# Linux\/[^ ]* \([0-9][^ ]*\) Kernel Configuration.*/\1/p' "$1" \
-        2>/dev/null | head -n1
-}
-
-_kcfg_archive() {    # <config> <version> -- keep a copy of what we built with
-    local src="$1" ver="$2" dst
-    _kcfg_readable "$src" || return 0
-    install -d -m 755 "$KCFG_DIR" || return 0
-    dst="$KCFG_DIR/config-$ver-$(date +%Y%m%d-%H%M%S)"
-    cp "$src" "$dst" 2>/dev/null || return 0
-    chmod 644 "$dst"
-    echo "# config kept as $dst"
-    # PRUNE THE BUILD SNAPSHOTS ONLY.  last-good/prev-good are not in this
-    # pattern and are never deleted here.
-    ls -1t "$KCFG_DIR"/config-* 2>/dev/null | tail -n +"$((CONFIG_KEEP + 1))" \
-        | while read -r _old; do rm -f "$_old"; done
-}
-
-_kcfg_mark_good() {  # <config> <version> -- this kernel has booted
-    local src="$1" ver="$2"
-    _kcfg_readable "$src" || return 0
-    install -d -m 755 "$KCFG_DIR" || return 0
-    # the same version again is the same kernel: refresh it, do not push the
-    # OTHER working config out with a copy of this one
-    if [ -f "$KCFG_DIR/last-good.config" ] \
-       && [ "$(_kcfg_ver "$KCFG_DIR/last-good.config")" != "$ver" ]; then
-        cp "$KCFG_DIR/last-good.config" "$KCFG_DIR/prev-good.config" 2>/dev/null
-        chmod 644 "$KCFG_DIR/prev-good.config" 2>/dev/null
-    fi
-    cp "$src" "$KCFG_DIR/last-good.config" 2>/dev/null || return 0
-    chmod 644 "$KCFG_DIR/last-good.config"
-    echo "# the config of $ver is now $KCFG_DIR/last-good.config"
-}
-
-# THE CONFIG THIS MACHINE IS RUNNING ON, wherever it can be read from.
-_kcfg_current() {
-    local c
-    for c in "$tree/.config" "$KCFG_DIR/last-good.config" "$(_kcfg_newest)"; do
-        [ -n "$c" ] && _kcfg_readable "$c" && { printf '%s' "$c"; return 0; }
-    done
-    if [ -r /proc/config.gz ]; then
-        c="$(mktemp)"; gunzip < /proc/config.gz > "$c" 2>/dev/null \
-            && { printf '%s' "$c"; return 0; }
-        rm -f "$c"
-    fi
-    return 1
-}
-
-_kcfg_state() {      # <config> <SYMBOL> -- what that symbol is, in words
-    local f="$1" sym="CONFIG_${2#CONFIG_}" l
-    l="$(grep -E "^($sym=|# $sym is not set)" "$f" 2>/dev/null | head -n1)"
-    [ -n "$l" ] || { printf 'absent'; return; }
-    case "$l" in "# $sym is not set") printf 'not set' ;; *) printf '%s' "${l#*=}" ;; esac
-}
-
-# ONE WRITER FOR kernel.conf.  `config set`, `config from` and `enable` all
-# change one KEY="value" line in a file the user edits by hand, so they all
-# back it up the same way and none of them rewrites anything else.
-_conf_set_var() {   # <KEY> <value>
-    local key="$1" val="$2" bak tmp
-    bak="$CONF.bak-$(date +%Y%m%d-%H%M%S)"
-    cp -p "$CONF" "$bak" || { echo "!! could not back up $CONF"; return 1; }
-    if grep -qE "^[[:space:]]*$key=" "$CONF"; then
-        tmp="$(mktemp)"
-        awk -v v="$key=\"$val\"" -v k="^[[:space:]]*$key=" '
-            $0 ~ k && !done { print v; done = 1; next }
-            { print }' "$CONF" > "$tmp" && cat "$tmp" > "$CONF"
-        rm -f "$tmp"
-    else
-        printf '\n%s="%s"\n' "$key" "$val" >> "$CONF"
-    fi
-    echo "# $CONF (backup: $(basename "$bak"))"
-    echo "#   $key=\"$val\""
-}
-
-# WHAT A SYMBOL IS, ACCORDING TO THE TREE: bool, tristate, or unknown --
-# which decides whether `enable` may say =m.
-_ksym_type() {   # <SYMBOL>
-    local sym="${1#CONFIG_}"
-    [ -d "$tree" ] || return 0
-    grep -rhA3 --include='Kconfig*' -E "^[[:space:]]*(menu)?config[[:space:]]+$sym\$" \
-         "$tree" 2>/dev/null \
-      | grep -m1 -oE '^[[:space:]]*(bool|tristate|string|int|hex)' \
-      | tr -d '[:space:]'
-}
-
-# THE SYMBOLS A KCONFIG FILE DEFINES, with their prompt -- the only way a
-# search can say "ATH9K_HTC: Atheros HTC based wireless cards" instead of
-# printing every symbol in a file that happens to mention the word.
-_ksym_scan() {   # <pattern> -- SYMBOL<TAB>type<TAB>prompt, for matches only
-    local pat="$1"
-    [ -d "$tree" ] || return 0
-    grep -rlis --include='Kconfig*' -- "$pat" "$tree" 2>/dev/null | head -n 40 \
-      | xargs -r awk -v pat="$pat" '
-          function low(x) { return tolower(x) }
-          /^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+/ {
-              sym = $2; next }
-          sym != "" && /^[[:space:]]*(bool|tristate|string|int|hex)([[:space:]]|$)/ {
-              type = $1
-              p = $0
-              # the prompt is the FIRST quoted string on the line, if any:
-              # `tristate "Atheros HTC based wireless cards support"`
-              if (match(p, /"[^"]*"/))
-                  p = substr(p, RSTART + 1, RLENGTH - 2)
-              else
-                  p = ""
-              if (index(low(sym), low(pat)) || index(low(p), low(pat)))
-                  print sym "\t" type "\t" p
-              sym = ""; next }
-          { if ($0 ~ /^[[:space:]]*$/) sym = "" }' 2>/dev/null \
-      | sort -u
-}
-
-# THE MODULES THIS KERNEL HAS: which version's /lib/modules to read.
-_kmod_ver() {
-    local r; r="$(uname -r)"
-    [ -d "/lib/modules/$r" ] && { printf '%s' "$r"; return 0; }
-    ls -1 /lib/modules 2>/dev/null | sort -V | tail -n1
-}
-
-# THE NEWEST SOURCE TREE, for a `config` command that names no version.
-_kcfg_tree() {
-    [ -d "${SRC:-}" ] || return 0
-    ls -1d "$SRC"/linux-*/ 2>/dev/null | grep -v '\-headers' | sort -V | tail -n1 \
-        | sed 's:/$::'
-}
-
-if [ "${_CFGCMD:-0}" = 1 ]; then
-    [ -d "$tree" ] || tree="$(_kcfg_tree)"
-    _sub="${_CFGARGS[0]-show}"
-    case "$_sub" in
-    show|"")
-        echo "# the next build's .config"
-        echo "#   CONFIG_FROM    = $CONFIG_FROM"
-        echo "#   CONFIG_REFRESH = ${CONFIG_REFRESH:-olddefconfig}"
-        echo "#   CONFIG_SET     = ${CONFIG_SET:-(nothing)}"
-        echo "#   kept in         $KCFG_DIR  (CONFIG_KEEP=$CONFIG_KEEP builds)"
-        echo
-        for _f in last-good prev-good; do
-            if [ -f "$KCFG_DIR/$_f.config" ]; then
-                printf '#   %-16s %s  (%s)\n' "$_f.config" \
-                    "$(_kcfg_ver "$KCFG_DIR/$_f.config")" \
-                    "$(date -r "$KCFG_DIR/$_f.config" '+%Y-%m-%d %H:%M')"
-            else
-                printf '#   %-16s -- none yet\n' "$_f.config"
-            fi
-        done
-        echo
-        echo "# add an option:      lfs-kernel config set NET_VENDOR_ATHEROS=y"
-        echo "# find its name:      lfs-kernel config search atheros"
-        echo "# then build:         lfs-kernel"
-        exit 0 ;;
-    list|ls)
-        if [ ! -d "$KCFG_DIR" ]; then
-            echo "# no saved configs yet ($KCFG_DIR) -- the next build writes one"
-            exit 0
-        fi
-        echo "# $KCFG_DIR"
-        for _f in "$KCFG_DIR"/last-good.config "$KCFG_DIR"/prev-good.config; do
-            [ -f "$_f" ] && printf '  %-34s %-10s %s\n' "$(basename "$_f")" \
-                "$(_kcfg_ver "$_f")" "$(date -r "$_f" '+%Y-%m-%d %H:%M')"
-        done
-        ls -1t "$KCFG_DIR"/config-* 2>/dev/null | while read -r _f; do
-            printf '  %-34s %-10s %s\n' "$(basename "$_f")" \
-                "$(_kcfg_ver "$_f")" "$(date -r "$_f" '+%Y-%m-%d %H:%M')"
-        done
-        echo "# start from one:  CONFIG_FROM=file:<path>  in $CONF"
-        echo "#   or CONFIG_FROM=last-good / prev-good / saved"
-        exit 0 ;;
-    diff)
-        _a="${_CFGARGS[1]:-$KCFG_DIR/prev-good.config}"
-        _b="${_CFGARGS[2]:-$KCFG_DIR/last-good.config}"
-        [ -f "$_a" ] || _a="$KCFG_DIR/$_a"
-        [ -f "$_b" ] || _b="$KCFG_DIR/$_b"
-        for _f in "$_a" "$_b"; do
-            [ -f "$_f" ] || { echo "!! no such config: $_f"; echo "   lfs-kernel config list"; exit 1; }
-        done
-        echo "# $_a ($(_kcfg_ver "$_a"))  ->  $_b ($(_kcfg_ver "$_b"))"
-        echo "#   < only in the first, > only in the second"
-        diff <(grep -E '^(CONFIG_|# CONFIG_)' "$_a" | sort) \
-             <(grep -E '^(CONFIG_|# CONFIG_)' "$_b" | sort) \
-            | grep -E '^[<>]' | sort -k2 || echo "#   identical"
-        exit 0 ;;
-    search|find)
-        _pat="${_CFGARGS[1]:-}"
-        [ -n "$_pat" ] || { echo "!! lfs-kernel config search <text>"; exit 1; }
-        _cfg="$(_kcfg_current || true)"
-        if [ -n "$_cfg" ]; then
-            echo "# '$_pat' in $_cfg"
-            grep -iE "^(CONFIG_[A-Z0-9_]*${_pat}[A-Z0-9_]*=|# CONFIG_[A-Z0-9_]*${_pat}[A-Z0-9_]* is not set)" \
-                 "$_cfg" | head -n 25 | sed 's/^/    /'
-        fi
-        echo
-        if [ -d "$tree" ]; then
-            # BY NAME OR BY PROMPT, NOT BY FILE.  Listing every symbol of
-            # every Kconfig that mentions the word gave 40 lines of MIPS
-            # console options for "atheros".  A symbol is a hit when its own
-            # name or its prompt says so, and the prompt is what tells you
-            # which one you want.
-            echo "# symbols in $tree  (state, type, what it is)"
-            _hits="$(_ksym_scan "$_pat")"
-            if [ -n "$_hits" ]; then
-                printf '%s\n' "$_hits" | head -n 30 | while IFS="$(printf '\t')" read -r _sym _ty _pr; do
-                    printf '    %-26s %-9s %-9s %s\n' "$_sym" \
-                        "$( [ -n "$_cfg" ] && _kcfg_state "$_cfg" "$_sym" )" \
-                        "$_ty" "$_pr"
-                done
-                _n="$(printf '%s\n' "$_hits" | wc -l)"
-                [ "$_n" -gt 30 ] && echo "    ... $((_n - 30)) more"
-            else
-                echo "    (nothing whose name or prompt says '$_pat')"
-            fi
-        else
-            echo "# no kernel tree here to search; unpack one with: lfs-kernel <version>"
-        fi
-        echo
-        echo "# a NET_VENDOR_* / WLAN_VENDOR_* symbol only opens the submenu:"
-        echo "#   the DRIVER under it has to be set too."
-        echo "# known hardware, by name:  lfs-kernel enable --list"
-        echo "# set a symbol:             lfs-kernel config set ATH9K_HTC=m"
-        [ -d "$tree" ] \
-            && echo "# read the help text:       cd $tree && make menuconfig   (/ searches)"
-        exit 0 ;;
-    save)
-        # SEED THE ARCHIVE WITHOUT A BUILD.  Before the first build there is
-        # nothing saved, so CONFIG_FROM=last-good has nothing to read -- and
-        # the config worth keeping is already on this machine.
-        _src="${_CFGARGS[1]:-}"
-        _good=0
-        for _a in ${_CFGARGS[@]+"${_CFGARGS[@]}"}; do
-            [ "$_a" = "--good" ] && _good=1
-        done
-        [ "$_src" = "--good" ] && _src=""
-        if [ -z "$_src" ]; then
-            if [ -r /proc/config.gz ]; then
-                _src="$(mktemp)"; gunzip < /proc/config.gz > "$_src"
-                _what="the running kernel"
-            elif _kcfg_readable "$tree/.config"; then
-                _src="$tree/.config"; _what="$tree"
-            else
-                echo "!! nothing to save: no /proc/config.gz and no .config in a tree"
-                exit 1
-            fi
-        else
-            _what="$_src"
-        fi
-        _kcfg_readable "$_src" || { echo "!! $_src is not a kernel config"; exit 1; }
-        _ver="$(_kcfg_ver "$_src")"
-        [ -n "$_ver" ] || _ver="$(uname -r | sed 's/-.*//')"
-        echo "# saving $_what  (kernel $_ver)"
-        _kcfg_archive "$_src" "$_ver"
-        if [ "$_good" = 1 ]; then
-            _kcfg_mark_good "$_src" "$_ver"
-        else
-            echo "#   it is a build snapshot, not a known-good config."
-            echo "#   --good marks it as one (use it for a kernel that BOOTS)."
-        fi
-        echo "# start from it next time:  lfs-kernel config from last-good"
-        exit 0 ;;
-    from)
-        _val="${_CFGARGS[1]:-}"
-        case "$_val" in
-            running|last-good|good|prev-good|prev|saved|last|keep|file:*) ;;
-            "") echo "# CONFIG_FROM = $CONFIG_FROM"
-                echo "#   running | last-good | prev-good | saved | keep | file:<path>"
-                exit 0 ;;
-            *)  echo "!! CONFIG_FROM=$_val is not one of:"
-                echo "   running last-good prev-good saved keep file:<path>"; exit 1 ;;
-        esac
-        case "$_val" in
-            last-good|good) _kcfg_readable "$KCFG_DIR/last-good.config" \
-                || { echo "!! there is no $KCFG_DIR/last-good.config yet."
-                     echo "   Make one from the kernel running now:"
-                     echo "     lfs-kernel config save --good"; exit 1; } ;;
-        esac
-        _conf_set_var CONFIG_FROM "$_val" || exit 1
-        exit 0 ;;
-    set|unset)
-        _items=("${_CFGARGS[@]:1}")
-        [ "${#_items[@]}" -gt 0 ] || {
-            echo "!! lfs-kernel config $_sub SYMBOL[=VALUE] ..."; exit 1; }
-        # the current list, as words
-        _new=""
-        for _w in ${CONFIG_SET:-}; do
-            _keep=1
-            for _i in "${_items[@]}"; do
-                _isym="CONFIG_${_i%%=*}"; _isym="CONFIG_${_isym#CONFIG_}"
-                _wsym="CONFIG_${_w%%=*}"; _wsym="CONFIG_${_wsym#CONFIG_}"
-                [ "$_isym" = "$_wsym" ] && _keep=0
-            done
-            [ "$_keep" = 1 ] && _new="$_new $_w"
-        done
-        if [ "$_sub" = set ]; then
-            for _i in "${_items[@]}"; do
-                case "$_i" in
-                    *=*) ;;
-                    *) echo "!! '$_i' has no value -- SYMBOL=y|m|n|<number>|\"text\""; exit 1 ;;
-                esac
-                _val="${_i#*=}"
-                case "$_val" in
-                    y|m|n|[0-9]*|\"*) ;;
-                    *) echo "# note: '$_val' is taken as a string value" ;;
-                esac
-                _new="$_new ${_i#CONFIG_}"
-            done
-        fi
-        _new="$(printf '%s' "$_new" | sed 's/^ *//')"
-        _conf_set_var CONFIG_SET "$_new" || exit 1
-        echo
-        echo "# nothing is built yet.  Apply it:"
-        echo "#     lfs-kernel                 # rebuild and install"
-        echo "#   Each entry is read back from the final .config: one the"
-        echo "#   kernel refuses (missing dependency, no such symbol) is"
-        echo "#   named and stops the build."
-        exit 0 ;;
-    *)  echo "!! lfs-kernel config: show | list | diff | search | set | unset"
-        echo "                      | save [--good] | from <source>"
-        exit 1 ;;
-    esac
-fi
-
-# --------------------------------------------------------------------------
-# HARDWARE BY NAME.
-#
-# "I have an AR9271 USB adapter" is the question; CONFIG_ATH9K_HTC plus
-# WLAN_VENDOR_ATH plus the htc_9271 firmware is the answer, and nothing on
-# the machine connects the two.  menuconfig will not either: it wants the
-# symbol you do not know yet.
-#
-# Each line is:  <name>|<symbols>|<firmware>|<what it is>
-# `enable <name>` puts the symbols into CONFIG_SET and the firmware into
-# FIRMWARE_ONLY, both in kernel.conf, both backed up.  A symbol this kernel
-# refuses is reported by the build, which reads every CONFIG_SET entry back.
-_KDEV_TABLE='
-ath9k-htc|WLAN_VENDOR_ATH=y ATH9K_HTC=m|ath9k_htc htc_9271*|Atheros AR9271/AR7010 USB wifi (TP-Link TL-WN722N v1, Alfa AWUS036NHA)
-ath9k|WLAN_VENDOR_ATH=y ATH9K=m ATH9K_PCI=y|ath9k_htc|Atheros AR9xxx PCI/PCIe wifi
-ath10k|WLAN_VENDOR_ATH=y ATH10K=m ATH10K_PCI=m|ath10k|Qualcomm Atheros QCA988x PCI wifi
-ath11k|WLAN_VENDOR_ATH=y ATH11K=m ATH11K_PCI=m|ath11k|Qualcomm QCA6390/WCN685x wifi
-alx|NET_VENDOR_ATHEROS=y ALX=m|-|Atheros AR816x/AR817x, Killer E2200 ethernet
-atl1c|NET_VENDOR_ATHEROS=y ATL1C=m|-|Atheros AR813x/AR815x ethernet
-iwlwifi|WLAN_VENDOR_INTEL=y IWLWIFI=m IWLMVM=m|intel iwlwifi-*.ucode|Intel wifi (AX200 and friends)
-rtl8xxxu|WLAN_VENDOR_REALTEK=y RTL8XXXU=m|rtlwifi rtw88|Realtek RTL8188/8192 USB wifi
-bluetooth-usb|BT=m BT_HCIBTUSB=m BT_RFCOMM=m BT_BNEP=m|rtl_bt intel|USB Bluetooth (most laptop and dongle radios)
-btrfs|BTRFS_FS=m BTRFS_FS_POSIX_ACL=y|-|the btrfs filesystem (stack: btrfs-progs)
-exfat|EXFAT_FS=m|-|exFAT, the usual format of big SD cards
-ntfs3|NTFS3_FS=m NTFS3_LZX_XPRESS=y|-|NTFS read/write (the in-kernel driver)
-nvme|BLK_DEV_NVME=y|-|NVMe SSDs
-usb-serial|USB_SERIAL=m USB_SERIAL_CP210X=m USB_SERIAL_FTDI_SIO=m USB_SERIAL_CH341=m|-|USB serial adapters (CP210x, FTDI, CH340)
-v4l2-usb|MEDIA_SUPPORT=m MEDIA_USB_SUPPORT=y USB_VIDEO_CLASS=m|-|USB webcams (UVC)
-'
-
-_kdev_line() {   # <name> -- the table line, or empty
-    printf '%s\n' "$_KDEV_TABLE" | awk -F'|' -v n="$1" 'NF && $1 == n {print; exit}'
-}
-
-_kdev_list() {
-    echo "# hardware this tool knows by name:"
-    printf '%s\n' "$_KDEV_TABLE" | awk -F'|' 'NF { printf "    %-15s %s\n", $1, $4 }'
-    echo
-    echo "# enable one:   lfs-kernel enable ath9k-htc"
-    echo "# or a symbol:  lfs-kernel enable ATH9K_HTC"
-    echo "# what is set:  lfs-kernel config show        modules: lfs-kernel modules"
-}
-
-if [ "${_ENABLE:-0}" = 1 ]; then
-    [ -d "$tree" ] || tree="$(_kcfg_tree)"
-    _args=("${_ENARGS[@]}")
-    if [ "${#_args[@]}" = 0 ] || [ "${_args[0]}" = "--list" ] || [ "${_args[0]}" = "list" ]; then
-        _kdev_list; exit 0
-    fi
-    _syms=""; _fw=""; _unknown=""
-    for _a in "${_args[@]}"; do
-        _row="$(_kdev_line "$_a")"
-        if [ -n "$_row" ]; then
-            _syms="$_syms $(printf '%s' "$_row" | cut -d'|' -f2)"
-            _f="$(printf '%s' "$_row" | cut -d'|' -f3)"
-            [ "$_f" = "-" ] || _fw="$_fw $_f"
-            echo "# $_a: $(printf '%s' "$_row" | cut -d'|' -f4)"
-            continue
-        fi
-        # not a name in the table: take it as a symbol, and ask the tree
-        # whether it can be a module before saying =m
-        case "$_a" in
-            *=*) _syms="$_syms ${_a#CONFIG_}"; continue ;;
-        esac
-        _sym="$(printf '%s' "${_a#CONFIG_}" | tr '[:lower:]' '[:upper:]')"
-        case "$(_ksym_type "$_sym")" in
-            tristate) _syms="$_syms $_sym=m"
-                      echo "# $_sym: a tristate symbol -- set to m (a module)" ;;
-            bool)     _syms="$_syms $_sym=y"
-                      echo "# $_sym: a bool symbol -- set to y (built in)" ;;
-            "")       _unknown="$_unknown $_a" ;;
-            *)        _syms="$_syms $_sym=y" ;;
-        esac
-    done
-    if [ -n "$_unknown" ]; then
-        echo "!! not a name I know, and not a symbol in this tree:$_unknown"
-        echo "   lfs-kernel enable --list            # the names"
-        echo "   lfs-kernel config search <text>     # the symbols"
-        echo "   lfs-kernel enable SYM=m             # if you are sure"
-        exit 1
-    fi
-    # merge into CONFIG_SET, last value wins, order kept
-    _new=""
-    for _w in ${CONFIG_SET:-}; do
-        _keep=1
-        for _i in $_syms; do
-            [ "CONFIG_${_i%%=*}" = "CONFIG_${_w%%=*}" ] && _keep=0
-        done
-        [ "$_keep" = 1 ] && _new="$_new $_w"
-    done
-    for _i in $_syms; do _new="$_new $_i"; done
-    _new="$(printf '%s' "$_new" | sed 's/^ *//')"
-    _conf_set_var CONFIG_SET "$_new" || exit 1
-    # the firmware, if this hardware needs some and it is not already named
-    if [ -n "$_fw" ] && [ "${FIRMWARE_FROM:-none}" != none ]; then
-        _fwnew="${FIRMWARE_ONLY:-}"
-        if [ -n "$_fwnew" ]; then      # empty means "everything": leave it
-            for _f in $_fw; do
-                case " $_fwnew " in *" $_f "*) ;; *) _fwnew="$_fwnew $_f" ;; esac
-            done
-            [ "$_fwnew" = "${FIRMWARE_ONLY:-}" ] \
-                || _conf_set_var FIRMWARE_ONLY "$_fwnew"
-        fi
-    fi
-    echo
-    echo "# nothing is built yet.  Apply it:"
-    echo "#     lfs-kernel                 # rebuild, install, and the firmware"
-    echo "#   then, after the reboot:"
-    echo "#     lfs-kernel modules ${_args[0]}"
-    echo "#     lfs-kernel firmware --missing"
-    exit 0
-fi
-
-if [ "${_MODCMD:-0}" = 1 ]; then
-    _mver="$(_kmod_ver)"
-    [ -n "$_mver" ] || { echo "!! no /lib/modules -- no kernel is installed here"; exit 1; }
-    _md="/lib/modules/$_mver"
-    _pat="${_MODARGS[0]-}"
-    _loaded="$(cut -d' ' -f1 /proc/modules 2>/dev/null | tr '_' '-' | sort -u)"
-    _all="$(find "$_md" -name '*.ko' -o -name '*.ko.*' 2>/dev/null \
-            | sed 's:.*/::; s:\.ko.*::' | tr '_' '-' | sort -u)"
-    _builtin="$(sed 's:.*/::; s:\.ko.*::' "$_md/modules.builtin" 2>/dev/null \
-                | tr '_' '-' | sort -u)"
-    _nall="$(printf '%s\n' "$_all" | grep -c . || true)"
-    _nld="$(printf '%s\n' "$_loaded" | grep -c . || true)"
-    _nbi="$(printf '%s\n' "$_builtin" | grep -c . || true)"
-    echo "# kernel $_mver: $_nall module(s) built, $_nld loaded, $_nbi built in"
-    [ "$_mver" = "$(uname -r)" ] \
-        || echo "#   (the running kernel is $(uname -r) -- this is another one)"
-    if [ -z "$_pat" ]; then
-        echo "# loaded now:"
-        printf '%s\n' "$_loaded" | grep . | tr '\n' ' ' | fold -s -w 72 | sed 's/^/    /'
-        echo
-        echo "# one subject:   lfs-kernel modules ath"
-        echo "# not built yet: lfs-kernel config search ath9k"
-        exit 0
-    fi
-    _hit="$(printf '%s\n' "$_all" "$_builtin" | sort -u \
-            | grep -i -- "$(printf '%s' "$_pat" | tr '_' '-')" || true)"
-    if [ -z "$_hit" ]; then
-        echo "# no module of this kernel is called anything like '$_pat'."
-        echo "#   is it even configured?   lfs-kernel config search $_pat"
-        echo "#   what it would be called: lfs-kernel enable --list"
-        exit 1
-    fi
-    echo "# modules matching '$_pat'"
-    printf '%s\n' "$_hit" | while read -r _m; do
-        _st="built"
-        printf '%s\n' "$_builtin" | grep -qx -- "$_m" && _st="built-in"
-        printf '%s\n' "$_loaded" | grep -qx -- "$_m" && _st="LOADED"
-        _desc="$(modinfo -F description "$(printf '%s' "$_m" | tr '-' '_')" \
-                 2>/dev/null | head -n1)"
-        printf '    %-24s %-9s %s\n' "$_m" "$_st" "${_desc:-}"
-    done
-    echo
-    echo "# load one now:   lfs-kernel load <name>"
-    echo "# and at boot:    lfs-kernel load <name> --boot"
-    echo "#   (a USB device loads its driver when you plug it in, if udev runs)"
-    exit 0
-fi
-
-# --------------------------------------------------------------------------
-# WHERE ARE WE?
-#
-# A kernel build is long enough to be interrupted -- Ctrl-C, a reboot, a
-# session that timed out -- and afterwards nothing on the machine says how
-# far it got.  The tree holds a .config that may or may not carry your
-# answers, object files that may or may not be a finished image, and
-# /lib/modules and the ESP each hold a kernel from some earlier day.
-#
-# `lfs-kernel status` reads all four and says, in order: what is running,
-# what the tree has, what is installed, and what to do next.  It builds
-# nothing, needs no network, and does not care whether the ESP is mounted.
-# --------------------------------------------------------------------------
-if [ "${_STATUS:-0}" = 1 ]; then
-    [ -d "$tree" ] || tree="$(_kcfg_tree)"
-    _ver="$(basename "${tree:-}" 2>/dev/null | sed 's/^linux-//')"
-    _run="$(uname -r)"; _runv="$(echo "$_run" | sed 's/-.*//')"
-    echo "### lfs-kernel status"
-    echo
-    echo "# running now"
-    echo "    kernel        $_run"
-    if [ -s /etc/pkgusr/kernel.last-good ]; then
-        echo "    known to boot $(cat /etc/pkgusr/kernel.last-good)"
-    else
-        echo "    known to boot -- nothing recorded yet"
-    fi
-    if [ -d "/lib/modules/$_run" ]; then
-        echo "    its modules   /lib/modules/$_run"
-    else
-        echo "    its modules   MISSING (/lib/modules/$_run is not there)"
-    fi
-    echo
-    echo "# the config"
-    echo "    CONFIG_FROM   $CONFIG_FROM"
-    for _f in last-good prev-good; do
-        if [ -f "$KCFG_DIR/$_f.config" ]; then
-            echo "    $_f     $(_kcfg_ver "$KCFG_DIR/$_f.config")  ($(date -r "$KCFG_DIR/$_f.config" '+%Y-%m-%d %H:%M'))"
-        else
-            echo "    $_f     -- none"
-        fi
-    done
-    # DOES THE TREE'S CONFIG CARRY WHAT YOU ASKED FOR?  This is the question
-    # after an interrupted run: the answers are applied BEFORE the compile,
-    # so they are in the file even when no kernel came out of it.
-    if [ -n "${CONFIG_SET:-}" ] && [ -f "${tree:-}/.config" ]; then
-        _miss=""
-        for _cs in $CONFIG_SET; do
-            _sym="CONFIG_${_cs%%=*}"; _sym="CONFIG_${_sym#CONFIG_}"; _val="${_cs#*=}"
-            case "$_val" in
-                n) grep -qE "^$_sym=(y|m)" "$tree/.config" && _miss="$_miss $_cs" ;;
-                *) grep -qx "$_sym=$_val" "$tree/.config" || _miss="$_miss $_cs" ;;
-            esac
-        done
-        if [ -z "$_miss" ]; then
-            echo "    CONFIG_SET    all $(echo $CONFIG_SET | wc -w) in $tree/.config"
-        else
-            echo "    CONFIG_SET    NOT in the tree's .config:$_miss"
-            echo "                  (the next build applies them)"
-        fi
-    fi
-    echo
-    echo "# the tree"
-    if [ -z "${tree:-}" ] || [ ! -d "$tree" ]; then
-        echo "    none in $SRC -- nothing has been unpacked here"
-    else
-        echo "    $tree"
-        _bz="$tree/arch/x86/boot/bzImage"
-        if [ ! -f "$tree/.config" ]; then
-            echo "    config        none yet"
-        elif [ -f "$_bz" ] && [ "$_bz" -nt "$tree/.config" ]; then
-            echo "    build         FINISHED -- bzImage is newer than .config"
-            echo "                  $(date -r "$_bz" '+%Y-%m-%d %H:%M')"
-        elif [ -f "$tree/vmlinux" ] || find "$tree" -maxdepth 2 -name '*.o' -print -quit 2>/dev/null | grep -q .; then
-            echo "    build         UNFINISHED -- object files, no current image"
-            echo "                  (an interrupted make; lfs-kernel continues"
-            echo "                   from here, it does not start over)"
-        else
-            echo "    build         not started"
-        fi
-        _nko="$(find "$tree" -name '*.ko' 2>/dev/null | wc -l)"
-        echo "    modules built $_nko in the tree"
-    fi
-    echo
-    echo "# installed"
-    if [ -n "$_ver" ] && [ -d "/lib/modules/$_ver" ]; then
-        echo "    /lib/modules/$_ver  $(test -s "/lib/modules/$_ver/modules.dep" && echo "(depmod has run)" || echo "-- NO modules.dep")"
-        echo "                  $(find "/lib/modules/$_ver" -name '*.ko*' 2>/dev/null | wc -l) module(s)"
-    elif [ -n "$_ver" ]; then
-        echo "    /lib/modules/$_ver -- not there: this kernel was never installed"
-    fi
-    if [ -d "${ESP:-}" ]; then
-        if [ -f "$ESP/$KERNEL_NAME" ]; then
-            echo "    $ESP/$KERNEL_NAME  $(date -r "$ESP/$KERNEL_NAME" '+%Y-%m-%d %H:%M')"
-        fi
-        for _k in "$ESP/$KERNEL_NAME"-*; do
-            [ -f "$_k" ] && echo "    $(basename "$_k")"
-        done
-        if [ -n "$_ver" ] && [ -f "$ESP/config-$_ver" ] && [ -f "$tree/.config" ]; then
-            if cmp -s "$ESP/config-$_ver" "$tree/.config"; then
-                echo "    the installed kernel was built from the tree's CURRENT config"
-            else
-                echo "    the installed config DIFFERS from the tree's .config --"
-                echo "      what is in the tree has not been built and installed yet"
-            fi
-        fi
-    else
-        echo "    $ESP is not mounted -- cannot say what is on the EFI partition"
-    fi
-    echo
-    echo "# next"
-    if [ -n "$_ver" ] && [ -f "$tree/.config" ] \
-       && { [ ! -f "$ESP/config-$_ver" ] || ! cmp -s "$ESP/config-$_ver" "$tree/.config"; }; then
-        echo "    lfs-kernel                 # build and install what the tree now has"
-        echo "      an interrupted build continues; nothing is thrown away."
-    else
-        echo "    nothing owed: the tree, /lib/modules and the ESP agree."
-    fi
-    echo "    lfs-kernel modules ath     # is a driver there, is it loaded"
-    echo "    lfs-kernel config show     # what the next build would use"
-    exit 0
-fi
-
-# --------------------------------------------------------------------------
-# LOADING A MODULE, NOW AND AT EVERY BOOT.
-#
-# A driver built as a module does nothing until something loads it.  For a
-# USB device udev does that when you plug it in; for everything else, and
-# on a machine where udev is not running, it is modprobe -- and then the
-# same name in /etc/sysconfig/modules, which is the file LFS's `modules`
-# bootscript reads.  Two places, one command.
-# --------------------------------------------------------------------------
-if [ -n "${_LOADCMD:-}" ]; then
-    _MODFILE="${MODULES_FILE:-/etc/sysconfig/modules}"
-    _boot=0; _names=()
-    for _a in ${_LOADARGS[@]+"${_LOADARGS[@]}"}; do
-        case "$_a" in
-            --boot) _boot=1 ;;
-            -*) echo "!! lfs-kernel $_LOADCMD: unknown option '$_a'"; exit 1 ;;
-            *) _names+=("$_a") ;;
-        esac
-    done
-    if [ "${#_names[@]}" = 0 ]; then
-        echo "!! lfs-kernel $_LOADCMD <module> [...] [--boot]"
-        echo "   which modules there are:  lfs-kernel modules <text>"
-        exit 1
-    fi
-    _rc=0
-    for _m in "${_names[@]}"; do
-        _m="$(printf '%s' "$_m" | tr '-' '_')"
-        if [ "$_LOADCMD" = unload ]; then
-            if modprobe -r "$_m" 2>&1; then
-                echo "# $_m: unloaded"
-            else
-                echo "!! $_m: could not be unloaded (in use? lsmod | grep $_m)"
-                _rc=1
-            fi
-            if [ -f "$_MODFILE" ] && grep -qE "^[[:space:]]*$_m([[:space:]]|$)" "$_MODFILE"; then
-                cp -p "$_MODFILE" "$_MODFILE.bak-$(date +%Y%m%d-%H%M%S)"
-                _t="$(mktemp)"
-                grep -vE "^[[:space:]]*$_m([[:space:]]|$)" "$_MODFILE" > "$_t" \
-                    && cat "$_t" > "$_MODFILE"
-                rm -f "$_t"
-                echo "#   and taken out of $_MODFILE"
-            fi
-            continue
-        fi
-        if grep -qE "^${_m}[[:space:]]" /proc/modules 2>/dev/null; then
-            echo "# $_m: already loaded"
-        elif modprobe "$_m" 2>&1; then
-            if grep -qE "^${_m}[[:space:]]" /proc/modules 2>/dev/null; then
-                echo "# $_m: loaded"
-            else
-                # BUILT IN IS NOT A FAILURE.  modprobe succeeds silently for
-                # a symbol that is =y; the module simply never appears in
-                # /proc/modules because it is part of the image.
-                echo "# $_m: modprobe returned success but it is not in"
-                echo "#   /proc/modules -- it is probably built INTO the kernel"
-                echo "#   (lfs-kernel modules $_m says which)"
-            fi
-        else
-            echo "!! $_m: modprobe refused it."
-            echo "   is it built?   lfs-kernel modules $_m"
-            echo "   is it set?     lfs-kernel config search $_m"
-            _rc=1
-            continue
-        fi
-        # WHAT THE KERNEL SAID ABOUT IT, which is where a missing firmware
-        # blob or an unsupported device id turns up.
-        if command -v dmesg >/dev/null 2>&1; then
-            _say="$(dmesg 2>/dev/null | tail -n 40 \
-                    | grep -iE "${_m}|${_m//_/-}|firmware" | tail -n 5)"
-            [ -n "$_say" ] && printf '%s\n' "$_say" | sed 's/^/    /'
-        fi
-        if [ "$_boot" = 1 ]; then
-            if [ -f "$_MODFILE" ] && grep -qE "^[[:space:]]*$_m([[:space:]]|$)" "$_MODFILE"; then
-                echo "#   $_MODFILE already lists it"
-            else
-                [ -f "$_MODFILE" ] \
-                    && cp -p "$_MODFILE" "$_MODFILE.bak-$(date +%Y%m%d-%H%M%S)"
-                if [ ! -f "$_MODFILE" ]; then
-                    install -d "$(dirname "$_MODFILE")"
-                    {
-                        echo "# /etc/sysconfig/modules -- one module per line,"
-                        echo "# loaded at boot by the 'modules' bootscript."
-                        echo "# Arguments may follow the name."
-                    } > "$_MODFILE"
-                fi
-                printf '%s\n' "$_m" >> "$_MODFILE"
-                echo "#   added to $_MODFILE (loaded at every boot)"
-            fi
-        else
-            echo "#   at every boot as well:  lfs-kernel load $_m --boot"
-        fi
-    done
-    exit $_rc
-fi
 
 # --------------------------------------------------------------------------
 # the ESP has to be the EFI partition, not a directory of the same name.
@@ -1945,44 +1095,6 @@ fi
 
 echo "# kernel $VERSION -> $ESP   (tree $tree, $JOBS)"
 
-# ---- the plan, when --run was not given ----------------------------------
-if [ "${_RUN:-0}" != 1 ]; then
-    echo
-    echo "### what a build would do  (nothing has been built)"
-    echo "    version       $VERSION"
-    if [ -d "$tree" ]; then
-        _bz="$tree/arch/x86/boot/bzImage"
-        if [ -f "$tree/.config" ] && [ -f "$_bz" ] && [ "$_bz" -nt "$tree/.config" ]; then
-            echo "    tree          $tree (already built -- make would do little)"
-        elif [ -f "$tree/.config" ]; then
-            echo "    tree          $tree (a build was started; make CONTINUES)"
-        else
-            echo "    tree          $tree (unpacked, not configured)"
-        fi
-    else
-        echo "    tree          $tree -- would be fetched and unpacked"
-    fi
-    echo "    config from   $CONFIG_FROM, refreshed with ${CONFIG_REFRESH:-olddefconfig}"
-    [ -n "${CONFIG_SET:-}" ] && echo "    then set      $CONFIG_SET"
-    echo "    installs      $ESP/$KERNEL_NAME (previous kept as ${KERNEL_NAME}_old)"
-    echo "                  /lib/modules/$VERSION, and the config beside the image"
-    case "${FIRMWARE_FROM:-none}" in
-        none) echo "    firmware      not touched (FIRMWARE_FROM=none)" ;;
-        *)    echo "    firmware      ${FIRMWARE_FROM}: ${FIRMWARE_ONLY:-everything}" ;;
-    esac
-    [ "${HEADERS:-no}" = yes ] \
-        && echo "    headers       /usr/include, as ${HEADERS_PKG:-linux-headers}"
-    case "${V4L2LOOPBACK:-no}" in yes|1|true)
-        echo "    also          v4l2loopback, built against this tree" ;;
-    esac
-    echo
-    echo "    This is an hour of compiling on most machines, and it REPLACES"
-    echo "    what $ESP/$KERNEL_NAME boots."
-    echo "    Go ahead:   lfs-kernel${_CLI_VERSION:+ $_CLI_VERSION} --run"
-    echo "    Where we are: lfs-kernel status"
-    exit 0
-fi
-
 # --------------------------------------------------------------------------
 # THE COMMANDS.  Everything above chooses the version and checks the paths;
 # everything below is the build, and is meant to be read.
@@ -2010,43 +1122,13 @@ if [ -n "${BOOTLOGO:-}" ]; then
 fi
 
 # .config
-#   running     /proc/config.gz -- the kernel carrying the machine
-#   last-good   the config of the last kernel that BOOTED  ($KCFG_DIR)
-#   prev-good   the one before it -- the way back from a bad answer
-#   saved       the newest config this tool built with, booted or not
-#   file:<path> any file;  keep  the tree's own .config
-_cfg_src=""
 case "$CONFIG_FROM" in
-    running)
-        if [ -r /proc/config.gz ]; then
-            _as_pkg "gunzip < /proc/config.gz > .config" || exit 1
-        elif _kcfg_readable "$KCFG_DIR/last-good.config"; then
-            # NOT A FAILURE WORTH STOPPING FOR.  A kernel built without
-            # CONFIG_IKCONFIG_PROC has no /proc/config.gz, and the config of
-            # the last kernel that booted is the same answer from a file.
-            echo "# /proc/config.gz is not readable (no CONFIG_IKCONFIG_PROC?)"
-            _cfg_src="$KCFG_DIR/last-good.config"
-        else
-            echo "!! /proc/config.gz unreadable, and no saved config either."
-            echo "   Set CONFIG_FROM=file:<path> in $CONF, or see:"
-            echo "     lfs-kernel config list"
-            exit 1
-        fi ;;
-    last-good|good)  _cfg_src="$KCFG_DIR/last-good.config" ;;
-    prev-good|prev)  _cfg_src="$KCFG_DIR/prev-good.config" ;;
-    saved|last)      _cfg_src="$(_kcfg_newest)" ;;
+    running) _as_pkg "gunzip < /proc/config.gz > .config" || {
+                 echo "!! /proc/config.gz unreadable -- set CONFIG_FROM=file:<path>"; exit 1; } ;;
     file:*)  _as_pkg "cp -v '${CONFIG_FROM#file:}' .config" || exit 1 ;;
     keep)    [ -f "$tree/.config" ] || { echo "!! no .config in $tree"; exit 1; } ;;
     *)       echo "!! CONFIG_FROM=$CONFIG_FROM not understood"; exit 1 ;;
 esac
-if [ -n "$_cfg_src" ]; then
-    _kcfg_readable "$_cfg_src" || {
-        echo "!! CONFIG_FROM=$CONFIG_FROM, but $_cfg_src is not a config."
-        echo "   lfs-kernel config list       # what there is"
-        exit 1; }
-    echo "# starting from $_cfg_src  (kernel $(_kcfg_ver "$_cfg_src"))"
-    _as_pkg "cp '$_cfg_src' .config" || exit 1
-fi
 # ---- refreshing the config for a NEW kernel ------------------------------
 #
 # A config from one kernel is never complete for another: every version adds
@@ -2126,11 +1208,6 @@ if [ -n "${CONFIG_SET:-}" ]; then
     fi
     echo "#   all $(echo $CONFIG_SET | wc -w) set, read back from .config"
 fi
-
-# THE CONFIG IS KEPT BEFORE ANYTHING IS COMPILED.  It is finished here --
-# source, refresh and CONFIG_SET all applied -- and a build that dies at
-# hour two must not take the answers with it.
-_kcfg_archive "$tree/.config" "$VERSION"
 
 # what a Wayland compositor needs; a warning, not a refusal
 for opt in CONFIG_DRM CONFIG_DRM_FBDEV_EMULATION CONFIG_INPUT_EVDEV CONFIG_SYSVIPC; do
@@ -2247,8 +1324,7 @@ depmod -a "$VERSION" || exit 1
 # perfectly installed.  The kernel is on disk at this point; record it.
 # (Run again after the headers, which add /usr/include.)
 _record() {
-    echo "# recording what $acct owns (a scan AS $acct, skipping /proc, the"
-    echo "#   package source trees and the caches; --root if something is missed)"
+    echo "# recording what $acct owns (scans the filesystem; this is slow) ..."
     packagemanager reload-pkg-list "$PKG" >/dev/null 2>&1 || return 0
     local _h; _h="$(getent passwd "$acct" | cut -d: -f6)"
     echo "# recorded $(grep -c . "$_h/pkg.lst" 2>/dev/null) file(s) for $acct"
@@ -2358,9 +1434,8 @@ esac
 # A kernel that boots is the only way back from one that does not, and its
 # TREE is what you need to rebuild or bisect -- not just the bzImage.  The
 # version that is running right now is recorded as last-good before this one
-# is; nothing here ever removes that tree.  (An older comment here promised
-# a `lfs-kernel prune`; there is none, and before 1.14.324 typing it started
-# a full build instead of saying so.)
+# is; nothing here ever removes that tree, and `lfs-kernel prune` (below)
+# refuses to.
 # ONLY A KERNEL THAT HAS BOOTED IS KNOWN TO BOOT.
 #
 # The old `elif` wrote the version just built into last-good whenever the
@@ -2375,12 +1450,9 @@ if [ "$_running" = "$VERSION" ]; then
     # the kernel just built is the one running: it demonstrably boots
     printf '%s\n' "$VERSION" > "$_lastgood"
     echo "# $VERSION is running, so it is now the kernel known to boot"
-    _kcfg_mark_good "$tree/.config" "$VERSION"
 elif [ -d "$SRC/linux-$_running" ]; then
     printf '%s\n' "$_running" > "$_lastgood"
     echo "# keeping $SRC/linux-$_running as the last kernel known to boot"
-    # ...and ITS config is the one known to work, not the one just built
-    _kcfg_mark_good "$SRC/linux-$_running/.config" "$_running"
 else
     echo "# the running kernel is $_running, and there is no tree for it here,"
     echo "#   so nothing is recorded as known-good.  $VERSION will be recorded"
@@ -2396,6 +1468,5 @@ echo "# $VERSION installed as $ESP/$KERNEL_NAME"
 echo "#   previous kernel kept as $ESP/${KERNEL_NAME}_old"
 echo "#   its source kept at    $SRC/linux-$(cat "$_lastgood" 2>/dev/null)"
 echo "#   owned by              $acct  (packagemanager verify | grep $PKG)"
-echo "#   its config kept in    $KCFG_DIR  (lfs-kernel config list)"
 echo "# running kernel is $(uname -r) -- reboot to use $VERSION"
 [ "$_fw_ok" = 1 ] || echo "# NOTE: firmware was NOT installed (see the message above)"

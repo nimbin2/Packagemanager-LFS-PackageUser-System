@@ -138,38 +138,6 @@ def appuser_home():
 APPUSER_HOME_DEFAULT = "/home/shared_user"
 
 
-# /home/Shared (1.14.315).  1.14.312 put a hub of LINKS in
-# /home/shared_user/Shared and argued against /home: a directory there that
-# is not a home looks like one.  Once the hub holds the DATA, that argument
-# turns round: the shared directories are the one thing in /home/shared_user
-# that is not private to an account, and taking them out is what lets every
-# account home be 0700.
-SHARED_HUB_DEFAULT = "/home/Shared"
-
-
-def shared_hub():
-    """Where every shared directory lives (1.14.312; the data itself since
-    1.14.315 -- see SHARED_HUB_DEFAULT).
-
-    It was ~/Shared of the main user.  Two things were wrong with that:
-
-      * ONE PERSON'S HOME IS NOT A SYSTEM PATH.  A program of your own, a
-        script, a launcher, an app account -- anything that wants "the
-        shared dirs" had to know whose home to look in.  A fixed path is the
-        same answer for every account.
-      * The SHARED_* variables were enumerated from $HOME/Shared by EVERY
-        login -- and in an app account $HOME/Shared is its own data
-        directory, so u_claude got SHARED_<FILENAME> for each file in it.
-
-    Default /home/Shared: the real directories, one per account
-    (/home/Shared/Claude, 2770 u_claude:u_claude).  Each account's ~/Shared
-    and the main user's ~/Shared are links into it, so nothing you type
-    changes.  `shared_hub=` in packagemanager.conf moves it.
-    """
-    return (load_config().get("shared_hub") or "").rstrip("/") \
-        or SHARED_HUB_DEFAULT
-
-
 def _app_home(u):
     """An application user's home: what passwd says, or where they go.
 
@@ -188,7 +156,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.340"
+TOOL_VERSION = "1.14.299"
 
 
 def _build_id():
@@ -717,99 +685,15 @@ def find_blfs():
 # dependencies, the generated script -- asks the one named there.
 _BOOK_FOR_PKG = {}
 
-# A STACK CAN READ ITS PACKAGES FROM ANOTHER BOOK (1.14.321).
-#
-#     media.stack:   from-book svn
-#
-# ...and every book entry of THAT file (not of files it includes) is read
-# from the development book: versions, dependencies, the generated script.
-# It is a property of the package, not of one run -- `update`, `info` and
-# `install --reinstall` ask the same book the stack built it from, or an
-# update-all would "update" mpv back to the stable book's older page.
-#
-# Dependencies outside the stack stay on their own book: an installed one is
-# left alone (the svn page naming a newer glib is not a reason to rebuild
-# glib), a missing one is built from the default book, and only a page the
-# default book does not have at all is read from the stack's book.
-_STACK_BOOKS = None          # anchor (lower) -> selector
-_PLAN_BOOK = None            # the stack book a running plan's target reads
-_BOOK_PATHS = {}             # selector -> local file ("" = could not resolve)
-
-
-def _stack_book_map():
-    """anchor -> selector, from every installed stack's `from-book`."""
-    global _STACK_BOOKS
-    if _STACK_BOOKS is not None:
-        return _STACK_BOOKS
-    _STACK_BOOKS = {}
-    # a stack run hands its own file's books to the installs it starts
-    # (it may be a checkout, not the installed copy)
-    for kv in (os.environ.get("PM_STACK_BOOKS") or "").split(","):
-        if "=" in kv:
-            a, sel = kv.split("=", 1)
-            _STACK_BOOKS[a.strip().lower()] = sel.strip()
-    d = STACK_DIR if "STACK_DIR" in globals() else "/etc/pkgusr/stacks"
-    for f in sorted(glob.glob(os.path.join(d, "*.stack"))):
-        try:
-            for r in _parse_stack_file(f):
-                sel = r["opts"].get("from-book")
-                if sel and r["kind"] == "book":
-                    _STACK_BOOKS.setdefault(r["target"].lower(), sel)
-        except (ValueError, OSError):
-            continue
-    return _STACK_BOOKS
-
-
-def _book_path_for(selector, refresh=False):
-    """The local file for a book selector, asked of `blfs path` ONCE.
-
-    With refresh, `blfs fetch` first -- a stack run on the svn book wants
-    today's svn book; every other command reads the cached copy and never
-    touches the network."""
-    if not selector:
-        return None
-    if os.path.isfile(selector):
-        return selector
-    if refresh or selector not in _BOOK_PATHS:
-        if refresh:
-            set_status("refreshing the %s book ..." % selector)
-            try:
-                r = subprocess.run(find_blfs() + ["fetch", selector],
-                                   capture_output=True, text=True)
-            finally:
-                clear_status()
-            if r.returncode != 0:
-                printWarning("  could not refresh the %s book; using the "
-                             "cached one" % selector)
-        r = subprocess.run(find_blfs() + ["path", selector],
-                           capture_output=True, text=True)
-        out = (r.stdout or "").strip().splitlines()
-        _BOOK_PATHS[selector] = out[-1] if r.returncode == 0 and out \
-            and os.path.isfile(out[-1]) else ""
-        if not _BOOK_PATHS[selector]:
-            printWarning("  no %s book on disk (blfs fetch %s)"
-                         % (selector, selector))
-    return _BOOK_PATHS[selector] or None
-
 
 def _book_override(anchor):
-    """The book this package should be read from, or None.
-
-    machine.conf `book =` first, then a stack's `from-book`, then -- inside
-    a plan for a stack-book package -- that book for a page the default
-    book does not have at all."""
+    """The book this package should be read from, or None."""
     if not anchor:
         return None
     if anchor not in _BOOK_FOR_PKG:
         opts = _machine_opts_for(anchor)
-        sel = opts.get("book") or _stack_book_map().get(anchor.lower()) or ""
-        _BOOK_FOR_PKG[anchor] = (_book_path_for(sel) or sel) if sel else ""
-    if _BOOK_FOR_PKG[anchor]:
-        return _BOOK_FOR_PKG[anchor]
-    if _PLAN_BOOK and not _map_lookup(_versions_for(""), [anchor]) \
-            and _map_lookup(_versions_for(_PLAN_BOOK), [anchor]):
-        return _PLAN_BOOK
-    return None
+        _BOOK_FOR_PKG[anchor] = opts.get("book") or ""
+    return _BOOK_FOR_PKG[anchor] or None
 
 
 def _blfs_book_flags(anchor=None):
@@ -840,13 +724,8 @@ _BLFS_ACTIVITY = {
 _FORWARDED_NOTES = set()
 
 
-_SAID_BOOK = set()
-
-
-def run_blfs(args, book=None):
+def run_blfs(args):
     """Run blfs; return (returncode, stdout, stderr).  rc 127 => blfs missing.
-
-    book= reads that book file for this call, whatever the package.
 
     Each call is a subprocess, and the first one for a given book INDEXES it,
     which takes many seconds.  Announce what is happening: an install that sits
@@ -855,15 +734,9 @@ def run_blfs(args, book=None):
     # what decides whether an override applies
     _anchor = next((a for a in args[1:] if not a.startswith("-")), None) \
         if len(args) > 1 else None
-    if book:
-        cmd = find_blfs() + ["--book-file", book] + list(args)
-    else:
-        cmd = find_blfs() + _blfs_book_flags(_anchor) + list(args)
-    # ONCE per package: a plan asks blfs several things about each one
-    if not book and _anchor and _book_override(_anchor) \
-            and _anchor not in _SAID_BOOK:
-        _SAID_BOOK.add(_anchor)
-        printInfo("  %s: read from %s"
+    cmd = find_blfs() + _blfs_book_flags(_anchor) + list(args)
+    if _anchor and _book_override(_anchor):
+        printInfo("  %s: read from %s (machine.conf)"
                   % (_anchor, os.path.basename(_book_override(_anchor))))
     verb = args[0] if args else ""
     if verb in _BLFS_ACTIVITY:
@@ -905,71 +778,62 @@ def run_blfs(args, book=None):
                 pass
 
 
-_VERSION_MAPS = {}           # book file ("" = default) -> {anchor: nv}
-_BOOK_MISSES = set()         # names no book had: ask the slow way once
-
-
-def _versions_for(book):
-    """The whole version map of one book, loaded once per process."""
-    if book not in _VERSION_MAPS:
-        try:
-            _VERSION_MAPS[book] = book_versions_all(book or None) or {}
-        except Exception:
-            _VERSION_MAPS[book] = {}
-    return _VERSION_MAPS[book]
-
-
-def _map_lookup(vmap, names):
-    for a in names:
-        if a in vmap:
-            return vmap[a]
-    for a in names:
-        low = a.lower()
-        for k, nv in vmap.items():
-            if k.lower() == low:
-                return nv
-    return None
+_VERSION_MAP = None          # anchor -> name_version, the whole book, once
 
 
 def book_version(anchor):
-    """Current name-version of a package in ITS book, or None.
+    """Current name-version of a package in the book, or None if unavailable.
 
-    One version map per book, loaded once (see book_versions_all); a name
-    no map has falls back to `blfs debug` once, and a miss is remembered --
-    `install imv` asked three slow questions to learn the same "no" three
-    times.  The package's book is machine.conf's, else its stack's
-    from-book, else the default.
+    ONE PROCESS FOR THE WHOLE BOOK, not one per question.  This ran `blfs
+    debug <anchor>` every time it was called -- a subprocess that opens and
+    reads the book cache to answer one lookup.  A stack preview asks it once
+    per entry (56 for sway) and the planner asks it for every package it
+    considers, so a command whose real work is a dictionary lookup spent
+    minutes launching processes:
 
-    THE PREFIX IS NOT PART OF THE BOOK'S NAME: `info webkitgtk` asks with
-    the account name p_webkitgtk, which no anchor matches.
+        looking up pipewire in the book        <- one process
+        looking up ... in the book             <- another
+
+    `book_versions_all` was already here, used only by `update`.  The map is
+    loaded on first use and answers everything after that; a name the map does
+    not have (an alias, a URL, a fragment) still falls back to the old call.
     """
+    global _VERSION_MAP
+    if _VERSION_MAP is None:
+        try:
+            _VERSION_MAP = book_versions_all() or {}
+        except Exception:
+            _VERSION_MAP = {}
+    # THE PREFIX IS NOT PART OF THE BOOK'S NAME.
+    #
+    # `info webkitgtk` asks with the ACCOUNT name, `p_webkitgtk`, which no
+    # book anchor matches -- so every call missed the map and fell through to
+    # `blfs debug p_webkitgtk`, a subprocess that reads the book cache to
+    # answer one lookup and then fails.  That is the pause after
+    # "looking up p_webkitgtk in the book", and the reason `info` showed no
+    # book version to compare against.
     _tries = [anchor]
     for _pre in (pkgusr_prefix(), user_prefix(), collector_prefix()):
         if _pre and anchor.startswith(_pre):
             _tries.append(anchor[len(_pre):])
-    own = _book_override(_tries[-1])
-    books = ([own] if own and os.path.isfile(own) else []) + [""]
-    if _PLAN_BOOK and _PLAN_BOOK not in books:
-        books.append(_PLAN_BOOK)
-    for b in books:
-        hit = _map_lookup(_versions_for(b), _tries)
+    for _a in _tries:
+        hit = _VERSION_MAP.get(_a)
         if hit:
             return hit
-    if _tries[-1] in _BOOK_MISSES:
-        return None
+    if _VERSION_MAP:
+        for _a in _tries:
+            low = _a.lower()
+            for a, nv in _VERSION_MAP.items():
+                if a.lower() == low:
+                    return nv
     rc, out, _ = run_blfs(["debug", _tries[-1]])
-    m = re.search(r"^title\s*:\s*(.+)$", out, re.M) if rc == 0 else None
+    if rc != 0:
+        return None
+    m = re.search(r"^title\s*:\s*(.+)$", out, re.M)
     nv = m.group(1).strip() if m else None
-    if nv:
-        _versions_for(books[0])[anchor] = nv   # ask once, even for an alias
-    else:
-        _BOOK_MISSES.add(_tries[-1])
+    if nv and _VERSION_MAP is not None:
+        _VERSION_MAP[anchor] = nv          # ask once, even for an alias
     return nv
-
-
-def default_book_version(anchor):
-    """The version the DEFAULT book has, whatever book the package reads."""
-    return _map_lookup(_versions_for(""), [anchor])
 
 
 def book_rdeps(target, no_recommended=False, optional=False):
@@ -990,49 +854,18 @@ def book_rdeps(target, no_recommended=False, optional=False):
     return result
 
 
-def _versions_cache_path(book=""):
-    """Where the anchor -> version map is kept between runs: one per book."""
+def _versions_cache_path():
+    """Where the anchor -> version map is kept between runs."""
     d = os.path.join("/var", "cache", "pkgusr")
     try:
         os.makedirs(d, exist_ok=True)
     except OSError:
         d = "/tmp"
-    tag = hashlib.md5(book.encode()).hexdigest()[:8] if book else "default"
-    return os.path.join(d, "book-versions-%s.json" % tag)
+    return os.path.join(d, "book-versions.json")
 
 
-def _default_book_file():
-    """The file the default book is: BLFS_BOOK_FILE, BLFS_BOOK, `blfs path`.
-
-    NOT the newest file on disk: once a stack fetched the svn book it was
-    the newest, and every version question on the machine would have been
-    answered from svn."""
-    _bf = os.environ.get("BLFS_BOOK_FILE") or ""
-    if _bf and os.path.isfile(_bf):
-        return _bf
-    if not hasattr(_default_book_file, "_p"):
-        _p = ""
-        try:
-            r = subprocess.run(find_blfs() + (
-                ["--book", os.environ["BLFS_BOOK"]]
-                if os.environ.get("BLFS_BOOK") else []) + ["path", "--offline"],
-                capture_output=True, text=True)
-            out = (r.stdout or "").strip().splitlines()
-            if r.returncode == 0 and out and os.path.isfile(out[-1]):
-                _p = out[-1]
-        except OSError:
-            pass
-        if not _p:                          # an older blfs without `path`
-            _books = sorted((f for f in glob.glob("/usr/share/blfs/books/*.html")
-                             if "svn" not in os.path.basename(f)),
-                            key=lambda f: os.stat(f).st_mtime, reverse=True)
-            _p = _books[0] if _books else ""
-        _default_book_file._p = _p
-    return _default_book_file._p
-
-
-def book_versions_all(book=None):
-    """Map anchor -> name_version for the whole book (default, or `book`).
+def book_versions_all():
+    """Map anchor -> name_version for the whole book.
 
     ONE CALL WAS NOT ENOUGH: IT IS ONE CALL PER PROCESS.  `blfs versions`
     re-reads the whole book to build this map, which is eighteen seconds on
@@ -1044,8 +877,15 @@ def book_versions_all(book=None):
     book file changes the cache is ignored, so a stale map cannot outlive
     the book it came from.
     """
-    # WHICH book: the one asked for, else the default book's file.
-    _bf = book if book and os.path.isfile(book) else _default_book_file()
+    # WHICH book: the explicit one if given, else whichever cached book file
+    # is newest -- the same file `blfs` would read.
+    _bf = os.environ.get("BLFS_BOOK_FILE") or ""
+    if not (_bf and os.path.isfile(_bf)):
+        _bf = ""
+        _books = sorted(glob.glob("/usr/share/blfs/books/*.html"),
+                        key=lambda f: os.stat(f).st_mtime, reverse=True)
+        if _books:
+            _bf = _books[0]
     _key = None
     if _bf:
         try:
@@ -1053,7 +893,7 @@ def book_versions_all(book=None):
             _key = "%s:%d:%d" % (_bf, _st.st_size, int(_st.st_mtime))
         except OSError:
             _key = None
-    _cp = _versions_cache_path(_bf)
+    _cp = _versions_cache_path()
     if _key:
         try:
             with open(_cp, encoding="utf-8") as f:
@@ -1062,7 +902,7 @@ def book_versions_all(book=None):
                 return _c["versions"]
         except (OSError, ValueError):
             pass
-    rc, out, _ = run_blfs(["versions"], book=_bf or None)
+    rc, out, _ = run_blfs(["versions"])
     versions = {}
     if rc == 0:
         for line in out.splitlines():
@@ -1407,39 +1247,6 @@ class User:
             except OSError:
                 pass
         return self.meta.get("name_version")
-
-
-def _resolve_need(name):
-    """A needs= name -> the book's anchor for it (1.14.317).
-
-    The book files a package under an ANCHOR that is not always its name:
-    libjpeg-turbo-3.2.0 is `libjpeg`.  needs=libjpeg-turbo therefore found
-    no page, the stack tried to INSTALL it, and stopped on
-        ERROR: 'libjpeg-turbo' not found
-    with the package installed all along -- the "did you mean" under it even
-    named the right anchor.  So: a name that is not an anchor, and matches
-    exactly ONE page's own package name (its version string without the
-    version), is that page.  More than one, or none, and the name is used as
-    given, which fails the way it always did.
-    """
-    try:
-        rc, out, _e = run_blfs(["search", name])
-    except Exception:
-        return name
-    anchors, by_pkg = set(), []
-    for ln in (out or "").splitlines():
-        m = re.match(r"\s*\[package\]\s+(\S+)\s+(\S+)", ln)
-        if not m:
-            continue
-        anchor, ver = m.group(1), m.group(2)
-        anchors.add(anchor)
-        base = re.sub(r"-\d[\w.+~-]*$", "", ver)
-        if base.lower() == name.lower():
-            by_pkg.append(anchor)
-    if name in anchors or len(set(by_pkg)) != 1:
-        return name
-    printInfo("  (%s is the book's `%s`)" % (name, by_pkg[0]))
-    return by_pkg[0]
 
 
 def gather_user(name):
@@ -4619,32 +4426,6 @@ def _explain_not_in_book(target):
         printInfo(f"  Nothing similar found either.  Try: blfs search {target}")
 
 
-def _install_finished(u):
-    """Positive evidence that an install FINISHED -- not that one started.
-
-    THIS IS WHY THE STACK NEEDED HAND-HOLDING.  `install_last` is copied
-    into the package home BEFORE the build runs (lfs-helper: "RECORD WHAT
-    IS INSTALLED BEFORE OVERWRITING THE RECORD"), so a build that dies at
-    configure leaves one behind.  For a package whose page declares no
-    programs or libraries to check -- cairomm is one -- `state` then has
-    nothing else to go on and answers "installed".
-
-    cairomm-1.0 failed at configure with 0 files tracked, was recorded
-    installed by that rule, and every later plan SKIPPED it as a dependency
-    that was already there.  pangomm found out the hard way:
-        Run-time dependency cairomm-1.0 found: NO
-    and the person had to name it by hand to get the chain moving.
-
-    A manifest with real paths, or the marker the runner writes after a
-    SUCCESSFUL install, is evidence.  A script that was copied in before
-    the build is not.
-    """
-    if getattr(u, "pkg_list", None):
-        return True
-    home = getattr(u, "home", "") or ""
-    return bool(home) and os.path.isfile(os.path.join(home, ".pkgusr-installed"))
-
-
 def build_install_plan(args):
     """Return (plan, missing, why).  plan = [(anchor, name_version, reason)] in
     install order (deps first); reason in {new, update, reinstall}.  why maps
@@ -4675,7 +4456,6 @@ def build_install_plan(args):
                   "built).  If the plan")
         printInfo("    then looks short, one of them was a dependency: "
                   "packagemanager deps <pkg>")
-        printInfo("    the list: packagemanager stack avoid --avoided")
     plan, seen, missing_all, why = [], set(), [], {}
     # WHAT IS ALREADY DONE, counted as we go.
     #
@@ -4683,8 +4463,6 @@ def build_install_plan(args):
     # plan that has shrunk 181 -> 151 -> 135 across three runs reads as three
     # identical fresh starts.  The progress was real and invisible.
     build_install_plan.already = set()
-    build_install_plan.behind = []          # installed deps the book has moved past
-    build_install_plan.unproven = []       # "installed", with nothing to show for it
     _not_found = []
     # Reading the book can take many seconds the first time (it is indexed
     # once per version).  Without a word on screen that looks like a hang, so
@@ -4697,40 +4475,11 @@ def build_install_plan(args):
         if anchor in seen or anchor in ignore:
             return
         seen.add(anchor)
-        # A DEPENDENCY OUTSIDE A STACK BOOK READS ITS OWN BOOK.  The order
-        # came from the svn book, so it carries svn's versions for
-        # everything; a dependency the stack does not own is judged -- and
-        # built, if missing -- against the book it always reads.
-        if _PLAN_BOOK and _book_override(anchor) != _PLAN_BOOK:
-            nv = default_book_version(anchor) or nv
         u = gather_user(anchor)
-        _done = u.state == "installed" and _install_finished(u)
-        if u.state == "installed" and not _done:
-            # recorded, but nothing says the install ever finished
-            build_install_plan.unproven.append(anchor)
-        up_to_date = (_done and (not u.version or u.version == nv))
+        up_to_date = (u.state == "installed"
+                      and (not u.version or u.version == nv))
         if up_to_date:
             build_install_plan.already.add(anchor)
-        # AN INSTALLED DEPENDENCY IS NOT A THING TO UPGRADE.
-        #
-        # `install gparted --recursive` planned 53 packages: gparted, its
-        # real missing dependencies -- and UPDATES of bubblewrap, alsa-lib,
-        # gtk3, gtk4, librsvg, glycin and thirty others that are installed
-        # and working, purely because the book has moved on since they were
-        # built.  Asking for one program is not asking to rebuild the
-        # desktop, and each of those rebuilds is a chance to break a
-        # machine that was fine.
-        #
-        # So: a DEPENDENCY that is installed is left alone, whatever version
-        # it is.  A package NAMED on the command line still goes through
-        # (that is an instruction), --update-deps restores the old
-        # behaviour, and `update --stack <name>` is the deliberate way to
-        # move a whole chain forward.
-        elif (_done and anchor not in _named
-              and not getattr(args, "update_deps", False)):
-            build_install_plan.already.add(anchor)
-            build_install_plan.behind.append((anchor, u.version or "?", nv))
-            return
         if args.reinstall:
             plan.append((anchor, nv, "reinstall" if up_to_date else
                          ("update" if u.state == "installed" else "new")))
@@ -4738,12 +4487,8 @@ def build_install_plan(args):
             plan.append((anchor, nv,
                          "update" if u.state == "installed" else "new"))
 
-    global _PLAN_BOOK
     for target in args.packages:
         set_status(f"working out what {target} needs ...")
-        _PLAN_BOOK = None
-        _tb = _book_override(target)
-        _PLAN_BOOK = _tb if _tb and os.path.isfile(_tb) else None
         if not getattr(args, "recursive", False):
             # DEFAULT: just this package, no dependency walk
             nv = book_version(target)
@@ -4905,67 +4650,7 @@ def install_local(name, path, run, yes, verb="install", test=False, clean=False)
     printSuccess(f"Done -- {name} {verb}ed.  logs: {_pkg_log_dir(name)}")
 
 
-def _stack_git_entry(name):
-    """The git/tar entry for `name` in an installed stack, or None."""
-    d = STACK_DIR if "STACK_DIR" in globals() else "/etc/pkgusr/stacks"
-    for f in sorted(glob.glob(os.path.join(d, "*.stack"))):
-        try:
-            for r in _parse_stack_file(f):
-                if r["kind"] in ("git", "tar") and r["target"] == name:
-                    return r
-        except (ValueError, OSError):
-            continue
-    return None
-
-
-def _install_git_packages(args):
-    """Build the git packages among args.packages from their own scripts.
-
-    NO BOOK.  `install --reinstall imv` asked the book about imv three
-    times (an index lookup, `blfs debug`, `blfs search`), took a minute to
-    say "not in the BLFS book", and built nothing -- imv is a git entry of
-    apps.stack, and its script is in its home.  A git package is recognised
-    from that script (or from a stack's git/tar entry, the first time),
-    before anything asks the book.  --clean and --test go through as they
-    do for `update`.  Returns the names it handled."""
-    done = []
-    for name in list(args.packages or []):
-        script = _canonical_script_path(name)
-        if not script:
-            p = os.path.join(pkgusr_home(name), "install_%s" % name)
-            script = p if os.path.isfile(p) else None
-        is_git = bool(script) and _is_git_package(name)
-        entry = None if is_git else _stack_git_entry(name)
-        if not is_git and not entry:
-            continue
-        done.append(name)
-        if entry and not script:
-            script, _ = _stack_git_script(
-                entry, os.path.join(TMP_DIR, "stack_files"))
-        u = gather_user(name)
-        if u.state == "installed" and not args.reinstall:
-            printSuccess("%s: installed (a %s package).  Rebuild it: "
-                         "--reinstall [--clean];  new commits: update %s"
-                         % (name, entry["kind"] if entry else "git", name))
-            continue
-        printInfo("%s: %s package -- building from %s (no book lookup)"
-                  % (name, entry["kind"] if entry else "git", script))
-        if script != (_canonical_script_path(name) or "") and entry:
-            apply_machine_opts(name, script)
-        install_local(name, script, args.run, args.yes, "install",
-                      test=getattr(args, "test", False),
-                      clean=getattr(args, "clean", False))
-    return done
-
-
 def cmd_install(args, _replanned=False):
-    # ---- git packages: their own script, never the book ----
-    if not args.local and args.packages:
-        _git_done = _install_git_packages(args)
-        if _git_done:
-            args.packages = [p for p in args.packages if p not in _git_done]
-            if not args.packages:
-                return
     # ---- local package: install a custom script directly, no BLFS ----
     if args.local or (len(args.packages) == 1
                       and book_version(args.packages[0]) is None
@@ -5002,29 +4687,6 @@ def cmd_install(args, _replanned=False):
             return f"depends on {parent}"
         return f"{kind} by {parent}"
 
-    _unproven = getattr(build_install_plan, "unproven", []) or []
-    if _unproven:
-        printWarning("  %d package(s) are recorded as installed but have no"
-                     " finished-install record:" % len(_unproven))
-        printWarning("    " + ", ".join(sorted(set(_unproven))[:8])
-                     + (" ..." if len(set(_unproven)) > 8 else ""))
-        printInfo("    Their install_last was written before a build that did"
-                  " not finish, so they")
-        printInfo("    are in this plan rather than skipped -- which is what"
-                  " lets the stack run")
-        printInfo("    through without naming them by hand.")
-    _behind = getattr(build_install_plan, "behind", []) or []
-    if _behind:
-        printInfo("  %d installed dependency(ies) are older than the book and"
-                  " are NOT touched:" % len(_behind))
-        printInfo("    " + ", ".join("%s (%s -> %s)" % (a, iv, bv)
-                                     for a, iv, bv in _behind[:6])
-                  + (" ..." if len(_behind) > 6 else ""))
-        printInfo("    that is deliberate: one program is not a reason to"
-                  " rebuild what works.")
-        printInfo("    move them forward on purpose:  packagemanager update"
-                  " <name> --run")
-        printInfo("    or build this plan against them: add --update-deps")
     if getattr(args, "select", False):
         plan = _select_plan_rows(
             plan, lambda r: f"{r[1]:<30} {r[2]:<10} {why_str(r[0])}")
@@ -5258,7 +4920,7 @@ def _pkglist_paths(user):
     return {p for p in pkglist_entries(pl) if p.startswith("/")}
 
 
-def _orphan_sweep(user, old_paths, since, remove=True):
+def _orphan_sweep(user, old_paths, since):
     """Remove files that were in the package's OLD manifest but were NOT rewritten
     by the new version (mtime older than the install start `since`).  Only old-
     manifest files are considered; config paths + the source tree are kept.  Does
@@ -5291,665 +4953,36 @@ def _orphan_sweep(user, old_paths, since, remove=True):
                 victims.append(p)
         except OSError:
             continue
-    # A LIBRARY SOMETHING IS STILL LINKED TO IS NOT AN ORPHAN.
-    #
-    # webkitgtk rebuilt from the GTK4 port to the GTK3 one leaves
-    # libwebkitgtk-6.0.so.4 in the old manifest, unrewritten and owned by this
-    # package -- every test above says "orphan", and deleting it breaks every
-    # program built against it, with no warning and no way back but a rebuild.
-    # So each library about to go is asked the only question that matters:
-    # does anything else still record its soname?  Files of this package do
-    # not count -- they go with it.
-    kept = []
-    if victims:
-        libs = [p for p in victims if re.search(r"\.so(\.\d+)*$", p)
-                and os.path.isfile(p) and not os.path.islink(p)]
-        victim_set = set(victims)
-        for p in libs:
-            s = _soname_of(p)
-            if not s:
-                continue
-            users = [(f, o) for f, o in _needed_by(s, skip_uid=own_uid)
-                     if f not in victim_set]
-            if users:
-                pkgs = sorted({o for _f, o in users})
-                printWarning("  --clean: KEEPING %s -- %d file(s) in %s still "
-                             "link against %s"
-                             % (p, len(users), ", ".join(pkgs[:4]), s))
-                kept.append((p, s, pkgs))
-        if kept:
-            keep_paths = {p for p, _s, _pk in kept}
-            # the symlinks that point at a kept library stay with it, or the
-            # soname it is found by disappears and nothing loads anyway
-            for p in list(victims):
-                if os.path.islink(p):
-                    t = os.path.realpath(p)
-                    if t in keep_paths:
-                        keep_paths.add(p)
-            victims = [p for p in victims if p not in keep_paths]
-            printInfo("    rebuild those packages, then clean again:")
-            for _p, _s, pkgs in kept:
-                printInfo("      packagemanager update %s --reinstall --run"
-                          % " ".join(p[2:] if p.startswith("p_") else p
-                                     for p in pkgs[:4]))
-                break
-            printInfo("    or see the whole picture:  packagemanager used-by %s"
-                      % kept[0][1])
-    if not remove:
-        # the caller decides (_clean_after_install parks them first)
-        return victims
     if victims:
         printInfo(f"  --clean: removing {len(victims)} old-version file(s) the "
                   f"upgrade no longer installs (configs / source kept)")
         remove_paths_as_user(user, victims)
-    elif not kept:
+    else:
         printInfo("  --clean: no leftover files from the old version.")
     return len(victims)
 
 
 def _reapply_install(user):
-    """Re-run ONLY the install phase (no recompile), as the user, to put back
-    the current-version files the mtime test mistook for old ones.
-
-    Returns True only when the phase ran and exited 0.
-
-    IT HAD NOT RUN SINCE 1.14.16 (fixed 1.14.311).  It called
-    `bash ~/install_<account>` -- the runtime copy 1.14.16 removed everywhere
-    else -- with stdout and stderr thrown away and the exit status ignored.
-    So every --clean deleted the files the mtime test misjudged, the "restore"
-    failed on `No such file or directory` where nobody could see it, and the
-    run ended green.  webkitgtk lost /usr/include/webkitgtk-6.0/jsc/*.h that
-    way: CMake's install skips a file whose content is unchanged ("--
-    Up-to-date:"), so the headers kept their old mtime and read as orphans.
-
-    Now: the same script and the same door as `packagemanager script
-    install` (lfs-helper build), its output kept in a log, and its result
-    returned so the caller can undo the clean when it fails.
-    """
-    home = pkgusr_home(user)
-    script = (_versioned_script_in(home)
-              or os.path.join(home, f"install_{user}"))
-    if not os.path.isfile(script):
-        printError(f"  --clean: no install script in {home} -- cannot reapply")
-        return False
-    helper = shutil.which("lfs-helper")
-    if helper and _can_su(user):
-        cmd = [helper, "build", user, "--script", script,
-               "--phase", "install", "--force"]
-    else:
-        inner = f"cd ~ && bash {shlex.quote(script)} install"
-        cmd = (["su", "-", user, "-c", inner] if _can_su(user)
-               else ["sh", "-c", inner])
-    log = os.path.join(_plans_dir(),
-                       re.sub(r"[^A-Za-z0-9_.-]+", "_", user) + ".clean-reapply.log")
+    """Re-run ONLY the install phase (no recompile), as the user, to restore any
+    current-version files that --clean may have removed (e.g. files installed
+    with preserved timestamps).  Orphans stay removed."""
+    inner = f"cd ~ && bash {shlex.quote(f'install_{user}')} install"
+    cmd = (["su", "-", user, "-c", inner] if _can_su(user)
+           else ["sh", "-c", inner])
     printInfo("  --clean: reapplying the install step to restore current files...")
-    printInfo("    $ " + " ".join(cmd[1:] if cmd[0] == helper else cmd))
-    try:
-        with open(log, "w") as lf:
-            rc = subprocess.run(cmd, stdout=lf, stderr=subprocess.STDOUT).returncode
-    except OSError as e:
-        printError(f"  --clean: could not run the install step ({e})")
-        return False
-    if rc != 0:
-        printError(f"  --clean: the install step FAILED (exit {rc}) -- log: {log}")
-        try:
-            for line in open(log, errors="replace").read().splitlines()[-12:]:
-                printInfo("    | " + line)
-        except OSError:
-            pass
-        return False
-    return True
-
-
-_PARK_SUFFIX = ".pkgusr-clean"
-
-
-def _park_ledger(user):
-    return os.path.join(_plans_dir(),
-                        re.sub(r"[^A-Za-z0-9_.-]+", "_", user) + ".parked")
-
-
-def _unpark_all(user):
-    """Put every parked file back, from the ledger.  Returns how many."""
-    ledger = _park_ledger(user)
-    n = 0
-    try:
-        lines = open(ledger).read().splitlines()
-    except OSError:
-        return 0
-    for p in lines:
-        if not p:
-            continue
-        q = p + _PARK_SUFFIX
-        if not os.path.lexists(q):
-            continue
-        if os.path.lexists(p):
-            # the install put the current version there: that one stays
-            try:
-                os.unlink(q)
-            except OSError:
-                pass
-            continue
-        try:
-            os.rename(q, p)
-            n += 1
-        except OSError as e:
-            printError(f"    could not put back {p} ({e}) -- it is at {q}")
-    try:
-        os.unlink(ledger)
-    except OSError:
-        pass
-    return n
-
-
-# =========================================================================== #
-# git packages: what they follow, and whether it moved            [IMPLEMENTED]
-# =========================================================================== #
-#
-# A book package has a version, and `update` compares it with the book's.  A
-# git package has a REF, and a ref answers a different question depending on
-# what it is:
-#   a branch  -- a moving target.  "Is it behind?" is asked of the remote, and
-#                the answer changes without anyone doing anything.
-#   a tag     -- a point in time.  It is never behind; the question is whether
-#                a NEWER tag exists, and moving to it is a decision.
-#   a commit  -- the same, without even a name to compare.
-# Telling them apart is the whole of this.
-
-_GIT_ENV = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_ASKPASS="/bin/true",
-                GIT_SSH_COMMAND="ssh -oBatchMode=yes")
-
-
-def _script_var(text, var):
-    """A shell assignment out of an install script: link="..." / git_ref=..."""
-    m = re.search(r'^\s*%s\s*=\s*(?:"([^"]*)"|\'([^\']*)\'|([^\s#]*))'
-                  % re.escape(var), text or "", re.M)
-    if not m:
-        return ""
-    return (m.group(1) or m.group(2) or m.group(3) or "").strip()
-
-
-def _git_clone_dir(name, link=""):
-    """Where this package's checkout is.  lfs-phases builds in $HOME/src, so
-    that is where to look -- and the remote is what confirms it, because a
-    home can hold more than one tree."""
-    home = pkgusr_home(name)
-    for base in (os.path.join(home, "src"), home):
-        if not os.path.isdir(base):
-            continue
-        try:
-            entries = sorted(os.listdir(base))
-        except OSError:
-            continue
-        cands = [os.path.join(base, d) for d in entries
-                 if os.path.isdir(os.path.join(base, d, ".git"))]
-        if link:
-            for c in cands:
-                r = subprocess.run(["git", "-C", c, "remote", "get-url", "origin"],
-                                   capture_output=True, text=True, env=_GIT_ENV)
-                if r.returncode == 0 and r.stdout.strip().rstrip("/") == link.rstrip("/"):
-                    return c
-        if len(cands) == 1:
-            return cands[0]
-    return ""
-
-
-def _git(clone, *args, timeout=60):
-    try:
-        r = subprocess.run(["git", "-C", clone] + list(args), capture_output=True,
-                           text=True, env=_GIT_ENV, timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
-
-
-def _ls_remote(link, pattern=None, timeout=90):
-    """[(sha, refname)] from the remote, without cloning anything."""
-    cmd = ["git", "ls-remote"]
-    if pattern == "tags":
-        cmd += ["--tags", "--refs"]
-    cmd.append(link)
-    if pattern and pattern != "tags":
-        cmd.append(pattern)
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, env=_GIT_ENV,
-                           timeout=timeout)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    if r.returncode != 0:
-        return []
-    out = []
-    for ln in r.stdout.splitlines():
-        parts = ln.split(None, 1)
-        if len(parts) == 2:
-            out.append((parts[0].strip(), parts[1].strip()))
-    return out
-
-
-def _vsort_key(tag):
-    """Sort 1.9.0 before 1.10.0, which a plain string sort does not."""
-    return [int(x) if x.isdigit() else x
-            for x in re.split(r"(\d+)", tag.lstrip("vV"))]
-
-
-def _git_pkg_state(name, remote=True):
-    """Everything worth saying about one git package.
-
-    Returns a dict, or None when this is not a git package.  `remote=False`
-    asks the disk only -- no network, for the bulk view."""
-    script = (_canonical_script_path(name)
-              or os.path.join(pkgusr_home(name), "install_%s" % name))
-    if not script or not os.path.isfile(script):
-        return None
-    try:
-        text = open(script, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return None
-    if not (re.search(r'is_git="?1"?', text) or re.search(r"\bgit\s+clone\b", text)):
-        return None
-    link = _script_var(text, "link")
-    ref = _script_var(text, "git_ref")
-    clone = _git_clone_dir(name, link)
-    st = {"name": name, "script": script, "link": link, "ref": ref,
-          "clone": clone, "kind": "?", "local": "", "remote": "",
-          "newer_tags": [], "behind": None, "note": ""}
-    if clone:
-        st["local"] = _git(clone, "rev-parse", "HEAD")
-    if not link:
-        st["note"] = "the script names no repository (link=)"
-        return st
-    if not remote:
-        return st
-    # WHAT KIND OF REF IS IT?  The remote knows; guessing from the string
-    # ("master" is a branch, "2.18.0" is a tag) is how a tag named `main`
-    # or a branch named `1.x` goes wrong.
-    heads = {r.rsplit("/", 1)[-1]: s for s, r in _ls_remote(link, "refs/heads/*")}
-    tags = [r.rsplit("/", 1)[-1] for _s, r in _ls_remote(link, "tags")]
-    st["tags"] = tags
-    if ref and ref in heads:
-        st["kind"] = "branch"
-        st["remote"] = heads[ref]
-    elif ref and ref in tags:
-        st["kind"] = "tag"
-        newer = [t for t in tags if _vsort_key(t) > _vsort_key(ref)]
-        st["newer_tags"] = sorted(newer, key=_vsort_key)
-    elif not ref:
-        st["kind"] = "default branch"
-        for d in ("main", "master"):
-            if d in heads:
-                st["remote"] = heads[d]
-                st["ref"] = d
-                break
-    elif ref:
-        st["kind"] = "commit or missing ref"
-        st["note"] = "the remote has no branch or tag called %s" % ref
-    # how far behind, when the clone already has the objects
-    if st["kind"].endswith("branch") and st["local"] and st["remote"] \
-            and st["local"] != st["remote"] and clone:
-        n = _git(clone, "rev-list", "--count", "%s..%s" % (st["local"], st["remote"]))
-        st["behind"] = int(n) if n.isdigit() else None
-    return st
-
-
-def _git_pkg_line(st):
-    n = st["name"]
-    ref = st["ref"] or "(default)"
-    if st["note"] and not st["remote"] and not st["newer_tags"]:
-        return "  %-20s %-14s %s" % (n, ref, st["note"])
-    if st["kind"].endswith("branch"):
-        if not st["remote"]:
-            return "  %-20s %-14s branch -- the remote could not be reached" % (n, ref)
-        if st["local"][:12] == st["remote"][:12]:
-            return "  %-20s %-14s branch, up to date (%s)" % (n, ref, st["local"][:8])
-        behind = ("%d commit(s) behind" % st["behind"]) if st["behind"] \
-            else "moved"
-        return "  %-20s %-14s branch, %s: %s -> %s" % (
-            n, ref, behind, (st["local"] or "?")[:8], st["remote"][:8])
-    if st["kind"] == "tag":
-        if not st["newer_tags"]:
-            return "  %-20s %-14s tag, nothing newer released" % (n, ref)
-        nt = st["newer_tags"]
-        return "  %-20s %-14s tag -- %d newer: %s" % (
-            n, ref, len(nt), ", ".join(nt[-4:]))
-    return "  %-20s %-14s %s %s" % (n, ref, st["kind"], st["note"])
-
-
-def cmd_git_status(args):
-    """What every git package follows, and whether it has moved."""
-    names = args.packages or list_all_users()
-    states = []
-    for n in sorted(set(names)):
-        st = _git_pkg_state(n, remote=not getattr(args, "local_only", False))
-        if st:
-            states.append(st)
-    if not states:
-        printInfo("no git-based packages here"
-                  if not args.packages else
-                  "none of those are git-based packages")
-        return 0
-    printHeader("git packages")
-    print()
-    print("  %-20s %-14s %s" % ("package", "ref", "state"))
-    print("  " + "-" * 62)
-    moved, taggy = [], []
-    for st in states:
-        print(_git_pkg_line(st))
-        if st["kind"].endswith("branch") and st["remote"] \
-                and st["local"][:12] != st["remote"][:12]:
-            moved.append(st["name"])
-        if st["newer_tags"]:
-            taggy.append(st)
-    print()
-    if moved:
-        printInfo("  follow the branch (fetch, rebuild, install):")
-        printInfo("    packagemanager update %s --run" % " ".join(moved))
-    for st in taggy:
-        printInfo("  %s is pinned to %s; to move it:" % (st["name"], st["ref"]))
-        printInfo("    packagemanager git-ref %s %s"
-                  % (st["name"], st["newer_tags"][-1]))
-    if not moved and not taggy:
-        printInfo("  nothing to do: every git package is where its ref says")
-    return 0
-
-
-def cmd_git_ref(args):
-    """Show what a git package could follow, or move it to another ref."""
-    name = args.package
-    st = _git_pkg_state(name)
-    if st is None:
-        printError("%s is not a git-based package" % name)
-        return 1
-    if not st["link"]:
-        printError("%s: its script names no repository" % name)
-        return 1
-    if not args.ref:
-        tags = sorted(st.get("tags") or [], key=_vsort_key)
-        heads = [r.rsplit("/", 1)[-1] for _s, r in _ls_remote(st["link"], "refs/heads/*")]
-        printHeader("%s -- %s" % (name, st["link"]))
-        print()
-        print("  now: %s (%s)" % (st["ref"] or "(default)", st["kind"]))
-        print()
-        print("  branches: " + (", ".join(heads[:8]) or "(none)"))
-        print("  tags, newest last:")
-        for t in tags[-12:]:
-            print("      %s%s" % (t, "   <- current" if t == st["ref"] else ""))
-        if not tags:
-            print("      (none -- this repository is not tagged)")
-        print()
-        printInfo("  pick one:  packagemanager git-ref %s <ref>" % name)
-        return 0
-    want = args.ref
-    known = set(st.get("tags") or []) | {
-        r.rsplit("/", 1)[-1] for _s, r in _ls_remote(st["link"], "refs/heads/*")}
-    if want not in known and not re.fullmatch(r"[0-9a-f]{7,40}", want):
-        printError("%s: the remote has no tag or branch called %s" % (name, want))
-        printInfo("  what it has:  packagemanager git-ref %s" % name)
-        return 1
-    # THE SCRIPT IS ONE OF TWO PLACES THE REF LIVES.  A stack entry writes it
-    # into the generated script, so editing only the script is undone by the
-    # next stack run -- say so, and name the file.
-    try:
-        text = open(st["script"], encoding="utf-8", errors="replace").read()
-    except OSError as e:
-        printError("%s: %s" % (st["script"], e))
-        return 1
-    new, n = re.subn(r'^(\s*git_ref\s*=\s*).*$', r'\1"%s"' % want, text,
-                     count=1, flags=re.M)
-    if not n:
-        printError("%s has no git_ref= line to change" % st["script"])
-        return 1
-    if not getattr(args, "run", False):
-        printInfo("  would set git_ref=\"%s\" in %s (was \"%s\")"
-                  % (want, st["script"], st["ref"]))
-        printInfo("  dry run -- add --run")
-        return 0
-    bak = st["script"] + ".bak-" + time.strftime("%Y%m%d-%H%M%S")
-    try:
-        shutil.copy2(st["script"], bak)
-        open(st["script"], "w").write(new)
-    except OSError as e:
-        printError("could not write %s: %s" % (st["script"], e))
-        return 1
-    printSuccess("%s: git_ref is now %s (was %s; backup %s)"
-                 % (name, want, st["ref"] or "(default)", os.path.basename(bak)))
-    src = _STACK_TARGET_SOURCE.get(name)
-    if src:
-        printWarning("  %s also carries this ref: a stack run regenerates the"
-                     " script and puts the old one back." % src)
-        printInfo("    change the entry there too:   ref=%s" % want)
-    printInfo("  then build it:  packagemanager update %s --run" % name)
-    return 0
-
-
-# =========================================================================== #
-# who still links against this?                                   [IMPLEMENTED]
-# =========================================================================== #
-#
-# A package-user system records who INSTALLED every file.  It records nothing
-# about who USES one -- and a library is used by things that were built
-# against it long ago.  webkitgtk rebuilt from the GTK4 port to the GTK3 one
-# leaves libwebkitgtk-6.0.so.4 behind with nothing to rebuild it, and
-# `--clean` is then one keystroke from deleting a library other programs are
-# still linked to.  ldd answers it for ONE file; this answers it for a
-# library.
-
-_ELF_SCAN_DIRS = ("/usr/bin", "/usr/sbin", "/usr/lib", "/usr/libexec",
-                  "/bin", "/sbin", "/lib", "/opt")
-_ELF_CONFIRM_MAX = 600      # readelf calls; a grep hit is cheap, this is not
-
-
-def _soname_of(path):
-    """The SONAME an ELF library announces -- libwebkitgtk-6.0.so.4, not the
-    file name libwebkitgtk-6.0.so.4.13.8.  That is the name other binaries
-    record, so it is the name to search for."""
-    if not os.path.isfile(path):
-        return None
-    try:
-        r = subprocess.run(["readelf", "-d", path], capture_output=True,
-                           text=True, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        r = None
-    if r and r.returncode == 0:
-        m = re.search(r"\(SONAME\)\s+Library soname: \[([^\]]+)\]", r.stdout)
-        if m:
-            return m.group(1)
-    b = os.path.basename(path)
-    m = re.match(r"^(lib.+?\.so(?:\.\d+)?)(?:\.|$)", b)
-    return m.group(1) if m else None
-
-
-def _needed_by(soname, skip_uid=None, dirs=None):
-    """Every ELF that records this soname in DT_NEEDED: [(path, owner)].
-
-    grep first -- a soname is a literal string in .dynstr, and grep over
-    /usr/lib is seconds -- then readelf only on the hits, because a string can
-    also appear in a script, a .la file or another library's rpath.
-    """
-    # RESOLVED HERE, NOT IN THE SIGNATURE.  A default argument is bound at
-    # import, so `dirs=_ELF_SCAN_DIRS` could never be overridden -- including
-    # by a test, which is how this function first appeared to find nothing.
-    live = [d for d in (dirs or _ELF_SCAN_DIRS) if os.path.isdir(d)]
-    if not live:
-        return []
-    try:
-        r = subprocess.run(["grep", "-rlZ", "--binary-files=binary", "-F",
-                            "--", soname] + live,
-                           capture_output=True, timeout=600)
-    except (OSError, subprocess.SubprocessError):
-        return []
-    _all = [c.decode("utf-8", "replace") for c in r.stdout.split(b"\0") if c]
-    cands = _all[:_ELF_CONFIRM_MAX]
-    if len(_all) > _ELF_CONFIRM_MAX:
-        # A TRUNCATED ANSWER MUST NOT READ AS A COMPLETE ONE.
-        printWarning("  %s: %d candidates, only the first %d were confirmed"
-                     % (soname, len(_all), _ELF_CONFIRM_MAX))
-    out = []
-    for p in cands:
-        if os.path.islink(p) or not os.path.isfile(p):
-            continue
-        if os.path.basename(p).startswith(soname.split(".so")[0] + ".so"):
-            continue                       # the library itself, or its siblings
-        try:
-            st = os.lstat(p)
-            if skip_uid is not None and st.st_uid == skip_uid:
-                continue                   # its own package may rebuild freely
-            d = subprocess.run(["readelf", "-d", p], capture_output=True,
-                               text=True, timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if d.returncode != 0:
-            continue
-        if re.search(r"\(NEEDED\).*\[%s\]" % re.escape(soname), d.stdout):
-            owner = "?"
-            try:
-                owner = pwd.getpwuid(st.st_uid).pw_name if pwd else "?"
-            except KeyError:
-                owner = str(st.st_uid)
-            out.append((p, owner))
-    return out
-
-
-def cmd_used_by(args):
-    """What still links against this library, or this package's libraries."""
-    target = args.name
-    sonames = []
-    if re.search(r"\.so(\.|$)", target):
-        sonames = [target if os.sep not in target
-                   else (_soname_of(target) or os.path.basename(target))]
-    else:
-        # a package: every shared library in its manifest
-        libs = [p for p in _pkglist_paths(target) or []
-                if re.search(r"/lib[^/]*\.so(\.\d+)*$", p)
-                and os.path.isfile(p) and not os.path.islink(p)]
-        for p in sorted(libs):
-            s = _soname_of(p)
-            if s and s not in sonames:
-                sonames.append(s)
-        if not sonames:
-            printInfo("%s installs no shared library (or has no manifest)" % target)
-            return 0
-    printHeader("What links against %s" % ", ".join(sonames))
-    print()
-    total = 0
-    for s in sonames:
-        users = _needed_by(s)
-        by_pkg = {}
-        for p, owner in users:
-            by_pkg.setdefault(owner, []).append(p)
-        if not users:
-            print("  %-34s nothing links against it" % s)
-            continue
-        total += len(users)
-        print("  %s -- %d file(s), %d package(s):" % (s, len(users), len(by_pkg)))
-        for owner in sorted(by_pkg):
-            ex = ", ".join(os.path.basename(x) for x in sorted(by_pkg[owner])[:3])
-            more = "" if len(by_pkg[owner]) <= 3 else " ..."
-            print("      %-22s %s%s" % (owner, ex, more))
-    print()
-    if total:
-        printInfo("  removing a library these were built against breaks them"
-                  " until they are rebuilt:")
-        printInfo("    packagemanager update <package> --reinstall --run")
-    else:
-        printInfo("  nothing needs these; they are safe to remove")
-    return 0
+    subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 def _clean_after_install(user, old_paths, since):
     """Full --clean sequence run AFTER a successful install: remove old-version
     orphans, reapply install (to undo any over-removal), then regenerate the
-    manifest so it reflects the final state.
-
-    PARK, REINSTALL, THEN JUDGE (1.14.311).  "Older than the install" is
-    not "no longer installed": CMake skips a file whose content has not
-    changed, meson and `install -p` keep timestamps, so a current file can
-    look old.  This used to delete first and trust a reapply to repair the
-    damage -- a reapply that had not run since 1.14.16, so the damage stayed
-    (webkitgtk's jsc/*.h, and every build against webkitgtk-6.0 broke).
-
-    Now nothing is deleted on the mtime test's word alone.  The candidates
-    are renamed aside (same directory, so it is one rename each and nothing
-    is copied), the install phase runs, and only then:
-      * a path the install put back IS current -- the parked copy goes;
-      * a path it did not put back is a real orphan -- that one goes;
-      * if the install step FAILS, every parked file is put back, and the
-        clean is reported as not done.  Nothing is half-cleaned.
-    """
-    # an earlier clean interrupted between park and judge: finish undoing it
-    if os.path.exists(_park_ledger(user)):
-        n = _unpark_all(user)
-        printWarning(f"  --clean: an interrupted clean had parked files -- "
-                     f"{n} put back first")
-
-    victims = _orphan_sweep(user, old_paths, since, remove=False)
-    if not victims:
-        printInfo("  --clean: no leftover files from the old version.")
-        printInfo("  --clean: regenerating the file manifest...")
-        write_pkg_list(user, background=False)
-        return 0
-
-    files = [p for p in victims if os.path.islink(p) or not os.path.isdir(p)]
-    dirs = [p for p in victims if p not in set(files)]
-    parked = []
-    with open(_park_ledger(user), "w") as led:
-        for p in files:
-            try:
-                os.rename(p, p + _PARK_SUFFIX)
-                parked.append(p)
-                led.write(p + "\n")
-                led.flush()
-            except OSError as e:
-                printWarning(f"    could not set {p} aside ({e}) -- left in place")
-    printInfo(f"  --clean: {len(parked)} file(s) look older than this install "
-              f"-- set aside while the install step confirms which are gone")
-
-    if not _reapply_install(user):
-        n = _unpark_all(user)
-        printError(f"  --clean: NOT DONE -- put {n} file(s) back as they were.")
-        printInfo("    The upgrade itself is installed; only the clean-up was undone.")
-        printInfo("    Fix the install step, then:  packagemanager update "
-                  f"{user[2:] if user.startswith('p_') else user} --reinstall --clean --run")
-        write_pkg_list(user, background=False)
-        return 0
-
-    still = [p for p in parked if os.path.lexists(p)]
-    gone = [p for p in parked if not os.path.lexists(p)]
-    # both kinds of parked copy go: for `still` the install wrote the
-    # current one, for `gone` nothing replaced it -- that is the orphan
-    remove_paths_as_user(user, [p + _PARK_SUFFIX for p in parked] + dirs)
-    try:
-        os.unlink(_park_ledger(user))
-    except OSError:
-        pass
-    if still:
-        printInfo(f"  --clean: {len(still)} of them are still installed by this "
-                  f"version (unchanged, so the install left their old date) -- kept")
-    if gone:
-        printInfo(f"  --clean: removed {len(gone)} file(s) the new version no "
-                  f"longer installs")
-        for p in gone[:10]:
-            printInfo("      " + p)
-        if len(gone) > 10:
-            printInfo("      ... and %d more" % (len(gone) - 10))
-    else:
-        printInfo("  --clean: nothing was an orphan after all")
+    manifest so it reflects the final state."""
+    removed = _orphan_sweep(user, old_paths, since)
+    if removed:
+        _reapply_install(user)
     printInfo("  --clean: regenerating the file manifest...")
     write_pkg_list(user, background=False)
-    return len(gone)
-
-
-def _is_phased_script(text):
-    """Does this install script hand its phases to the runner?
-
-    The runner is what fetches, unpacks, resumes in the build directory and
-    re-runs one phase -- so "phased" means "ends in pkgusr_run", not "defines
-    some particular function".  Three spellings, because the header and the
-    library name are each written by a different generation of the tools.
-    """
-    t = text or ""
-    return bool(re.search(r"\bpkgusr_run\b", t)
-                or re.search(r"PKGUSR_LIB|lfs-phases", t)
-                or re.search(r"^###\s*phases:", t, re.M))
+    return removed
 
 
 def _is_git_package(name):
@@ -6175,19 +5208,6 @@ def _stack_targets(name):
     except ValueError as e:
         printError(str(e))
         return None
-    # a stack on another book: refresh it once, and make sure the entries
-    # read it even when this file is not the installed copy
-    _sb = {r["target"]: r["opts"]["from-book"] for r in rows
-           if r["kind"] == "book" and r["opts"].get("from-book")}
-    if _sb:
-        _stack_book_map().update({k.lower(): v for k, v in _sb.items()})
-        _BOOK_FOR_PKG.clear()
-        os.environ["PM_STACK_BOOKS"] = ",".join(
-            "%s=%s" % kv for kv in sorted(_sb.items()))
-        for _sel in sorted(set(_sb.values())):
-            _book_path_for(_sel, refresh=True)
-            printInfo("  %d package(s) of this stack read the %s book"
-                      % (list(_sb.values()).count(_sel), _sel))
     return [r["target"] for r in rows
             if r["kind"] in ("book", "git", "tar")]
 
@@ -6239,61 +5259,10 @@ def cmd_update(args):
                 printWarning(f"{name}: not a git package and not in the book -- "
                              f"skipping (check the name, or use --local).")
                 continue
-            # IS IT PHASED?  ASK THE RIGHT QUESTION.
-            #
-            # This looked for `unpack_pkg`, which is the RARE OVERRIDE a script
-            # defines to replace the built-in unpack entirely.  A correct,
-            # current script does not define it -- the runner's own unpack is
-            # what clones git -- so every properly phased package was told its
-            # script "isn't phased", with advice (`template --git`) that
-            # overwrites the file and takes any hand-tuned build_pkg with it:
-            #     meson setup build ... -D c_link_args=-licuuc
-            # A phased script is one that ENDS IN THE RUNNER.  That is the
-            # thing that makes fetch/rebuild work, and it is what to test.
-            _body = open(script, errors="replace").read()
-            if not _is_phased_script(_body):
-                printWarning(f"{name}: this script does not end in the phase "
-                             f"runner, so `update` cannot fetch and rebuild it "
-                             f"cleanly.")
-                printInfo("    a phased script ends with:")
-                printInfo('      . "${PKGUSR_LIB:-lfs-phases}" && pkgusr_run "$@"')
-                printInfo("    and puts its commands in build_pkg / install_pkg.")
-                printInfo(f"    `packagemanager template {name} --git <url>` writes"
-                          f" a fresh one -- to a NEW file first, then move your")
-                printInfo("    build commands across: it does not keep them.")
-            # SAY WHETHER THERE IS ANYTHING TO UPDATE TO.
-            #
-            # "git package -- updating from its repo" is true of a package
-            # pinned to the newest tag, where the rebuild produces the same
-            # commit it already has: the command works, does exactly what it
-            # says, and changes nothing -- and there is no way to tell that
-            # from the output.  The remote knows; ask it.
-            _st = None if getattr(args, "no_git_check", False) \
-                else _git_pkg_state(name)
-            if _st:
-                if _st["kind"].endswith("branch") and _st["remote"]:
-                    if _st["local"][:12] == _st["remote"][:12]:
-                        printInfo("  %s: %s is at %s, the same commit as here "
-                                  "-- this rebuilds what is already installed"
-                                  % (name, _st["ref"], _st["remote"][:8]))
-                    else:
-                        printInfo("  %s: %s moved %s -> %s%s -- this brings it in"
-                                  % (name, _st["ref"], (_st["local"] or "?")[:8],
-                                     _st["remote"][:8],
-                                     (" (%d commit(s))" % _st["behind"])
-                                     if _st["behind"] else ""))
-                elif _st["kind"] == "tag":
-                    if _st["newer_tags"]:
-                        printInfo("  %s: pinned to tag %s; %s is out"
-                                  % (name, _st["ref"], _st["newer_tags"][-1]))
-                        printInfo("    a rebuild stays on %s.  To move it:"
-                                  % _st["ref"])
-                        printInfo("      packagemanager git-ref %s %s --run"
-                                  % (name, _st["newer_tags"][-1]))
-                    else:
-                        printInfo("  %s: pinned to tag %s, which is the newest "
-                                  "released -- this rebuilds the same commit"
-                                  % (name, _st["ref"]))
+            if "unpack_pkg" not in open(script, errors="replace").read():
+                printWarning(f"{name}: git script isn't phased -- it won't fetch/"
+                             f"rebuild cleanly. Regenerate it with:\n"
+                             f"    packagemanager template {name} --git <repo-url>")
             printInfo(f"{name}: git package -- updating from its repo.")
             install_local(name, script, args.run, args.yes, "update",
                           test=getattr(args, "test", False),
@@ -6345,10 +5314,6 @@ def cmd_update(args):
             vlookup = book_versions_all()
             names = list_all_users()
 
-        # a walk from a stack-book target carries that book's versions for
-        # every dependency; the ones it does not own read their own book
-        _stack_walk = getattr(args, "recursive", False) and any(
-            _book_override(t) for t in (args.packages or []))
         _bk = _current_blfs_book()
         _checked = len(names)
         printInfo(f"Checking {len(names)} package(s) against the book"
@@ -6364,13 +5329,6 @@ def cmd_update(args):
             u = gather_user(name)
             anchor = u.meta.get("name") or name
             bv = vlookup.get(anchor)
-            # EACH PACKAGE AGAINST ITS OWN BOOK: a stack's from-book (or
-            # machine.conf's book=) -- the default map would "update" an
-            # svn-built mpv back to the stable page.
-            if _book_override(anchor):
-                bv = book_version(anchor) or bv
-            elif _stack_walk:
-                bv = default_book_version(anchor) or bv
             if u.state != "installed":
                 if name in named or anchor in named:
                     not_installed.append(name)
@@ -6438,47 +5396,20 @@ def cmd_update(args):
                              f"found) -- use:  packagemanager install {name}")
 
         if git_tracked:
-            # "LEFT ALONE" IS NOT AN ANSWER TO "IS IT OUT OF DATE?"
-            #
-            # This said `-git` cannot be behind a book version, which is true
-            # and beside the point: a package that follows a BRANCH is behind
-            # whenever the branch moves, and the remote can be asked in a
-            # second.  A package pinned to a TAG is not behind at all -- the
-            # question there is whether a newer tag exists, and taking it is a
-            # decision, not an update.  Both are answered here rather than
-            # left to the reader.
             print()
-            printInfo("  %d package(s) follow GIT, not the book:"
+            printInfo("  %d package(s) follow GIT, not the book -- left alone:"
                       % len(git_tracked))
-            _moved, _tagged = [], []
             for _n, _iv, _bv in git_tracked:
-                _st = _git_pkg_state(_n) if not getattr(args, "no_git_check",
-                                                        False) else None
-                if _st:
-                    print(_git_pkg_line(_st))
-                    if _st["kind"].endswith("branch") and _st["remote"] \
-                            and _st["local"][:12] != _st["remote"][:12]:
-                        _moved.append(_n)
-                    if _st["newer_tags"]:
-                        _tagged.append(_st)
-                else:
-                    printInfo("    %-22s tracked as %-20s (the book has %s)"
-                              % (_n, _iv, _bv or "no page"))
-            if _moved:
-                printInfo("    behind their branch -- fetch, rebuild, install:")
-                printInfo("      packagemanager update %s --run" % " ".join(_moved))
-            for _st in _tagged:
-                printInfo("    %s is pinned to %s, and %s is out:"
-                          % (_st["name"], _st["ref"], _st["newer_tags"][-1]))
-                printInfo("      packagemanager git-ref %s %s --run"
-                          % (_st["name"], _st["newer_tags"][-1]))
-            if not _moved and not _tagged:
-                printInfo("    every one of them is where its ref says it"
-                          " should be")
-            printInfo("    the whole picture:  packagemanager git-status")
-            printInfo("    (taking the BOOK's page instead would be a"
-                      " different build:")
-            printInfo("     `packagemanager update <pkg> --reinstall --run`.)")
+                printInfo("    %-22s tracked as %-20s (the book has %s)"
+                          % (_n, _iv, _bv or "no page"))
+            printInfo("    `-git` is not a version, so it cannot be behind"
+                      " one.  To move such a")
+            printInfo("    package, rebuild its stack entry:  packagemanager"
+                      " stack <name> --only <pkg> --run --force")
+            printInfo("    (that follows the ref in the stack file.  Taking"
+                      " the book's page instead")
+            printInfo("    would be a different build: "
+                      "`packagemanager update <pkg> --reinstall --run`.)")
 
         # named packages that are already current: offer to re-apply
         for anchor, name, iv, bv in uptodate:
@@ -7990,32 +6921,7 @@ def _python_module_here(name):
         return False
 
 
-# WHAT A MANIFEST SCAN MUST NOT WALK.
-#
-# `reload-pkg-list p_linux` took minutes, and the time went nowhere near the
-# installed files: the scan walked /usr/src/pkgusr -- every package user's
-# unpacked source tree, the kernel's own quarter-million files among them --
-# plus /proc, /sys, the snapshots and the caches.  None of it can contain an
-# INSTALLED file by definition: a package's home is excluded from its own
-# manifest, and no package installs into another's source tree.
-_SCAN_SKIP = ["/proc", "/sys", "/dev", "/run", "/tmp", "/var/tmp",
-              "/var/cache", "/mnt", "/media", "/lost+found",
-              "/.snapshots", "/snapshots", "/sources", "/build"]
-
-
-def _scan_prune_args():
-    """find(1) arguments that skip those directories (and stay on one fs)."""
-    skips = list(_SCAN_SKIP) + [d.rstrip("/") for d in pkgusr_roots()]
-    out = ["-xdev", "("]
-    for i, d in enumerate(skips):
-        if i:
-            out.append("-o")
-        out += ["-path", d]
-    out += [")", "-prune", "-o"]
-    return out
-
-
-def write_pkg_list(user, background=True, as_root=False):
+def write_pkg_list(user, background=True):
     """Regenerate /usr/src/<user>/pkg.lst.  Runs list_package AS the package
     user (su -) when possible, so it only scans directories that user owns --
     much faster than scanning the whole filesystem as root."""
@@ -8069,29 +6975,16 @@ def write_pkg_list(user, background=True, as_root=False):
                " /\\/lib\\/modules\\/[^/]+\\/source\\// { next } "
                " { print }'"
                % shlex.quote(home.rstrip("/") + "/"))
-    # THE SCAN ITSELF, PRUNED.  `list_package` is the hint's script and walks
-    # everything; this is the same question asked of the same filesystem
-    # without the directories that cannot hold an installed file.  It is run
-    # AS the package user, which also skips every directory that account
-    # cannot read -- and that is the difference between minutes and seconds
-    # on a machine with 90 source trees.  --root scans as root instead: it
-    # reaches directories the account cannot enter (0700 dirs owned by
-    # somebody else), and takes the long way round.
-    _find = " ".join(shlex.quote(x) for x in
-                     ["find", "/"] + _scan_prune_args()
-                     + ["-user", user, "-print"])
-    _scan = f"{_find} 2>/dev/null | LC_ALL=C sort -u"
-    if _can_su(user) and not as_root:
+    if _can_su(user):
         # su - starts in the user's home, so pkg.lst.new/pkg.lst are ~/...
-        inner = (f"{_scan} | {_filter} > pkg.lst.new"
+        inner = (f"{lp} {quser} 2>/dev/null | {_filter} > pkg.lst.new"
                  f" && mv pkg.lst.new pkg.lst")
         cmd = ["su", "-", user, "-c", inner]
     else:
         tmp = shlex.quote(os.path.join(home, "pkg.lst.new"))
         dst = shlex.quote(os.path.join(home, "pkg.lst"))
-        cmd = ["sh", "-c", f"{_scan} | {_filter} > {tmp}"
-                           f" && mv {tmp} {dst}"
-                           f" && chown {quser} {dst} 2>/dev/null; true"]
+        cmd = ["sh", "-c", f"{lp} {quser} 2>/dev/null | {_filter} > {tmp}"
+                           f" && mv {tmp} {dst}"]
 
     if background:                                    # detached / disowned
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
@@ -8116,12 +7009,8 @@ def cmd_reload_pkg_list(args):
                 printInfo(f"{acct}: pkg.lst regeneration started"
                           f" (disowned background task).")
             continue
-        _as_root = getattr(args, "root", False)
-        printInfo(f"{acct}: scanning for files it owns "
-                  + ("as root (every directory) ..." if _as_root
-                     else f"as {acct} ..."))
-        _t0 = time.time()
-        if not write_pkg_list(user, background=False, as_root=_as_root):
+        printInfo(f"{acct}: scanning for files it owns ...")
+        if not write_pkg_list(user, background=False):
             printError(f"{acct}: could not regenerate pkg.lst")
             rc = 1
             continue
@@ -8132,18 +7021,7 @@ def cmd_reload_pkg_list(args):
         except OSError:
             n = 0
         if n:
-            printSuccess(f"{acct}: {n} file(s) recorded in {manifest}"
-                         f"  ({time.time() - _t0:.0f}s)")
-            if not _as_root:
-                # SAY WHAT THE FAST SCAN CANNOT SEE.  A file this package
-                # owns inside a directory it may not read is not in this
-                # list, and nothing else would ever say so.
-                printInfo(f"  scanned as {acct}: directories it cannot enter"
-                          f" were skipped, and so were")
-                printInfo(f"  {', '.join(_SCAN_SKIP[:6])} ... and the package"
-                          f" source roots.")
-                printInfo(f"  If something is missing:  packagemanager"
-                          f" reload-pkg-list {user} --root")
+            printSuccess(f"{acct}: {n} file(s) recorded in {manifest}")
         else:
             printWarning(f"{acct}: no files found -- it owns nothing on disk.")
             printInfo("  Either it was never installed, or its files ended up"
@@ -9126,13 +8004,6 @@ def _cmd_config_interactive(args):
     if args.main_user:
         cfg["main_user"] = args.main_user
         changed = True
-    if getattr(args, "shared_hub", None):
-        _h = os.path.abspath(args.shared_hub).rstrip("/")
-        if cfg.get("shared_hub") != _h:
-            cfg["shared_hub"] = _h
-            changed = True
-            printInfo("  the links move the next time the accounts are set up:")
-            printInfo("    packagemanager stack services --only app-users --run")
     # Nothing given on the command line and something is unset?  Ask.  Leaving
     # a setting blank and carrying on means it surfaces much later as a failed
     # install with no obvious cause.
@@ -9166,8 +8037,6 @@ def _cmd_config_interactive(args):
     print(f"  user prefix      : {cfg['user_prefix']}_   (shared users)")
     print(f"  main user        : {cfg.get('main_user') or '(not set)'}   "
           f"(your human login account)")
-    print(f"  shared hub       : {shared_hub()}   "
-          f"(links to every shared directory)")
     print(f"  editor           : {editor()}")
     print(f"  difftool         : {difftool()}")
 
@@ -9213,8 +8082,8 @@ player cannot read your documents, your keys, or another application's data.
 
 Creating the account is the easy part; what makes it usable is the rest:
 
-  * your home directory stays yours, and the account's stays its own: the
-    account's home is 0700
+  * your home directory stays yours -- the account's home is 0750, so the
+    application cannot read it
   * your login joins the account's group, so a shared directory works
   * `su - u_<name>` from your account without a password, where the hint's
     /etc/pam.d/su_u_user is installed (skipped where it is not: su then
@@ -9921,7 +8790,8 @@ def _relocate_app_home(u):
 
 def _repoint_shared_link(u, old_home, new_home):
     """~/Shared/<Name> of the main user pointed into the old home."""
-    hub = shared_hub()
+    mh = _home_of(main_user() or "") or ""
+    hub = os.path.join(mh, "Shared") if mh else ""
     if not hub or not os.path.isdir(hub):
         return
     for n in os.listdir(hub):
@@ -10063,7 +8933,7 @@ def _setup_application_user(u, args):
 
     Creating the account is the easy part.  What makes it useful:
       * your account may `su - <user>` without a password (via PAM)
-      * the home is 0700, so no other account can read it
+      * the home is 0750, so other users cannot read it
       * your account joins the user's group, for the shared directory
       * an optional shared directory both accounts can write
       * an optional launcher in ~/bin so the program runs as that user
@@ -10077,16 +8947,10 @@ def _setup_application_user(u, args):
         printWarning("    packagemanager config --main-user <your-login>")
         return
 
-    # 1. the home is private -- 0700, NOT 0750 (1.14.315)
-    #
-    # 0750 let the account's GROUP in, and your login is in that group (for
-    # the shared directory).  So "a browser cannot read your documents" held,
-    # and the reverse did not: you could read its profile and cookies, and
-    # so could anything running as you.  The shared directory lives in the
-    # hub now, so nothing needs to pass through the home.
+    # 1. the home is private
     if os.path.isdir(home):
-        _run(["chmod", "0700", home])
-        printInfo(f"  home {home} is 0700 (private to {u})")
+        _run(["chmod", "0750", home])
+        printInfo(f"  home {home} is 0750 (private to {u} and its group)")
 
     # 2. your account joins the user's group -- this is what makes a shared
     #    directory work, and what lets PAM identify you as entitled
@@ -10105,50 +8969,43 @@ def _setup_application_user(u, args):
         _link_xdg_profile(main, u)
 
     # 5. a shared directory, when asked for
-    #
-    # THE DIRECTORY LIVES IN THE HUB, THE LINK LIVES IN THE HOME (1.14.315).
-    # It was the other way round: the data in <account home>/Shared and a
-    # link to it in the hub -- so reaching it meant passing through the
-    # account's home, and the home had to be group-readable (0750) for
-    # that.  Your login is in the account's group, so it could read the
-    # browser profile, the cookies, everything.  Now the data is
-    # /home/Shared/<Name> (2770 u_<name>:u_<name>), the home is 0700, and
-    # the account's own ~/Shared is a link into the hub -- which keeps
-    # `--download-dir ~/Shared` in app-users.conf meaning the same thing.
     if getattr(args, "share_dir", False):
-        _hub = _ensure_shared_hub(main)
-        share = os.path.join(_hub, args.name[:1].upper() + args.name[1:])
-        if os.path.islink(share):
-            printWarning(f"  {share} is a link (to {os.readlink(share)}) -- the "
-                         f"layout before 1.14.315; left alone")
-            printInfo("    move the data in, as the 1.14.315 notes say, then "
-                      "run this again")
-        else:
-            _run(["mkdir", "-p", share])
-            _run(["chown", f"{u}:{u}", share])
-            _run(["chmod", "2770", share])   # setgid: new files keep the group
-            printInfo(f"  shared directory: {share}  (2770 {u}:{u})")
-            # ...and the account's ~/Shared points at it
-            _in_home = os.path.join(home, "Shared")
-            if os.path.islink(_in_home):
-                if os.path.realpath(_in_home) != os.path.realpath(share):
-                    printWarning(f"  {_in_home} points at "
-                                 f"{os.readlink(_in_home)} -- left alone")
-            elif os.path.isdir(_in_home):
-                if not os.listdir(_in_home):
-                    os.rmdir(_in_home)
-                    _run(["ln", "-s", share, _in_home])
-                    _run(["chown", "-h", f"{u}:{u}", _in_home])
-                else:
-                    # DATA IS NEVER MOVED BY THIS.  It was asked for as a
-                    # hand step; the command is printed, not run.
-                    printWarning(f"  {_in_home} still holds files -- not "
-                                 f"moved (that is yours to do)")
-                    printInfo(f"    mv {_in_home}/* {_in_home}/.[!.]* {share}/ "
-                              f"&& rmdir {_in_home} && ln -s {share} {_in_home}")
-            elif not os.path.lexists(_in_home):
-                _run(["ln", "-s", share, _in_home])
-                _run(["chown", "-h", f"{u}:{u}", _in_home])
+        share = os.path.join(_app_home(u), "Shared")
+        _run(["mkdir", "-p", share])
+        _run(["chown", f"{u}:{u}", share])
+        _run(["chmod", "2770", share])   # setgid: new files keep the group
+        # ONE DIRECTORY OF LINKS, NAMED AFTER THE ACCOUNT.  These used to
+        # land as ~/<name>-shared, one per account, scattered through the
+        # home directory.  ~/Shared/<Name> keeps them together and gives the
+        # env file below something to enumerate.
+        _mh = _home_of(main) or ""
+        link = ""
+        if _mh:
+            _hub = os.path.join(_mh, "Shared")
+            if not os.path.isdir(_hub):
+                _run(["mkdir", "-p", _hub])
+                _run(["chown", f"{main}:{main}", _hub])
+            link = os.path.join(_hub, args.name[:1].upper() + args.name[1:])
+            if os.path.islink(link):
+                if os.path.realpath(link) != os.path.realpath(share):
+                    printWarning(f"  {link} already points at "
+                                 f"{os.path.realpath(link)} -- left alone")
+                    link = ""
+            elif os.path.exists(link):
+                # A REAL DIRECTORY IS NOT OURS TO REPLACE.
+                printWarning(f"  {link} exists and is not a symlink -- "
+                             f"left alone")
+                printInfo("    move it aside yourself if you want the link")
+                link = ""
+            else:
+                _run(["ln", "-s", share, link])
+        printInfo(f"  shared directory: {share}")
+        if link:
+            printInfo(f"    reachable from your account as {link}")
+        _old = os.path.join(_mh, f"{args.name}-shared") if _mh else ""
+        if _old and os.path.islink(_old):
+            printInfo(f"    (the older link {_old} is still there; remove it "
+                      f"when you are ready)")
 
     # 6. a launcher and a menu entry, when the program is really there
     app = getattr(args, "app", None) or getattr(args, "name", None) \
@@ -10736,99 +9593,9 @@ def _home_is_untouched(home):
     return True
 
 
-def _shared_hub(main_home=""):
-    """Where the per-account links live -- the system hub, not a home
-    (1.14.312; the argument is kept for the callers and ignored)."""
-    return shared_hub()
-
-
-def _ensure_shared_hub(main):
-    """Create the hub, and make the main user's ~/Shared a link to it.
-
-    MOVING, NOT COPYING, AND ONLY OUR LINKS.  A ~/Shared that is already a
-    directory has the links earlier releases made in it; each one moves to
-    the hub (same name, same target).  Anything else in it -- a file, a
-    directory, a link of your own that clashes with one in the hub -- is
-    yours, so the directory stays, and says so.  Only an EMPTY ~/Shared is
-    replaced by the link.
-    """
-    hub = shared_hub()
-    if not os.path.isdir(hub):
-        _run(["mkdir", "-p", hub])
-    # root owns it, your login's group may add a link by hand (0775): the
-    # hub is a system path that YOU curate, and nobody else may
-    grp_name = main if (main and _group_exists(main)) else "root"
-    _run(["chown", f"root:{grp_name}", hub])
-    _run(["chmod", "0775" if grp_name != "root" else "0755", hub])
-    mh = _home_of(main) if main else None
-    if not mh:
-        return hub
-    home_link = os.path.join(mh, "Shared")
-    if os.path.islink(home_link):
-        if os.path.realpath(home_link) != os.path.realpath(hub):
-            printWarning(f"  {home_link} points at {os.readlink(home_link)}, "
-                         f"not the hub {hub} -- left alone")
-        return hub
-    if os.path.isdir(home_link):
-        moved, kept = 0, []
-        for n in sorted(os.listdir(home_link)):
-            p = os.path.join(home_link, n)
-            dest = os.path.join(hub, n)
-            if not os.path.islink(p):
-                kept.append(n)
-                continue
-            t = os.readlink(p)
-            if os.path.lexists(dest):
-                if os.path.islink(dest) and os.readlink(dest) == t:
-                    os.unlink(p)            # already moved on an earlier run
-                    continue
-                kept.append(n)
-                continue
-            os.symlink(t, dest)
-            os.lchown(dest, 0, 0)
-            os.unlink(p)
-            moved += 1
-        if moved:
-            printInfo(f"  moved {moved} link(s) from {home_link} to {hub}")
-        if kept:
-            printWarning(f"  {home_link} still holds {', '.join(kept[:5])}"
-                         f"{' ...' if len(kept) > 5 else ''} -- yours, so it "
-                         f"stays a directory")
-            printInfo(f"    the shared links are in {hub}; move those by hand, "
-                      f"then run this again")
-            return hub
-        try:
-            os.rmdir(home_link)
-        except OSError:
-            return hub
-    os.symlink(hub, home_link)
-    try:
-        _pw = pwd.getpwnam(main)
-        os.lchown(home_link, _pw.pw_uid, _pw.pw_gid)
-    except (KeyError, OSError):
-        pass
-    printInfo(f"  {home_link} -> {hub}")
-    return hub
-
-
-def _remove_empty_hub(mh):
-    """The hub goes when nothing is left in it -- and ~/Shared, the link to
-    it, goes with it, or it dangles."""
-    hub = shared_hub()
-    if not (hub and os.path.isdir(hub) and not os.listdir(hub)):
-        return
-    try:
-        os.rmdir(hub)
-        printInfo(f"  removed {hub} (empty)")
-    except OSError:
-        return
-    hl = os.path.join(mh, "Shared") if mh else ""
-    if hl and os.path.islink(hl) and not os.path.exists(hl):
-        try:
-            os.unlink(hl)
-            printInfo(f"  removed {hl} (it pointed at the hub)")
-        except OSError:
-            pass
+def _shared_hub(main_home):
+    """The main user's ~/Shared, where the per-account links live."""
+    return os.path.join(main_home, "Shared") if main_home else ""
 
 
 def _stale_shared_links(main_home, home=""):
@@ -10980,24 +9747,15 @@ def cmd_user_delete(args):
             printInfo(f"  removed {home}")
         except OSError as e:
             printError(f"  rmtree {home}: {e}")
-    # ITS SHARED DIRECTORY IS NOT IN ITS HOME ANY MORE (1.14.315), so the
-    # archive above does not carry it.  Empty: removed.  With files: kept,
-    # and said -- those are files you put there, not the account's.
-    _bare = u[len(user_prefix()):]
-    _sd = os.path.join(shared_hub(), _bare[:1].upper() + _bare[1:])
-    if os.path.isdir(_sd) and not os.path.islink(_sd):
-        if not os.listdir(_sd):
-            try:
-                os.rmdir(_sd)
-                printInfo(f"  removed {_sd} (empty)")
-            except OSError:
-                pass
-        else:
-            printWarning(f"  kept {_sd} -- it has files in it; look, then:"
-                         f"  rm -r {_sd}")
-    # the hub is ours only while it holds our links: an empty hub is
-    # left-over furniture, one with something else in it is yours.
-    _remove_empty_hub(mh)
+    # the hub is ours only while it holds our links: an empty ~/Shared is
+    # left-over furniture, a ~/Shared with something else in it is yours.
+    hub = _shared_hub(mh)
+    if hub and os.path.isdir(hub) and not os.listdir(hub):
+        try:
+            os.rmdir(hub)
+            printInfo(f"  removed {hub} (empty)")
+        except OSError:
+            pass
     printSuccess(f"{u} removed.")
     _shared_vars_note(links)
     printInfo("  take its lines out of /etc/pkgusr/stacks/app-users.conf, "
@@ -11141,7 +9899,13 @@ def cmd_user_purge(args):
             printInfo(f"  removed {p}")
         except OSError as e:
             printWarning(f"  {p}: {e}")
-    _remove_empty_hub(mh)
+    hub = _shared_hub(mh)
+    if hub and os.path.isdir(hub) and not os.listdir(hub):
+        try:
+            os.rmdir(hub)
+            printInfo(f"  removed {hub} (empty)")
+        except OSError:
+            pass
     idir = os.path.join(mh, ".local", "share", "icons", "lfs-apps") if mh else ""
     if idir and os.path.isdir(idir) and not os.listdir(idir):
         try:
@@ -11209,318 +9973,6 @@ def cmd_user_purge(args):
     if mh and os.path.isfile(os.path.join(mh, ".config", "sway", "config")):
         printInfo("  and `exec xdg-runtime-share` is still in your sway config "
                   "-- yours to remove")
-    return 0
-
-
-# =========================================================================== #
-# command: service -- the SysV services, without remembering the layout
-# =========================================================================== #
-#
-# A SysV service is two things in two places: /etc/rc.d/init.d/<name>, which
-# starts it, and the S/K symlinks in /etc/rc.d/rc<N>.d, which decide whether
-# boot does.  Everything here is `ls`, `ln -s` and `rm` on those -- no daemon,
-# no database, nothing this tool has to keep in step with the system.
-#
-# START IS NOT ENABLE.  systemd taught everyone that they are different, and
-# SysV has always had them separate; `service sshd start` runs the script now
-# whatever the links say, and `enable` only touches the links.
-
-SVC_STATE_DIR = "/var/lib/pkgusr/services"
-SVC_ACTIONS = ("start", "stop", "restart", "reload", "force-reload", "status",
-               "enable", "disable", "list")
-
-
-def _svc_dirs():
-    """(init.d, the directory holding rc<N>.d) -- LFS's layout, then the
-    plain one, because only one of them exists on a given machine."""
-    for initd, rcroot in (("/etc/rc.d/init.d", "/etc/rc.d"), ("/etc/init.d", "/etc")):
-        if os.path.isdir(initd):
-            return initd, rcroot
-    return None, None
-
-
-# NOT EVERY FILE IN init.d IS A SERVICE.  `functions` is a library the others
-# source, `rc` is what init runs, `template` is a skeleton to copy.  Listing
-# them invites starting them.
-_SVC_NOT_SERVICES = {"functions", "rc", "rcS", "template", "README", "Makefile"}
-
-
-def _svc_all(initd):
-    out = []
-    try:
-        names = sorted(os.listdir(initd))
-    except OSError:
-        return out
-    for n in names:
-        if n in _SVC_NOT_SERVICES or n.endswith((".bak", "~", ".orig", ".new")):
-            continue
-        p = os.path.join(initd, n)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            out.append(n)
-    return out
-
-
-def _svc_links(rcroot, name):
-    """Every rc<N>.d link for this service: [(level, 'S'|'K', num, path)]."""
-    out = []
-    try:
-        entries = sorted(os.listdir(rcroot))
-    except OSError:
-        return out
-    for d in entries:
-        m = re.match(r"^rc([0-6S])\.d$", d)
-        if not m:
-            continue
-        full = os.path.join(rcroot, d)
-        try:
-            for f in sorted(os.listdir(full)):
-                lm = re.match(r"^([SK])(\d{2})" + re.escape(name) + r"$", f)
-                if lm:
-                    out.append((m.group(1), lm.group(1), lm.group(2),
-                                os.path.join(full, f)))
-        except OSError:
-            continue
-    return out
-
-
-def _svc_default_runlevel():
-    try:
-        for line in open("/etc/inittab"):
-            m = re.match(r"^\s*id:([0-6]):initdefault:", line)
-            if m:
-                return m.group(1)
-    except OSError:
-        pass
-    return "3"
-
-
-def _svc_header_levels(initd, name):
-    """Default-Start / Default-Stop from the script's INIT INFO block.
-
-    The book's scripts carry it, so the runlevels a service belongs in are
-    written down on the machine -- no need to invent them here."""
-    start, stop = "", ""
-    try:
-        for line in open(os.path.join(initd, name), errors="replace"):
-            m = re.match(r"^#\s*Default-Start:\s*(.*)$", line)
-            if m:
-                start = "".join(re.findall(r"[0-6S]", m.group(1)))
-            m = re.match(r"^#\s*Default-Stop:\s*(.*)$", line)
-            if m:
-                stop = "".join(re.findall(r"[0-6S]", m.group(1)))
-            if line.startswith("### END INIT INFO"):
-                break
-    except OSError:
-        pass
-    return start, stop
-
-
-def _svc_enabled_levels(rcroot, name):
-    return sorted({lv for lv, kind, _n, _p in _svc_links(rcroot, name) if kind == "S"})
-
-
-def _svc_running(initd, name, quick=True):
-    """'yes' / 'no' / '?' -- asked of the script itself.
-
-    The LSB convention is 0 for running and 1-4 for not, which every script
-    from the book follows through statusproc.  A script with no `status` says
-    so by failing differently, and '?' is an honest answer."""
-    p = os.path.join(initd, name)
-    try:
-        r = subprocess.run([p, "status"], stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, timeout=10 if quick else 60)
-    except (OSError, subprocess.SubprocessError):
-        return "?", ""
-    out = (r.stdout or b"").decode("utf-8", "replace").strip()
-    if r.returncode == 0:
-        return "yes", out
-    if r.returncode in (1, 2, 3, 4):
-        return "no", out
-    return "?", out
-
-
-def _svc_state_file(name):
-    return os.path.join(SVC_STATE_DIR, name + ".links")
-
-
-def cmd_service(args):
-    initd, rcroot = _svc_dirs()
-    if not initd:
-        printError("no /etc/rc.d/init.d (nor /etc/init.d) -- no SysV services here")
-        return 1
-    # `service sshd start` and `service start sshd` both read naturally;
-    # whichever word is an action is the action.
-    name, action = args.name, args.action
-    if name in SVC_ACTIONS and (action is None or action not in SVC_ACTIONS):
-        name, action = action, name
-    if not name and not action:
-        action = "list"
-    if name and not action:
-        action = "status"
-    if action not in SVC_ACTIONS:
-        printError("%s: not one of %s" % (action, ", ".join(SVC_ACTIONS)))
-        return 2
-
-    if action == "list":
-        return _svc_cmd_list(initd, rcroot, args)
-
-    if not name:
-        printError("which service?  packagemanager service list")
-        return 2
-    script = os.path.join(initd, name)
-    if not os.path.isfile(script):
-        printError("%s: no such service" % name)
-        near = [s for s in _svc_all(initd) if name in s]
-        if near:
-            printInfo("  did you mean: %s" % ", ".join(near))
-        printInfo("  what there is:  packagemanager service list")
-        return 1
-
-    if action in ("start", "stop", "restart", "reload", "force-reload", "status"):
-        # STARTING IS NOT ENABLING, and it does not ask the links for
-        # permission: this is the whole point of being able to run sshd for an
-        # afternoon without it coming back at the next boot.
-        if action == "start" and not _svc_enabled_levels(rcroot, name):
-            printInfo("  %s is not enabled at boot -- starting it anyway" % name)
-        if not os.access(script, os.X_OK):
-            printWarning("  %s is not executable -- fixing that first" % script)
-            _run(["chmod", "755", script])
-        return subprocess.run([script, action]).returncode
-
-    # ---- enable / disable: the links, and only the links -------------------
-    links = _svc_links(rcroot, name)
-    if action == "disable":
-        gone = [p for _lv, kind, _n, p in links if kind == "S"]
-        if not gone:
-            printInfo("%s is already not started at boot" % name)
-            return 0
-        # REMEMBER EXACTLY WHAT WAS THERE.  The priority number is the only
-        # thing that cannot be worked out again -- it lives in the
-        # blfs-bootscripts Makefile, which may be long gone by then.
-        try:
-            os.makedirs(SVC_STATE_DIR, exist_ok=True)
-            with open(_svc_state_file(name), "w") as f:
-                f.write("\n".join(gone) + "\n")
-        except OSError as e:
-            printWarning("  could not record the links (%s) -- enable will "
-                         "rebuild them from the script's header" % e)
-        for p in gone:
-            try:
-                os.unlink(p)
-                printInfo("  removed %s" % p)
-            except OSError as e:
-                printWarning("  %s: %s" % (p, e))
-        printSuccess("%s: disabled (it is not stopped -- `service %s stop` does that)"
-                     % (name, name))
-        return 0
-
-    # enable
-    if _svc_enabled_levels(rcroot, name):
-        printInfo("%s is already started at boot (runlevels %s)"
-                  % (name, ",".join(_svc_enabled_levels(rcroot, name))))
-        return 0
-    # 1. the exact links we removed, if we removed them
-    restored = []
-    try:
-        saved = [l.strip() for l in open(_svc_state_file(name)) if l.strip()]
-    except OSError:
-        saved = []
-    for p in saved:
-        d = os.path.dirname(p)
-        if not os.path.isdir(d):
-            continue
-        try:
-            os.symlink("../init.d/" + name, p)
-            restored.append(p)
-        except OSError as e:
-            printWarning("  %s: %s" % (p, e))
-    if restored:
-        for p in restored:
-            printInfo("  %s -> ../init.d/%s" % (p, name))
-        try:
-            os.unlink(_svc_state_file(name))
-        except OSError:
-            pass
-        printSuccess("%s: enabled (restored as it was)" % name)
-        return 0
-    # 2. otherwise build them: the number from a link that survived, the
-    #    runlevels from the script's own header.
-    num = args.priority or next((n for _lv, _k, n, _p in links), None) or "50"
-    start, stop = _svc_header_levels(initd, name)
-    if args.levels:
-        start = "".join(re.findall(r"[0-6S]", args.levels))
-    start = start or "2345"
-    stop = stop or "016"
-    made = []
-    for lv in start:
-        d = os.path.join(rcroot, "rc%s.d" % lv)
-        if not os.path.isdir(d):
-            continue
-        p = os.path.join(d, "S%s%s" % (num, name))
-        if not os.path.lexists(p):
-            try:
-                os.symlink("../init.d/" + name, p)
-                made.append(p)
-            except OSError as e:
-                printWarning("  %s: %s" % (p, e))
-    for lv in stop:
-        d = os.path.join(rcroot, "rc%s.d" % lv)
-        if not os.path.isdir(d):
-            continue
-        p = os.path.join(d, "K%s%s" % (num, name))
-        if not os.path.lexists(p):
-            try:
-                os.symlink("../init.d/" + name, p)
-                made.append(p)
-            except OSError as e:
-                printWarning("  %s: %s" % (p, e))
-    if not made:
-        printWarning("%s: nothing to link (no rc<N>.d directories?)" % name)
-        return 1
-    for p in made:
-        printInfo("  %s -> ../init.d/%s" % (p, name))
-    printSuccess("%s: enabled at runlevels %s (priority %s)" % (name, start, num))
-    printInfo("  it is not started yet:  packagemanager service %s start" % name)
-    return 0
-
-
-def _svc_cmd_list(initd, rcroot, args):
-    names = _svc_all(initd)
-    if not names:
-        printInfo("no services in %s" % initd)
-        return 0
-    default_lv = _svc_default_runlevel()
-    printHeader("services  (init scripts in %s, boot links in %s/rc<N>.d)"
-                % (initd, rcroot))
-    print("  default runlevel: %s\n" % default_lv)
-    print("  %-22s %-10s %-9s %s" % ("service", "at boot", "running", "runlevels"))
-    print("  " + "-" * 60)
-    for n in names:
-        lv = _svc_enabled_levels(rcroot, n)
-        boot = "yes" if default_lv in lv else ("other" if lv else "no")
-        run = "-"
-        if not args.quick:
-            run, _out = _svc_running(initd, n)
-        print("  %-22s %-10s %-9s %s" % (n, boot, run, ",".join(lv) or "-"))
-    print()
-    printInfo("  packagemanager service <name> start|stop|restart|status")
-    printInfo("  packagemanager service <name> enable|disable      (boot only)")
-    if args.quick:
-        printInfo("  (--quick: 'running' not asked; drop it to ask each script)")
-    # THE SERVICES THAT ARE NOT INIT SCRIPTS.  /lib/services/* are what `ifup`
-    # hands an interface to; they never appear in rc<N>.d and cannot be
-    # started, and not saying so is how "dhcpcd is installed but nothing runs
-    # it" happens.
-    for sd in ("/lib/services", "/usr/lib/services"):
-        if os.path.isdir(sd):
-            have = sorted(os.listdir(sd))
-            if have:
-                print()
-                printInfo("  network services in %s (run by ifup, never on their "
-                          "own): %s" % (sd, ", ".join(have)))
-                printInfo("    an interface uses one by naming it: SERVICE=\"<name>\""
-                          " in /etc/sysconfig/ifconfig.<iface>")
-            break
     return 0
 
 
@@ -12385,8 +10837,7 @@ def _system_env_values():
     home = _home_of(main) if main else None
     if home:
         vals["PKGUSR_SYS_HOME"] = home
-    # the hub, whoever asks -- not a path inside one person's home
-    vals["PKGUSR_SYS_SHARED"] = shared_hub()
+        vals["PKGUSR_SYS_SHARED"] = os.path.join(home, "Shared")
     return vals
 
 
@@ -12564,10 +11015,6 @@ def cmd_env(args):
 #
 # File format, one entry per line:
 #     book   <target> [key=value ...]      a BLFS book package (deps resolved)
-#     <any>  ... when="<shell>"            only when that command succeeds --
-#                                          a package this machine needs only
-#                                          sometimes (btrfs-progs on a btrfs
-#                                          system).  It is asked every run.
 #     git    <name> url=<repo> [ref=<ref>] [prog=<installed-program>]
 #     tar    <name> url=<tarball-url> pkg=<filename> [prog=|have=] [build=|install=]
 #     check  <name>                        root script <stackdir>/<name>.sh;
@@ -12638,12 +11085,7 @@ def _parse_stack_file(path):
     worse than one refused."""
     import shlex
     entries = []
-    kinds = ("book", "git", "tar", "check", "cfg", "avoid", "include",
-             "from-book")
-    # `from-book svn`: the book entries of THIS file below it read that book
-    # (an entry's own from-book= wins; `from-book default` ends it).  Not
-    # inherited by an included file, and not passed up to the includer.
-    _file_book = None
+    kinds = ("book", "git", "tar", "check", "cfg", "avoid", "include")
     # THE "INCLUDE ONCE" SET BELONGS TO THE WHOLE PARSE, not to one include
     # line.  Owning it per line meant sway.stack's `include avoid` finished
     # and cleared it, so `include media` started fresh and media's own
@@ -12703,12 +11145,6 @@ def _parse_stack_file(path):
             # `include <name>` splices another stack's entries in at this
             # point, in order.  The included file is a stack in its own right,
             # so `packagemanager stack media --run` builds just that part.
-            if kind == "from-book":
-                if len(parts) != 2:
-                    raise ValueError("%s:%d: from-book takes one book selector"
-                                     " (svn, 13.0-systemd, a file)" % (path, n))
-                _file_book = None if parts[1] in ("default", "-") else parts[1]
-                continue
             if kind == "include":
                 if len(parts) != 2:
                     raise ValueError("%s:%d: include takes one stack name"
@@ -12770,10 +11206,6 @@ def _parse_stack_file(path):
                 raise ValueError("%s:%d: a git entry needs url=" % (path, n))
             if kind == "tar" and ("url" not in opts or "pkg" not in opts):
                 raise ValueError("%s:%d: a tar entry needs url= and pkg=" % (path, n))
-            if kind == "book" and _file_book:
-                opts.setdefault("from-book", _file_book)
-            if opts.get("from-book") in ("default", "-"):
-                del opts["from-book"]
             entries.append({"kind": kind, "target": target, "opts": opts})
       if not entries:
         raise ValueError("%s: the stack file has no entries" % path)
@@ -13166,32 +11598,6 @@ def cmd_stack(args):
 
     avoid = [e["target"] for e in entries if e["kind"] == "avoid"]
     entries = [e for e in entries if e["kind"] != "avoid"]
-    if getattr(args, "avoided", False):
-        # the list the header only counts
-        printHeader("never built by stack %s (%d)" % (args.name, len(avoid)))
-        for a in sorted(set(avoid), key=str.lower):
-            print("  " + a)
-        return
-    # THE BOOKS THIS STACK READS.  Its from-book entries become the
-    # packages' book for this run and for every install it starts; the
-    # book itself is refreshed once here (svn moves daily), and every
-    # lookup after that reads the file on disk.
-    _sb = {e["target"]: e["opts"]["from-book"] for e in entries
-           if e["kind"] == "book" and e["opts"].get("from-book")}
-    if _sb:
-        _stack_book_map().update({k.lower(): v for k, v in _sb.items()})
-        _BOOK_FOR_PKG.clear()
-        os.environ["PM_STACK_BOOKS"] = ",".join(
-            "%s=%s" % kv for kv in sorted(_sb.items()))
-        for _sel in sorted(set(_sb.values())):
-            _bp = _book_path_for(_sel, refresh=not getattr(args, "status",
-                                                           False))
-            if not getattr(args, "status", False):
-                printInfo("  book %s: %d entr%s  (%s)"
-                          % (_sel, sum(1 for v in _sb.values() if v == _sel),
-                             "y" if list(_sb.values()).count(_sel) == 1
-                             else "ies",
-                             os.path.basename(_bp) if _bp else "NOT ON DISK"))
     if getattr(args, "no_git", False):
         # git and tar entries are the extras -- cloned tools, fonts.  Skipping
         # them finishes the book part of the desktop first, and matters while
@@ -13226,11 +11632,7 @@ def cmd_stack(args):
             # stack" and then passed nothing to the installer, so the
             # packages were built anyway.  It is the stack's exclusion list
             # now, handed to every entry's resolve.
-            # A COUNT, NOT THE LIST: eighty names above every plan pushed
-            # the plan itself off the screen.
-            print("  %d package(s) never built by this stack  "
-                  "(list: packagemanager stack %s --avoided)\n"
-                  % (len(set(avoid)), args.name))
+            print("  never built by this stack: %s\n" % ", ".join(avoid))
         print("  file: %s\n" % path)
 
     import shutil as _sh
@@ -13304,28 +11706,6 @@ def cmd_stack(args):
         entries = [e for e in entries if e["target"] in _only]
         printInfo("running only: %s" % ", ".join(e["target"] for e in entries))
         print()
-    # WHEN=: AN ENTRY THIS MACHINE DOES NOT NEED.
-    #
-    # btrfs-progs belongs in the stack of a btrfs machine and nowhere else,
-    # and a second stack file per filesystem is not an answer.  The test is
-    # a shell command, run here, every time -- so a disk added later is
-    # picked up without editing anything.
-    _when_out = []
-    _kept = []
-    for e in entries:
-        _w = e["opts"].get("when")
-        if _w and subprocess.run(["/bin/bash", "-c", _w],
-                                 stdout=subprocess.DEVNULL,
-                                 stderr=subprocess.DEVNULL).returncode != 0:
-            _when_out.append((e["target"], _w))
-            continue
-        _kept.append(e)
-    entries = _kept
-    if _when_out and not getattr(args, "status", False):
-        for _t, _w in _when_out:
-            printInfo("  %s: not for this machine -- when=%s" % (_t, _w))
-        print()
-
     rows = []
     for e in entries:
         e["_key"] = "%s %s" % (e["kind"], e["target"])
@@ -13589,7 +11969,7 @@ def cmd_stack(args):
                 # `needs=` closes that: the named packages are installed --
                 # through the same door as everything else -- before the entry
                 # runs.
-                for _need in [_resolve_need(x.strip()) for x in
+                for _need in [x.strip() for x in
                               (e["opts"].get("needs") or "").replace(",", " ").split()
                               if x.strip()]:
                     if gather_user(_need).state == "installed":
@@ -13950,198 +12330,6 @@ def cmd_reclaim(args):
     return rc
 
 
-def _setid_table():
-    """setid.conf as {path: (mode, owner, group, package)}.
-
-    The 5th column (package) is the one this command is here for: it is the
-    only written-down statement of WHICH package installs a setuid file, and
-    a setuid file held by any other package is damage, not history.
-    """
-    out = {}
-    for d in (os.environ.get("PM_STACK_DIR") or "/etc/pkgusr/stacks",
-              os.path.join(os.path.dirname(os.path.abspath(__file__)), "stacks")):
-        conf = os.path.join(d, "setid.conf")
-        if not os.path.isfile(conf):
-            continue
-        try:
-            with open(conf, errors="replace") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    col = [c.strip() for c in line.split("|")]
-                    if len(col) < 2 or not col[0].startswith("/"):
-                        continue
-                    col += [""] * (5 - len(col))
-                    out[col[0]] = (col[1], col[2] or "root", col[3] or "-", col[4])
-        except OSError:
-            continue
-        break
-    return out
-
-
-def cmd_disown(args):
-    """Take back the files a package cannot have installed.
-
-    `reclaim` is the other direction: it pushes ownership TOWARDS pkg.lst,
-    which is right when a package lost files and wrong when the record is
-    what went bad.  This one distrusts the record, and it exists because the
-    record did go bad -- three times, the same way:
-
-        -rwx--x--x 1 p_webkitgtk p_webkitgtk /usr/bin/su
-        lrwxrwxrwx 1 p_webkitgtk p_webkitgtk /usr/sbin/iptables -> xtables-nft-multi
-
-    Neither is webkitgtk's.  They were swept into its manifest because
-    attribution is by TIME WINDOW and a webkitgtk build runs for hours, and
-    the lease then acted on that manifest -- clearing su's setuid bit on the
-    way, because `chown` does that and says nothing.  1.14.310 shuts both
-    doors; this repairs machines that already went through them.
-
-    Two rules, and nothing is guessed from either:
-
-      * setid.conf names the package that installs each setuid file.  Anyone
-        else holding it gives it back to root, with the mode from the table.
-      * a symlink is installed by whoever installed its target.  A link whose
-        target belongs to another package goes back to that package.
-
-    Whatever is handed back is struck from the package's pkg.lst as well:
-    an ownership fix that leaves the record claiming the file is a fix that
-    undoes itself on the next `--clean`, which would DELETE these paths.
-    """
-    if args.run and os.geteuid() != 0:
-        printError("disown changes ownership; run it as root.")
-        return 1
-
-    setid = _setid_table()
-    if not setid:
-        printWarning("no setid.conf found -- only the symlink rule can run")
-
-    if getattr(args, "all", False):
-        names = sorted(_pkg_dirs())
-    elif args.packages:
-        names = args.packages
-    else:
-        printError("name a package, or --all")
-        return 2
-
-    accounts = set()
-    for root in pkgusr_roots():
-        try:
-            accounts.update(os.listdir(root))
-        except OSError:
-            pass
-
-    def owner_of(path, follow=False):
-        try:
-            st = os.stat(path) if follow else os.lstat(path)
-            return pwd.getpwuid(st.st_uid).pw_name
-        except (KeyError, OSError):
-            return None
-
-    rc, total = 0, 0
-    for name in names:
-        acct = pkgusr_name(name)
-        pkg = re.sub(r"^" + re.escape(pkgusr_prefix()), "", acct)
-        lst = os.path.join(pkgusr_home(acct), "pkg.lst")
-        try:
-            paths = [l.strip() for l in open(lst, errors="replace") if l.strip()]
-        except OSError as e:
-            if getattr(args, "all", False):
-                continue
-            printError("%s: cannot read %s (%s)" % (acct, lst, e))
-            rc = 1
-            continue
-
-        wrong = []          # (path, reason, give-to, mode-or-None)
-        for path in paths:
-            if owner_of(path) != acct:
-                continue
-            pol = setid.get(path)
-            if pol and pol[3] != pkg:
-                who = pol[3] or "no package"
-                wrong.append((path, "setid.conf says %s installs it" % who,
-                              "root", pol[0]))
-                continue
-            if os.path.islink(path):
-                tgt = os.path.realpath(path)
-                to = owner_of(tgt, follow=True)
-                if to and to != acct and to != "root" and to in accounts:
-                    wrong.append((path, "points at %s's %s" % (to, tgt), to, None))
-
-        if not wrong:
-            if not getattr(args, "all", False):
-                printSuccess("%s: nothing it could not have installed (%d checked)"
-                             % (acct, len(paths)))
-            continue
-
-        total += len(wrong)
-        printWarning("%s: %d recorded path(s) belong somewhere else" % (acct, len(wrong)))
-        for path, why, to, _m in wrong:
-            printInfo("    %-46s -> %-12s %s" % (path, to, why))
-        if not args.run:
-            printInfo("  Dry run -- re-run with --run to hand them back.")
-            continue
-
-        done = []
-        for path, _why, to, mode in wrong:
-            try:
-                if to == "root":
-                    os.lchown(path, 0, 0)
-                    # THE MODE COMES BACK TOO.  The chown that took the file
-                    # cleared its setuid bit; handing it to root without the
-                    # bit leaves `su` exactly as broken as it was.
-                    if mode and not os.path.islink(path):
-                        os.chmod(path, int(mode, 8))
-                else:
-                    os.lchown(path, pwd.getpwnam(to).pw_uid, grp.getgrnam(to).gr_gid)
-                done.append(path)
-            except (OSError, KeyError) as e:
-                printError("    could not hand back %s (%s)" % (path, e))
-                rc = 1
-
-        # ...AND OUT OF THE RECORD, or `update <pkg> --clean` deletes them.
-        if done:
-            keep = [p for p in paths if p not in set(done)]
-            try:
-                with open(lst + ".new", "w") as f:
-                    f.write("\n".join(keep) + ("\n" if keep else ""))
-                os.replace(lst + ".new", lst)
-            except OSError as e:
-                printError("    %s: could not rewrite pkg.lst (%s)" % (acct, e))
-                rc = 1
-            # lfs-helper's build manifests: $LFS_PKGUSR_DIR/manifests/<pkg>.files,
-            # which defaults to /usr/src/lfs-pkgusr.  It is the list the LEASE
-            # reads, so leaving the path in it re-arms the whole thing.
-            _state = (os.environ.get("LFS_PKGUSR_DIR")
-                      or os.path.join(os.path.dirname(BASE_DIR.rstrip("/")) or "/usr/src",
-                                      "lfs-pkgusr"))
-            for man in dict.fromkeys(
-                    [os.path.join(_state, "manifests", pkg + ".files"),
-                     os.path.join("/usr/src/lfs-pkgusr/manifests", pkg + ".files")]):
-                if not os.path.isfile(man):
-                    continue
-                try:
-                    lines = [l.rstrip("\n") for l in open(man, errors="replace")]
-                    left = [l for l in lines if l.strip() not in set(done)]
-                    if len(left) != len(lines):
-                        with open(man + ".new", "w") as f:
-                            f.write("\n".join(left) + ("\n" if left else ""))
-                        os.replace(man + ".new", man)
-                        printInfo("    %s: %d line(s) removed" % (man, len(lines) - len(left)))
-                except OSError as e:
-                    printError("    %s (%s)" % (man, e))
-                    rc = 1
-            printSuccess("%s: %d path(s) handed back" % (acct, len(done)))
-
-    if total == 0:
-        printSuccess("nothing to hand back")
-    elif not args.run:
-        printInfo("")
-        printInfo("  After --run, put the setuid bits back and check them:")
-        printInfo("      lfs-helper setid --run")
-    return rc
-
-
 def cmd_which_package(args):
     """Which package installed this path.
 
@@ -14487,9 +12675,6 @@ commands, by what you are doing:
     plan                       what a run would do, before doing it
     reload-pkg-list            refresh the cached package list
     reclaim <pkg> | --all      give a package back files another took from it
-    disown <pkg> | --all       the other direction: take back what a package
-                               cannot have installed (setuid files, other
-                               packages' symlinks) and clean its pkg.lst
     which-package <path>       which package installed it
     blfs ...                   pass a command straight to blfs
 
@@ -14835,9 +13020,6 @@ def main():
     p.add_argument("--recursive", action="store_true",
                    help="also resolve and build the package's dependencies "
                         "(default: just the named package(s))")
-    p.add_argument("--update-deps", action="store_true",
-                   help="also rebuild dependencies that are installed but "
-                        "older than the book (default: leave them alone)")
     p.add_argument("-f", "--force", action="store_true",
                    help="(deprecated: non-recursive is now the default; kept for "
                         "compatibility)")
@@ -14856,9 +13038,6 @@ def main():
     p.add_argument("--clean", action="store_true",
                    help="after install, remove stale files from a previous "
                         "version (configs and the source tree kept)")
-    p.add_argument("--no-git-check", action="store_true",
-                   help="do not ask the git remotes whether a branch moved "
-                        "(no network)")
     p.add_argument("--regenerate", action="store_true",
                    help="rebuild scripts from the book, ignoring any edited "
                         "script in the package user's home")
@@ -14956,9 +13135,6 @@ def main():
     p.set_defaults(func=cmd_remove)
 
     p = sub.add_parser("reload-pkg-list", help="regenerate /usr/src/<name>/pkg.lst")
-    p.add_argument("--root", action="store_true",
-                   help="scan as root: slower, but reaches directories the "
-                        "package user cannot enter")
     p.add_argument("packages", nargs="+")
     p.add_argument("--background", action="store_true",
                    help="run detached and return at once (the old default)")
@@ -15049,8 +13225,6 @@ def main():
     p.add_argument("--check-refs", action="store_true",
                    help="ask each git entry's remote whether its ref= still "
                         "exists, and stop -- builds nothing")
-    p.add_argument("--avoided", action="store_true",
-                   help="list the packages this stack never builds, and stop")
     p.set_defaults(func=cmd_stack)
 
     p = sub.add_parser("reclaim",
@@ -15065,17 +13239,6 @@ def main():
     p.add_argument("--run", action="store_true",
                    help="actually change ownership (default: dry run)")
     p.set_defaults(func=cmd_reclaim)
-
-    p = sub.add_parser("disown",
-                       help="hand back the files a package cannot have "
-                            "installed (setuid files and other packages' "
-                            "symlinks), and strike them from its pkg.lst")
-    p.add_argument("packages", nargs="*")
-    p.add_argument("--all", action="store_true",
-                   help="every installed package, not a named list")
-    p.add_argument("--run", action="store_true",
-                   help="actually change ownership (default: dry run)")
-    p.set_defaults(func=cmd_disown)
 
     p = sub.add_parser("which-package", aliases=["which-pkg"],
                        help="which package installed a path (reads pkg.lst)")
@@ -15183,10 +13346,6 @@ def main():
     p.add_argument("--collector-prefix", help="prefix for shared install-dir groups")
     p.add_argument("--user-prefix", help="prefix for shared users")
     p.add_argument("--main-user", help="your human login account (e.g. n76310)")
-    p.add_argument("--shared-hub", metavar="DIR",
-                   help="where the links to the shared directories live "
-                        "(default /home/Shared); your ~/Shared and each "
-                        "account's ~/Shared link into it")
     p.add_argument("--editor", help="editor for 'verify --set-validate-command' "
                    "(default: $EDITOR or vim)")
     p.add_argument("--difftool", help="diff tool for 'migrate-scripts --vimdiff' "
@@ -15305,47 +13464,6 @@ def main():
     q.add_argument("user")
     q.add_argument("groups", nargs="+")
     q.set_defaults(func=cmd_user_disallow)
-
-    p = sub.add_parser("git-status", aliases=["git"],
-                       help="what each git package follows (branch or tag) and "
-                            "whether the remote has moved past it")
-    p.add_argument("packages", nargs="*", help="default: every git package here")
-    p.add_argument("--local-only", action="store_true",
-                   help="do not ask the remotes (no network)")
-    p.set_defaults(func=cmd_git_status)
-
-    p = sub.add_parser("git-ref",
-                       help="show the branches and tags a git package could "
-                            "follow, or move it to one")
-    p.add_argument("package")
-    p.add_argument("ref", nargs="?", help="omit to list what the remote has")
-    p.add_argument("--run", action="store_true",
-                   help="actually change git_ref= (default dry-run)")
-    p.set_defaults(func=cmd_git_ref)
-
-    p = sub.add_parser("used-by", aliases=["needed-by"],
-                       help="what still links against a library, or against "
-                            "this package's libraries (DT_NEEDED, not the "
-                            "book's dependency list)")
-    p.add_argument("name", help="a package name, a soname (libfoo.so.4) or a "
-                   "path to a library")
-    p.set_defaults(func=cmd_used_by)
-
-    p = sub.add_parser("service", help="the SysV services: list them, start/stop "
-                       "one, enable/disable it at boot (start does not need "
-                       "enable)")
-    p.add_argument("name", nargs="?", help="the service, as in /etc/rc.d/init.d/<name>")
-    p.add_argument("action", nargs="?",
-                   help="list | status | start | stop | restart | reload | "
-                        "enable | disable  (either order: `service sshd start` "
-                        "or `service start sshd`; no action means status)")
-    p.add_argument("--levels", help="enable: the runlevels to start in "
-                   "(default: the script's own Default-Start, else 2345)")
-    p.add_argument("--priority", help="enable: the two-digit order number "
-                   "(default: the one its other links already use)")
-    p.add_argument("--quick", action="store_true",
-                   help="list: do not ask each script whether it is running")
-    p.set_defaults(func=cmd_service)
 
     p = sub.add_parser("init", help="set up the install group + make install dirs "
                        "(dry-run unless --run; shows/confirms each command)")
@@ -15503,14 +13621,7 @@ def main():
     if (not config_exists() and args.command != "config"
             and sys.stdin.isatty() and sys.stdout.isatty()):
         first_run_setup()
-    # THE EXIT CODE IS AN ANSWER.  Every command's return value was thrown
-    # away here, so `packagemanager` exited 0 whatever happened -- including
-    # `service <name> status` on a service that is not running, which is the
-    # one command people put in an `if`.  Only a non-zero INT becomes the exit
-    # status; a command that returns something else (or nothing) is unchanged.
-    rc = args.func(args)
-    if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
-        sys.exit(rc)
+    args.func(args)
 
 
 if __name__ == "__main__":

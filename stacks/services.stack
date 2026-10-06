@@ -1,5 +1,5 @@
 # services.stack -- the boot-time services a SysV desktop needs.
-# stack-version: 1.14.330
+# stack-version: 1.14.292
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -51,39 +51,6 @@ git    bash-completion url=https://github.com/scop/bash-completion ref=2.18.0 \
 # saying `'C' is not a UTF-8 locale`, with nothing to say why.
 cfg    shell-env \
        expect='test -f /etc/bashrc && test -f /etc/locale.conf && { test ! -d /etc/profile.d || test -f /etc/profile.d/i18n.sh; }'
-
-# BTRFS, ON A BTRFS MACHINE ONLY.  `btrfs check`, `scrub`, `balance`,
-# subvolumes and snapshots all come from btrfs-progs, and without it a btrfs
-# root can be mounted and nothing else -- no repair, no snapshot, and
-# mkinitramfs/fsck have no helper.  when= asks the machine: a filesystem
-# mounted now, or a partition on any disk (so it is also right in a chroot
-# whose target is btrfs and in the installer, before the mount).
-book   btrfs-progs \
-       when="grep -qw btrfs /proc/mounts || lsblk -no FSTYPE 2>/dev/null | grep -qx btrfs || blkid -t TYPE=btrfs >/dev/null 2>&1" \
-       expect="command -v btrfs >/dev/null && btrfs --version >/dev/null"
-
-# EXFAT, WHICH ARRIVES IN A POCKET.  mkfs.exfat / fsck.exfat / exfatlabel
-# for the cards and sticks that come formatted that way -- no when= test,
-# because the medium is not in the machine when the stack runs.
-#
-# NOT A BLFS PAGE.  The book carries no exFAT package at all (checked
-# against the stable index, 1.14.330); what it links to in passing is
-# relan/exfat, the FUSE implementation -- a different thing.  This is the
-# userspace for the KERNEL driver, which is the modern path and the one
-# this machine uses:
-#     lfs-kernel enable exfat        # EXFAT_FS=m, then lfs-kernel --run
-# relan/exfat (mount.exfat-fuse) is only worth having on a kernel without
-# that driver.
-#
-# The release tarball is an autotools dist, so ./configure is in it; the
-# build line falls back to autogen.sh if a future tarball is a bare export.
-tar    exfatprogs \
-       url=https://github.com/exfatprogs/exfatprogs/releases/download/1.4.2/exfatprogs-1.4.2.tar.xz \
-       pkg=exfatprogs-1.4.2.tar.xz \
-       prog=mkfs.exfat \
-       build="test -x ./configure || ./autogen.sh; ./configure --prefix=/usr --sbindir=/usr/sbin; make" \
-       install="make install" \
-       expect="command -v mkfs.exfat >/dev/null && command -v fsck.exfat >/dev/null"
 
 book   acpid                    # power/lid/button events -- what a laptop needs
 
@@ -139,8 +106,7 @@ cfg    shadow-pam \
 # this step also does the two things no per-account command can: merge
 # /etc/pam.d/su_u_user (one file listing every account that may be entered
 # without a password) and write /etc/profile.d/shared-dirs.sh (one file
-# exporting SHARED_<NAME> for each link in the hub,
-# /home/Shared -- your ~/Shared links there).
+# exporting SHARED_<NAME> for each ~/Shared/<Name>).
 #
 # Needs a main user: `packagemanager config --main-user <your-login>`.
 # Nothing of yours is edited -- no .bashrc, no .bash_profile -- and the PAM
@@ -149,29 +115,11 @@ cfg    shadow-pam \
 # Re-checked on every run (see shadow-pam): the accounts IT MANAGES (the
 # names in app-users.conf -- not every u_*: a hand-made u_test is not its
 # business) are not directly in /home, su calls su_u_user, root owns it, and
-# it checks the caller, not the target.  And (1.14.312) your ~/Shared is
-# the link to the hub, not a directory of links: a machine set up before the
-# hub existed re-runs this step once and moves them.
+# it checks the caller, not the target.
 cfg    app-users \
-       expect='test -x /usr/bin/xdg-runtime-share && ! awk -F"|" "\$1 !~ /^[[:space:]]*(#|name[[:space:]]|\$)/ { gsub(/[[:space:]]/, \"\", \$1); print \"u_\" \$1 }" /etc/pkgusr/stacks/app-users.conf | while read -r u; do getent passwd "$u" | cut -d: -f6; done | grep -qE "^/home/[^/]+\$" && { test ! -f /etc/pam.d/su || grep -qE "^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_exec[.]so.*su_u_user" /etc/pam.d/su; } && { test ! -e /etc/pam.d/su_u_user || { test "$(stat -c %U:%a /etc/pam.d/su_u_user)" = root:755 && ! grep -qF -e "=~ \"\$PAM_USER\"" /etc/pam.d/su_u_user; }; } && { m="$(grep "^main_user=" /etc/pkgusr/packagemanager.conf 2>/dev/null | head -n1 | cut -d= -f2)"; h="$(getent passwd "$m" 2>/dev/null | cut -d: -f6)"; [ -z "$h" ] || [ ! -d "$h/Shared" ] || [ -L "$h/Shared" ]; }'
+       expect='test -x /usr/bin/xdg-runtime-share && ! awk -F"|" "\$1 !~ /^[[:space:]]*(#|name[[:space:]]|\$)/ { gsub(/[[:space:]]/, \"\", \$1); print \"u_\" \$1 }" /etc/pkgusr/stacks/app-users.conf | while read -r u; do getent passwd "$u" | cut -d: -f6; done | grep -qE "^/home/[^/]+\$" && { test ! -f /etc/pam.d/su || grep -qE "^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_exec[.]so.*su_u_user" /etc/pam.d/su; } && { test ! -e /etc/pam.d/su_u_user || { test "$(stat -c %U:%a /etc/pam.d/su_u_user)" = root:755 && ! grep -qF -e "=~ \"\$PAM_USER\"" /etc/pam.d/su_u_user; }; }'
 
-# WHO MAY TURN THE MACHINE OFF.  A package user owns files, not identity:
-# halt, poweroff and reboot have to BECOME root, so they stay root's and a
-# group decides who may run them -- 4550 root:<collector>_power, with the
-# desktop user in that group.  The same step writes the power-perms boot
-# script, because /sys/power/state is made fresh at every boot and its group
-# has to be re-applied there.
-#
-# expect= matters more here than almost anywhere else.  Without it this entry
-# was cached "done" for ever, and the modes it set are exactly the kind that
-# get destroyed silently: a sysvinit rebuild reinstalls halt without the
-# setuid bit, and a `chown` -- from anything, including this project's own
-# ownership sweep before 1.14.308 -- clears setuid as a side effect the
-# kernel never reports.  Then poweroff stops working for the user and nothing
-# says why.  Re-checked on every run: the group, the mode and owner of halt,
-# and the boot script.
-cfg    power \
-       expect='g="${POWER_GROUP:-}"; if [ -z "$g" ]; then p="$(grep "^collector_prefix=" /etc/pkgusr/packagemanager.conf 2>/dev/null | head -n1 | cut -d= -f2)"; g="${p%_}_power"; fi; h=/usr/bin/halt; [ -f "$h" ] || h=/sbin/halt; getent group "$g" >/dev/null 2>&1 && test -f /etc/rc.d/init.d/power-perms && test "$(stat -Lc "%a %U:%G" "$h" 2>/dev/null)" = "4550 root:$g"'
+cfg    power
 book   fcron                    # the cron daemon; make-ca's weekly update needs one
 
 # blfs-bootscripts: 20250225 is the FINAL release (BLFS has stopped shipping

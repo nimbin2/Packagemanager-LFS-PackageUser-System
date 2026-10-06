@@ -1,5 +1,5 @@
 # vision.stack -- computer vision, kept out of the desktop stack.
-# stack-version: 1.14.320
+# stack-version: 1.14.292
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.

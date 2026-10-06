@@ -190,11 +190,9 @@ updates an installed package. To move packages to what the book now carries:
 here than the version its page was written against -- not a refusal, just
 the numbers.
 
-The desktop is three stacks that build as one: `wayland` (session, mesa,
-wayland, GTK4, wlroots), `media` (the codec / gstreamer / WebRTC / webkitgtk
-chain) and `sway` (the compositor, its tools, your own programs). sway.stack
-starts with `include wayland` and `include media`, so a full desktop build is
-still one command -- and when a codec or webkitgtk needs redoing you rebuild just that
+`media` is the codec / gstreamer / WebRTC / webkitgtk chain. sway.stack
+pulls it in with `include media`, so a full desktop build is still one
+command -- and when a codec or webkitgtk needs redoing you rebuild just that
 part:
 
     packagemanager stack media --run
@@ -213,13 +211,10 @@ usermod -aG audio,video,input <name>          # the main_user from the interview
 export LFS_DESKTOP_USER=<name>
 
 packagemanager stack sway --check-refs        # every git ref still exists?
-packagemanager stack sway --run               # desktop: includes wayland + media, then sway, foot, pipewire
-packagemanager stack apps --run               # zathura, imv -- programs, not the desktop
+packagemanager stack sway --run               # desktop: wlroots, sway, foot, webkit, pipewire, mesa
 packagemanager stack network --check-refs
 packagemanager stack network --run            # wpa_supplicant, iptables-nft, net-tools
 packagemanager stack services --run           # bootscripts, fcron, acpid, mytools, shell-env, app-users
-packagemanager stack dev --run                # gdb -- nothing needs it, so it goes last
-packagemanager stack tools --run              # trans, jq -- same: nothing needs them
 ```
 
 `sway` includes `check kernel-sway`, which reads the running kernel's config
@@ -300,8 +295,7 @@ generated, so it can be edited before the first build.
 | `HEADERS`, `V4L2LOOPBACK`, `BOOTLOGO` | as you like |
 
 ```sh
-lfs-kernel                         # the plan; nothing is built
-lfs-kernel --run                   # build, install, record as p_linux
+lfs-kernel                         # build, install, record as p_linux
 lfs-kernel verify                  # image, modules, depmod, headers, firmware
 ```
 
@@ -403,7 +397,7 @@ packagemanager update <pkg> --run            # what the book has newer
 packagemanager which-package /usr/bin/foo
 packagemanager reclaim <pkg> --run           # give files back another package took
 packagemanager user create firefox --shared --share-dir --launcher   # an app account
-lfs-kernel latest --run                      # try a newer kernel beside this one
+lfs-kernel latest                            # try a newer kernel beside this one
 ```
 
 A new BLFS release: `blfs fetch`, `packagemanager blfs set-default`,

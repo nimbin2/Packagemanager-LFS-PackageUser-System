@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.340"
+LFS_VERSION = "1.14.299"
 
 
 def _build_id():
@@ -5724,12 +5724,7 @@ def cmd_bs_gen_chroot_scripts(args):
         for nm, left in unresolved:
             sys.stderr.write("    %-18s %s\n"
                              % (nm, ", ".join("<%s>" % x for x in left)))
-    # SINGLE QUOTES INSIDE THE BRACES.  Reusing the f-string's own quote
-    # character is legal only from Python 3.12, and `lfs` is the one tool that
-    # runs on the HOST -- where Python is whatever the distribution ships
-    # (Debian 12: 3.11).  There it did not fail at this line, it failed to
-    # start at all, with a SyntaxError pointing at a debug print.
-    print(f"# step order -> {pkgusr_state(lfs, 'progress', 'steporder')}")
+    print(f"# step order -> {pkgusr_state(lfs, "progress", "steporder")}")
     write_chroot_env(lfs)
     install_helper(lfs)
     _install_collector_groups(lfs)

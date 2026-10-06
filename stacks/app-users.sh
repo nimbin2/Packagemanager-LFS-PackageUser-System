@@ -47,14 +47,6 @@ $PM env --system --run >/dev/null 2>&1 \
     && note "refreshed /etc/profile.d/pkgusr-system.sh (PKGUSR_SYS_*)" \
     || true
 
-# THE HUB: where the links to every shared directory live (1.14.312).  Asked
-# of the tool, NOT read from $PKGUSR_SYS_SHARED -- this shell inherited that
-# at login, and before 1.14.312 it named ~/Shared.  /home/Shared
-# unless `packagemanager config --shared-hub DIR` says otherwise.
-HUB="$($PM env --system 2>/dev/null | sed -n 's/^export PKGUSR_SYS_SHARED="\(.*\)"$/\1/p' | head -n1)"
-[ -n "$HUB" ] || HUB="/home/Shared"
-note "shared hub: $HUB"
-
 # CONFIRM THE COMMAND EXISTS BEFORE THE LOOP.  Every line would otherwise
 # fail the same way, three times, with the parser's error rather than ours.
 if ! $PM user setup --help >/dev/null 2>&1; then
@@ -79,25 +71,8 @@ declare -A A_SHARE A_DIR A_GROUPS
 accounts=""
 L_ACCT=(); L_NAME=(); L_APP=(); L_DESK=(); L_LAUNCH=(); L_ICON=()
 format=new
-S_ACCT=(); S_CMD=()
 while IFS= read -r raw || [ -n "$raw" ]; do
     case "$(trim "$raw")" in ""|\#*) continue ;; esac
-    # @setup <account|*> <command | URL | /path/script> -- run AS the
-    # account once (see step 1a).  Not split on `|`: a command may pipe.
-    case "$(trim "$raw")" in
-        @setup[[:space:]]*)
-            rest="$(trim "${raw#*@setup}")"
-            sacct="${rest%%[[:space:]]*}"
-            scmd="$(trim "${rest#"$sacct"}")"
-            case "$sacct" in
-                \*|[a-z0-9_-]*) ;;
-                *) warn "line '$raw': '$sacct' is not an account -- skipped"; continue ;;
-            esac
-            [ -n "$scmd" ] || { warn "line '$raw': @setup without a command -- skipped"; continue; }
-            S_ACCT+=("$sacct"); S_CMD+=("$scmd")
-            continue ;;
-        @*) warn "line '$raw': unknown directive -- skipped"; continue ;;
-    esac
     IFS='|' read -r f1 f2 f3 f4 f5 f6 f7 f8 f9 <<< "$raw"
     f1="$(trim "$f1")"
     # the header tells the format
@@ -173,58 +148,6 @@ done
 echo
 
 [ -n "$names" ] || { warn "no usable lines in $CONF"; exit 1; }
-
-# ---- 1a. @setup: the account's own extra steps ------------------------------
-# A command, a local script or a URL to a bash script, run AS the account
-# (login shell, its own HOME) -- never as root.  ONCE: a step that ran is
-# recorded by its text in $SETUP_DB/<account>, so a later run skips it and
-# a CHANGED line runs again.  APP_USERS_RERUN=1 runs them all again.
-SETUP_DB="${APP_USERS_SETUP_DB:-/var/lib/pkgusr/app-setup}"
-fetch_to() {  # url file
-    if command -v curl >/dev/null 2>&1; then curl -fsSL "$1" -o "$2"
-    elif command -v wget >/dev/null 2>&1; then wget -q -O "$2" "$1"
-    else echo "no curl or wget" >&2; return 1; fi
-}
-if [ "${#S_CMD[@]}" -gt 0 ]; then
-    mkdir -p "$SETUP_DB" && chmod 700 "$SETUP_DB"
-    for i in "${!S_CMD[@]}"; do
-        cmd="${S_CMD[$i]}"
-        if [ "${S_ACCT[$i]}" = "*" ]; then targets="$names"; else targets="${S_ACCT[$i]}"; fi
-        key="$(printf '%s' "$cmd" | md5sum | cut -c1-12)"
-        for acct in $targets; do
-            case " $names " in *" $acct "*) ;; *) warn "@setup $acct: no such account in $CONF -- skipped"; continue ;; esac
-            db="$SETUP_DB/$acct"
-            if [ "${APP_USERS_RERUN:-0}" != 1 ] && grep -qx "$key" "$db" 2>/dev/null; then
-                note "$acct: setup already done -- $cmd"
-                continue
-            fi
-            note "$acct: setup -- $cmd"
-            case "$cmd" in
-                http://*|https://*)
-                    tmp="$(mktemp /tmp/app-setup.XXXXXX)"
-                    if ! fetch_to "$cmd" "$tmp"; then
-                        rm -f "$tmp"; warn "$acct: could not download $cmd"; continue
-                    fi
-                    chmod 644 "$tmp"
-                    su - "$PREFIX$acct" -s /bin/bash -c "bash '$tmp'"; rc=$?
-                    rm -f "$tmp" ;;
-                /*)
-                    if [ -f "$cmd" ]; then
-                        su - "$PREFIX$acct" -s /bin/bash -c "bash '$cmd'"; rc=$?
-                    else
-                        su - "$PREFIX$acct" -s /bin/bash -c "$cmd"; rc=$?
-                    fi ;;
-                *)  su - "$PREFIX$acct" -s /bin/bash -c "$cmd"; rc=$? ;;
-            esac
-            if [ "$rc" = 0 ]; then
-                grep -qx "$key" "$db" 2>/dev/null || echo "$key" >> "$db"
-            else
-                warn "$acct: setup failed (exit $rc) -- runs again next time: $cmd"
-            fi
-        done
-    done
-    echo
-fi
 # TRIM ONCE, HERE.  $names is built by appending " $n", so it starts with a
 # space and ${names%% *} is empty -- which printed `su - u_` twice before,
 # in two different blocks.  One trim, at the top, and every later use is
@@ -233,7 +156,7 @@ names="$(printf '%s' "$names" | sed 's/^ *//')"
 
 # ---- 1b. a line that STOPPED asking for a shared directory -----------------
 # `user setup` makes what the line asks for; it never takes away, so an
-# account switched from dir=yes to dir=no keeps its /home/Shared/<Name> --
+# account switched from dir=yes to dir=no keeps its ~/Shared/<Name> link --
 # and /etc/profile.d/shared-dirs.sh keeps exporting $SHARED_<NAME> for it.
 # An EMPTY leftover is removed here (nothing can be lost).  One with files in
 # it is yours: this says where it is and what would remove it.
@@ -241,27 +164,15 @@ MAIN_HOME="$(getent passwd "$MAIN" | cut -d: -f6)"
 for name in $accounts; do
     [ "${A_DIR[$name]:-}" = yes ] && continue
     cap="$(printf '%s' "$name" | cut -c1 | tr '[:lower:]' '[:upper:]')$(printf '%s' "$name" | cut -c2-)"
-    d="$HUB/$cap"
-    # since 1.14.315 the hub holds the DIRECTORY and the account's ~/Shared
-    # is the link; before that, the hub held a link.  Either is handled.
-    ah="$(getent passwd "$PREFIX$name" | cut -d: -f6)"
-    if [ -L "$d" ]; then
-        tgt="$(readlink -f "$d" 2>/dev/null || true)"
-    elif [ -d "$d" ]; then
-        tgt="$d"
-    else
-        continue
-    fi
+    link="$MAIN_HOME/Shared/$cap"
+    [ -L "$link" ] || continue
+    tgt="$(readlink -f "$link" 2>/dev/null || true)"
     if [ ! -d "$tgt" ] || [ -z "$(ls -A "$tgt" 2>/dev/null)" ]; then
-        [ -L "$d" ] && rm -f "$d"
-        [ -d "$tgt" ] && rmdir "$tgt" 2>/dev/null
-        note "$name: dir=no -- removed the empty $d"
-        if [ -n "$ah" ] && [ -L "$ah/Shared" ] && [ ! -e "$ah/Shared" ]; then
-            rm -f "$ah/Shared" && note "   and the link $ah/Shared"
-        fi
+        rm -f "$link" && note "$name: dir=no -- removed the empty $link"
+        [ -d "$tgt" ] && rmdir "$tgt" 2>/dev/null && note "   and $tgt"
     else
-        note "$name: dir=no, but $d still has files in it -- left alone"
-        note "   look, then remove it yourself"
+        note "$name: dir=no, but $link still has files in it -- left alone"
+        note "   look, then:  rm $link   (the files stay in $tgt)"
     fi
 done
 echo
@@ -417,21 +328,18 @@ fi
 echo
 
 # ---- 3. the shell variables ----------------------------------------------
-# ENUMERATE, DO NOT LIST.  The fragment reads the hub at login, so an
+# ENUMERATE, DO NOT LIST.  The fragment reads ~/Shared at login, so an
 # account added to the conf file shows up in the next shell without this
 # file being rewritten -- and a link you make by hand appears too.
 frag="$PROFILE_D/shared-dirs.sh"
 if [ -d "$PROFILE_D" ]; then
     if [ -e "$frag" ] && ! grep -qF "$MARKER" "$frag"; then
         warn "$frag exists and is not ours -- left alone"
-        note "   it would have exported SHARED_<NAME> for each $HUB/<Name>"
+        note "   it would have exported SHARED_<NAME> for each ~/Shared/<Name>"
     else
         cat > "$frag" <<PROF
 $MARKER
-# One variable per shared directory: $HUB/Claude -> \$SHARED_CLAUDE.
-# The SAME set in every account: the hub is a system path, not \$HOME/Shared
-# (which in an app account is its own data directory -- enumerating that
-# exported one SHARED_* per FILE in it, before 1.14.312).
+# One variable per shared directory: ~/Shared/Claude -> \$SHARED_CLAUDE.
 # Enumerated, not listed, so an account added or removed needs no change
 # here -- and a link you make by hand appears too.
 #
@@ -443,8 +351,8 @@ for _v in \$(env | sed -n 's/^\(SHARED_[A-Z0-9_]*\)=.*/\1/p'); do
     eval "_p=\\\${\$_v}"
     [ -d "\$_p" ] || unset "\$_v"
 done
-if [ -d "$HUB" ]; then
-    for _sd in "$HUB"/*; do
+if [ -d "\$HOME/Shared" ]; then
+    for _sd in "\$HOME"/Shared/*; do
         [ -e "\$_sd" ] || continue
         _n="\$(basename "\$_sd" | tr '[:lower:]-' '[:upper:]_')"
         export "SHARED_\$_n=\$_sd"
@@ -503,7 +411,7 @@ PROF
 else
     warn "no $PROFILE_D -- cannot install the SHARED_* variables"
     note "   source this from your own shell instead, and it stays yours:"
-    note "     for d in $HUB/*; do export \"SHARED_\$(basename \$d | tr a-z- A-Z_)=\$d\"; done"
+    note "     for d in ~/Shared/*; do export \"SHARED_\$(basename \$d | tr a-z- A-Z_)=\$d\"; done"
 fi
 
 # ---- 3b. the session group, applied by the session -------------------------
