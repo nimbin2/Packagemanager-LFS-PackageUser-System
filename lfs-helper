@@ -49,7 +49,7 @@ set -u
 # Bump on every change that alters behaviour.  `lfs-helper --version` makes it
 # possible to tell at a glance whether the copy inside the chroot is the one
 # that was just fixed -- guessing at that has wasted a lot of time.
-LFS_HELPER_VERSION="1.14.299"
+LFS_HELPER_VERSION="1.14.146"
 
 # A fingerprint of this file's own contents.  A hand-maintained version number
 # goes stale the moment someone forgets to bump it -- and the reason for
@@ -980,7 +980,7 @@ cmd_add_user() {
     pkgusr_ready || die "run 'lfs-helper init-pkgusr --run' first"
 
     if user_exists "$name"; then
-        [ "${_QUIET_EXISTING:-0}" = 1 ] || say "# user '$name' already exists"
+        say "# user '$name' already exists"
     else
         if have_shadow_tools; then
             # Let Shadow allocate the ids.  Choosing them by hand means racing
@@ -1056,20 +1056,14 @@ load_snapshot() {
 have_su() { command -v su >/dev/null 2>&1; }
 
 snapshot_dirs() {
-    # PRUNE, DO NOT FILTER.  `-not -path "$SRCROOT/*"` hides a path AFTER find
-    # has walked into it, so every scan still descended /usr/src -- every
-    # package's unpacked source and build tree, LLVM's and WebKit's included
-    # -- and threw the answer away.  Each phase ended with five such walks:
-    # nvtop's two-second install sat for minutes on "scanning the tree".
-    # -prune does not descend.  The pruned directory itself is still listed,
-    # exactly as the filter listed it.
     local r="${SNAP_ROOT%/}"
-    find "${SNAP_ROOT:-/}" -xdev \
-        \( -path "$SRCROOT" -o -path "$r/dev" -o -path "$r/proc" \
-           -o -path "$r/sys" -o -path "$r/run" -o -path "$r/tmp" \
-           -o -path "$r/sources" -o -path "$r/build" \
-           -o -path "$r/root" -o -path "$r/home" \) -type d -print -prune \
-        -o -type d -print \
+    find "${SNAP_ROOT:-/}" -xdev -type d \
+        -not -path "$SRCROOT/*" \
+        -not -path "$r/dev/*"  -not -path "$r/proc/*" \
+        -not -path "$r/sys/*"  -not -path "$r/run/*" \
+        -not -path "$r/tmp/*"  -not -path "$r/sources/*" \
+        -not -path "$r/build/*" \
+        -not -path "$r/root/*" -not -path "$r/home/*" \
         2>/dev/null | LC_ALL=C sort
 }
 
@@ -1084,13 +1078,13 @@ snapshot() {
     # since comm cannot tell.  A package user's profile sets LC_ALL=POSIX and
     # root's shell may not, so the two sides really can differ.
     local r="${SNAP_ROOT%/}"
-    # pruned, not filtered -- see snapshot_dirs
-    find "${SNAP_ROOT:-/}" -xdev \
-        \( -path "$SRCROOT" -o -path "$r/dev" -o -path "$r/proc" \
-           -o -path "$r/sys" -o -path "$r/run" -o -path "$r/tmp" \
-           -o -path "$r/sources" -o -path "$r/build" \
-           -o -path "$r/root" -o -path "$r/home" \) -type d -prune \
-        -o \( -type f -o -type l \) -print \
+    find "${SNAP_ROOT:-/}" -xdev \( -type f -o -type l \) \
+        -not -path "$SRCROOT/*" \
+        -not -path "$r/dev/*"  -not -path "$r/proc/*" \
+        -not -path "$r/sys/*"  -not -path "$r/run/*" \
+        -not -path "$r/tmp/*"  -not -path "$r/sources/*" \
+        -not -path "$r/build/*" \
+        -not -path "$r/root/*" -not -path "$r/home/*" \
         2>/dev/null | LC_ALL=C sort
 }
 
@@ -2498,64 +2492,6 @@ unwritable_dirs_from_log() {
             | sort -u)"
     fi
 
-    # CARGO NAMES THE DESTINATION IN BACKTICKS, ON THE LINE ABOVE THE REASON.
-    #
-    #   Error: CliError { error: Some(failed to copy `.../libgstrsrtp.a` to
-    #       `/usr/lib/gstreamer-1.0/libgstrsrtp.a`
-    #   Caused by:
-    #       Permission denied (os error 13)
-    #
-    # No quotes, no "Permission denied" on the same line, and the path that
-    # matters is the SECOND backticked one -- so nothing matched, the repair
-    # ran zero rounds, and the box still said "grant access and retry".
-    local _cargodirs=""
-    if grep -qE "failed to copy \`|os error 13" "$log" 2>/dev/null; then
-        _cargodirs="$(tail -c 524288 "$log" 2>/dev/null \
-            | grep -aoE 'to `/[^`]+`' \
-            | sed 's/^to `//; s/`$//' \
-            | sed 's|/[^/]*$||' \
-            | sort -u)"
-    fi
-
-    # AN ABSOLUTE PATH IN THE MESSAGE IS THE ANSWER, AND NOBODY READ IT.
-    #
-    #   install: cannot create regular file
-    #     '/usr/lib/udev/rules.d/90-backlight.rules': Permission denied
-    #
-    # The file does not exist, so the handover has nothing to give away; the
-    # directory is another package's and not writable, so the grant is what
-    # is needed -- and the `cd`-based extractor below only fires when the
-    # build printed a `cd` and then a RELATIVE path.  With an absolute path
-    # right there in the message, nothing was extracted and light's udev
-    # rule stopped the install.
-    # CMAKE WRAPS ITS MESSAGE.
-    #
-    #     file INSTALL cannot copy file
-    #     "/usr/src/pkgusr/p_nvtop/.../io.github.syllo.nvtop.metainfo.xml"
-    #     to "/usr/share/metainfo/io.github.syllo.nvtop.metainfo.xml": Permission
-    #     denied.
-    # "Permission" and "denied" on two lines, so no line matched and the second
-    # round found nothing to grant: nvtop stopped after one round with a plain
-    # permission error on the screen.  Join each `file INSTALL` block (up to
-    # the blank line CMake ends it with) and read the destination from that.
-    local _cmakedirs=""
-    _cmakedirs="$(tail -c 524288 "$log" 2>/dev/null | awk '
-        /file INSTALL cannot/ { blk = $0; inb = 1; next }
-        inb && /^[[:space:]]*$/ { print blk; inb = 0; next }
-        inb { blk = blk " " $0 }
-        END { if (inb) print blk }' \
-        | tr -s ' ' \
-        | grep -aE 'Permission denied|Operation not permitted' \
-        | grep -aoE '(to|directory) "/[^"]+"' | sed 's/^[a-z]* "//; s/"$//' \
-        | while IFS= read -r _cp; do
-              if [ -d "$_cp" ]; then echo "$_cp"; else echo "${_cp%/*}"; fi
-          done | sort -u)"
-    local _instdirs=""
-    _instdirs="$(tail -c 524288 "$log" 2>/dev/null \
-        | grep -aoE "cannot create (regular file|directory) '/[^']+'" \
-        | sed "s/.*'\(\/[^']*\)'.*/\1/" \
-        | sed 's|/[^/]*$||' | sort -u)"
-
     # (plain awk: match() with a capture array is a gawk extension)
     _cdpaths="$(tail -c 524288 "$log" 2>/dev/null | awk '
         /cd .\/|cd \x27\// {
@@ -2570,9 +2506,6 @@ unwritable_dirs_from_log() {
         }' 2>/dev/null | sort -u)"
 
     { printf '%s\n' "$_mesondirs"
-      printf '%s\n' "$_cargodirs"
-      printf '%s\n' "$_instdirs"
-      printf '%s\n' "$_cmakedirs"
       printf '%s\n' "$_cdpaths"
       printf '%s\n' "$_tail" | grep -aoE "'[^']+'|\"[^\"]+\"" | tr -d "'\""
       printf '%s\n' "$_tail" | grep -aoE "/[A-Za-z0-9._/+-]{6,}"; } \
@@ -2951,7 +2884,7 @@ meson_takeover_from_log() {
     # meson's chmod succeeds.  Only files it is actually installing (named on
     # meson's own "Installing SRC to DIR" lines) and only where the current
     # owner is another PACKAGE USER: root's files are never taken.
-    local log="$1" user="$2" took=0 src dest f owner _t_owner="" _t_src=""
+    local log="$1" user="$2" took=0 src dest f owner
     grep -qE "Unhandled python OSError|\[Errno 13\]|\[Errno 1\]" "$log" 2>/dev/null || return 1
     while IFS= read -r line; do
         src="${line#Installing }"; src="${src%% to *}"
@@ -2966,47 +2899,8 @@ meson_takeover_from_log() {
         esac
         pkgusr_kind "$owner" >/dev/null 2>&1 || true
         say "    $f belongs to $owner -- handing it to $user (the installer owns what it installs)"
-        soft "could not hand $f to $user" -- real_chown "$user:$user" "$f" \
-            && { took=$((took+1)); _t_owner="$owner"; _t_src="$src"; }
+        soft "could not hand $f to $user" -- real_chown "$user:$user" "$f" && took=$((took+1))
     done <<< "$(tail -c 2097152 "$log" 2>/dev/null | grep '^Installing .* to /')"
-    # THE WHOLE INSTALL PLAN, NOT THE LINE IT STOPPED ON.
-    #
-    # libglvnd replaces Mesa's GL, GLES, EGL and KHR headers and its libGL:
-    # a legitimate move of dozens of files from p_mesa to p_libglvnd.  meson
-    # stops at the first one, so the log named one file per round, and after
-    # three the round limit called it a bundled subproject -- it was not.
-    # meson writes its complete plan to meson-info/intro-installed.json
-    # (source -> destination) at setup, so once one file has had to change
-    # hands, every destination still owned by that same package changes
-    # hands in this round.  Same guards: package users only, never root.
-    # Not for a subproject's file: that is the bundled-copy case below, and
-    # handing its whole plan over would hide it.
-    if [ "$took" -ge 1 ] && [ -n "$_t_owner" ] \
-       && [ "${_t_src#*/subprojects/}" = "$_t_src" ]; then
-        local _plan="" _dir _home _n=0 _d _o
-        # walk up from the file meson was installing to the tree that holds
-        # meson-info, and no further than the package user's home
-        _home="$(getent passwd "$user" | cut -d: -f6)"
-        _dir="$(dirname "$_t_src")"
-        while [ -n "$_dir" ] && [ "$_dir" != / ]; do
-            _plan="$(find "$_dir" -maxdepth 3 -path '*/meson-info/intro-installed.json' 2>/dev/null | head -1)"
-            [ -n "$_plan" ] && break
-            [ "$_dir" = "$_home" ] && break
-            _dir="$(dirname "$_dir")"
-        done
-        if [ -n "$_plan" ] && command -v python3 >/dev/null 2>&1; then
-            while IFS= read -r _d; do
-                [ -e "$_d" ] && [ ! -L "$_d" ] || continue
-                _o="$(stat -c %U "$_d" 2>/dev/null)" || continue
-                [ "$_o" = "$_t_owner" ] || continue
-                real_chown "$user:$user" "$_d" 2>/dev/null && _n=$((_n+1))
-            done <<< "$(python3 -c 'import json,sys; print("\n".join(json.load(open(sys.argv[1])).values()))' "$_plan" 2>/dev/null)"
-            if [ "$_n" -gt 0 ]; then
-                say "    ...and $_n more file(s) of $_t_owner that meson's install plan puts there"
-                took=$((took + _n))
-            fi
-        fi
-    fi
     # ONE FILE PER ROUND IS A LOOP, NOT PROGRESS.
     #
     # meson stops at the FIRST file it may not replace, so its log names only
@@ -3015,264 +2909,14 @@ meson_takeover_from_log() {
     # .mo file per round.  When a package keeps taking a single file from the
     # same other package, it is installing a BUNDLED COPY of it, and the fix
     # is upstream of the ownership question.
-    # ...and only a file that comes FROM a subproject is a bundled copy.
-    if [ "$took" = 1 ] && [ -n "$_t_owner" ] && [ "${_t_src#*/subprojects/}" != "$_t_src" ]; then
-        LAST_SINGLE_HANDOVER="$_t_owner"
+    if [ "$took" = 1 ] && [ -n "${owner:-}" ]; then
+        LAST_SINGLE_HANDOVER="$owner"
     else
         LAST_SINGLE_HANDOVER=""
     fi
     [ "$took" -ge 1 ]
 }
 
-
-# A RULE ON DISK IS NOT A RULE IN FORCE.
-#
-# light installs 90-backlight.rules, and until udevd is told, nothing has
-# changed: /sys/class/backlight/*/brightness keeps its old group, light still
-# cannot write it, and the only symptom is "it does not work" -- on a system
-# where every file is exactly where it should be.  A reboot fixes it, which
-# is how this kind of thing stays hidden for a week.
-#
-# Reload always (cheap, and cannot break a running device), then re-trigger
-# ONLY the subsystems the new rules actually mention.  A bare `udevadm
-# trigger` re-adds every device on the machine; on a desktop that can reset
-# input devices and drop a session, which is not a thing a package install
-# should do.
-_udev_reload_if_rules_changed() {   # <manifest>
-    local man="$1" rules subs
-    [ -r "$man" ] || return 0
-    rules="$(grep -E '/udev/rules\.d/[^/]+\.rules$' "$man" 2>/dev/null)"
-    [ -n "$rules" ] || return 0
-    if ! command -v udevadm >/dev/null 2>&1; then
-        note "# installed a udev rule, and there is no udevadm here to load it"
-        return 0
-    fi
-    # IN A CHROOT THERE IS NO udevd TO TELL.  Saying so beats a confusing
-    # "Failed to send reload request".
-    if [ "$(stat -c %d:%i /proc/1/root/. 2>/dev/null)" \
-         != "$(stat -c %d:%i / 2>/dev/null)" ]; then
-        note "# a udev rule was installed; this is a chroot, so nothing was"
-        note "#   reloaded -- it takes effect when you boot this tree"
-        return 0
-    fi
-    say "# a udev rule changed -- telling udevd:"
-    if udevadm control --reload 2>/dev/null; then
-        say "#   rules reloaded"
-    else
-        warn "udevadm control --reload failed; the rule is on disk but not in force"
-        return 0
-    fi
-    # THE ACTION MATTERS AS MUCH AS THE SUBSYSTEM.
-    #
-    # `udevadm trigger` sends **change** unless told otherwise, and light's
-    # rule is `ACTION=="add", SUBSYSTEM=="backlight", RUN+="chgrp video ..."`
-    # -- so the trigger fired, udevd re-examined the device, the rule did not
-    # match, and /sys/class/backlight/*/brightness stayed root:root.  Reload
-    # plus trigger LOOKED like it had done the job.
-    #
-    # So take the actions out of the rules too, and trigger each one.
-    acts="$(printf '%s\n' "$rules" | while IFS= read -r r; do
-                [ -r "$r" ] || continue
-                sed -n 's/.*ACTION=="\([a-z]*\)".*/\1/p' "$r"
-            done | sort -u | tr '\n' ' ')"
-    [ -n "$acts" ] || acts="change"
-    subs="$(printf '%s\n' "$rules" | while IFS= read -r r; do
-                [ -r "$r" ] || continue
-                sed -n 's/.*SUBSYSTEM=="\([a-z0-9_-]*\)".*/\1/p' "$r"
-            done | sort -u | tr '\n' ' ')"
-    if [ -z "$subs" ]; then
-        say "#   no SUBSYSTEM== in the new rule(s), so nothing was re-triggered."
-        say "#   If a device needs it:  udevadm trigger --action=add --subsystem-match=<what>"
-        return 0
-    fi
-    for sub in $subs; do
-        for act in $acts; do
-            if udevadm trigger --action="$act" --subsystem-match="$sub" 2>/dev/null; then
-                say "#   re-triggered '$sub' with action '$act'"
-            else
-                warn "could not re-trigger '$sub' ($act); by hand:"
-                warn "   udevadm trigger --action=$act --subsystem-match=$sub"
-            fi
-        done
-    done
-    udevadm settle --timeout=10 >/dev/null 2>&1 || true
-}
-
-_missing_py_module() {   # _missing_py_module <log>  -> module name or ""
-    grep -aoE "Cannot import '[a-zA-Z0-9_.]+'|No module named '[a-zA-Z0-9_.]+'" \
-        "$1" 2>/dev/null | head -n1 | cut -d"'" -f2
-}
-
-# A TEST'S DEPENDENCY IS NOT A BUILD'S DEPENDENCY, and installing it would
-# have hidden a generator bug for two releases.  numpy's install phase
-# wrongly contained its test suite; the missing module was `pytest`, and an
-# eager "install what is missing" would have installed pytest, run a
-# multi-minute test suite inside an install, and left the real fault --
-# a test block in the wrong phase -- undiscovered.
-_PY_TEST_ONLY="pytest py.test hypothesis attrs pytest_xdist pytest-xdist
-               nose coverage tox mock flaky"
-
-_py_module_provider() {   # _py_module_provider <module> -> BLFS page or ""
-    case "$1" in
-        mesonpy)            echo meson_python ;;
-        setuptools_scm)     echo setuptools_scm ;;
-        Cython|cython)      echo Cython ;;
-        numpy)              echo NumPy ;;
-        flit_core)          echo flit_core ;;
-        hatchling)          echo hatchling ;;
-        scikit_build_core)  echo scikit-build-core ;;
-        poetry.core|poetry_core) echo poetry-core ;;
-        wheel)              echo wheel ;;
-        setuptools)         echo setuptools ;;
-        *)                  echo "" ;;
-    esac
-}
-
-# INSTALL A MISSING BUILD BACKEND, IF ASKED TO.  Opt-in (--auto-modules or
-# PM_AUTO_MODULES=1): a build that cannot proceed without a python backend
-# is a dependency problem the tool can fix, but installing packages nobody
-# asked for is not something to do by default -- and never for a module
-# only the TEST suite wants.
-_install_missing_module() {   # _install_missing_module <log>
-    local mod prov
-    mod="$(_missing_py_module "$1")"
-    [ -n "$mod" ] || return 1
-    case " $_PY_TEST_ONLY " in
-        *" $mod "*)
-            warn "'$mod' is a TEST dependency, not a build one -- NOT installing it"
-            note "   a test suite in an install phase is the real fault here."
-            note "   Regenerate the script and the test moves to \`test\`:"
-            note "     packagemanager regenerate-script $(unprefix_pkg_user "${name:-}") --overwrite"
-            return 1 ;;
-    esac
-    prov="$(_py_module_provider "$mod")"
-    if [ -z "$prov" ]; then
-        warn "no known BLFS page provides the python module '$mod'"
-        note "   find it:  packagemanager search $mod"
-        return 1
-    fi
-    say "# '$mod' is missing; installing $prov (asked for with --auto-modules) ..."
-    if packagemanager install "$prov" --run --yes --recursive; then
-        printf '%s\n' "$prov ($mod)" >> "${_AUTO_MODULES_LOG:-/dev/null}"
-        return 0
-    fi
-    warn "installing $prov failed; $mod is still missing"
-    return 1
-}
-
-_take_cmake_dest() {   # _take_cmake_dest <log> <package user>
-    # CMAKE NAMES THE DESTINATION ACROSS THREE LINES.
-    #
-    #   CMake Error at tools/llvm-ar/cmake_install.cmake:52 (file):
-    #     file INSTALL cannot copy file
-    #     ".../build/bin/llvm-ar" to
-    #     "/usr/bin/llvm-ar": Permission denied.
-    #
-    # /usr/bin is drwxrwxr-t root:install -- writable by the group and
-    # STICKY, so only the file's owner may replace it, and /usr/bin/llvm-ar
-    # belonged to p_rust.  No grant fixes that: the directory was never the
-    # problem.  The meson handover next door reads "Installing SRC to DIR"
-    # lines and needs "Unhandled python OSError", so it saw nothing either,
-    # and the repair ran zero rounds.
-    #
-    # Ownership follows the installer.  llvm-ar is llvm's file; take it, and
-    # only from another PACKAGE USER -- root's files are never taken.
-    # the log is joined into one line before matching, because the message
-    # is three lines and the destination is on the third
-    local log="$1" user="${2:-}" dest owner took=0
-    [ -r "$log" ] || return 1
-    [ -n "$user" ] || return 1
-    # ...AND A SYMLINK IT WILL NOT OVERWRITE AT ALL.
-    #
-    #     file INSTALL cannot duplicate symlink
-    #       ".../build/libtiff/libtiff.so.6"
-    #     at
-    #       "/usr/lib/libtiff.so.6"
-    #     because: File exists
-    #
-    # Round 1 handed the .pc file over and the retry then died on this: the
-    # ownership was fine, cmake simply refuses to replace an existing
-    # symlink.  Handing it over changes nothing -- it has to GO.  Only
-    # another package user's, never root's, and only after saying whose it
-    # was.
-    # THE GATE HAS TO KNOW THE WORDING TOO.  The extractor learned meson's
-    # "Operation not permitted: '<path>'" and this gate did not, so the
-    # function returned before looking -- the same shape as the 1.14.222
-    # cmake detector: two places, one fact.
-    grep -qE "file INSTALL cannot (copy file|duplicate symlink)|Operation not permitted: '" \
-        "$log" 2>/dev/null || return 1
-    while IFS= read -r dest; do
-        [ -n "$dest" ] || continue
-        case "$dest" in /*) ;; *) continue ;; esac
-        [ -e "$dest" ] || continue
-        owner="$(stat -c %U "$dest" 2>/dev/null)" || continue
-        [ "$owner" = "$user" ] && continue
-        case "$owner" in
-            root|"")
-                # A ROOT FILE THIS PACKAGE'S MANIFEST CLAIMS (a setid bit we
-                # applied) is handed over BEFORE the phase by the lease, and
-                # restored if the phase fails.  1.14.261 did it here, after
-                # the failure, which needed this log's wording to match.
-                # Nothing root owns is taken here any more.
-                note "#   $dest is root's -- left alone"; continue ;;
-        esac
-        if [ -L "$dest" ]; then
-            # cmake will not overwrite a symlink whatever it is owned by
-            say "    $dest is $owner's symlink -- removing it ($user installs it now)"
-            rm -f "$dest" 2>/dev/null || {
-                warn "could not remove $dest"; continue; }
-            took=1
-            continue
-        fi
-        say "    $dest belongs to $owner -- handing it to $user (the installer owns what it installs)"
-        chown "$user:$user" "$dest" 2>/dev/null || {
-            warn "could not hand $dest to $user"; continue; }
-        took=1
-    done <<EOF
-$(tail -c 262144 "$log" 2>/dev/null | tr '\n' ' ' \
-  | grep -aoE 'file INSTALL cannot copy file[[:space:]]+"[^"]+"[[:space:]]+to[[:space:]]+"[^"]+"' \
-  | sed 's/.*[[:space:]]to[[:space:]]*"//; s/"$//' | sort -u
-tail -c 262144 "$log" 2>/dev/null | tr '\n' ' ' \
-  | grep -aoE 'cannot duplicate symlink[[:space:]]+[^[:space:]]+[[:space:]]+at[[:space:]]+[^[:space:]]+' \
-  | awk '{print $NF}' | sort -u
-# meson/python say it differently, and EPERM on a sticky directory is the
-# same problem: "Operation not permitted: '/usr/sbin/unix_chkpwd'"
-tail -c 262144 "$log" 2>/dev/null \
-  | grep -aoE "Operation not permitted: '[^']+'" \
-  | sed "s/.*'\([^']*\)'.*/\1/" | sort -u)
-EOF
-    [ "$took" = 1 ]
-}
-
-_clear_stale_dest() {   # _clear_stale_dest <log> <package user>
-    # `mv`/`cp` refusing an existing destination is not a permission problem
-    # and no grant will fix it.  Remove the stale copy IF the package being
-    # installed owns it, and say so; anything else is left alone, because a
-    # destination owned by someone else is a real conflict.
-    local log="$1" user="${2:-}" path owner cleared=0
-    [ -r "$log" ] || return 1
-    [ -n "$user" ] || return 1
-    while IFS= read -r path; do
-        [ -n "$path" ] || continue
-        case "$path" in /*) ;; *) continue ;; esac
-        [ -e "$path" ] || continue
-        owner="$(stat -c %U "$path" 2>/dev/null)"
-        if [ "$owner" != "$user" ]; then
-            warn "$path exists and belongs to $owner, not $user --"
-            warn "   leaving it alone: that is a conflict, not stale output"
-            continue
-        fi
-        note "# $path is $user's own output from a previous install;"
-        note "#   removing it so this install can replace it"
-        rm -rf "$path" || { warn "could not remove $path"; continue; }
-        cleared=1
-    done <<EOF
-$(tail -c 262144 "$log" 2>/dev/null \
-  | grep -aoE "cannot overwrite '[^']+'|cannot move '[^']+' to '[^']+': Directory not empty" \
-  | grep -aoE "'[^']+'" | tr -d "'" | sort -u)
-EOF
-    [ "$cleared" = 1 ]
-}
 
 auto_grant_from_log() {
     local log="$1" user="$2" need d granted=0
@@ -3666,181 +3310,6 @@ pkg_users_list() {
     done < <(pkgusr_roots)
 }
 
-# ---------------------------------------------------------------------------
-# setuid/setgid bits: recorded during the build, applied by root afterwards.
-#
-# A PACKAGE USER OWNS FILES, NOT IDENTITY.  The install and chmod wrappers
-# refuse setid modes, which is right -- a package user CAN set setuid on its
-# own file, and the result runs as the PACKAGE USER, not as root.  That is
-# how `su` came to say
-#     setgid: Operation not permitted
-# instead of working: shadow's `install -m 4755 su` was downgraded to 755,
-# and nothing set it afterwards.
-#
-# So: chown to root FIRST, then the mode.  Both, or neither.
-# ---------------------------------------------------------------------------
-
-# What upstream installs with a setid bit, for the case where no request was
-# recorded (an older build, or a package installed by hand).
-# path|mode|group|who asks for it -- checked only if the file exists, and
-# always reported with the mode and owner actually found.
-#
-# `-` IN THE GROUP COLUMN MEANS KEEP WHAT IS THERE, and for a setUID file
-# that is the right answer on this system: only the owner has to be root for
-# the bit to mean root, and the group records which package installed the
-# file.  These all said `root`, so this table ran immediately after the
-# request table and undid it -- `/usr/bin/su is now 4755 root:p_shadow`
-# followed by `/usr/bin/su is now 4755 root:root`, seventeen changes to
-# reach the wrong one.
-#
-# A setGID entry is different: THERE the group is the whole point
-# (dbus-daemon-launch-helper must be group messagebus, fcrontab group
-# fcron), so those keep a named group.
-_setid_known() {
-    # ONE TABLE: setid.conf.  This was a second list, embedded here, and it
-    # disagreed with setid.conf on the mode -- 4755 here, 4711 there -- so
-    # `cfg shadow-pam` set 4711 and the next `lfs-helper setid --run` set
-    # 4755, each correcting the other (the 1.14.260 shape again).  Now the
-    # config file is the list and this reads it.  Only root-owned lines are
-    # setid policy.  Output: path|mode|group|why
-    local conf
-    if ! conf="$(_setid_conf)"; then
-        warn "no setid.conf found (looked in \$SETID_CONF, ${PKGUSR_ETC:-/etc/pkgusr}/stacks, beside lfs-helper)"
-        return 0
-    fi
-    awk -F'|' -v src="$(basename "$conf")" '
-        /^[[:space:]]*(#|$)/ { next }
-        { f = $1; m = $2; o = $3; g = $4
-          gsub(/[[:space:]]/, "", f); gsub(/[[:space:]]/, "", m)
-          gsub(/[[:space:]]/, "", o); gsub(/[[:space:]]/, "", g)
-          if (f == "" || m == "") next
-          if (o != "" && o != "root") next
-          print f "|" m "|" (g == "" ? "-" : g) "|" src }' "$conf"
-}
-
-_setid_state() {   # -> "<mode> <owner>:<group>"
-    stat -c '%a %U:%G' "$1" 2>/dev/null
-}
-
-_setid_apply() {   # <mode> <group> <path>   (root; reads the result back)
-    local mode="$1" grp="$2" f="$3" got=""
-    chown "root:$grp" "$f" || { warn "   chown root:$grp $f failed"; return 1; }
-    chmod "$mode" "$f"     || { warn "   chmod $mode $f failed"; return 1; }
-    # CONFIRM YOUR OWN EFFECTS: chmod returns 0 on a nosuid mount too, and
-    # the bit is then not there.
-    got="$(_setid_state "$f")"
-    case "$got" in
-        "${mode#0} root:$grp"|"$mode root:$grp")
-            ok "   $f is now $got"; return 0 ;;
-    esac
-    warn "   $f still reads '$got', not '$mode root:$grp'"
-    warn "   (a nosuid mount cannot hold a setid bit -- check: findmnt -T $f)"
-    return 1
-}
-
-cmd_setid() {
-    need_root
-    local run=0 a
-    for a in "$@"; do case "$a" in --run) run=1 ;; esac; done
-    local outstanding=0 applied=0 known=0 line mode grp why got home u f
-
-    say "Setuid/setgid bits refused during the build (a package user cannot"
-    say "set them; root can):"
-    say ""
-    while IFS= read -r u; do
-        home="$(pkgusr_home_for "$u" 2>/dev/null)" || continue
-        # a ledger left root-owned by an older release blocks the NEXT
-        # build, not this one, so repair it whenever we are here anyway
-        for _lf in "$home/.pkgusr-setid.requests" "$home/.pkgusr-setid.applied"; do
-            [ -e "$_lf" ] || continue
-            [ "$(stat -c %U "$_lf" 2>/dev/null)" = "$u" ] && continue
-            chown "$u:$u" "$_lf" 2>/dev/null \
-                && note "gave $u back $(basename "$_lf")"
-        done
-        [ -s "$home/.pkgusr-setid.requests" ] || continue
-        say "  $u:"
-        while IFS= read -r line; do
-            [ -n "$line" ] || continue
-            # the recorded line is literally `chmod <mode> <path> [path ...]`
-            set -- $line
-            [ "${1:-}" = chmod ] || continue
-            mode="${2:-}"; shift 2
-            for f in "$@"; do
-                case "$f" in -*) continue ;; esac
-                if [ ! -e "$f" ]; then
-                    warn "    $f: recorded, but not on disk (package removed?)"
-                    continue
-                fi
-                got="$(_setid_state "$f")"
-                say "    $f  is $got, asked for $mode"
-                outstanding=$((outstanding+1))
-                # KEEP THE GROUP THE FILE ALREADY HAS.  Only the USER has
-                # to be root for a setuid bit to mean root; the group is how
-                # this system records which package owns a file, and
-                # root:root threw that away -- `/usr/bin/su is now 4755
-                # root:root` when it should read root:p_shadow.  setid.conf
-                # uses `-` for exactly this; the request path did not.
-                _grp_now="$(stat -c '%G' "$f" 2>/dev/null)"
-                [ -n "$_grp_now" ] || _grp_now=root
-                # A PATH setid.conf NAMES IS DECIDED THERE.  The package asked
-                # for 4755 on su, the table says 4711; applying both flipped
-                # the file twice in one run.
-                if _setid_policy_for "$f" >/dev/null; then
-                    say "      (setid.conf decides this one -- see below)"
-                    continue
-                fi
-                [ "$run" = 1 ] && { _setid_apply "$mode" "$_grp_now" "$f" \
-                    && applied=$((applied+1)); }
-            done
-        done < "$home/.pkgusr-setid.requests"
-        if [ "$run" = 1 ]; then
-            # moved aside, not deleted: what was applied stays answerable
-            cat "$home/.pkgusr-setid.requests" >> "$home/.pkgusr-setid.applied" 2>/dev/null
-            : > "$home/.pkgusr-setid.requests" 2>/dev/null || true
-            # ...and hand both back: they live in the package user's home and
-            # the next build appends to them as that user
-            chown "$u:$u" "$home/.pkgusr-setid.requests" \
-                  "$home/.pkgusr-setid.applied" 2>/dev/null || true
-        fi
-    done < <(pkg_users_list)
-    [ "$outstanding" = 0 ] && say "  (none recorded)"
-
-    say ""
-    say "Programs upstream installs with a setid bit, as found on disk:"
-    say ""
-    while IFS='|' read -r f mode grp why; do
-        [ -n "$f" ] || continue
-        [ -e "$f" ] || continue
-        got="$(_setid_state "$f")"
-        # `-` MEANS KEEP THE GROUP THE FILE HAS.  With `root` hard-coded
-        # here, this table undid the request table one line later.
-        if [ "$grp" = "-" ]; then
-            grp="$(stat -c '%G' "$f" 2>/dev/null)"
-            [ -n "$grp" ] || grp=root
-        fi
-        [ "$got" = "${mode#0} root:$grp" ] && continue
-        known=$((known+1))
-        say "  $f"
-        say "      is   $got"
-        say "      want $mode root:$grp   ($why)"
-        [ "$run" = 1 ] && { _setid_apply "$mode" "$grp" "$f" \
-            && applied=$((applied+1)); }
-    done < <(_setid_known)
-    [ "$known" = 0 ] && say "  (each one is already root-owned with its bit)"
-
-    say ""
-    if [ "$run" = 1 ]; then
-        say "Applied $applied change(s).  Try what was broken:  su -"
-        return 0
-    fi
-    if [ $((outstanding + known)) -gt 0 ]; then
-        say "Nothing was changed.  Apply it:  lfs-helper setid --run"
-        return 1
-    fi
-    ok "every setid bit this system needs is in place"
-    return 0
-}
-
 cmd_find_user_site() {
     need_root
     local run=0; [ "${1:-}" = "--run" ] && run=1
@@ -4045,22 +3514,7 @@ EOF
 #     install: cannot change permissions of '/usr/sbin': Operation not permitted
 # The directory is already there and correctly set up, so there is nothing to do.
 real=/usr/bin/install
-
-# CHECK BEFORE REDIRECTING.  `printf >> file 2>/dev/null || echo ...` does
-# not work: the shell itself reports the failed redirection ("Permission
-# denied") before printf ever runs, and 2>/dev/null on printf cannot
-# suppress it -- which is how the recorder's own message came to fail an
-# install that had finished.
-_sid_record() {   # _sid_record <line>
-    local f="$HOME/.pkgusr-setid.requests"
-    if [ -w "$f" ] || { [ ! -e "$f" ] && [ -w "$HOME" ]; }; then
-        printf '%s\n' "$1" >> "$f"
-    else
-        echo "*** (could not record: $1)" >&2
-        echo "***  apply it as root instead:  lfs-helper setid --run" >&2
-    fi
-}
-args=(); skipped=""; _setid_mode=""
+args=(); skipped=""
 
 # BUNDLED SHORT OPTIONS FIRST, or none of the rules below see what they are
 # looking for.  Everything here matched `-d` only as a whole argument, and
@@ -4135,16 +3589,7 @@ while [ $# -gt 0 ]; do
         -m|--mode)
             case "$2" in
                 [2467][0-7][0-7][0-7])   # setuid/setgid/sticky requested
-                    # WRITE DOWN WHAT WAS REFUSED -- the chmod wrapper does,
-                    # and this is the same refusal.  shadow installs su with
-                    # `install -m 4755`, so the bit was dropped here and
-                    # nothing recorded it; months later `su -` failed with
-                    #     setgid: Operation not permitted
-                    # which names neither su's mode nor its owner.  The
-                    # targets are known after the parse loop, so the mode is
-                    # remembered here and written at the end.
-                    _setid_mode="$2"
-                    echo "*** install -m $2 (using 755 instead; apply it as root: lfs-helper setid --run)" >&2
+                    echo "*** install -m $2 (using 755 instead; set the bit as root if you want it)" >&2
                     args+=(-m 755); shift 2 ;;
                 *) args+=("$1" "$2"); shift 2 ;;
             esac ;;
@@ -4210,32 +3655,7 @@ case "$_dest" in
             exit 0
         fi ;;
 esac
-# RECORD THE REFUSED BIT AGAINST THE FILE THAT ACTUALLY LANDED.
-#
-# Only after the install succeeded: a request naming a file that was never
-# installed sends root to chmod something that is not there.
-if [ -z "$_setid_mode" ]; then
-    exec "$real" "${args[@]}"
-fi
-"$real" "${args[@]}" || exit $?
-_f="$HOME/.pkgusr-setid.requests"
-_last="${args[$((${#args[@]} - 1))]}"
-_srcs2=(); _n2=${#args[@]}
-for ((_i = 0; _i < _n2 - 1; _i++)); do
-    case "${args[$_i]}" in -*) continue ;; esac
-    if [ "$_i" -gt 0 ]; then
-        case "${args[$((_i - 1))]}" in -m|--mode|-o|--owner|-g|--group|-t|-S) continue ;; esac
-    fi
-    _srcs2+=("${args[$_i]}")
-done
-if [ -d "$_last" ]; then
-    for _s in ${_srcs2[@]+"${_srcs2[@]}"}; do
-        _sid_record "chmod $_setid_mode ${_last%/}/$(basename "$_s")"
-    done
-else
-    _sid_record "chmod $_setid_mode $_last"
-fi
-exit 0
+exec "$real" "${args[@]}"
 EOF
 
     # A SERVICE ACCOUNT IS ROOT'S JOB.
@@ -4286,21 +3706,6 @@ EOF
 #!/bin/bash
 # Allow everything except setuid/setgid, which a package user must not set.
 real=/usr/bin/chmod
-
-# CHECK BEFORE REDIRECTING.  `printf >> file 2>/dev/null || echo ...` does
-# not work: the shell itself reports the failed redirection ("Permission
-# denied") before printf ever runs, and 2>/dev/null on printf cannot
-# suppress it -- which is how the recorder's own message came to fail an
-# install that had finished.
-_sid_record() {   # _sid_record <line>
-    local f="$HOME/.pkgusr-setid.requests"
-    if [ -w "$f" ] || { [ ! -e "$f" ] && [ -w "$HOME" ]; }; then
-        printf '%s\n' "$1" >> "$f"
-    else
-        echo "*** (could not record: $1)" >&2
-        echo "***  apply it as root instead:  lfs-helper setid --run" >&2
-    fi
-}
 me="$(id -un)"
 for a in "$@"; do
     case "$a" in
@@ -4315,8 +3720,7 @@ for a in "$@"; do
             # its setgid bit at install time.  A refusal nobody records is a
             # decision that has to be re-derived from its consequences.
             echo "*** chmod $* (skipped: refuses to set setuid/setgid; do it as root if needed)" >&2
-            # A RECORDER THAT CANNOT WRITE IS A NOTE, NOT A FAILURE.
-            _sid_record "chmod $*"
+            printf 'chmod %s\n' "$*" >> "$HOME/.pkgusr-setid.requests" 2>/dev/null
             exit 0 ;;
     esac
 done
@@ -5012,26 +4416,13 @@ _claim_candidates() {   # <owner> <manifest> ; paths on stdout
         printf '%s\n' "$r$p"
     done < "$man" > "$tmp"
     # stat in batches: a path that does not exist simply produces no line
-    # A SETUID FILE IS NEVER CLAIMED.
-    #
-    #     ~ > su -
-    #     su: Authentication service cannot retrieve authentication info
-    #
-    # This ran before EVERY phase, configure included, and shadow's manifest
-    # lists /usr/bin/su: "gave 'p_shadow' 16 path(s)" was su, passwd, chage
-    # and the rest going 4711 root -> 755 p_shadow, because chown clears the
-    # bit.  Nothing put them back -- the lease only sees a file someone
-    # ELSE owns, and after this p_shadow owned them.  Root's setid files are
-    # the lease's to hand over: it copies them aside, restores them on
-    # failure and applies setid.conf on success.
-    xargs -d '\n' -r -a "$tmp" stat -c '%U %A %n' -- 2>/dev/null | awk -v o="$owner" '
+    xargs -d '\n' -r -a "$tmp" stat -c '%U %n' -- 2>/dev/null | awk -v o="$owner" '
         {
-            u = $1; a = $2
-            i = index($0, " "); rest = substr($0, i + 1)
-            j = index(rest, " "); path = substr(rest, j + 1)
+            u = $1
+            i = index($0, " ")
+            path = substr($0, i + 1)
             if (u == o) next
             if (u != "root" && u != "lfs" && u != "UNKNOWN") next
-            if (substr(a, 4, 1) ~ /[sS]/ || substr(a, 7, 1) ~ /[sS]/) next
             print path
         }'
     rm -f "$tmp"
@@ -5076,30 +4467,8 @@ _claim_earlier_stages() {
     detail "# claiming files from earlier stages of $owner ..."
     local chownbin; chownbin="$(_real_tool chown)"
     local batch; batch="$(mktemp)" || return 0
-    # AN EARLIER STAGE IS EARLIER THAN THIS PACKAGE'S OWN INSTALLS.
-    #
-    # Chapter 7 builds gettext, perl, Python ... as root under the same names
-    # chapter 8 uses, so the step's OWN manifest holds root-owned leftovers
-    # the first package-user build must take over.  After that first
-    # successful install, a root-owned entry in its own manifest is not a
-    # leftover -- it is something recorded by mistake: LLVM's listed
-    # /usr/bin/lfs, /usr/bin/packagemanager and /etc/pam.d/su_u_user (root
-    # wrote them during its hours-long install window), and this step
-    # "gave 'p_llvm' 13 path(s)", making a script root runs on every su
-    # writable by p_llvm.  The -tmp/-pass/libstdcpp stages are always earlier.
-    local _home_done=""
-    _home_done="$(pkgusr_home_for "$(unprefix_pkg_user "$owner")" 2>/dev/null)"
-    local _installed_before=0
-    [ -n "$_home_done" ] && { [ -s "$_home_done/.pkgusr-installed" ] || [ -s "$_home_done/VERSION" ]; } \
-        && _installed_before=1
     for base in $seen; do
         man="$MANIFESTS/$base.files"
-        if [ "$_installed_before" = 1 ]; then
-            case "$base" in
-                *-tmp|*-pass1|*-pass2|libstdcpp|libstdc++) ;;
-                *) continue ;;
-            esac
-        fi
         if [ -s "$man" ]; then
             _claim_candidates "$owner" "$man" > "$batch"
             if [ -s "$batch" ]; then
@@ -5272,354 +4641,6 @@ EOF
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# THE LEASE: files a phase will overwrite that someone else owns.  (1.14.263)
-#
-# The old way was fail, read the log, repair, retry.  Every tool words the
-# refusal differently -- cmake, meson, python, a bash redirect -- and each
-# needed its own parser.  Shadow's configure died on
-#     line 153: /etc/pam.d/su: Permission denied
-# which no parser recognised, so the round granted the DIRECTORY, which was
-# never the problem, and stopped.  And the setid pass and the 1.14.261
-# take-back were two halves of one cycle: root gets the file for its bit,
-# the next install cannot replace it, a repair hands it back.
-#
-# So, around every install/configure phase, as root:
-#   before   copy each file the phase will write that another account owns,
-#            with its owner and mode, and hand it to the installer.  COPY,
-#            never move: the phase itself starts with `su - p_<pkg>`, and
-#            su, its pam file and unix_chkpwd must exist at that moment.
-#   failure  put every copy back, owner and mode included, and read it back.
-#   success  a setid.conf file gets its policy; a file the phase did not
-#            change goes back to its owner; a file it rewrote belongs to the
-#            installer (the rule everywhere else).
-#
-# WHICH FILES, before anything runs:
-#   * install/all/update: the package's own manifest -- ROOT-owned entries
-#     only.  Those are files it installed that root took for a setid bit.
-#   * configure/all/update: the paths configure_pkg writes, read from the
-#     script (script_write_targets).
-# A root-owned file is leased ONLY when this package's manifest claims it.
-# The script is editable by the package user; without that rule, one edited
-# line could hand it /etc/shadow.  Files of non-package accounts (the main
-# user, u_*) are never leased.  The first install of a file another package
-# owns cannot be known in advance, so the repair loop stays as the fallback.
-# ---------------------------------------------------------------------------
-LEASES="$STATE/leases"
-
-# script_write_targets <script> [function ...]  -> absolute paths, one a line
-#
-# What a shell function WRITES, read from its text: redirect targets
-# (> >> and tee), the destination of install/cp/mv/ln, the files of sed -i.
-# A `for VAR in a b c` loop expands ${VAR}/$VAR; any other expansion, a
-# glob or a brace is dropped rather than guessed.  Comments and heredoc
-# BODIES are skipped -- a heredoc body is data, and "prose is not code".
-script_write_targets() {
-    local script="$1"; shift
-    [ -r "$script" ] || return 1
-    [ $# -gt 0 ] || set -- configure_pkg
-    local fn
-    for fn in "$@"; do
-        sed -n "/^${fn}() {/,/^}/p" "$script"
-    done | awk '
-        function emit(p,    n, i, x, v, out) {
-            gsub(/^["\047]|["\047]$/, "", p)
-            if (p !~ /^\//) return
-            if (p ~ /[*?[{}]/) {
-                # ${VAR} is the one brace we understand
-                if (p !~ /\$\{[A-Za-z_][A-Za-z_0-9]*\}/) return
-                tmp = p; gsub(/\$\{[A-Za-z_][A-Za-z_0-9]*\}/, "", tmp)
-                if (tmp ~ /[*?[{}]/) return
-            }
-            if (p ~ /\$/) {
-                for (v in lists) {
-                    if (index(p, "${" v "}") || p ~ ("\\$" v "([^A-Za-z_0-9]|$)")) {
-                        n = split(lists[v], x, " ")
-                        for (i = 1; i <= n; i++) {
-                            out = p
-                            gsub("\\$\\{" v "\\}", x[i], out)
-                            gsub("\\$" v, x[i], out)
-                            if (out !~ /\$/) emit(out)
-                        }
-                        return
-                    }
-                }
-                return
-            }
-            if (p ~ /^\/(dev|proc|sys|tmp|run)(\/|$)/) return
-            print p
-        }
-        # skip a heredoc body until its delimiter
-        hd != "" { d = $0; if (strip) sub(/^\t+/, "", d); if (d == hd) hd = ""; next }
-        /^[[:space:]]*#/ { next }
-        {
-            buf = buf $0
-            if (sub(/\\$/, "", buf)) next
-            line = buf; buf = ""
-            # the opener line still counts; its BODY does not
-            if (match(line, /<<-?[[:space:]]*["\047]?[A-Za-z_][A-Za-z_0-9]*["\047]?/)) {
-                h = substr(line, RSTART, RLENGTH)
-                strip = (h ~ /^<<-/)
-                gsub(/^<<-?[[:space:]]*|["\047]/, "", h)
-                hd = h
-                line = substr(line, 1, RSTART - 1) " " substr(line, RSTART + RLENGTH)
-            }
-            # redirect targets (not 2> / &> / <>, and not >&2)
-            l = line
-            while (match(l, /(^|[^0-9&<>])>>?[[:space:]]*[^[:space:];|&<>()]+/)) {
-                t = substr(l, RSTART, RLENGTH); l = substr(l, RSTART + RLENGTH)
-                sub(/^[^>]*>>?[[:space:]]*/, "", t)
-                if (t !~ /^&/) emit(t)
-            }
-            nseg = split(line, seg, /&&|\|\||;|\|/)
-            for (s = 1; s <= nseg; s++) {
-                # drop empty fields: a segment ending in a space splits into
-                # a trailing "" that would become the "last word"
-                nn = split(seg[s], ww, /[[:space:]]+/); n = 0
-                for (j = 1; j <= nn; j++) if (ww[j] != "") w[++n] = ww[j]
-                k = 1; while (k <= n && (w[k] ~ /^(do|then|else|elif|!|sudo|\{|\()$/)) k++
-                if (k > n) continue
-                cmd = w[k]
-                if (cmd == "for" && k + 2 <= n && w[k+2] == "in") {
-                    v = w[k+1]; lists[v] = ""
-                    for (j = k + 3; j <= n; j++) { x1 = w[j]; sub(/;$/, "", x1); if (x1 != "" && x1 != "do") lists[v] = lists[v] " " x1 }
-                    continue
-                }
-                if (cmd ~ /^(install|cp|mv|ln)$/) {
-                    last = ""; isdir = 0; tdir = ""
-                    for (j = k + 1; j <= n; j++) {
-                        if (w[j] ~ /^>/) break
-                        if (w[j] == "-t" && j < n) { tdir = w[j+1]; j++; continue }
-                        if (cmd == "install" && w[j] ~ /^-[A-Za-z]*d/) isdir = 1
-                        if (w[j] ~ /^-/) {
-                            # install -m 644 / -o x / -g y take a value
-                            if (cmd == "install" && w[j] ~ /^-[mog]$/) j++
-                            continue
-                        }
-                        last = w[j]
-                    }
-                    if (!isdir && tdir == "" && last != "") emit(last)
-                    continue
-                }
-                if (cmd == "tee") {
-                    for (j = k + 1; j <= n; j++) if (w[j] !~ /^-/) emit(w[j])
-                    continue
-                }
-                if (cmd == "sed") {
-                    inplace = 0; havescript = 0
-                    for (j = k + 1; j <= n; j++) {
-                        if (w[j] ~ /^-i/ || w[j] == "--in-place") { inplace = 1; continue }
-                        if (w[j] == "-e" || w[j] == "-f") { havescript = 1; j++; continue }
-                        if (w[j] ~ /^-/) continue
-                        if (!havescript) { havescript = 1; continue }
-                        if (inplace) emit(w[j])
-                    }
-                }
-            }
-        }' | awk '!seen[$0]++'
-}
-
-cmd_script_targets() {
-    local script="${1:-}"
-    case "$script" in
-        ""|-h|--help)
-            say "lfs-helper script-targets <install script> [function ...]"
-            say ""
-            say "Lists the absolute paths the named functions write (default"
-            say "configure_pkg): redirects, tee, install/cp/mv/ln destinations,"
-            say "sed -i.  for-loops are expanded; other expansions are dropped."
-            say "This is the list the lease reads before a phase runs."
-            [ -n "$script" ]; return ;;
-    esac
-    shift
-    [ -r "$script" ] || die "script-targets: cannot read $script"
-    script_write_targets "$script" "$@"
-}
-
-# the single policy table: setid.conf, wherever this install keeps it
-_setid_conf() {
-    local c
-    for c in "${SETID_CONF:-}" "${PKGUSR_ETC:-/etc/pkgusr}/stacks/setid.conf" \
-             "$(dirname "$(readlink -f "$0" 2>/dev/null || echo "$0")")/stacks/setid.conf"; do
-        [ -n "$c" ] && [ -r "$c" ] && { printf '%s\n' "$c"; return 0; }
-    done
-    return 1
-}
-
-# _setid_policy_for <path>  -> "mode|owner|group" from setid.conf, or nothing
-_setid_policy_for() {
-    local conf; conf="$(_setid_conf)" || return 1
-    awk -F'|' -v p="$1" '
-        /^[[:space:]]*(#|$)/ { next }
-        { f = $1; gsub(/[[:space:]]/, "", f)
-          if (f == p) { m = $2; o = $3; g = $4
-                        gsub(/[[:space:]]/, "", m); gsub(/[[:space:]]/, "", o); gsub(/[[:space:]]/, "", g)
-                        print m "|" (o == "" ? "root" : o) "|" (g == "" ? "-" : g); found = 1; exit } }
-        END { exit !found }' "$conf"
-}
-
-_lease_dir() { printf '%s/%s\n' "$LEASES" "$(unprefix_pkg_user "$1")"; }
-
-# _lease_candidates <owner> <script> <phase>
-_lease_candidates() {
-    local owner="$1" script="$2" phase="$3" pkg man
-    pkg="$(unprefix_pkg_user "$owner")"
-    man="$MANIFESTS/$pkg.files"
-    case "$phase" in
-        install|all|update)
-            if [ -r "$man" ]; then
-                # A PACKAGE RECLAIMS ITS OWN FILES.  Every manifest entry
-                # someone else owns now -- root (a setid bit applied) or
-                # another package (a later install took it) -- is leased.
-                # Only root's took this path, so shadow's own file held by
-                # another package still failed on a bash redirect or cp,
-                # whose wording no repair parses.  lease_files keeps the
-                # guards: package accounts and manifest-claimed root only.
-                grep -v '^[[:space:]]*$' "$man" | xargs -r -d '\n' stat -c '%U|%n' 2>/dev/null \
-                    | awk -F'|' -v o="$owner" '$1 != o { sub(/^[^|]*\|/, ""); print }'
-            fi ;;
-    esac
-    case "$phase" in
-        configure|all|update) script_write_targets "$script" configure_pkg ;;
-    esac
-}
-
-# lease_files <owner> <script> <phase>   (root; before the phase)
-lease_files() {
-    local owner="$1" script="$2" phase="$3" dir ledger n=0 p u g m accounts
-    [ "$(id -u)" = 0 ] || return 0
-    case "$phase" in install|configure|all|update) ;; *) return 0 ;; esac
-    user_exists "$owner" || return 0
-    dir="$(_lease_dir "$owner")"; ledger="$dir/ledger"
-    # A LEDGER LEFT BEHIND means the last phase never got to settle (killed,
-    # power cut).  Its copies are the only record of what was there: restore
-    # them first, then lease afresh.
-    if [ -s "$ledger" ]; then
-        note "# $owner: a lease from an interrupted run is still open -- restoring it first"
-        lease_restore "$owner" || {
-            warn "!! could not restore the old lease in $dir -- not leasing again"
-            return 1; }
-    fi
-    local man="$MANIFESTS/$(unprefix_pkg_user "$owner").files"
-    accounts="$(pkg_users_list 2>/dev/null)"
-    mkdir -p "$dir/files" 2>/dev/null && chmod 700 "$LEASES" "$dir" 2>/dev/null
-    : > "$ledger" || { warn "!! cannot write $ledger -- no lease"; return 1; }
-    local _cfg_targets=""
-    case "$phase" in
-        configure|all|update) _cfg_targets="$(script_write_targets "$script" configure_pkg 2>/dev/null)" ;;
-    esac
-    while IFS= read -r p; do
-        [ -n "$p" ] || continue
-        [ -e "$p" ] || [ -L "$p" ] || continue
-        [ -d "$p" ] && [ ! -L "$p" ] && continue
-        grep -qF "$p|" "$ledger" 2>/dev/null && continue
-        # NO SYMLINK IN THE WAY.  If a directory on the path is a link a
-        # package user controls, the name the manifest vouches for is not
-        # the file that would be handed over.
-        if [ "$(cd "$(dirname "$p")" 2>/dev/null && pwd -P)/$(basename "$p")" != "$p" ]; then
-            detail "#   $p goes through a symlinked directory -- left alone"
-            continue
-        fi
-        u="$(stat -c %U "$p" 2>/dev/null)" || continue
-        [ "$u" = "$owner" ] && continue
-        if [ "$u" = root ]; then
-            if ! grep -qxF "$p" "$man" 2>/dev/null; then
-                detail "#   $p is root's and $owner's manifest does not claim it -- left alone"
-                continue
-            fi
-            # A MANIFEST CLAIM IS NOT ENOUGH FOR ROOT'S FILES.  Manifests are
-            # built by time window, and a long phase swallowed what root
-            # wrote meanwhile -- LLVM's claimed /usr/bin/lfs and
-            # /etc/pam.d/su_u_user, and the lease handed them to p_llvm.  A
-            # package's file is root's for two reasons only: a setid bit
-            # (the policy put it there) or its own configure commands write
-            # it.  Anything else root owns is not the package's to borrow.
-            if ! { [ -u "$p" ] || [ -g "$p" ] || _setid_policy_for "$p" >/dev/null 2>&1 \
-                   || printf '%s\n' "$_cfg_targets" | grep -qxF "$p"; }; then
-                detail "#   $p is root's, not setid and not written by $owner's configure -- left alone"
-                continue
-            fi
-        elif ! printf '%s\n' "$accounts" | grep -qxF "$u"; then
-            detail "#   $p belongs to $u, not a package account -- left alone"
-            continue
-        fi
-        g="$(stat -c %G "$p")"; m="$(stat -c %a "$p")"
-        n=$((n + 1))
-        cp -a "$p" "$dir/files/$n" 2>/dev/null || {
-            warn "!!  could not copy $p aside -- not leasing it"; continue; }
-        printf '%s|%s|%s|%s|%s\n' "$p" "$m" "$u" "$g" "$n" >> "$ledger"
-        if chown -h "$owner:$owner" "$p" 2>/dev/null; then
-            detail "#   leased $p ($m $u:$g) to $owner for this phase"
-        else
-            warn "!!  could not hand $p to $owner"
-        fi
-    done < <(_lease_candidates "$owner" "$script" "$phase")
-    [ -s "$ledger" ] || rm -rf "$dir" 2>/dev/null
-    return 0
-}
-
-# lease_restore <owner>   -- failure: every copy back, owner and mode, read back
-lease_restore() {
-    local owner="$1" dir ledger p m u g n bad=0 got want
-    dir="$(_lease_dir "$owner")"; ledger="$dir/ledger"
-    [ -s "$ledger" ] || return 0
-    while IFS='|' read -r p m u g n; do
-        [ -n "$p" ] || continue
-        rm -f "$p" 2>/dev/null
-        if cp -a "$dir/files/$n" "$p" 2>/dev/null; then
-            chown -h "$u:$g" "$p" 2>/dev/null
-            [ -L "$p" ] || chmod "$m" "$p" 2>/dev/null
-        fi
-        got="$(stat -c '%a %U:%G' "$p" 2>/dev/null)"
-        want="$m $u:$g"
-        [ -L "$p" ] && { got="${got#* }"; want="$u:$g"; }
-        if [ "$got" = "$want" ] && cmp -s "$dir/files/$n" "$p" 2>/dev/null \
-           || { [ -L "$p" ] && [ "$(readlink "$p")" = "$(readlink "$dir/files/$n")" ]; }; then
-            detail "#   restored $p ($want)"
-        else
-            warn "!!  $p did not come back as it was ($got, wanted $want)"
-            warn "      the original is still at $dir/files/$n"
-            bad=1
-        fi
-    done < "$ledger"
-    [ "$bad" = 0 ] && rm -rf "$dir"
-    return "$bad"
-}
-
-# lease_settle <owner>   -- success
-lease_settle() {
-    local owner="$1" dir ledger p m u g n pol pm po pg
-    dir="$(_lease_dir "$owner")"; ledger="$dir/ledger"
-    [ -s "$ledger" ] || return 0
-    while IFS='|' read -r p m u g n; do
-        [ -n "$p" ] || continue
-        if [ ! -e "$p" ] && [ ! -L "$p" ]; then
-            note "#   $p was leased and the phase removed it"
-            continue
-        fi
-        if pol="$(_setid_policy_for "$p")"; then
-            IFS='|' read -r pm po pg <<<"$pol"
-            [ "$pg" = "-" ] && pg="$(stat -c %G "$p")"
-            # _setid_apply is root:<group> + mode, read back; the owner
-            # column is root for every setid line, and anything else is
-            # not a setid policy this code should apply
-            if [ "$po" = root ]; then
-                _setid_apply "$pm" "$pg" "$p" >/dev/null || warn "!!  $p: setid.conf policy did not apply"
-                continue
-            fi
-        fi
-        if cmp -s "$dir/files/$n" "$p" 2>/dev/null; then
-            # the phase did not change it: the lease was not needed
-            chown -h "$u:$g" "$p" 2>/dev/null
-            [ -L "$p" ] || chmod "$m" "$p" 2>/dev/null
-            detail "#   $p unchanged -- back to $u:$g"
-        else
-            say "#   $p rewritten by $owner -- it owns it now (was $u:$g)"
-        fi
-    done < "$ledger"
-    rm -rf "$dir"
-}
-
 report_setid_requests() {
     # Printed after the phase, by root, because only root can act on it.
     local owner="${1:-}" home f
@@ -5627,32 +4648,6 @@ report_setid_requests() {
     home="$(pkgusr_home_for "$owner" 2>/dev/null)"
     f="$home/.pkgusr-setid.requests"
     [ -s "$f" ] || return 0
-    # APPLY THEM, DO NOT RECITE THEM.
-    #
-    # This function runs AS ROOT, right after the install -- the one moment
-    # when the thing that is missing can simply be done.  It printed nine
-    # chmod lines for shadow and left `su` non-setuid until somebody typed
-    # them, which is the same "warn and walk away" that
-    # /etc/pam.d/su_u_user and the mode of that file were both guilty of.
-    #
-    # `lfs-helper setid --run` is the routine that already knows how: it
-    # applies each recorded request and READS THE MODE BACK.  Call it, and
-    # report what it did rather than what the reader should do.
-    if [ "$(id -u)" = 0 ]; then
-        warn ""
-        warn "This package asked for setuid/setgid bits, which a package user"
-        warn "cannot set -- applying them now (root):"
-        while IFS= read -r line; do
-            [ -n "$line" ] && warn "    $line"
-        done < "$f"
-        if cmd_setid --run; then
-            warn "    applied.  'lfs-helper setid' lists anything still outstanding."
-        else
-            warn "    SOME COULD NOT BE APPLIED -- see above; the requests are kept."
-            warn "    retry at any time:  lfs-helper setid --run"
-        fi
-        return 0
-    fi
     warn ""
     warn "This package asked for setuid/setgid bits, which a package user"
     warn "cannot set.  Nothing else refuses them; the binaries are installed"
@@ -5662,14 +4657,7 @@ report_setid_requests() {
     while IFS= read -r line; do
         [ -n "$line" ] && warn "    $line"
     done < "$f"
-    warn ""
-    warn "All of them at once, at any later time:"
-    warn "    lfs-helper setid            # what is outstanding"
-    warn "    lfs-helper setid --run      # apply it"
-    # NOT CLEARED HERE.  Printing once and emptying the file made this a
-    # notice you had to be watching for: six hours of build output later
-    # there was no way to ask what had been refused.  `setid --run` is what
-    # clears a line, once it has applied it and read the result back.
+    : > "$f" 2>/dev/null || true
 }
 
 run_phase_as() {
@@ -5708,13 +4696,6 @@ run_phase_as() {
         case "$phase" in all|update) clear_phases "$track" ;; esac
     fi
     mkdir -p "$(dirname "$log")" 2>/dev/null || true
-    # THE LEASE (1.14.263): files this phase will overwrite that root or
-    # another package owns are handed to the installer first, and settled or
-    # restored below.  Root writes anything, so a root run needs none.
-    local _leased=0
-    if [ "$as_root" != 1 ] && have_su && user_exists "$owner"; then
-        lease_files "$owner" "$script" "$phase" && _leased=1
-    fi
     if [ "$as_root" = 1 ] || ! have_su || ! user_exists "$owner"; then
         ( [ -n "$cwd" ] && cd "$cwd"; eval "env $envpass bash '$script' '$phase'" ) \
             2>&1 | tee "$log"
@@ -5723,22 +4704,6 @@ run_phase_as() {
         # `su -` resets the environment, so the vars go on the command line
         su - "$owner" -c "env $envpass bash '$script' '$phase'" 2>&1 | tee "$log"
         rc=${PIPESTATUS[0]}
-    fi
-    # A SINGLE-PHASE RUN KNOWS WHICH PHASE FAILED: ITS OWN.
-    #
-    # LAST_FAILED_PHASE was only set in the all|update branch below, and it
-    # is cleared at the top of this function -- so the FIRST retry (which
-    # runs just `install`) left it empty, and cmd_build's second round fell
-    # back to `$phase` = all.  opencv's round 2 therefore re-cloned and
-    # rebuilt a tree that had reached 100%, to redo an install that needed
-    # one more directory grant.  Rounds 1 and 2 printed the difference:
-    #     round 1 ... (phase install only -- the build is done)
-    #     round 2 ... (phase all)
-    if [ "$rc" != 0 ]; then
-        case "$phase" in
-            all|update) ;;                 # parsed from the log below
-            *) LAST_FAILED_PHASE="$phase" ;;
-        esac
     fi
     if [ -n "$track" ]; then
         local _p
@@ -5809,23 +4774,7 @@ run_phase_as() {
     fi
     if [ "$rc" = 0 ] && [ -n "$log" ] && [ -f "$log" ]; then
         local _swallowed=""
-        # CMAKE SAYS IT DIFFERENTLY, AND IT SAID IT.
-        #
-        #   CMake Error at CMakeLists.txt:6 (set):
-        #     There is an unterminated variable reference.
-        #   -- Configuring incomplete, errors occurred!
-        #
-        # ...and the run printed "llvm: done (all phases complete)".  The
-        # pattern below knows make and ninja; cmake fails before either runs,
-        # so nothing matched and a configure error became a finished build.
-        # That is the exact failure this check was written for, in another
-        # tool's words.
-        #
-        # And the `ninja` in the first alternative never matched anything:
-        # ninja prints `ninja: build stopped: subcommand failed.` with no
-        # `***`, so it needs its own branch -- the one place this check was
-        # supposed to work, and did not.
-        _swallowed="$(grep -m1 -E "^(make(\[[0-9]+\])?|ninja): \*\*\* .*(Error [0-9]+|build stopped)|^ninja: build stopped|^install: cannot create|: Permission denied$|^CMake Error|^-- Configuring incomplete|^configure: error:|^meson\.build:[0-9]+:[0-9]+: ERROR:|^ERROR: Unhandled python|^error: could not compile|^fatal: could not read Username|^fatal: repository .* not found|^fatal: Authentication failed|BackendUnavailable: Cannot import|^ModuleNotFoundError: No module named" \
+        _swallowed="$(grep -m1 -E "^(make(\[[0-9]+\])?|ninja): \*\*\* .*(Error [0-9]+|build stopped)|^install: cannot create|: Permission denied$" \
                       "$log" 2>/dev/null)"
         if [ -n "$_swallowed" ]; then
             warn "!! this phase exited 0, but its log says otherwise:"
@@ -5833,17 +4782,6 @@ run_phase_as() {
             warn "   Treating it as a FAILURE -- a package that could not write"
             warn "   its files is not installed, whatever the exit status said."
             rc=1
-        fi
-    fi
-    # SETTLE ONLY AFTER THE LOG HAS HAD ITS SAY: a zero exit with "Permission
-    # denied" in the log is a failure, and a failure puts every leased file
-    # back.
-    if [ "$_leased" = 1 ]; then
-        if [ "$rc" = 0 ]; then
-            lease_settle "$owner"
-        else
-            lease_restore "$owner" \
-                || warn "!! some leased files could not be restored -- see above"
         fi
     fi
     return "$rc"
@@ -5927,37 +4865,6 @@ _version_from_script() {
     [ -r "${1:-}" ] || return 0
     sed -n "s/^name_version=[\"']\(.*\)[\"']\$/\1/p" "$1" 2>/dev/null | head -1 \
         | sed 's/^.*-\([0-9][0-9.]*\)$/\1/'
-}
-
-# WHAT IS INSTALLED IS WHAT FINISHED -- ON EVERY PATH THAT FINISHES.
-#
-# `update` reads the installed version from .pkgusr-installed.  It was
-# written in ONE branch: a single-phase run completing the last phase.  A
-# normal `--phase all` install (every packagemanager install) took the other
-# branch and never wrote it; and VERSION, beside it, parsed only
-# name_version="..." while the generator writes name_version='...'.  So no
-# record was written on success, the reader fell back to install_last (staged
-# BEFORE the build), and a failed build advanced the version.  1.14.273 then
-# seeded the marker with the OLD version before a build -- and with nothing
-# updating it on success, LLVM 22.1.8 installed and kept reading 21.1.8, and
-# every stack run planned it again.
-#
-# Called after every phase has succeeded, whichever branch got there.
-_record_installed() {   # <name> <owner> <script>
-    local name="$1" owner="$2" script="$3" nv home
-    nv="$(sed -n "s/^name_version=['\"]\([^'\"]*\)['\"].*/\1/p" "$script" 2>/dev/null | head -n1)"
-    [ -n "$nv" ] || return 0
-    home="$(pkgusr_home_for "$owner" 2>/dev/null)"
-    [ -n "$home" ] && [ -d "$home" ] || home="$(pkgusr_home_for "$name" 2>/dev/null)"
-    [ -n "$home" ] && [ -d "$home" ] || return 0
-    {
-        echo "$nv"
-        echo "# installed $(date '+%Y-%m-%d %H:%M:%S') by lfs-helper"
-        [ -n "${_book_of_script:-}" ] && echo "# from: $_book_of_script"
-    } > "$home/VERSION"
-    printf '%s\n' "$nv" > "$home/.pkgusr-installed"
-    # benign: notes in the package's own home, rewritten every install
-    real_chown "$owner:$owner" "$home/VERSION" "$home/.pkgusr-installed" 2>/dev/null || true
 }
 
 _write_pkgusr_info() {
@@ -6090,8 +4997,6 @@ _package_already_owns_files() {
 cmd_build() {
     need_root
     local name="" phase="all" force=0 run_tests=0 jobs="" auto_fix=1
-    local auto_modules="${PM_AUTO_MODULES:-0}"
-    local _AUTO_MODULES_LOG=""
     local _force_stage=auto script_override="" as_root=0
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -6108,7 +5013,6 @@ cmd_build() {
             --tests) run_tests=1; shift ;;
             --jobs|-j) jobs="${2:?--jobs needs a number}"; shift 2 ;;
             --no-auto-fix) auto_fix=0; shift ;;
-            --auto-modules) auto_modules=1; shift ;;
             # A CONFIGURATION STEP THAT NEEDS ROOT (1.14.79) told people to run
             #     lfs-helper build fcron --phase configure --force --as-root
             # and cmd_build did not take --as-root: the flag existed on
@@ -6296,9 +5200,7 @@ cmd_build() {
     else
         pkgusr_ready || die "run 'lfs-helper init-pkgusr --run' first"
         owner="$(pkg_owner_name "$name")"
-        # an existing account is the normal case for every build after the
-        # first -- say nothing about it (`lfs-helper add-user` still does)
-        _QUIET_EXISTING=1 cmd_add_user "$owner"
+        cmd_add_user "$owner"
         stagedir="$(pkgusr_home_for "$owner")"
         staged="$stagedir/install_$name"
         # ALREADY THERE IS ALREADY STAGED.
@@ -6381,20 +5283,7 @@ cmd_build() {
     mkdir -p "$(dirname "$GRANTED")" 2>/dev/null || true
     : > "$GRANTED" 2>/dev/null || true
     create_service_accounts_from_script "$staged"
-    # ROOT MUST NOT LEAVE A FILE THE PACKAGE USER CANNOT WRITE.
-    #
-    # This truncation runs as root, so the ledger came out root:root -- and
-    # then the install wrapper, running as the package user, could not
-    # append to it:
-    #     /usr/lib/pkgusr/install: .pkgusr-setid.requests: Permission denied
-    # The swallowed-failure check saw "Permission denied" and failed the
-    # build, correctly, over the RECORDER rather than the package.  Every
-    # root write to this file hands it back.
-    _sidf="$(pkgusr_home_for "$owner" 2>/dev/null)/.pkgusr-setid.requests"
-    if [ -n "${_sidf:-}" ]; then
-        : > "$_sidf" 2>/dev/null || true
-        chown "$owner:$owner" "$_sidf" 2>/dev/null || true
-    fi
+    : > "$(pkgusr_home_for "$owner" 2>/dev/null)/.pkgusr-setid.requests" 2>/dev/null || true
     say "# building $name ..."
     local rc=0
     make_wrappers
@@ -6528,32 +5417,6 @@ cmd_build() {
          && ! printf '%s' "$envpass" | grep -q "MAKEFLAGS="; then
         envpass="$envpass MAKEFLAGS='$MAKEFLAGS'"
     fi
-    # THREE BUILD SYSTEMS, THREE VARIABLES, ONE NUMBER.
-    #
-    # make reads MAKEFLAGS; cmake reads CMAKE_BUILD_PARALLEL_LEVEL; cargo
-    # reads CARGO_BUILD_JOBS; ninja reads NOTHING and defaults to nproc+2,
-    # which is why machine.conf patches its -j into the script.  Setting
-    # MAKEFLAGS alone limited one of the four, so `--jobs 13` was not a
-    # limit -- a cmake or rust package still ran wide and got OOM-killed.
-    # READ THE VALUE THAT WILL ACTUALLY BE PASSED.
-    #
-    # This looked at ${MAKEFLAGS:-} -- the AMBIENT one, in root's shell --
-    # while the number lives in /etc/pkgusr/build.env, which is already in
-    # $envpass by now.  In a chroot root shell MAKEFLAGS is unset, so
-    # `MAKEFLAGS=-j13` in build.env produced no CARGO_BUILD_JOBS at all and
-    # rust built on every core.
-    _jn="$jobs"
-    [ -n "$_jn" ] || _jn="$(printf '%s' "$envpass" \
-                            | grep -oE "MAKEFLAGS='?-j ?[0-9]+" \
-                            | grep -oE '[0-9]+' | head -n1)"
-    [ -n "$_jn" ] || _jn="$(printf '%s' "${MAKEFLAGS:-}" \
-                            | grep -oE '\-j ?[0-9]+' | grep -oE '[0-9]+' | head -n1)"
-    if [ -n "$_jn" ]; then
-        printf '%s' "$envpass" | grep -q "CMAKE_BUILD_PARALLEL_LEVEL=" \
-            || envpass="$envpass CMAKE_BUILD_PARALLEL_LEVEL='$_jn'"
-        printf '%s' "$envpass" | grep -q "CARGO_BUILD_JOBS=" \
-            || envpass="$envpass CARGO_BUILD_JOBS='$_jn'"
-    fi
     # Keep pip out of the package user's ~/.local.  PIP_USER=0 stops it
     # installing there, and PYTHONNOUSERSITE=1 stops it *seeing* an existing
     # per-user copy and concluding the requirement is "already satisfied" --
@@ -6667,10 +5530,9 @@ cmd_build() {
     # and it then reports a diff that is simply wrong.  The sort and the
     # comparison have to agree; pinning either one alone guarantees they do not.
     newfiles="$(LC_ALL=C comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after"))"
-    local _after_dirs; _after_dirs="$(snapshot_dirs)"     # one walk, used twice
-    newdirs="$(LC_ALL=C comm -13 <(printf '%s\n' "$before_dirs") <(printf '%s\n' "$_after_dirs"))"
+    newdirs="$(LC_ALL=C comm -13 <(printf '%s\n' "$before_dirs") <(snapshot_dirs))"
     printf '%s\n' "$after" > "$SNAPSHOT"
-    printf '%s\n' "$_after_dirs" > "$SNAPDIRS"
+    printf '%s\n' "$(snapshot_dirs)" > "$SNAPDIRS"
 
     # Everything this build wrote: created OR modified since the stamp.
     # Always work out what the build TOUCHED, even when we are not going to
@@ -6707,23 +5569,20 @@ cmd_build() {
         # knew that; this one did not.  Same rule, one more place.
         local _bld="${BUILD_ROOT:-$r/build}"
         say "# scanning the tree for what this step touched (a fresh tree takes a moment) ..."
-        # ONE pruned walk for both lists (it was two unpruned ones).  A
-        # pruned directory is reported only as itself, as before: $SRCROOT,
-        # sources, dev, proc, sys, run and tmp when newer; never the build root.
-        local _tw
-        _tw="$(find "${r:-/}" -xdev \
-                     \( -path "$_bld" \) -prune \
-                     -o \( -path "$SRCROOT" -o -path "$r/sources" -o -path "$r/dev" \
-                        -o -path "$r/proc" -o -path "$r/sys" -o -path "$r/run" \
-                        -o -path "$r/tmp" \) -type d -newer "$stamp" -printf 'd %p\n' -prune \
-                     -o \( -path "$SRCROOT" -o -path "$r/sources" -o -path "$r/dev" \
-                        -o -path "$r/proc" -o -path "$r/sys" -o -path "$r/run" \
-                        -o -path "$r/tmp" \) -prune \
-                     -o -newer "$stamp" \( -type d -printf 'd %p\n' \
-                                         -o \( -type f -o -type l \) -printf 'f %p\n' \) \
-                     2>/dev/null)"
-        touched_dirs="$(printf '%s\n' "$_tw" | sed -n 's/^d //p' | sort -u)"
-        touched="$(printf '%s\n' "$_tw" | sed -n 's/^f //p' | sort -u)"
+        touched_dirs="$(find "${r:-/}" -xdev -type d -newer "$stamp" \
+                     -not -path "$SRCROOT/*" \
+                     -not -path "$r/sources/*" -not -path "$_bld/*" \
+                     -not -path "$_bld" -not -path "$r/dev/*" \
+                     -not -path "$r/proc/*"  -not -path "$r/sys/*" \
+                     -not -path "$r/run/*"   -not -path "$r/tmp/*" \
+                     2>/dev/null | sort -u)"
+        touched="$(find "${r:-/}" -xdev \( -type f -o -type l \) -newer "$stamp" \
+                     -not -path "$SRCROOT/*" \
+                     -not -path "$r/sources/*" -not -path "$_bld/*" \
+                     -not -path "$r/dev/*" \
+                     -not -path "$r/proc/*"  -not -path "$r/sys/*" \
+                     -not -path "$r/run/*"   -not -path "$r/tmp/*" \
+                     2>/dev/null | sort -u)"
     fi
     rm -f "$stamp"
 
@@ -6731,38 +5590,14 @@ cmd_build() {
     # Record what was touched regardless of whether ownership changed -- a
     # config step that rewrites /etc/hosts installs no NEW file but has very
     # much done its job.
-    # A PACKAGE USER CANNOT HAVE WRITTEN A ROOT-OWNED FILE.
-    #
-    # Attribution is by time window.  LLVM's install phase ran for hours
-    # (its compile is generated into install_pkg), and in that window root
-    # ran `make install` of these tools and `cfg app-users` -- so
-    # /usr/bin/lfs, /usr/bin/packagemanager and /etc/pam.d/su_u_user went
-    # into LLVM's manifest.  The lease then treated them as LLVM's own
-    # root-owned files and handed su_u_user, a script root runs on every
-    # su, to p_llvm for the length of each install round.
-    # When the phase ran AS the package user, it could only have written
-    # files it can write: whatever is root's now was not its doing.  (A
-    # file it rewrote under a lease is its own by now -- lease_settle ran
-    # before this scan.)  Root-run phases and chown-after builds still record
-    # root files, which is what they produce.
-    local _root_ok=0
-    { [ "${as_root:-0}" = 1 ] || [ "${chown_after:-0}" = 1 ]; } && _root_ok=1
-    { [ -f "$man" ] && cat "$man"
-      { printf '%s\n' "$newfiles"; printf '%s\n' "$touched"; } \
-        | while IFS= read -r _tf; do
-              [ -n "$_tf" ] || continue
-              if [ "$_root_ok" != 1 ] && [ "$(stat -c %u "$_tf" 2>/dev/null)" = 0 ]; then
-                  continue
-              fi
-              printf '%s\n' "$_tf"
-          done; } \
+    { [ -f "$man" ] && cat "$man"; printf '%s\n' "$newfiles"
+      printf '%s\n' "$touched"; } \
         | grep -v '^$' | sort -u \
         | _drop_other_packages_files "$owner" > "$man.tmp" \
         && mv "$man.tmp" "$man"
     { [ -f "$mand" ] && cat "$mand"; printf '%s\n' "$newdirs"; } \
         | grep -v '^$' | sort -u > "$mand.tmp" && mv "$mand.tmp" "$mand"
     say "# tracked $(wc -l < "$man") file(s) for '$name'"
-    _udev_reload_if_rules_changed "$man"
 
     # ...and the owner-scanned record too, once ownership makes it meaningful.
     # One door: cmd_record_install decides which strategy applies (item 6).
@@ -6849,31 +5684,8 @@ cmd_build() {
     # that stops because the USER must do something -- "mount your EFI System
     # Partition first" -- must never be answered by handing directories away.
     local _perm_ish=0
-    # "file INSTALL cannot": CMake wraps "Permission denied" over two lines.
-    grep -qiE "permission denied|operation not permitted|cannot (create|make|remove|change|touch)|couldn't copy|read-only file system|file INSTALL cannot" \
+    grep -qiE "permission denied|operation not permitted|cannot (create|make|remove|change|touch)|couldn't copy|read-only file system" \
          "$log" 2>/dev/null && _perm_ish=1
-    # A BOOK COMMAND THAT WORKS ONCE.
-    #
-    # libtiff's page ends by moving its html docs into a versioned
-    # directory.  The first install creates
-    # /usr/share/doc/libtiff-4.7.1/tiff; the second cannot:
-    #     mv: cannot overwrite '/usr/share/doc/libtiff-4.7.1/tiff': Directory not empty
-    # Nothing is wrong with the system -- the destination is this package's
-    # own output from last time, and a REINSTALL means replacing it.  The
-    # gate did not recognise it, so 38 rebuilds stopped on a directory the
-    # package itself had put there.
-    #
-    # Only ever the exact path the message names, only when it belongs to
-    # THIS package, and only for a phase that is reinstalling.
-    # THE GATE DECIDES; THE LOOP ACTS.
-    #
-    # This used to call _clear_stale_dest here.  It removed the directory --
-    # correctly, and said so -- and then the retry loop ran zero rounds,
-    # because the loop only counts what IT fixed.  The repair happened and
-    # nothing re-ran the phase, so the package failed anyway with the
-    # obstacle already gone.  Detect here, act in the loop.
-    grep -qE "cannot overwrite '[^']+'|: Directory not empty" "$log" 2>/dev/null \
-        && _perm_ish=1
     # "cannot make directory ...: No such file or directory" is not a
     # permission problem and granting will never fix it -- but it IS
     # automatically fixable, so it must reach the retry loop.
@@ -6916,18 +5728,6 @@ cmd_build() {
                 && _fixed_something=1
         fi
         create_missing_dirs_from_log "$log" "$owner" && _fixed_something=1
-        # the package's own leftovers from a previous install of the same
-        # version: removing them IS the fix, and it counts as one, so the
-        # phase is retried
-        _clear_stale_dest "$log" "${owner:-}" && _fixed_something=1
-        # a destination file another package owns, in a sticky directory:
-        # handing it over is the fix, and it counts as one
-        _take_cmake_dest "$log" "${owner:-}" && _fixed_something=1
-        if [ "${auto_modules:-0}" = 1 ]; then
-            [ -n "$_AUTO_MODULES_LOG" ] \
-                || _AUTO_MODULES_LOG="$(mktemp -t pm-auto-modules.XXXXXX)"
-            _install_missing_module "$log" && _fixed_something=1
-        fi
         # a file another package owns, which THIS package is installing:
         # ownership follows the installer (granting cannot fix EPERM)
         takeover_files_from_log "$log" "$owner" && _fixed_something=1
@@ -6968,21 +5768,11 @@ cmd_build() {
         # THAT phase; the sources and the build tree are untouched and still
         # there, which is exactly why the grant is all that was missing.
         local _retry_phase="$phase"
-        # `update` IS A COMPOUND PHASE TOO.
-        #
-        # This mapped only `all`, so a failure inside `update` retried
-        # `update` -- and poppler's retry, after a grant for
-        # /usr/share/gir-1.0, re-unpacked the tarball and re-ran cmake from
-        # scratch.  145 files were already installed; the one that needed
-        # doing again was the install step.  The log says which inner phase
-        # failed (`!! phase 'install' FAILED`); both compound phases should
-        # use it.
-        case "$phase" in
-            all|update)
-                case "${LAST_FAILED_PHASE:-}" in
-                    install|configure) _retry_phase="$LAST_FAILED_PHASE" ;;
-                esac ;;
-        esac
+        if [ "$phase" = all ]; then
+            case "${LAST_FAILED_PHASE:-}" in
+                install|configure) _retry_phase="$LAST_FAILED_PHASE" ;;
+            esac
+        fi
         say ""
         if [ "$_retry_phase" != "$phase" ]; then
             say "# retrying $name (phase $_retry_phase only -- the build is done), round $_round ..."
@@ -7076,42 +5866,6 @@ cmd_build() {
         fail "!   auto-repair: $([ "$auto_fix" = 1 ] && echo enabled || echo DISABLED)," \
              "gate: $([ "$_perm_ish" = 1 ] && echo "recognised" || echo "did not recognise this failure")," \
              "rounds run: ${_round:-0}"
-        # A PYTHON BUILD BACKEND IS A PACKAGE, AND ITS NAME IS NOT THE
-        # MODULE'S.  numpy died on
-        #     BackendUnavailable: Cannot import 'mesonpy'
-        # and the page that provides `mesonpy` is called meson_python -- not
-        # guessable, and the traceback is 60 lines of pip internals with the
-        # one useful word at the bottom.
-        local _pymod _pyprov
-        _pymod="$(grep -aoE "Cannot import '[a-zA-Z0-9_.]+'|No module named '[a-zA-Z0-9_.]+'" \
-                  "$log" 2>/dev/null | head -n1 | cut -d"'" -f2)"
-        if [ -n "$_pymod" ]; then
-            case "$_pymod" in
-                mesonpy)        _pyprov="meson_python" ;;
-                setuptools_scm) _pyprov="setuptools_scm" ;;
-                Cython|cython)  _pyprov="Cython" ;;
-                numpy)          _pyprov="NumPy" ;;
-                flit_core)      _pyprov="flit_core" ;;
-                hatchling)      _pyprov="hatchling" ;;
-                scikit_build_core) _pyprov="scikit-build-core" ;;
-                poetry.core|poetry_core) _pyprov="poetry-core" ;;
-                *)              _pyprov="" ;;
-            esac
-            if [ -n "${_AUTO_MODULES_LOG:-}" ] && [ -s "$_AUTO_MODULES_LOG" ]; then
-            fail "!   installed on the way (--auto-modules), not asked for:"
-            while IFS= read -r _am; do fail "!     $_am"; done < "$_AUTO_MODULES_LOG"
-        fi
-        fail "!   a python module is missing, not a permission: '$_pymod'"
-            if [ -n "$_pyprov" ]; then
-                fail "!   the BLFS page that provides it is '$_pyprov':"
-                fail "!     packagemanager install $_pyprov --run --recursive"
-            else
-                fail "!   find the page that provides it:"
-                fail "!     packagemanager search $_pymod"
-            fi
-            fail "!   then rebuild this package.  A plain \`install\` builds ONE"
-            fail "!   package: --recursive is what builds what it needs."
-        fi
         local _md_now
         _md_now="$(missing_dirs_from_log "$log" 2>/dev/null | tr '\n' ' ')"
         if [ -n "$_md_now" ]; then
@@ -7899,13 +6653,27 @@ EOF
         fi
     fi
 
-    # Record what is installed, in the package user's own home: VERSION and
-    # .pkgusr-installed, both in _record_installed (below), for the branch
-    # that finished every phase.
+    # Record what is installed, in the package user's own home.
+    #
+    # The scripts are regenerated from the book whenever it moves on, so their
+    # name_version tells you what the BOOK has, not what is on disk.  Without a
+    # record of the latter, "is this up to date?" is unanswerable.
+    local _nv _home
+    _nv="$(sed -n 's/^name_version="\(.*\)"$/\1/p' "$s" 2>/dev/null | head -n1)"
+    _home="$(pkgusr_home_for "$owner")"
+    if [ -n "$_nv" ] && [ -d "$_home" ]; then
+        {
+            echo "$_nv"
+            echo "# installed $(date '+%Y-%m-%d %H:%M:%S') by lfs-helper"
+            [ -n "${_book_of_script:-}" ] && echo "# from: $_book_of_script"
+        } > "$_home/VERSION"
+        # benign: a note in the package's own home, rewritten every install
+        real_chown "$owner:$owner" "$_home/VERSION" 2>/dev/null || true
+    fi
+
     if [ "$phase" = "all" ] || [ "$phase" = "update" ]; then
         _write_pkgusr_info "$name" "$owner" "${LFS_PKG_SOURCE:-lfs}" \
             "$(_version_from_script "$staged")"
-        _record_installed "$name" "$owner" "$s"
         mark_done "$name"
         ok "# $name: done"
         report_granted_groups
@@ -7928,18 +6696,7 @@ EOF
             # running again on every build-all.
             [ -f "$MANIFESTS/$name.files" ] && \
                 _mark_adopted "$name" "$(_manifest_size "$MANIFESTS/$name.files")"
-            _record_installed "$name" "$owner" "$s"
             ok "# $name: done (all phases complete)"
-            # AND WHAT IT INSTALLED ON THE WAY, on the SUCCESS path too: the
-            # whole point of reporting it is that the run changed more than
-            # the package that was asked for, and a successful run is
-            # exactly when nobody goes looking.
-            if [ -n "${_AUTO_MODULES_LOG:-}" ] && [ -s "$_AUTO_MODULES_LOG" ]; then
-                say "# installed on the way (--auto-modules), not asked for:"
-                while IFS= read -r _am; do say "#   $_am"; done \
-                    < "$_AUTO_MODULES_LOG"
-                say "#   they are real package users now: packagemanager info <name>"
-            fi
             report_granted_groups
         fi
     fi
@@ -8174,153 +6931,6 @@ cmd_rename_group() {
     fi
     "$(_real_tool groupmod)" -n "$new" "$old" || die "could not rename $old"
     ok "renamed: $old -> $new"
-}
-
-# REGROUP ONE DIRECTORY.
-#
-#     /etc/pam.d  p_bash-completion:nimgnu_bash-completion  drwxrwxr-x
-#
-# A directory granted through the wrong group -- here one named after a
-# package that has nothing to do with pam -- cannot be fixed with chgrp
-# alone: every member of the old group keeps write access to it, and the
-# packages that DO install there have to join the new one.  So:
-#
-#   1. who installs INTO it: every package whose manifest or pkg.lst lists a
-#      direct child, every account owning an entry in it, and its owner
-#   2. the new group's name, asked the way a grant asks (owner-named,
-#      directory-named, or typed)
-#   3. which members of the OLD group still need it: those installing into
-#      another directory that keeps the old group (or owning one)
-#   4. the plan, then yes/no -- nothing changes before the answer
-#
-# The old group itself is left as it is (even when empty): deleting a group
-# is a separate decision, and the plan says when it has become unused.
-cmd_regroup_dir() {
-    need_root
-    local dir="${1:?usage: lfs-helper regroup-dir <directory>}"
-    dir="$(readlink -f "$dir")" || die "no such directory: $1"
-    [ -d "$dir" ] || die "not a directory: $dir"
-    local owner old
-    owner="$(stat -c %U "$dir")"; old="$(stat -c %G "$dir")"
-    [ "$owner" = root ] && die "$dir is owned by root -- that is not a package's directory to share"
-
-    say "$dir  ($(stat -c '%A %U:%G' "$dir"))"
-
-    # 1. installers into THIS directory (direct children only)
-    local installers
-    installers="$(
-        { for man in "$MANIFESTS"/*.files; do
-              [ -f "$man" ] || continue
-              if awk -v d="$dir" '{ p = $0; sub(/\/[^\/]*$/, "", p); if (p == d) { f = 1; exit } } END { exit !f }' "$man"; then
-                  pkg_owner_name "$(basename "${man%.files}")"
-              fi
-          done
-          for _r in "$PKGUSR_ROOT" "$CFGUSR_ROOT"; do
-              [ -d "$_r" ] || continue
-              for _l in "$_r"/*/pkg.lst; do
-                  [ -f "$_l" ] || continue
-                  awk -v d="$dir" '{ p = $0; sub(/\/[^\/]*$/, "", p); if (p == d) { f = 1; exit } } END { exit !f }' "$_l" \
-                      && basename "$(dirname "$_l")"
-              done
-          done
-          find "$dir" -mindepth 1 -maxdepth 1 -printf '%u\n' 2>/dev/null
-          echo "$owner"
-        } | while IFS= read -r _u; do
-                [ -n "$_u" ] || continue
-                # package and config accounts only: never root, a login or a u_ account
-                case "$_u" in
-                    "${PKGUSR_PREFIX:-p_}"?*|"${CFGUSR_PREFIX:-cfg_}"?*) ;;
-                    *) continue ;;
-                esac
-                getent passwd "$_u" >/dev/null 2>&1 && echo "$_u"
-            done | sort -u)"
-
-    # 2. the new name
-    local by_owner by_dir new ans
-    by_owner="$(sanitise_group_name "$(collector_group_for "$owner")")"
-    by_dir="$(sanitise_group_name "${COLLECTOR_PREFIX}_$(basename "$dir")")"
-    say ""
-    say "  installs into it: $(echo $installers)"
-    say "  current group:    $old  (members: $(getent group "$old" | cut -d: -f4))"
-    say ""
-    say "  New group for $dir:"
-    say "     1) ${C_B}${by_dir}${C_OFF}   (named after the directory)"
-    say "     2) ${C_B}${by_owner}${C_OFF}   (named after its owner)"
-    say "     or type another name, or q to cancel"
-    printf '  [1/2/name/q] (default 1): ' > /dev/tty
-    read -e -r ans < /dev/tty || ans=q
-    case "$ans" in
-        ""|1) new="$by_dir" ;;
-        2)    new="$by_owner" ;;
-        q|Q)  say "cancelled -- nothing changed"; return 0 ;;
-        *)    new="$(sanitise_group_name "$ans")"
-              [ -n "$new" ] || die "'$ans' is not a usable group name -- nothing changed" ;;
-    esac
-    [ "$new" = "$old" ] && { say "$dir already has group $new -- nothing to do"; return 0; }
-
-    # 3. who still needs the OLD group, for the directories that keep it
-    local others keep="" drop="" m d2 needs
-    # EVERY real filesystem, not just /'s: a directory of $old on another
-    # mount that is not seen here would cost its installers their membership.
-    local _mnts
-    _mnts="$(findmnt -rno TARGET -t ext2,ext3,ext4,xfs,btrfs,f2fs,jfs,reiserfs 2>/dev/null | tr '\n' ' ')"
-    [ -n "$_mnts" ] || _mnts="/"
-    others="$(find $_mnts -xdev \( -path "$SRCROOT" -o -path /proc -o -path /sys -o -path /dev \
-                     -o -path /run -o -path /tmp \) -prune \
-                  -o -type d -group "$old" -print 2>/dev/null | sort -u | grep -vxF "$dir")"
-    for m in $(getent group "$old" | cut -d: -f4 | tr ',' ' '); do
-        needs=""
-        while IFS= read -r d2; do
-            [ -n "$d2" ] || continue
-            if [ "$(stat -c %U "$d2")" = "$m" ] \
-               || find "$d2" -mindepth 1 -maxdepth 1 -user "$m" -print -quit 2>/dev/null | grep -q .; then
-                needs="$d2"; break
-            fi
-            for man in "$MANIFESTS/$(unprefix_pkg_user "$m").files" "$PKGUSR_ROOT/$m/pkg.lst" "$CFGUSR_ROOT/$m/pkg.lst"; do
-                [ -f "$man" ] || continue
-                if awk -v d="$d2" '{ p = $0; sub(/\/[^\/]*$/, "", p); if (p == d) { f = 1; exit } } END { exit !f }' "$man"; then
-                    needs="$d2"; break 2
-                fi
-            done
-        done <<< "$others"
-        if [ -n "$needs" ]; then keep="$keep $m"; else drop="$drop $m"; fi
-    done
-
-    # 4. the plan
-    say ""
-    say "  PLAN"
-    say "    chgrp $new $dir   (mode g+rwx kept for the installers)"
-    group_exists "$new" && say "    group $new exists (gid $(getent group "$new" | cut -d: -f3))" \
-                        || say "    CREATE group $new (collector range)"
-    say "    add to $new:     $(echo $installers)"
-    [ -n "$drop" ] && say "    remove from $old: $(echo $drop)   (no other directory of $old is theirs)"
-    [ -n "$keep" ] && say "    stay in $old:     $(echo $keep)   (they still install into a directory of $old)"
-    [ -z "$others" ] && say "    $old is then on no directory at all -- delete it yourself if unused:  groupdel $old"
-    printf '  apply? [y/N]: ' > /dev/tty
-    read -e -r ans < /dev/tty || ans=n
-    case "$ans" in [Yy]*) ;; *) say "cancelled -- nothing changed"; return 0 ;; esac
-
-    ensure_group "$new" || die "could not create group $new -- nothing changed"
-    for m in $installers; do add_to_group "$m" "$new" || warn "could not add $m to $new"; done
-    real_chgrp "$new" "$dir" || die "chgrp $new $dir failed"
-    real_chmod g+rwx "$dir" 2>/dev/null
-    for m in $drop; do
-        gpasswd -d "$m" "$old" >/dev/null 2>&1 || warn "could not remove $m from $old"
-    done
-    # the records a later grant consults
-    local rel="${dir#${SNAP_ROOT%/}}"
-    if [ -f "$COLLECTOR_MAP" ]; then
-        grep -v "^$rel|" "$COLLECTOR_MAP" > "$COLLECTOR_MAP.tmp" 2>/dev/null; mv "$COLLECTOR_MAP.tmp" "$COLLECTOR_MAP"
-    fi
-    mkdir -p "$(dirname "$COLLECTOR_MAP")"; echo "$rel|$new" >> "$COLLECTOR_MAP"
-    for m in $installers; do
-        grep -qxF "$new|$m|$owner" "$GRANTED" 2>/dev/null || echo "$new|$m|$owner" >> "$GRANTED"
-    done
-    say ""
-    ok "$dir is now $(stat -c '%A %U:%G' "$dir")"
-    say "  $new: $(getent group "$new" | cut -d: -f4)"
-    say "  $old: $(getent group "$old" | cut -d: -f4)"
-    say "  (membership changes apply to NEW logins and builds; a running shell keeps its groups)"
 }
 
 # Which package installed this path?
@@ -9777,21 +8387,6 @@ cmd_verify() {
         ok "every file has a real owner"
     fi
 
-    # ---- 3c. setid bits the build refused --------------------------------- #
-    # A CHECK MUST SAY WHAT IS MISSING RATHER THAN WAIT TO BE ASKED.  These
-    # were printed once, hours earlier, in the middle of a build log.
-    local _sid=0 _sf _su
-    while IFS= read -r _su; do
-        _sf="$(pkgusr_home_for "$_su" 2>/dev/null)/.pkgusr-setid.requests"
-        [ -s "$_sf" ] && _sid=$((_sid + $(grep -c . "$_sf")))
-    done < <(pkg_users_list)
-    if [ "$_sid" -gt 0 ]; then
-        warn "$_sid setuid/setgid bit(s) were refused during the build and never applied"
-        warn "   what and why:  lfs-helper setid"
-        warn "   apply them:    lfs-helper setid --run"
-        problems=$((problems+1))
-    fi
-
     detail "# checking homes, the build user and the uid order ..."
     # ---- 4b. the passes the dead copy had and this one did not ------------- #
     # homes owned by their own user, the build user's leftovers, and the uid
@@ -10257,24 +8852,6 @@ cmd_pm_install() {
         else
             warn "$home/install_$user_name differs from $base and is no longer"
             warn "   used -- move your edits into $base (or delete the old file)"
-        fi
-    fi
-    # RECORD WHAT IS INSTALLED BEFORE OVERWRITING THE RECORD.
-    #
-    # `update` reads the installed version from .pkgusr-installed, written
-    # only after a successful install -- and, for a package built before that
-    # marker existed, from install_last, which is replaced HERE, before the
-    # build.  LLVM 21.1.8 (no marker) failed on 22.1.8's patch, and the next
-    # plan dropped it as current: spirv-llvm-translator then asked for LLVM 22
-    # and found 21.1.8.  So the first time through, the old install_last's
-    # version becomes the marker, and a failure leaves it there.
-    if [ ! -s "$home/.pkgusr-installed" ] && [ -f "$home/install_last" ] \
-       && ! [ "$install_script" -ef "$home/install_last" ]; then
-        local _was
-        _was="$(sed -n "s/^name_version=['\"]\{0,1\}\([^'\"]*\).*/\1/p" "$home/install_last" 2>/dev/null | head -n1)"
-        if [ -n "$_was" ]; then
-            printf '%s\n' "$_was" > "$home/.pkgusr-installed" \
-                && chown "$user_name:" "$home/.pkgusr-installed" 2>/dev/null || true
         fi
     fi
     if ! [ "$install_script" -ef "$home/install_last" ]; then
@@ -11208,29 +9785,11 @@ EOF
 [ -z "${INPUTRC:-}" ] && [ -f /etc/inputrc ] && export INPUTRC=/etc/inputrc
 EOF
 
-    # THE LOCALE COMES FROM A FILE, NOT FROM A LINE YOU EDIT INTO A SCRIPT.
-    #
-    # This used to write `: # export LANG=en_US.UTF-8` -- commented out, on
-    # the grounds that an unset LANG is a choice.  It is not a choice anyone
-    # makes: nothing else on the system sets LANG either, so every machine
-    # built this way sits in the C locale until somebody notices a terminal
-    # complaining ("foot: 'C' is not a UTF-8 locale"), and the only way to
-    # fix it is to hand-edit a generated file.  BLFS's own version has the
-    # same shape and the same outcome -- a placeholder nobody fills in.
-    #
-    # So it reads /etc/locale.conf, which is where LFS puts the locale and
-    # what `cfg shell-env` writes from `lfs config locale`.  With no
-    # locale.conf this does nothing, exactly as before.
     _write_if_absent "$d/i18n.sh" <<'EOF'
-# written by lfs-helper (shell startup files) -- safe to replace
-# Locale.  LANG lives in /etc/locale.conf, one file for the whole system:
-#     echo 'LANG=en_US.UTF-8' > /etc/locale.conf
-# `packagemanager stack services --only shell-env --run` writes it for you,
-# from `lfs config locale`, and checks the locale really exists.
-if [ -r /etc/locale.conf ]; then
-    . /etc/locale.conf
-    if [ -n "${LANG:-}" ]; then export LANG; fi
-    if [ -n "${LC_ALL:-}" ]; then export LC_ALL; fi
+# Locale.  Set LANG here (e.g. en_US.UTF-8); an unset LANG means the C
+# locale, which is a choice, not an accident.
+if [ -z "${LANG:-}" ] && command -v locale >/dev/null 2>&1; then
+    : # export LANG=en_US.UTF-8
 fi
 export LESSCHARSET="${LESSCHARSET:-utf-8}"
 EOF
@@ -11851,11 +10410,6 @@ Builds one package as its own package user, tracking every file it installs.
                 expect some failures)
   --jobs N      override MAKEFLAGS for this build
   --no-auto-fix do not grant collector-group access on a permission failure
-  --auto-modules  on a missing python build backend, install the BLFS page
-                that provides it (--recursive) and retry.  Never for a
-                module only a TEST needs (pytest, hypothesis, ...): a test
-                suite in an install phase is a script bug, not a missing
-                package.  Off by default; PM_AUTO_MODULES=1 also works.
 EOF
         ;;
       strip)
@@ -11916,21 +10470,10 @@ Ownership and permissions (the package-user model):
     lfs-helper verify                 check the tree against what the
                                       manifests say it should be
     lfs-helper verify --fix           and repair what it can
-    lfs-helper setid [--run]          setuid/setgid bits the build refused
-                                      (su, passwd, dbus-launch-helper, ...)
     lfs-helper fix-perms <name> --run grant one package the access it needs
     lfs-helper grant-dir <dir> <user> --run
     lfs-helper rename-group <old> <new> --run   # fix a mistyped group name
-    lfs-helper regroup-dir <directory>          # move a directory to another group (asks, shows the plan)
                                       give one user access to one directory
-    lfs-helper undone                 steps of the chroot build not yet done
-    lfs-helper sort-users --run       sort passwd and group by id
-    lfs-helper check-login            can root and the main user log in
-
-  The chroot build's own steps -- init-accounts, establish-ownership,
-  seal-install-dirs, install-profile, repair-adoption -- are dispatched by
-  `build-all` and listed by `lfs-helper list`.  They are not wrong to run by
-  hand, but nothing needs to.
 
 Collector groups (shared directories):
     lfs-helper export-groups [<file>] save the decisions for the next build
@@ -11964,8 +10507,6 @@ Look around / tidy up:
                                       run one phase as the package user (the
                                       one runner both drivers use)
     lfs-helper find-user-site --run   find pip installs hidden in ~/.local
-    lfs-helper script-targets <script> [fn ...]
-                                      the files a phase writes (the lease list)
 
 Any command: -h explains it.  Dry run is the default; --run applies.
 State: $STATE
@@ -11996,8 +10537,6 @@ case "${1:-}" in
     manifests)     shift; cmd_manifests "$@" ;;
     fix-perms)     shift; cmd_fix_perms "$@" ;;
     clean-sources) shift; cmd_clean_sources "$@" ;;
-    setid)          shift; cmd_setid "$@" ;;
-    script-targets) shift; cmd_script_targets "$@" ;;
     find-user-site) shift; cmd_find_user_site "$@" ;;
     check-toolchain) shift; cmd_check_toolchain "$@" ;;
     verify)          shift; cmd_verify "$@" ;;
@@ -12011,7 +10550,6 @@ case "${1:-}" in
     which-package)   shift; cmd_which_package "$@" ;;
     grant-dir)       shift; cmd_grant_dir "$@" ;;
     rename-group)    shift; cmd_rename_group "$@" ;;
-    regroup-dir)     shift; cmd_regroup_dir "$@" ;;
     make-wrappers)   shift; cmd_make_wrappers "$@" ;;
     wrapper-dir)     shift; cmd_wrapper_dir "$@" ;;
     export-groups) shift; cmd_export_groups "$@" ;;

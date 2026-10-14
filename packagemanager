@@ -27,23 +27,22 @@ installs ends up owned by that user, so `list_package <name>` records the exact
 manifest into /usr/src/<name>/pkg.lst.  Collector groups (nimgnu_*) share
 directories between package-users; u_* users run GUI apps for the human.
 
-The commands
-------------
-`packagemanager --help` lists them, grouped by what you are doing, and that
-list is generated beside the parsers themselves.
+Roadmap (built incrementally, one command at a time)
+----------------------------------------------------
+  info                 [IMPLEMENTED] package-user info table (name/uid/gid/home/pkg_list)
+  check                [TODO] report install state of a package
+  search               [TODO] find a package in the book        -> blfs search
+  dependencies         [TODO] recursive dependency order        -> blfs deps/order
+  install              [TODO] resolve deps, build missing, run lfs-helper pm-install
+  remove               [TODO] remove a package-user + its files (via pkg.lst)
+  reload-pkg-list      [TODO] regenerate /usr/src/<name>/pkg.lst
+  list                 [TODO] list all package-users
+  files_with_broken_id [TODO] find files whose uid/gid don't resolve
 
-THERE WAS A SECOND LIST HERE.  A hand-kept "Roadmap" marking check, search,
-dependencies, install, remove and reload-pkg-list as [TODO] -- all six had
-been implemented for releases, and none of the twenty commands added since
-appeared at all.  A list of commands maintained anywhere but next to the
-commands goes stale silently, and this file is the place a reader starts.
-
-Design decisions still open:
-  * should the CONFIGURE phase run as root?  Every BLFS "Configuring" section
-    is written for root, and files it creates would be root-owned, which the
-    file tracking does not expect.
-  * the `.new` mechanism: three functions move stack files and it still
-    surprises people.
+Design decisions still open (we'll settle these as we implement the commands):
+  * install: auto-run lfs-helper pm-install per package, or just print/queue?
+  * packagemanager_install: retired in 1.12.0 -- folded into lfs-helper pm-install
+  * fix `check`, implement `remove`; parameterize the hardcoded site values.
 """
 
 import argparse
@@ -118,35 +117,8 @@ BASE_DIR = os.environ.get("PKGUSR_BASE") or _base_dir_default()
 
 def appuser_home():
     """Where application users live -- separate from package users, because
-    they are accounts a person uses rather than build trees.
-
-    DEFAULT /home, NOT the package base.  This returned BASE_DIR, so every
-    application user's home, shared directory and XDG profile link were
-    built under /usr/src -- `mkdir -p /usr/src/u_claude/Shared`, and a
-    ~/Shared/Claude link pointing into the package tree.  A build tree is
-    not a home.  Configurable as before (`appuser_home` in the config), but
-    the default is now the one that is right.
-    """
-    return load_config().get("appuser_home") or APPUSER_HOME_DEFAULT
-
-
-# ONE SUBDIRECTORY FOR ALL OF THEM.  The user's layout, recorded on the
-# machine as appuser_home=/home/shared_user -- and ignored: the account was
-# moved to a hard-coded "/home/<user>", so /home filled up with u_* beside
-# the real logins.  The default is that subdirectory; the config key still
-# overrides it.
-APPUSER_HOME_DEFAULT = "/home/shared_user"
-
-
-def _app_home(u):
-    """An application user's home: what passwd says, or where they go.
-
-    passwd FIRST, because an account whose home has already been moved
-    (usermod -d) must not have its shared directory rebuilt somewhere else
-    -- which is exactly what happened: the homes were moved to /home and the
-    next `cfg app-users` run recreated Shared under /usr/src.
-    """
-    return _home_of(u) or os.path.join(appuser_home(), u)
+    they are accounts a person uses rather than build trees."""
+    return load_config().get("appuser_home") or BASE_DIR
 INSTALL_SCRIPTS_DIR = os.environ.get("PKGUSR_INSTALL_SCRIPTS", "/etc/pkgusr/install_scripts")
 TMP_DIR = "/tmp/packagemanager"
 
@@ -156,7 +128,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.299"
+TOOL_VERSION = "1.14.146"
 
 
 def _build_id():
@@ -664,44 +636,7 @@ def find_blfs():
     return ["blfs"]                                   # rely on $PATH
 
 
-# A PACKAGE MAY NEED A DIFFERENT BOOK, AND ONLY A WHOLE PAGE IS COHERENT.
-#
-# The systemd book's linux-pam page lists systemd as required; the 12.4 SysV
-# book's linux-pam page has no Required section at all -- it wants only
-# Shadow.  Same package, two books, two dependency graphs, and this machine
-# is SysV.
-#
-# NOT a merge.  Taking the dependency list from one book and the commands
-# from another produces a script neither book has ever tested: the versions
-# differ (1.7.1 vs 1.7.2), the configure switches differ, the doc tarball
-# differs.  A whole page from the older book is something upstream shipped
-# and someone ran.  Half of each is not.
-#
-# machine.conf:
-#     [linux-pam]
-#     book = /usr/share/blfs/books/BLFS-BOOK-12_4-nochunks.html
-#
-# ...and everything that asks the book about THAT package -- versions,
-# dependencies, the generated script -- asks the one named there.
-_BOOK_FOR_PKG = {}
-
-
-def _book_override(anchor):
-    """The book this package should be read from, or None."""
-    if not anchor:
-        return None
-    if anchor not in _BOOK_FOR_PKG:
-        opts = _machine_opts_for(anchor)
-        _BOOK_FOR_PKG[anchor] = opts.get("book") or ""
-    return _BOOK_FOR_PKG[anchor] or None
-
-
-def _blfs_book_flags(anchor=None):
-    over = _book_override(anchor) if anchor else None
-    if over:
-        if os.path.isfile(over):
-            return ["--book-file", over]
-        return ["--book", over]
+def _blfs_book_flags():
     if os.environ.get("BLFS_BOOK_FILE"):
         return ["--book-file", os.environ["BLFS_BOOK_FILE"]]
     if os.environ.get("BLFS_BOOK"):
@@ -730,14 +665,7 @@ def run_blfs(args):
     Each call is a subprocess, and the first one for a given book INDEXES it,
     which takes many seconds.  Announce what is happening: an install that sits
     silent for half a minute before its first output looks frozen."""
-    # the package a call is ABOUT is its first non-flag argument, which is
-    # what decides whether an override applies
-    _anchor = next((a for a in args[1:] if not a.startswith("-")), None) \
-        if len(args) > 1 else None
-    cmd = find_blfs() + _blfs_book_flags(_anchor) + list(args)
-    if _anchor and _book_override(_anchor):
-        printInfo("  %s: read from %s (machine.conf)"
-                  % (_anchor, os.path.basename(_book_override(_anchor))))
+    cmd = find_blfs() + _blfs_book_flags() + list(args)
     verb = args[0] if args else ""
     if verb in _BLFS_ACTIVITY:
         arg = args[1] if len(args) > 1 and not args[1].startswith("-") else ""
@@ -804,29 +732,15 @@ def book_version(anchor):
             _VERSION_MAP = book_versions_all() or {}
         except Exception:
             _VERSION_MAP = {}
-    # THE PREFIX IS NOT PART OF THE BOOK'S NAME.
-    #
-    # `info webkitgtk` asks with the ACCOUNT name, `p_webkitgtk`, which no
-    # book anchor matches -- so every call missed the map and fell through to
-    # `blfs debug p_webkitgtk`, a subprocess that reads the book cache to
-    # answer one lookup and then fails.  That is the pause after
-    # "looking up p_webkitgtk in the book", and the reason `info` showed no
-    # book version to compare against.
-    _tries = [anchor]
-    for _pre in (pkgusr_prefix(), user_prefix(), collector_prefix()):
-        if _pre and anchor.startswith(_pre):
-            _tries.append(anchor[len(_pre):])
-    for _a in _tries:
-        hit = _VERSION_MAP.get(_a)
-        if hit:
-            return hit
+    hit = _VERSION_MAP.get(anchor)
+    if hit:
+        return hit
     if _VERSION_MAP:
-        for _a in _tries:
-            low = _a.lower()
-            for a, nv in _VERSION_MAP.items():
-                if a.lower() == low:
-                    return nv
-    rc, out, _ = run_blfs(["debug", _tries[-1]])
+        low = anchor.lower()
+        for a, nv in _VERSION_MAP.items():
+            if a.lower() == low:
+                return nv
+    rc, out, _ = run_blfs(["debug", anchor])
     if rc != 0:
         return None
     m = re.search(r"^title\s*:\s*(.+)$", out, re.M)
@@ -854,54 +768,9 @@ def book_rdeps(target, no_recommended=False, optional=False):
     return result
 
 
-def _versions_cache_path():
-    """Where the anchor -> version map is kept between runs."""
-    d = os.path.join("/var", "cache", "pkgusr")
-    try:
-        os.makedirs(d, exist_ok=True)
-    except OSError:
-        d = "/tmp"
-    return os.path.join(d, "book-versions.json")
-
-
 def book_versions_all():
-    """Map anchor -> name_version for the whole book.
-
-    ONE CALL WAS NOT ENOUGH: IT IS ONE CALL PER PROCESS.  `blfs versions`
-    re-reads the whole book to build this map, which is eighteen seconds on
-    a 12 MB book -- and `info` pays it to answer one question.  The page
-    index is cached; this map was not, so every command that wanted a
-    version rebuilt it from scratch.
-
-    Cached on disk against the book's own size and mtime: the moment the
-    book file changes the cache is ignored, so a stale map cannot outlive
-    the book it came from.
-    """
-    # WHICH book: the explicit one if given, else whichever cached book file
-    # is newest -- the same file `blfs` would read.
-    _bf = os.environ.get("BLFS_BOOK_FILE") or ""
-    if not (_bf and os.path.isfile(_bf)):
-        _bf = ""
-        _books = sorted(glob.glob("/usr/share/blfs/books/*.html"),
-                        key=lambda f: os.stat(f).st_mtime, reverse=True)
-        if _books:
-            _bf = _books[0]
-    _key = None
-    if _bf:
-        try:
-            _st = os.stat(_bf)
-            _key = "%s:%d:%d" % (_bf, _st.st_size, int(_st.st_mtime))
-        except OSError:
-            _key = None
-    _cp = _versions_cache_path()
-    if _key:
-        try:
-            with open(_cp, encoding="utf-8") as f:
-                _c = json.load(f)
-            if _c.get("key") == _key and isinstance(_c.get("versions"), dict):
-                return _c["versions"]
-        except (OSError, ValueError):
-            pass
+    """Map anchor -> name_version for the whole book, in ONE blfs call (so update
+    doesn't spawn a process per package)."""
     rc, out, _ = run_blfs(["versions"])
     versions = {}
     if rc == 0:
@@ -911,19 +780,6 @@ def book_versions_all():
                 a, nv = a.strip(), nv.strip()
                 if a and nv and " " not in a:
                     versions[a] = nv
-    if versions and _key:
-        # CONFIRM IT CAN BE READ BACK, not just written: a cache that fails
-        # to load silently turns into the 18 seconds all over again, on
-        # every command, invisibly.
-        try:
-            with open(_cp, "w", encoding="utf-8") as f:
-                json.dump({"key": _key, "versions": versions}, f)
-            with open(_cp, encoding="utf-8") as f:
-                if json.load(f).get("key") != _key:
-                    printWarning("  the version cache did not read back; "
-                                 "every command will rebuild it")
-        except (OSError, ValueError) as e:
-            printInfo("  (not caching the book version map: %s)" % e)
     return versions
 
 
@@ -1017,20 +873,9 @@ def _parse_bash_vars(text, scalars=(), arrays=()):
     # trailing comment is allowed and ignored.
     out = {}
     for key in scalars:
-        # SINGLE QUOTES TOO, AND THE BOOK USES THEM.
-        #
-        # This read only  key="value".  The book-generated scripts write
-        #     name_version='Rustc-1.93.1'
-        # so name_version was never parsed for any package built from the
-        # book -- and that is where the installed version comes from.
-        # `info webkitgtk` printed uid, home, 1727 files and every
-        # dependency, and not WHICH webkitgtk; `update` filed it under
-        # "cannot judge"; late-deps reported 28 packages with no recorded
-        # version.  One quote character, three symptoms.
-        m = re.search(rf'^{key}=(?:"(?P<d>.*?)"|\x27(?P<s>.*?)\x27)[ \\t]*(#.*)?$', text, re.M)
+        m = re.search(rf'^{key}="(.*?)"[ \t]*(#.*)?$', text, re.M)
         if m:
-            out[key] = m.group("d") if m.group("d") is not None \
-                else m.group("s")
+            out[key] = m.group(1)
     for key in arrays:
         m = re.search(rf'^{key}=\((.*?)\)[ \t]*(#.*)?$', text, re.M)
         if m:
@@ -1226,26 +1071,6 @@ class User:
 
     @property
     def version(self):
-        # THE VERSION IS WHAT FINISHED INSTALLING.
-        #
-        # install_last is staged into the home BEFORE the build, so reading
-        # the version out of it meant a FAILED build advanced it: webkitgtk
-        # 2.52.5 died at configure and `update` then said "already up to
-        # date (2.52.5)" with 2.50.5's libraries still on disk.
-        #
-        # .pkgusr-installed is written by lfs-helper only after every phase
-        # succeeded.  Where it is absent -- every package built before this
-        # release -- fall back to install_last, which is the old behaviour
-        # and no worse than it was.
-        if self.home:
-            try:
-                with open(os.path.join(self.home, ".pkgusr-installed"),
-                          encoding="utf-8", errors="replace") as f:
-                    done = f.read().strip()
-                if done:
-                    return done
-            except OSError:
-                pass
         return self.meta.get("name_version")
 
 
@@ -1302,46 +1127,8 @@ def print_user_details(u):
         head += f"  ({u.version})"
     print(f"\n{colors.cyan}{head}{colors.normal}  "
           f"[{_STATE_COLOR.get(state, '')}{state}{colors.normal}]")
-    # `why` EXISTS TO EXPLAIN A VERDICT THAT NEEDS EXPLAINING.
-    #
-    # For an installed package it was printing the routine sentence every
-    # time -- "recorded files present (the page names no targets to verify
-    # against)" above the very fields it is talking about -- so the one line
-    # that ever matters was indistinguishable from noise.  Routine reasons
-    # are dropped; anything unusual is kept and labelled `note`, because for
-    # an installed package it is a note, not a justification.
-    _routine = ("all installed_* targets present",
-                "recorded files present",
-                "its script names no verifiable target")
-    _dull = any(r in (why or "") for r in _routine)
-    if why and not (state == "installed" and _dull):
-        _label = "note" if state == "installed" else "why"
-        print(f"  {colors.dim}{_label:<12}{colors.normal}: {why}")
-    # THE VERSION IS THE FIRST THING ANYONE WANTS, and it was only in the
-    # header -- shown when `u.version` happened to be set, and silent
-    # otherwise.  webkitgtk printed uid, home, 1727 files and every
-    # dependency, and not which webkitgtk.
-    #
-    # `name_version` is in the install script itself (WebKitGTK-2.50.2), so
-    # when the recorded version is missing there is still an answer; it just
-    # has to say which answer it is.  And the BOOK's version belongs beside
-    # it: "is this current" is the question behind the question.
-    # JUST THE NUMBER.  The header already says WebKitGTK-2.50.5, so
-    # repeating the name in the field made the two lines look like two
-    # different facts.
-    def _ver_only(nv):
-        m2 = re.search(r"-([0-9][0-9A-Za-z.\-_+]*)$", nv or "")
-        return m2.group(1) if m2 else (nv or "")
-    _nv = m.get("name_version") or ""
-    _inst = _ver_only(u.version or "")
-    if not _inst and _nv:
-        _inst = _ver_only(_nv)
-        if _inst:
-            _inst += "  (from the install script, not recorded)"
-    _book = _ver_only(expected or "")
+    print(f"  {colors.dim}why{colors.normal:<9}: {why}")
     rows = [
-        ("version", _inst or "not recorded, and the script does not name one"),
-        ("book", _book if _book and _book not in _inst else None),
         ("uid/gid", f"{u.uid}/{u.gid}" if u.has_user else None),
         ("home", u.home),
         ("link", m.get("link")),
@@ -1359,25 +1146,6 @@ def print_user_details(u):
         if label == "info":
             lines = [ln.strip() for ln in str(value).replace("\\n", "\n").split("\n")
                      if ln.strip()]
-            # THE BOOK'S BLURB REPEATS THE DEPENDENCY LISTS, which are three
-            # rows further down: webkitgtk printed 18 required packages
-            # twice, in different spellings, and the description they were
-            # attached to scrolled away.  Keep the prose, drop the lines that
-            # are just a dependency list.
-            _deps = set()
-            for _k in ("required", "recommended", "optional"):
-                for _d in m.get(_k, []):
-                    _deps.add(_d.split("-")[0].lower())
-            def _is_dep_list(ln):
-                parts = [x.strip() for x in ln.replace(" and ", ", ").split(",")
-                         if x.strip()]
-                if len(parts) < 3:
-                    return False
-                hit = sum(1 for x in parts
-                          if x.split("-")[0].lower().replace(" ", "-") in _deps
-                          or x.split("-")[0].lower() in _deps)
-                return hit >= max(2, len(parts) // 2)
-            lines = [ln for ln in lines if not _is_dep_list(ln)]
             if not lines:
                 continue
             print(f"  {label:<12}: {lines[0]}")
@@ -1581,59 +1349,6 @@ def _prewarm_scripts(plan, script_dir, force_regen=False):
                      % (err or out).strip().splitlines()[-1:] or "no output")
         return
     printInfo("  %d written" % made)
-
-
-def _report_stale_requires(names, _verbose=False):
-    """For a single-package update: which of its requirements are older here.
-
-    The prereq check catches a missing TOOL.  It says nothing about a
-    dependency that is present but older than the version the book's page
-    was written against -- and that is the real question behind "can I
-    update webkitgtk without updating glib2":
-
-        webkitgtk 2.52.5 requires GLib-2.88.3; this system has GLib-2.86.4.
-
-    That may build perfectly.  It may also fail at configure, or worse,
-    build and misbehave.  Nobody can tell from here, so this reports the
-    numbers and leaves the decision alone -- refusing would break the one
-    workflow it exists to serve, which is updating one package at a time.
-    """
-    for name in names[:4]:
-        u = gather_user(name)
-        if not u.meta:
-            continue
-        rows = []
-        for kind in ("required", "recommended"):
-            for dep in u.meta.get(kind, []):
-                a = _resolve_dep(dep, _pkg_dirs()) if "_resolve_dep" in globals() \
-                    else None
-                want = book_version(a or dep.rsplit("-", 1)[0]) or dep
-                have = None
-                if a:
-                    have = gather_user(a).version or \
-                        (gather_user(a).meta or {}).get("name_version")
-                if have and want and not _same_version(have, want):
-                    _row = (kind, a or dep, have, want)
-                    if _row not in rows:      # two deps can resolve alike
-                        rows.append(_row)
-        if not rows:
-            continue
-        print()
-        printWarning("  %s's requirements that differ from the book here:"
-                     % name)
-        _show = rows if _verbose else rows[:12]
-        for kind, a, have, want in _show:
-            printWarning("    %-11s %-22s installed %-24s book %s"
-                         % (kind, a, have, want))
-        if len(rows) > len(_show):
-            # A TRUNCATED LIST MUST SAY HOW TO SEE THE REST.  "... and 5
-            # more" with no way to ask is a dead end.
-            printInfo("    ... and %d more -- all of them:  packagemanager "
-                      "update %s -v" % (len(rows) - len(_show), name))
-        printInfo("    This is not a refusal: one of them may be exactly what")
-        printInfo("    you do not want to touch.  It is what the page was")
-        printInfo("    written against, so if the build fails at configure,")
-        printInfo("    start with these.")
 
 
 def _stop_if_prereqs_missing(args):
@@ -1977,45 +1692,9 @@ def _read_conf_section(path, anchor):
     return {}
 
 
-def _opt_sections(anchor, keys, first_only=False):
-    """Which sections actually define these keys -- [all], the package, or both.
-
-    Both messages below used to name the package section whatever the truth
-    was: `machine.conf [rust]: x.py --jobs 13` for a file with no [rust]
-    section, and `[somepkg] and [all] set weird_option` where only one of
-    them did.  A message that names a thing must be checked against the
-    thing, and here the thing is two files and two sections.
-    """
-    keys = set(keys)
-    out = []
-    for sec in (anchor, "all"):
-        for f in (os.environ.get("PM_MACHINE_CONF", MACHINE_CONF),
-                  os.environ.get("PM_PACKAGE_FIXES", PACKAGE_FIXES)):
-            if keys & set(_read_conf_section(f, sec)):
-                out.append(sec)
-                break
-        # the package section overrides [all], so for a value that was USED
-        # only the winner is worth naming: "[webkitgtk] and [all]: ninja -j8"
-        # credited a section whose 13 had just been overridden by 8.
-        if out and first_only:
-            break
-    return out
-
-
 def _machine_opts_for(anchor):
-    # [all] FIRST, THEN THE PACKAGE.
-    #
-    # `jobs` had to be written per package, because ninja ignores MAKEFLAGS
-    # and there was no way to say "never more than 13 on this machine" once.
-    # An [all] section in either file applies to every package, and a named
-    # section overrides it -- so [webkitgtk] jobs = 8 still wins over
-    # [all] jobs = 13.
     opts = _read_conf_section(
-        os.environ.get("PM_PACKAGE_FIXES", PACKAGE_FIXES), "all")
-    opts.update(_read_conf_section(
-        os.environ.get("PM_MACHINE_CONF", MACHINE_CONF), "all"))
-    opts.update(_read_conf_section(
-        os.environ.get("PM_PACKAGE_FIXES", PACKAGE_FIXES), anchor))
+        os.environ.get("PM_PACKAGE_FIXES", PACKAGE_FIXES), anchor)
     opts.update(_read_conf_section(
         os.environ.get("PM_MACHINE_CONF", MACHINE_CONF), anchor))
     return opts
@@ -2288,29 +1967,6 @@ def _check_script_prereqs(anchor, script_path):
     _warn_missing_build_tools(anchor, script_path)
 
 
-def _has_command(body, cmd):
-    r"""Is `cmd` really invoked here -- not mentioned in a comment?
-
-    THE BOOK PUTS IT AFTER `&&`.  webkitgtk's page writes
-        mkdir -vp build && cd build && cmake -D CMAKE_BUILD_TYPE=Release \\
-    and the detector used `^\s*cmake`, so it found no cmake line and
-    reported "machine.conf [webkitgtk] set USE_WOFF2 ... but the script has
-    no `meson setup` or `cmake` line -- NOT applied".  Seven options,
-    silently dropped, on the one package where they matter most.
-    `_insert_on_command` had already learnt about `&&`; only the test that
-    decides whether to call it had not.
-
-    Comment lines do not count: the same page opens with a NOTE about "the
-    cmake command", which is prose.
-    """
-    for line in body.split("\n"):
-        if line.lstrip().startswith("#"):
-            continue
-        if re.search(r"(?:^|\s|&&|;)%s\b" % re.escape(cmd), line):
-            return True
-    return False
-
-
 def _insert_on_command(body, cmd, arg):
     """Add an argument to the first REAL invocation of `cmd`, skipping
     comments -- a book NOTE that mentions the command by name is prose."""
@@ -2324,68 +1980,9 @@ def _insert_on_command(body, cmd, arg):
     return "\n".join(out)
 
 
-def _meson_option_names(anchor):
-    """The options this package's own source declares, if it is unpacked.
-
-    meson fails the whole build on an unknown option, and a machine.conf
-    section is written by hand: `[gst10-plugins-bad] alsa = enabled` looks
-    perfectly reasonable and is wrong, because `alsa` is a
-    gst-plugins-BASE option.  The answer is in the source tree, which is on
-    disk by the time anything is built.
-    """
-    home = pkgusr_home(anchor)
-    src = os.path.join(home, "src")
-    if not os.path.isdir(src):
-        return None
-    names = set()
-    found = False
-    for d in sorted(os.listdir(src)):
-        for f in ("meson.options", "meson_options.txt"):
-            path = os.path.join(src, d, f)
-            if not os.path.isfile(path):
-                continue
-            found = True
-            try:
-                body = open(path, encoding="utf-8", errors="replace").read()
-            except OSError:
-                continue
-            names |= set(re.findall(r"""^\s*option\(\s*['"]([^'"]+)['"]""",
-                                    body, re.M))
-    return names if found else None
-
-
-def _warn_unknown_meson_opts(anchor, opts):
-    """Drop options the package does not have, and say which they are."""
-    known = _meson_option_names(anchor)
-    if not known:
-        return opts          # not unpacked yet, or not a meson package
-    # meson's own built-ins are not in meson.options and are always valid
-    builtin = {"wrap_mode", "buildtype", "prefix", "libdir", "default_library",
-               "c_args", "cpp_args", "c_link_args", "cpp_link_args",
-               "b_lto", "b_ndebug", "werror", "optimization", "strip",
-               "auto_features", "backend", "jobs", "configure_args"}
-    bad = {k: v for k, v in opts.items() if k not in known and k not in builtin}
-    if not bad:
-        return opts
-    for k in sorted(bad):
-        printWarning("  machine.conf [%s]: '%s' is not an option of this "
-                     "package -- NOT passed" % (anchor, k))
-        # the near misses are what makes this useful: `alsa` under
-        # [gst10-plugins-bad] belongs under [gst10-plugins-base]
-        near = sorted(n for n in known if k in n or n in k)[:4]
-        if near:
-            printInfo("    it does have: %s" % ", ".join(near))
-        printInfo("    meson would have failed the whole build on this"
-                  " (\"Unknown option\").")
-        printInfo("    the options it does have:  grep -h \"^option(\" %s"
-                  % os.path.join(pkgusr_home(anchor), "src", "*",
-                                 "meson.options"))
-    return {k: v for k, v in opts.items() if k not in bad}
-
-
 def apply_machine_opts(anchor, script_path):
     """Merge machine.conf's [anchor] options into the script's meson line."""
-    opts = _warn_unknown_meson_opts(anchor, _machine_opts_for(anchor))
+    opts = _machine_opts_for(anchor)
     if not opts or not script_path or not os.path.isfile(script_path):
         return
     try:
@@ -2404,10 +2001,6 @@ def apply_machine_opts(anchor, script_path):
     #     ERROR: Unknown option: "needs".
     # One file, two readers: each must ignore what belongs to the other.
     opts.pop("needs", None)
-    # Same hazard, same answer: expect= is a post-install feature probe read
-    # by the stack runner.  It belongs in a stack line, but this file is
-    # where a key that is not a build option does damage, so drop it here too.
-    opts.pop("expect", None)
     # ...and REMOVE it if an earlier version already wrote it into the script.
     # 1.13.69 stopped adding -Dneeds=, but every script generated while the
     # bug existed still carries it, and merging is idempotent so nothing took
@@ -2442,45 +2035,13 @@ def apply_machine_opts(anchor, script_path):
     # the failure it prevents arrives hours in, as a killed compiler.
     _jobs = opts.pop("jobs", None)
     if _jobs:
-        _n = str(_jobs).lstrip("-j")
-        # NINJA IS NOT THE ONLY ONE THAT IGNORES THE ENVIRONMENT.
-        #
-        # rust's own page says it: the build "can be mostly limited to a
-        # specified number of processors by a COMBINATION of adding the
-        # switch --jobs <N> on each invocation of ./x.py and using the
-        # CARGO_BUILD_JOBS environment variable".  With only the variable
-        # set, `./x.py build` used every core.
-        #
-        # Each pattern refuses to touch a line that already names -j or
-        # --jobs, so an explicit choice in a script or a stack entry wins.
-        _subs = (
-            # ninja: no environment variable at all
-            # ...and not only at the start of a line: `cmake .. && ninja` is
-            # how half the pages are written, and that ninja was untouched
-            (r"(?m)(^|&&[ \t]*|;[ \t]*)(ninja\b(?![^\n]*(\s-j|\s--jobs)))",
-             r"\1\2 -j" + _n, "ninja -j%s"),
-            # ./x.py build|install|test|dist
-            (r"(?m)^(\s*\.?/?x\.py\s+\w+(?![^\n]*(\s-j|\s--jobs)))",
-             r"\1 --jobs " + _n, "x.py --jobs %s"),
-            # cargo build / cbuild / install / cinstall
-            (r"(?m)^(\s*cargo\s+c?(?:build|install)\b(?![^\n]*(\s-j|\s--jobs)))",
-             r"\1 -j " + _n, "cargo -j %s"),
-        )
-        _changed = []
-        for _pat, _rep, _what in _subs:
-            _nb = re.sub(_pat, _rep, body)
-            if _nb != body:
-                body = _nb
-                _changed.append(_what % _n)
-        if _changed:
+        _nb = re.sub(r"(?m)^(\s*ninja\b(?![^\n]*\s-j))",
+                     r"\1 -j" + str(_jobs).lstrip("-j"), body)
+        if _nb != body:
+            body = _nb
             with open(script_path, "w") as f:
                 f.write(body)
-            printInfo("  machine.conf %s: %s"
-                      % (" and ".join("[%s]" % w
-                                      for w in _opt_sections(anchor, ["jobs"],
-                                                             first_only=True))
-                         or "[%s]" % anchor,
-                         ", ".join(_changed)))
+            printInfo("  machine.conf [%s]: ninja -j%s" % (anchor, _jobs))
     _wrap = opts.pop("wrap_mode", None)
     if _wrap:
         if "meson setup" not in body:
@@ -2496,20 +2057,6 @@ def apply_machine_opts(anchor, script_path):
                 with open(script_path, "w") as f:
                     f.write(body)
                 printInfo("  machine.conf [%s]: wrap-mode %s" % (anchor, _wrap))
-    # KEYS THAT ADDRESS THE TOOL, NOT THE BUILD.
-    #
-    # `[linux-pam] book = .../BLFS-BOOK-12_4-nochunks.html` tells the tool
-    # WHICH BOOK to read that package from -- and it went straight onto the
-    # build line:
-    #     meson setup -Dbook=/usr/share/blfs/books/... ..
-    #     ERROR: Unknown option: "book".
-    # jobs and configure_args were already popped out one at a time; a
-    # reserved SET means the next such key cannot leak the same way, and
-    # `_warn_unknown_meson_opts` cannot save us here because at script
-    # generation time the source is not unpacked yet and it has no
-    # meson.options to check against.
-    for _reserved in ("book",):
-        opts.pop(_reserved, None)
     _conf_args = opts.pop("configure_args", None)
     if _conf_args:
         if "./configure" not in body:
@@ -2565,26 +2112,11 @@ def apply_machine_opts(anchor, script_path):
     # and the person had nowhere to put -D ENABLE_SPELLCHECK=OFF.  Both build
     # systems take -Dkey=value; only the command word differs.  (autotools is
     # already handled above, by configure_args.)
-    # NOTHING LEFT TO APPLY IS NOT A PROBLEM.
-    #
-    # `[all] jobs = 13` was consumed above (x.py --jobs 13, printed and
-    # correct) and then this warned that rust's options had NOT been
-    # applied -- with nothing left in opts to apply.
-    if not opts:
-        return
-    _anchor_cmd = ("meson setup" if _has_command(body, "meson setup")
-                   else ("cmake" if _has_command(body, "cmake") else ""))
+    _anchor_cmd = "meson setup" if "meson setup" in body else (
+        "cmake" if re.search(r"^\s*cmake\b", body, re.M) else "")
     if not _anchor_cmd:
-        # ...AND NAME THE SECTION THAT ACTUALLY EXISTS.  It said
-        #     machine.conf has [rust] but ...
-        # about a file with no [rust] section at all: the keys had come from
-        # [all].  A message that names a thing must be checked against the
-        # thing.
-        _where = _opt_sections(anchor, opts)
-        printWarning("  machine.conf %s set %s for %s, but the script has no "
-                     "`meson setup` or `cmake` line -- NOT applied"
-                     % (" and ".join("[%s]" % w for w in _where) or "(unknown)",
-                        ", ".join(sorted(opts)), anchor))
+        printWarning(f"  machine.conf has [{anchor}] but the script has no "
+                     f"`meson setup` or `cmake` line -- options NOT applied")
         printWarning("  (an autotools package takes configure_args instead)")
         return
     new = body
@@ -2738,26 +2270,14 @@ def install_targets(meta):
     """Collect concrete things the install script says it installs:
     programs, libraries, directories (from installed_program(s)/-libraries/
     -director(y|ies))."""
-    # ONE SCALAR, TWO PATHS.  The book writes "Installed Directories:
-    # /usr/include/opus and /usr/share/doc/opus-1.6.1", and both ended up in
-    # a single `installed_directory=`.  The check then looked for a
-    # directory literally called
-    #     "/usr/include/opus /usr/share/doc/opus-1.6.1"
-    # which of course does not exist -- so opus read "unvalidated: missing:
-    # dir /usr/include/opus ..." with /usr/include/opus sitting right there.
-    # Same for a program or library field with two names in it.
-    def _paths(v):
-        return [x for x in str(v or "").split() if x]
-
     progs, libs, dirs = [], [], []
-    progs += _paths(meta.get("installed_program"))
-    for _p2 in meta.get("installed_programs", []):
-        progs += _paths(_p2)
-    for _l in meta.get("installed_libraries", []):
-        libs += _paths(_l)
-    dirs += _paths(meta.get("installed_directory"))
-    for _d in meta.get("installed_directories", []):
-        dirs += _paths(_d)
+    if meta.get("installed_program"):
+        progs.append(meta["installed_program"])
+    progs += meta.get("installed_programs", [])
+    libs += meta.get("installed_libraries", [])
+    if meta.get("installed_directory"):
+        dirs.append(meta["installed_directory"])
+    dirs += meta.get("installed_directories", [])
     # A STACK ENTRY'S OWN DECLARATION WINS OVER A STALE RECORD.
     #
     # If the stack says what proves this package installed, use that: it is
@@ -2870,25 +2390,6 @@ def assess(u, expected=None, run_cmd=True):
                 and missing[0] == f"program {_pkgname}"):
             return "unvalidated", ("its script names no verifiable target"
                                    " (rebuilt scripts declare one)")
-        # A DOC DIRECTORY NOBODY WAS GOING TO BUILD IS NOT A FAULT.
-        #
-        # /usr/share/doc/opus-1.6.1 exists only if Doxygen and texlive are
-        # installed, and this system deliberately has neither -- the
-        # generator comments those steps out.  So the page names a directory
-        # that was never going to appear, and opus read "unvalidated"
-        # because of it while every header and library was in place.
-        # the path COMPONENT, not a /usr prefix: a doc directory is a doc
-        # directory under any prefix, and anchoring on /usr/share/doc made
-        # this untestable anywhere else
-        _docs = [x for x in missing
-                 if x.startswith("dir ")
-                 and ("/share/doc/" in x or "/share/gtk-doc" in x
-                      or "/share/info" in x or "/share/man" in x)]
-        if _docs and len(_docs) == len(missing):
-            return "installed", ("docs not built (no doxygen/texlive here): %s"
-                                 % ", ".join(d[4:] for d in _docs[:2]))
-        if _docs:
-            missing = [x for x in missing if x not in _docs]
         if missing:
             # SAY WHERE THE EXPECTATION CAME FROM.  "missing: dir
             # /usr/include/wlr" sent the user to look for a directory; the
@@ -3022,7 +2523,7 @@ def cmd_verify(args):
         printWarning("the book named no file to check):")
         for n in _act:
             u = gather_user(n)
-            st, why = assess(u, None, run_cmd=False)
+            st, why = assess(u, versions.get(u.meta.get("name") or n))
             printWarning("  %-24s %-14s %s" % (n, st, why))
         # ONLY WHAT THIS COMMAND CAN ACTUALLY BUILD.
         #
@@ -3084,30 +2585,15 @@ def cmd_info(args):
             if st in ("not installed", "unvalidated") and not args.no_book:
                 print_book_info(u.name or u.search)
 
-    # THREE BUGS IN TWO LINES, and `info` crashed after printing everything
-    # it was asked for:
-    #     NameError: name '_states' is not defined
-    # `_states` was never initialised here (it belongs to verify's loop,
-    # where this was copied from), `name` does not exist in this scope --
-    # `anchor` does -- and the line was there twice.  The dict is worth
-    # having: it is what names the packages that need attention.
-    counts, _states = {}, {}
+    counts = {}
     for u in users:
         anchor = u.meta.get("name") or u.name or u.search
         st, _ = assess(u, versions.get(anchor), run_cmd=False)
         counts[st] = counts.get(st, 0) + 1
-        _states[anchor] = st
+        _states[name] = st
+        _states[name] = st
     print(f"\nTotal: {len(users)}   " +
           "   ".join(f"{k}: {v}" for k, v in sorted(counts.items())))
-    # ...and say which ones, where the eye lands, rather than leaving the
-    # reader to match a count against the list above.
-    _act = [n for n, st in _states.items()
-            if st in ("not installed", "broken")]
-    if _act:
-        print()
-        printWarning("%d of these need attention: %s"
-                     % (len(_act), ", ".join(sorted(_act))))
-        printInfo("  what and why:  packagemanager verify %s" % " ".join(sorted(_act)))
 
 
 # =========================================================================== #
@@ -3125,13 +2611,6 @@ def cmd_info(args):
 # Collector groups live at 90000+, by convention and by the sanity check.
 COLLECTOR_GID_MIN = 90000
 COLLECTOR_GID_MAX = 99000
-
-# Application users (u_*) get their OWN range too.  They were created with
-# the package-user range, so u_claude took 10349 and the next package user
-# started after it -- an application account in the middle of the package
-# accounts, uid and private gid alike.
-APP_UID_MIN = 30000
-APP_UID_MAX = 39999
 
 
 def nimgnu_name(name):
@@ -3547,23 +3026,18 @@ def cmd_nimgnu_list(args):
 
 def cmd_nimgnu_create(args):
     g = nimgnu_name(args.name)
-    if _group_exists(g):
-        printInfo(f"{g}: already exists.")
+    if _group_exists(g) and _user_exists(g):
+        printInfo(f"{g}: already exists (group + user).")
         return
     printHeader(f"Create collector {g}")
     print()
-    # A GROUP, IN THE COLLECTOR RANGE -- no account.  This ran
-    # the package-user helper with the package range, which made a login account
-    # named after the group (home /usr/src/pkgusr/p_nimgnu_python-modules)
-    # and a gid in the middle of the package users (10096).  Every other
-    # collector group comes from _create_collector_group at 90000+.
-    if _create_collector_group(g):
-        printSuccess(f"{g} created (gid {grp.getgrnam(g).gr_gid if grp else '?'}).")
+    cmd = find_add_package_user() + [g, g, "10000", "20000", g, "10000", "20000"]
+    printInfo(f"Creating collector group + user: {' '.join(cmd)}")
+    if _run(cmd):
+        printSuccess(f"{g} created (group + collector user).")
+        report_created_user(g, kind="collector user")
         printInfo(f"  assign directories to it with: "
                   f"packagemanager add-dir-to-sysgroup {args.name} <dir>")
-    else:
-        printError(f"could not create {g}")
-        return 1
 
 
 def cmd_nimgnu_add(args):
@@ -3736,11 +3210,6 @@ SHARED_DIR_PATTERNS = [
     "/usr/share/aclocal", "/usr/share/gtk-doc/html",
     "/usr/lib/systemd/system", "/usr/lib/udev/rules.d",
     "/etc/xdg/autostart", "/usr/libexec",
-    # /etc/profile.d is shared by nature: rust, bash-completion, gettext and
-    # the book's own config pages each drop ONE file in it.  Without this the
-    # first package to create the directory owns it -- p_libnice here -- and
-    # every later package has to be granted it one at a time.
-    "/etc/profile.d",
     "/usr/share/terminfo/*",
 ]
 
@@ -4177,10 +3646,7 @@ def install_tag(anchor, book_version_str):
     if u.state != "installed":
         return colors.yellow + "not installed" + colors.normal
     if u.version and book_version_str and u.version != book_version_str:
-        # "the book has moved on", not "this will be updated": nothing in a
-        # stack run changes an installed package.
-        return (colors.cyan + f"installed {u.version} (book is newer)"
-                + colors.normal)
+        return colors.cyan + f"installed {u.version} (update available)" + colors.normal
     return colors.green + f"installed {u.version or ''}".rstrip() + colors.normal
 
 
@@ -4431,31 +3897,6 @@ def build_install_plan(args):
     install order (deps first); reason in {new, update, reinstall}.  why maps
     anchor -> (kind, parent) so we can show 'required by <parent>'."""
     ignore = {x for x in (args.ignore or "").split(",") if x}
-    # THE AVOID LIST IS A PROPERTY OF THE MACHINE, NOT OF A STACK RUN.
-    #
-    # `install linux-pam --run --recursive` planned **Systemd-261.2** on a
-    # SysV system.  avoid.stack says `avoid systemd` and has since 1.14.224 --
-    # but only `stack` ever read it, so a bare install walked the book's
-    # graph with no exclusions at all and offered to install the one thing
-    # this machine must never have.
-    #
-    # A package named ON THE COMMAND LINE is still built: asking for it
-    # explicitly is an instruction, and refusing that would be second-
-    # guessing.  It is dependencies that are filtered.
-    _named = {a for a in (args.packages or [])}
-    _avoided = _machine_avoids() - _named
-    if _avoided:
-        ignore |= _avoided
-        # SAY IT, because an avoided REQUIRED dependency changes the build.
-        # linux-pam's page (in the systemd book) lists systemd as required;
-        # skipping it is the right call on a SysV machine and the reader
-        # still needs to know it happened.
-        printInfo("  %d package(s) this machine never builds are excluded "
-                  "from the plan" % len(_avoided))
-        printInfo("    (avoid.stack; a package you name yourself is still "
-                  "built).  If the plan")
-        printInfo("    then looks short, one of them was a dependency: "
-                  "packagemanager deps <pkg>")
     plan, seen, missing_all, why = [], set(), [], {}
     # WHAT IS ALREADY DONE, counted as we go.
     #
@@ -4705,35 +4146,12 @@ def cmd_install(args, _replanned=False):
     # because libass was never installed and was never going to be.  The
     # plan knows; it just did not say.
     if not getattr(args, "recursive", False) and len(plan) == 1:
-        # A SWALLOWED EXCEPTION HERE IS SILENCE WHERE THE WARNING SHOULD BE.
-        #
-        # `except (SystemExit, Exception): _missing = []` made a failed
-        # dependency lookup indistinguishable from "no missing
-        # dependencies", and the trap this whole block exists to catch went
-        # uncaught -- numpy planned alone and died on
-        #     BackendUnavailable: Cannot import 'mesonpy'
-        # with meson_python (a book page, and numpy's Required) never built.
-        _missing, _why_not = [], ""
         try:
-            # the SAME ignore set the plan was built with (build_install_plan
-            # has its own local; this referenced a name that does not exist
-            # here, so every non-recursive install printed "NameError: name
-            # 'ignore' is not defined" instead of its missing dependencies)
-            _ignore = {x for x in (getattr(args, "ignore", "") or "").split(",") if x}
-            _deps, _ = blfs_order_anchors(plan[0][0], ignore=_ignore)
+            _deps, _ = blfs_order_anchors(plan[0][0], ignore=ignore)
             _missing = [nv for a, nv, _k, parent in _deps
                         if parent and gather_user(a).state != "installed"]
-        except SystemExit as e:
-            _why_not = "the book lookup exited (%s)" % e
-        except Exception as e:
-            _why_not = "%s: %s" % (type(e).__name__, e)
-        if _why_not:
-            printWarning("  could not work out what %s depends on -- %s"
-                         % (plan[0][1], _why_not))
-            printWarning("  so this plan builds ONLY %s, and a missing"
-                         " dependency will not be" % plan[0][1])
-            printWarning("  reported until the build fails on it.  Safer:"
-                         "  --recursive")
+        except (SystemExit, Exception):
+            _missing = []
         if _missing:
             printWarning("  %d dependenc%s of %s %s NOT installed:"
                          % (len(_missing), "y" if len(_missing) == 1 else "ies",
@@ -4929,16 +4347,6 @@ def _orphan_sweep(user, old_paths, since):
     if old_paths is None:
         return 0
     protected = _PROTECTED_PREFIXES + (BASE_DIR.rstrip("/") + "/",)
-    # NEVER ANOTHER PACKAGE'S FILE.  An old manifest can list a path that
-    # has since moved to someone else: switching Mesa to glvnd hands
-    # libGL.so.1 to libglvnd, which installs it BEFORE the Mesa rebuild --
-    # so it is old, in Mesa's old list, and not rewritten by Mesa.  mtime
-    # alone would delete the GL library.  A package cleans only what it
-    # still owns.
-    try:
-        own_uid = pwd.getpwnam(user).pw_uid if pwd else None
-    except KeyError:
-        own_uid = None
     victims = []
     for p in sorted(old_paths):
         if any(p == pre.rstrip("/") or p.startswith(pre) for pre in protected):
@@ -4946,10 +4354,7 @@ def _orphan_sweep(user, old_paths, since):
         if not os.path.lexists(p):
             continue
         try:
-            st = os.lstat(p)
-            if own_uid is not None and st.st_uid != own_uid:
-                continue
-            if st.st_mtime < since:
+            if os.path.getmtime(p) < since:
                 victims.append(p)
         except OSError:
             continue
@@ -5096,13 +4501,9 @@ def _report_no_book(no_book, consult_lfs, no_record=(), unjudged=(),
         print()
     if no_record:
         printInfo(f"  {len(no_record)} installed, but no recorded version "
-                  f"here -- what the book carries is shown beside each:")
-        for _nr in sorted(no_record)[:12]:
-            printInfo("    " + _nr)
-        if len(no_record) > 12:
-            printInfo("    ... and %d more" % (len(no_record) - 12))
-        printInfo("    the installed version, if the script still names it:"
-                  "  packagemanager info <name>")
+                  f"(built before packagemanager, or its record was lost):")
+        printInfo("    " + ", ".join(sorted(no_record)[:12])
+                  + (" ..." if len(no_record) > 12 else ""))
     if unjudged:
         printInfo(f"  {len(unjudged)} with no completed-install record here "
                   f"(the LFS build tracks these in its own manifests):")
@@ -5175,65 +4576,7 @@ def _systemctl_users(steps):
     return out
 
 
-def _machine_avoids():
-    """Everything this machine never builds, from avoid.stack.
-
-    `avoid` entries were only consulted by `stack`, so `install` and
-    `update` walked the book's dependency graph with nothing excluded.  The
-    exclusions describe the MACHINE -- that is why they were moved into
-    their own file in 1.14.224 -- so every plan should honour them.
-    """
-    out = set()
-    d = STACK_DIR if "STACK_DIR" in globals() else "/etc/pkgusr/stacks"
-    for f in sorted(glob.glob(os.path.join(d, "*.stack"))):
-        try:
-            for r in _parse_stack_file(f):
-                if r["kind"] == "avoid":
-                    out.add(r["target"])
-        except (ValueError, OSError):
-            continue
-    return out
-
-
-def _stack_targets(name):
-    """The packages a stack builds -- book/git/tar entries, not checks."""
-    path = name if os.path.sep in name else os.path.join(
-        STACK_DIR if "STACK_DIR" in globals() else "/etc/pkgusr/stacks",
-        name if name.endswith(".stack") else name + ".stack")
-    if not os.path.isfile(path):
-        printError("no such stack: %s (%s)" % (name, path))
-        return None
-    try:
-        rows = _parse_stack_file(path)
-    except ValueError as e:
-        printError(str(e))
-        return None
-    return [r["target"] for r in rows
-            if r["kind"] in ("book", "git", "tar")]
-
-
 def cmd_update(args):
-    # "UPDATE THE MEDIA CHAIN" WITHOUT TYPING EIGHTEEN NAMES.
-    #
-    # `stack media --run` builds what is MISSING and never updates what is
-    # installed -- correct, and not what someone means by "update the media
-    # stack".  The other end, `update webkitgtk`, is one package.  Between
-    # them there was nothing but a list of names to type out.
-    if getattr(args, "stack", None):
-        _tg = _stack_targets(args.stack)
-        if _tg is None:
-            return 2
-        if args.packages:
-            printInfo("  --stack %s and named packages: using the named ones"
-                      % args.stack)
-        else:
-            args.packages = _tg
-            printInfo("  --stack %s: %d package(s) considered -- %s"
-                      % (args.stack, len(_tg), ", ".join(_tg[:8])
-                         + (" ..." if len(_tg) > 8 else "")))
-            printInfo("    only those the book has moved past will appear in "
-                      "the plan.")
-            printInfo("    pick from them instead of taking all:  --select")
     # --local: update a single package from a custom/local install script
     # (e.g. a git-based package).
     if getattr(args, "local", None):
@@ -5281,7 +4624,6 @@ def cmd_update(args):
 
     cached = use_stored_plan("update", plan_key, assume_yes=args.yes) if args.run else None
     no_book, no_record, unjudged, uptodate = [], [], [], []
-    git_tracked = []
     _checked = 0
 
     if cached is not None:
@@ -5349,33 +4691,7 @@ def cmd_update(args):
                 # same test as the comparison, where it came out falsy --
                 # and the package was filed as up to date.  Not knowing is
                 # not the same as being current.
-                #
-                # BUT --reinstall IS NOT A QUESTION ABOUT VERSIONS.  It says
-                # "build this again at the book's version", and the answer
-                # does not depend on what is recorded: with the version
-                # missing, `update curl --reinstall` reported "nothing to
-                # update, 1 it cannot judge" and did nothing, 28 times in a
-                # row, for packages whose records predate the tool.
-                if getattr(args, "reinstall", False):
-                    plan.append((anchor, name, "(reinstall)", bv))
-                else:
-                    # ...AND SAY WHAT THE BOOK HAS.  "no recorded version"
-                    # answers half the question: the reader wants to know
-                    # what they would get, and the plan already knows it.
-                    no_record.append("%s (book: %s)" % (name, bv or "?"))
-                continue
-            # A GIT-TRACKED PACKAGE HAS NO VERSION TO COMPARE.
-            #
-            # gst-plugins-rs is a `git` stack entry following upstream, and
-            # its name_version is `gst-plugins-rs-git`.  Against the book's
-            # 1.28.6 that read as "older", so an update plan offered to
-            # replace a cargo-built checkout with the book's page -- a
-            # different build entirely, silently.  `-git` is not a version
-            # and cannot be behind one.
-            _is_git_tracked = (str(u.version or "").endswith("-git")
-                               or (u.meta or {}).get("is_git") in ("1", 1))
-            if _is_git_tracked:
-                git_tracked.append((name, u.version, bv))
+                no_record.append(name)
                 continue
             outdated = not _same_version(bv, u.version)
             if outdated:
@@ -5395,22 +4711,6 @@ def cmd_update(args):
                 printWarning(f"{name} is NOT installed (no completed install "
                              f"found) -- use:  packagemanager install {name}")
 
-        if git_tracked:
-            print()
-            printInfo("  %d package(s) follow GIT, not the book -- left alone:"
-                      % len(git_tracked))
-            for _n, _iv, _bv in git_tracked:
-                printInfo("    %-22s tracked as %-20s (the book has %s)"
-                          % (_n, _iv, _bv or "no page"))
-            printInfo("    `-git` is not a version, so it cannot be behind"
-                      " one.  To move such a")
-            printInfo("    package, rebuild its stack entry:  packagemanager"
-                      " stack <name> --only <pkg> --run --force")
-            printInfo("    (that follows the ref in the stack file.  Taking"
-                      " the book's page instead")
-            printInfo("    would be a different build: "
-                      "`packagemanager update <pkg> --reinstall --run`.)")
-
         # named packages that are already current: offer to re-apply
         for anchor, name, iv, bv in uptodate:
             if name not in named and anchor not in named:
@@ -5418,15 +4718,6 @@ def cmd_update(args):
             if getattr(args, "no_reinstall", False):
                 printInfo(f"{name} is already up to date ({bv}); skipping "
                           f"(--no-reinstall).")
-                continue
-            # A DRY RUN ASKS NOTHING.  `update --stack media` prompted four
-            # times -- once per already-current package -- before printing a
-            # plan it was never going to carry out.  A preview that needs
-            # answers is not a preview.
-            if not getattr(args, "run", False):
-                printInfo(f"  {name} is already current ({bv}) -- not in the "
-                          f"plan.  To rebuild it anyway:")
-                printInfo(f"    packagemanager update {name} --reinstall --run")
                 continue
             if args.yes or ask_yes_no(f"{name} is already up to date ({bv}). "
                                       f"Re-apply the update anyway?"):
@@ -5631,27 +4922,6 @@ def cmd_update(args):
                     "--clean" if getattr(args, "clean", False) else "",
                     "-e" if args.ignore_recommended else "",
                     "--optional" if args.optional else "") if f] + ["--run"])
-            _report_stale_requires([st[1] for st in steps],
-                                   _verbose=getattr(args, "verbose", False))
-            # WHERE THE WHOLE LIST IS.  Asking about one package tells you
-            # nothing about the rest, and the command for "everything the
-            # book has moved on from" is this one with no name after it.
-            # WHAT WILL ACTUALLY CHANGE, in one line.  The requirement
-            # report above lists a dozen packages and reads like a plan; it
-            # is not one, and saying so beats hoping the header is noticed.
-            printInfo("  this plan updates %d package(s): %s"
-                      % (len(steps), ", ".join(st[1] for st in steps[:10])
-                         + (" ..." if len(steps) > 10 else "")))
-            printInfo("    nothing else is touched -- the requirements above"
-                      " are a comparison, not a list of work.")
-            if args.packages:
-                printInfo("  other ways to choose:")
-                printInfo("    packagemanager update                    #"
-                          " everything the book has moved past")
-                printInfo("    packagemanager update --stack media      #"
-                          " just that stack's packages")
-                printInfo("    packagemanager update --stack media --select"
-                          " --run   # pick from them")
             printInfo(f"Dry run -- this exact command runs THIS plan ({len(steps)} "
                       f"package(s)):\n    {exact}")
             printInfo(f"(cached under key '{plan_key}', so --run reuses/resumes it).")
@@ -5873,578 +5143,6 @@ def cmd_plan(args):
               "clear all:  packagemanager plan clear")
 
 
-
-# ---------------------------------------------------------------------------
-# WHO WAS BUILT BEFORE WHAT.
-#
-# Every generated script records the page's own required/recommended/optional
-# lists, and every package's pkg.lst is written when it finished installing.
-# Those two facts together answer the question that cost this system its ALSA
-# and its WebRTC: was anything a package can USE installed after that package
-# was built?  Nothing else has to be inferred, guessed or remembered.
-# ---------------------------------------------------------------------------
-
-def _pkg_dirs():
-    root = os.path.join(BASE_DIR, load_config().get("pkgusr_subdir", "pkgusr"))
-    if not os.path.isdir(root):
-        root = BASE_DIR
-    out = {}
-    for d in sorted(os.listdir(root)):
-        full = os.path.join(root, d)
-        if not os.path.isdir(full):
-            continue
-        if not os.path.isfile(os.path.join(full, "install_last")):
-            continue
-        out[re.sub(r"^" + re.escape(pkgusr_prefix()), "", d)] = full
-    return out
-
-
-def _built_when(home):
-    """When this package last finished installing.
-
-    pkg.lst is written after the install, so its mtime is the install time.
-    install_last is the fallback: generated just before the run.
-    """
-    for f in ("pkg.lst", "install_last"):
-        p = os.path.join(home, f)
-        try:
-            return os.path.getmtime(p), f
-        except OSError:
-            continue
-    return None, ""
-
-
-def _script_deps(home):
-    """required/recommended/optional, as the page declared them."""
-    out = {}
-    try:
-        body = open(os.path.join(home, "install_last"),
-                    encoding="utf-8", errors="replace").read()
-    except OSError:
-        return out
-    for kind in ("required", "recommended", "optional"):
-        m = re.search(r"^%s=\((.*?)\)$" % kind, body, re.M | re.S)
-        if not m:
-            continue
-        out[kind] = re.findall(r"'([^']*)'", m.group(1))
-    return out
-
-
-def _norm(s):
-    return re.sub(r"[^a-z0-9]", "", s.lower())
-
-
-_DEP_IDX = {}
-
-
-def _dep_index(installed):
-    """title -> package, built from the packages themselves.
-
-    A dep is written as the page's TITLE ('gst-plugins-base-1.28.1',
-    'FreeType-2.14.1'); a package directory is the page's id
-    ('gst10-plugins-base', 'freetype2').  Normalising the strings cannot
-    bridge that, and 119 of them did not resolve -- which quietly broke the
-    REBUILD ORDER, because a dependency edge that does not resolve is an edge
-    that does not exist: gst10-plugins-bad sorted before gst10-plugins-base,
-    and fontconfig before freetype2.
-    
-    Every script already records `name_version` -- the tarball base, which is
-    the title -- so the mapping is in the data and does not have to be
-    guessed.
-    """
-    key = tuple(sorted(installed))
-    if _DEP_IDX.get("key") == key:
-        return _DEP_IDX["idx"]
-    idx = {}
-    for name, home in installed.items():
-        idx.setdefault(_norm(name), name)
-        try:
-            body = open(os.path.join(home, "install_last"),
-                        encoding="utf-8", errors="replace").read(4096)
-        except OSError:
-            continue
-        m = re.search(r"^name_version='([^']*)'", body, re.M)
-        if not m:
-            continue
-        base = re.sub(r"-[0-9][0-9a-z.]*$", "", m.group(1))
-        idx.setdefault(_norm(base), name)
-    _DEP_IDX.update(key=key, idx=idx)
-    return idx
-
-
-def _resolve_dep(dep, installed):
-    """A dep is 'Little-CMS-2.18'; a package dir is 'lcms2'.
-
-    THE MAJOR VERSION IS PART OF THE NAME, sometimes.  gtk3 and gtk4 both
-    record name_version 'GTK-<v>', so the base name 'GTK' matched whichever
-    was indexed first -- and `GTK-4.20.3` resolved to **gtk3**.  webkitgtk
-    requires both, so it listed gtk3 twice and gtk4 not at all; the same
-    collision hides libsoup-3.x behind libsoup, sdl3 behind sdl, qt6 behind
-    qt.
-
-    So try base+major BEFORE base: `GTK-4.20.3` -> gtk4, `libsoup-3.6.6` ->
-    libsoup3, and `Opus-1.6.1` -> opus1 does not exist, which falls through
-    to opus as before.
-    """
-    idx = _dep_index(installed)
-    base = re.sub(r"-[0-9][0-9a-z.]*$", "", dep)
-    m = re.search(r"-([0-9]+)", dep[len(base):]) if len(dep) > len(base) else None
-    major = m.group(1) if m else ""
-    cands = []
-    if major:
-        cands += [base + major, base.replace("-", "") + major,
-                  base.split("-")[0] + major]
-    cands += [base, base.replace("-", ""), base.split("-")[0]]
-    for cand in cands:
-        n = _norm(cand)
-        if n and n in idx:
-            return idx[n]
-    return None
-
-
-# DOCS AND TESTS ARE NOT FEATURES.
-#
-# graphviz appeared against wayland, llvm, ruby, libinput, libexif and
-# libical; docutils against glib2 and libdrm.  Rebuilding six packages to
-# regenerate documentation nobody reads is not the point of this audit, and
-# burying the real findings under it is how a report gets ignored.
-_DOC_DEPS = {"graphviz", "docutils", "doxygen", "sphinx", "texlive", "asciidoc",
-             "asciidoctor", "dejagnu", "valgrind", "gtk-doc", "xmlto", "ruby",
-             "fop", "docbook-xsl", "docbook", "libxslt-docs", "dblatex"}
-# ...and these are build-time conveniences, not linked features
-_TOOL_DEPS = {"git", "cmake", "cython", "fcron", "meson", "ninja", "nasm",
-              "yasm", "expect", "which", "mako", "setuptools", "wheel",
-              "hatchling", "pytest", "gi-docgen", "gobject-introspection-docs",
-              "unifdef", "gperf"}
-
-
-# INSTALL DOES NOT REBUILD.  `packagemanager install <pkg> --run
-# --regenerate` on an installed package answers "Nothing to do -- everything
-# is installed and up to date" -- correctly, and 28 times in a row, so the
-# whole rebuild pass did nothing and said so in a way that looked like
-# success.  The verb that rebuilds at the same version is `update
-# --reinstall`.
-def _rebuild_cmd(name):
-    return ["packagemanager", "update", name, "--reinstall", "--regenerate",
-            "--run", "--yes"]
-
-
-def _required_graph(installed, kinds=("required",)):
-    """package -> the packages it depends on, from its own script."""
-    g = {}
-    for name, home in installed.items():
-        deps, d = set(), _script_deps(home)
-        for kind in kinds:
-            for dep in d.get(kind, []):
-                got = _resolve_dep(dep, installed)
-                if got and got != name:
-                    deps.add(got)
-        g[name] = deps
-    return g
-
-
-def _depends_on(g, a, b, seen=None):
-    """does a require b, directly or through anything?"""
-    if seen is None:
-        seen = set()
-    if a in seen:
-        return False
-    seen.add(a)
-    for d in g.get(a, ()):
-        if d == b or _depends_on(g, d, b, seen):
-            return True
-    return False
-
-
-# A TIMESTAMP IS EVIDENCE; A PROBE IS AN ANSWER.
-#
-# Two packages built in the same session cannot be ordered by pkg.lst
-# mtimes, and that is exactly where the interesting cases are (ffmpeg and
-# alsa-lib, zero days apart).  The stacks already carry `expect=` probes that
-# read the built artifact -- run them.
-def cmd_probe(args):
-    import glob as _glob   # noqa: also used by the no-probes branch below
-    stacks = sorted(_glob.glob("/etc/pkgusr/stacks/*.stack"))
-    if not stacks:
-        printError("no stack files in /etc/pkgusr/stacks")
-        return 1
-    n = ok = bad = 0
-    for path in stacks:
-        for e in _parse_stack_file(path):
-            probe = e["opts"].get("expect")
-            if not probe:
-                continue
-            if args.package and e["target"] not in args.package:
-                continue
-            n += 1
-            r = subprocess.run(["/bin/bash", "-c", probe],
-                               stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT)
-            stack_name = os.path.basename(path).replace(".stack", "")
-            if r.returncode == 0:
-                ok += 1
-                printSuccess("%-22s %s" % (e["target"], probe))
-                continue
-            bad += 1
-            printError("%-22s %s" % (e["target"], probe))
-            # A PROBE THAT FAILS BECAUSE THE PACKAGE IS NOT THERE IS NOT THE
-            # SAME FINDING.  gst10-libav had never been built -- it was
-            # missing from the stack until now -- and the report said "the
-            # feature is NOT in the installed package", which sends the
-            # reader looking for a build option.
-            home = pkgusr_home(e["target"])
-            installed = os.path.exists(os.path.join(home, "pkg.lst"))
-            if not installed:
-                printInfo("    that package is NOT INSTALLED here -- nothing"
-                          " was built without the feature,")
-                printInfo("    there is nothing built at all.  Build it:")
-                printInfo("      packagemanager stack %s --only %s --run"
-                          % (stack_name, e["target"]))
-            else:
-                printInfo("    the package is installed and the feature is"
-                          " not in it.  Rebuild:")
-                # not `stack --only`: that runs install, which no-ops on an
-                # installed package
-                printInfo("      %s" % " ".join(_rebuild_cmd(e["target"])))
-            # ...and what the probe itself said, because a probe can be wrong
-            # about a path as easily as a package can be wrong about a feature
-            first = (r.stdout or b"").decode("utf-8", "replace").strip()
-            if first:
-                printInfo("    the check said: %s" % first.splitlines()[0][:120])
-    if n == 0:
-        printInfo("no expect= probes in the stacks"
-                  + (" for %s" % ", ".join(args.package) if args.package else ""))
-        # SAY WHY THERE ARE NONE.  A stack file you have edited is never
-        # overwritten -- the new one lands beside it as .stack.new -- so an
-        # installed tool can carry probes that no installed STACK has, and
-        # "no probes" reads as "nothing to check" rather than "your stacks
-        # predate them".
-        waiting = []
-        for newf in sorted(_glob.glob("/etc/pkgusr/stacks/*.stack.new")):
-            try:
-                if "expect=" in open(newf, encoding="utf-8",
-                                     errors="replace").read():
-                    waiting.append(newf)
-            except OSError:
-                continue
-        if waiting:
-            print("")
-            printWarning("%d newer stack file(s) beside yours DO carry probes:"
-                         % len(waiting))
-            for newf in waiting:
-                base = os.path.basename(newf).replace(".stack.new", "")
-                printInfo("    %s" % newf)
-                printInfo("      take it:  packagemanager stack %s --take-new"
-                          % base)
-            printInfo("  Your copy was edited, so make install left it alone"
-                      " and put the new one beside it.")
-        else:
-            printInfo("  Probes live in the stack files as expect=\"...\"."
-                      "  These stacks have none,")
-            printInfo("  which is what an older stack looks like:"
-                      " compare with the shipped one.")
-        return 0
-    print("")
-    if bad:
-        printWarning("%d of %d probe(s) failed -- see each line: a package that"
-                     " is not installed and one" % (bad, n))
-        printWarning("   built without a feature are different problems.")
-        return 1
-    printSuccess("all %d probe(s) pass: the features they check are present." % ok)
-    return 0
-
-
-def cmd_late_deps(args):
-    installed = _pkg_dirs()
-    if not installed:
-        printError("no package users with an install_last under %s" % BASE_DIR)
-        return 1
-    kinds = [k.strip() for k in (args.kind or "recommended,optional").split(",")
-             if k.strip()]
-    # WHY DID IT DECIDE THAT?  The order is computed from edges, and an edge
-    # that does not resolve is invisible -- so when a position looks wrong,
-    # the useful thing is the graph it actually used for that package.
-    if getattr(args, "why", False):
-        for name in (args.package or sorted(installed)):
-            if name not in installed:
-                printWarning("%s is not installed here" % name)
-                continue
-            when, src = _built_when(installed[name])
-            print("")
-            printHeader(name)
-            print("  built:  %s (%s)"
-                  % (time.strftime("%Y-%m-%d %H:%M",
-                                   time.localtime(when)) if when else "unknown", src))
-            d = _script_deps(installed[name])
-            for kind in ("required", "recommended", "optional"):
-                for dep in d.get(kind, []):
-                    got = _resolve_dep(dep, installed)
-                    if got is None:
-                        print("  %-12s %-28s -> no installed package of that name"
-                              % (kind, dep))
-                        continue
-                    dw, _ = _built_when(installed[got])
-                    if dw and when:
-                        diff = dw - when
-                        rel = ("built %+d day(s) relative to it" % (diff // 86400)
-                               if abs(diff) >= 86400 else
-                               "built %+d hour(s) relative to it" % (diff // 3600))
-                    else:
-                        rel = "no date"
-                    print("  %-12s %-28s -> %s, %s" % (kind, dep, got, rel))
-        return 0
-    only = set(args.package or [])
-    problems, unresolved, nodate = [], set(), []
-    for name, home in installed.items():
-        if only and name not in only:
-            continue
-        when, src = _built_when(home)
-        if when is None:
-            nodate.append(name)
-            continue
-        late = []
-        for kind in kinds:
-            for dep in _script_deps(home).get(kind, []):
-                got = _resolve_dep(dep, installed)
-                if got is None:
-                    unresolved.add(dep)
-                    continue
-                if got == name:
-                    continue
-                dwhen, _ = _built_when(installed[got])
-                if dwhen is None:
-                    continue
-                # SLACK THAT HIDES THE CASE IS TOO MUCH SLACK.
-                #
-                # A day was chosen because pkg.lst is rewritten by
-                # reload-pkg-list and by --clean, so packages from one run
-                # differ by minutes.  But `ffmpeg ... alsa-lib +0 day(s)` was
-                # then filed as fine, and alsa-lib a few HOURS after ffmpeg
-                # is the original bug exactly.  An hour covers the rewrite
-                # noise; anything more is a gap.
-                if dwhen - when > 3600:
-                    late.append((kind, got, dep, dwhen - when))
-        if late:
-            problems.append((name, when, src, late))
-
-    # THREE DIFFERENT ANSWERS, and the report was giving one.
-    #
-    #   ORDERABLE  the dependency does not need this package, so it can simply
-    #              be built first -- a stack line moves and the problem is
-    #              gone for the next machine.
-    #   CIRCULAR   the dependency REQUIRES this package (cairo needs glib2,
-    #              mesa needs libxcb).  No order exists.  The only fix is a
-    #              second pass: build, build the dependency, rebuild.
-    #   COSMETIC   documentation and build tools.  Nothing to gain.
-    g = _required_graph(installed)
-    # RECOMMENDED IS A DEPENDENCY TOO, for the purpose of asking whether an
-    # order exists.  With `required` alone the report said
-    #     in the stack: put mesa before libxcb
-    # and mesa cannot precede libxcb -- it needs it.  BLFS lists that edge as
-    # recommended, not required, and cairo needs glib2 the same way.  Advice
-    # that cannot be taken is worse than no advice.
-    g_order = _required_graph(installed, ("required", "recommended"))
-    orderable, circular, cosmetic = [], [], []
-    for name, when, src, late in problems:
-        o, c, d = [], [], []
-        for item in late:
-            dep_pkg = item[1]
-            if dep_pkg in _DOC_DEPS or dep_pkg in _TOOL_DEPS:
-                d.append(item)
-            elif _depends_on(g_order, dep_pkg, name):
-                c.append(item)
-            else:
-                o.append(item)
-        if o:
-            orderable.append((name, when, src, o))
-        if c:
-            circular.append((name, when, src, c))
-        if d:
-            cosmetic.append((name, when, src, d))
-
-    def _show(rows, header, note):
-        if not rows:
-            return
-        print("")
-        printHeader(header)
-        printInfo("  " + note)
-        for name, when, src, late in sorted(rows, key=lambda r: -len(r[3])):
-            print("")
-            printWarning("%s  (built %s)"
-                         % (name, time.strftime("%Y-%m-%d", time.localtime(when))))
-            for kind, got, _dep, gap in late:
-                when_s = ("%d day(s)" % (gap // 86400) if gap >= 86400
-                          else "%d hour(s)" % (gap // 3600))
-                print("    %-12s %-22s installed %s later%s"
-                      % (kind, got, when_s,
-                         "  <- same session: only a probe can settle it"
-                         if gap < 21600 else ""))
-            # SAY WHAT TO CHANGE, not just what is wrong.  The orderable ones
-            # are a stack edit; without the line the reader has to work out
-            # which file and which position.
-            if rows is orderable:
-                print("    in the stack:  put %s before %s"
-                      % (", ".join(sorted({g for _k, g, _d, _x in late})), name))
-
-    if not problems:
-        printSuccess("no package was built before something it can use.")
-    _show(orderable, "built too early -- and an order exists",
-          "move these dependencies earlier in the stack, then rebuild these once.")
-    _show(circular, "built too early -- no order exists",
-          "the dependency requires this package, so it cannot go first."
-          "  A second pass is the only fix.")
-    if args.include_docs:
-        _show(cosmetic, "documentation and build tools only",
-              "rebuilding gains you documentation, not features.")
-    elif cosmetic:
-        print("")
-        printInfo("%d package(s) differ only in documentation or build tools"
-                  " (--include-docs to see them)" % len(cosmetic))
-
-    # THE REBUILD ORDER IS NOT THE REPORT ORDER.  Rebuilding a library after
-    # the thing that links it means doing it twice.
-    todo = {r[0] for r in orderable} | {r[0] for r in circular}
-    if args.include_docs:
-        todo |= {r[0] for r in cosmetic}
-    if todo:
-        # ORDER BY EVERY EDGE THAT DECIDES A FEATURE, not just the required
-        # ones: mesa RECOMMENDS libxcb, so libxcb has to be rebuilt first or
-        # mesa is rebuilt against the old one.  Cycles are expected here
-        # (cairo and glib2 recommend each other) and are broken below.
-        # ORDER THE CLUSTERS, NOT THE NODES.
-        #
-        # Picking one node out of a cycle and then going back to the ready
-        # scan strands the rest of the cluster at the end: freetype2 and
-        # harfbuzz (which recommend/require each other) came out LAST, after
-        # fontconfig and cairo -- both of which require freetype2.  So the
-        # cycle has to be treated as one unit.
-        #
-        # Tarjan gives the strongly connected components; the components form
-        # a DAG by construction, so they sort cleanly.  Inside a component
-        # there is no right answer, and the same rule as before applies:
-        # least dependent, most depended on.
-        nodes = set(todo)
-        # THE OPTIONAL EDGE IS THE WHOLE POINT OF THIS PASS.
-        #
-        # The order graph was required+recommended, so mpg123 was rebuilt
-        # BEFORE pulseaudio -- and mpg123's missing feature IS pulseaudio.
-        # Ordering a rebuild by the edges that do not decide features, while
-        # ignoring the ones that do, cannot be right.
-        #
-        # Optional edges make the graph much more cyclic; that is honest
-        # rather than inconvenient, and SCCs handle it.  Inside a component
-        # the STRONG edges (required, recommended) still decide, because
-        # those are the ones that break a build rather than a feature.
-        g_all = _required_graph(installed,
-                                ("required", "recommended", "optional"))
-        adj = {n: (g_all.get(n, set()) & nodes) for n in nodes}
-        strong = {n: (g_order.get(n, set()) & nodes) for n in nodes}
-        index, low, on_stack, stack, sccs, counter = {}, {}, set(), [], [], [0]
-
-        def _strong(v):
-            # iterative: a 400-package graph would recurse past the limit
-            work = [(v, iter(sorted(adj[v])))]
-            index[v] = low[v] = counter[0]; counter[0] += 1
-            stack.append(v); on_stack.add(v)
-            while work:
-                node, it = work[-1]
-                advanced = False
-                for w in it:
-                    if w not in index:
-                        index[w] = low[w] = counter[0]; counter[0] += 1
-                        stack.append(w); on_stack.add(w)
-                        work.append((w, iter(sorted(adj[w]))))
-                        advanced = True
-                        break
-                    if w in on_stack:
-                        low[node] = min(low[node], index[w])
-                if advanced:
-                    continue
-                work.pop()
-                if work:
-                    low[work[-1][0]] = min(low[work[-1][0]], low[node])
-                if low[node] == index[node]:
-                    comp = []
-                    while True:
-                        w = stack.pop(); on_stack.discard(w); comp.append(w)
-                        if w == node:
-                            break
-                    sccs.append(comp)
-
-        for n in sorted(nodes):
-            if n not in index:
-                _strong(n)
-
-        # Tarjan emits each component only after everything it depends on,
-        # so this is already dependency order.
-        comp_of = {n: i for i, c in enumerate(sccs) for n in c}
-        ordered, cycles = [], []
-
-        def _inside(c):
-            cs = set(c)
-            return sorted(c, key=lambda n: (len(strong[n] & cs),
-                                            len(adj[n] & cs),
-                                            -sum(1 for m in cs if n in strong[m]),
-                                            -sum(1 for m in cs if n in adj[m]),
-                                            n))
-
-        for comp in sccs:
-            if len(comp) > 1:
-                cycles.extend(_inside(comp))
-                ordered.extend(_inside(comp))
-            else:
-                ordered.extend(comp)
-
-        print("")
-        printHeader("rebuild, in this order (%d)" % len(ordered))
-        printInfo("  dependencies first, so nothing is rebuilt twice.")
-        for n in ordered:
-            print("    %s" % " ".join(_rebuild_cmd(n)))
-        if cycles:
-            print("")
-            printInfo("  %d of these are in dependency cycles, where no order"
-                      " is completely right:" % len(cycles))
-            printInfo("    " + ", ".join(cycles))
-            printInfo("  each was placed by fewest unmet dependencies, then by"
-                      " how many wait for it.")
-            printInfo("  If a feature is still missing afterwards, run"
-                      " late-deps again: a cycle")
-            printInfo("  can need two passes, and the second one is short.")
-        if args.rebuild:
-            print("")
-            if not args.run:
-                printInfo("that is the plan; add --run to do it.")
-                return 1
-            for i, n in enumerate(ordered, 1):
-                printHeader("rebuild %d/%d: %s" % (i, len(ordered), n))
-                rc = subprocess.run(_rebuild_cmd(n)).returncode
-                if rc != 0:
-                    printError("%s failed (exit %d) -- stopping here, with"
-                               " %d left." % (n, rc, len(ordered) - i))
-                    printInfo("  fix it, then run late-deps --rebuild --run again:"
-                              " what succeeded is recorded and will not repeat.")
-                    return 1
-            printSuccess("rebuilt %d package(s)." % len(ordered))
-            return 0
-    if unresolved and args.verbose:
-        print("")
-        printInfo("could not match to an installed package (so not checked): %s"
-                  % ", ".join(sorted(unresolved)))
-    elif unresolved:
-        print("")
-        printInfo("%d dependency name(s) match no INSTALLED package"
-                  " (--verbose lists them)." % len(unresolved))
-        printInfo("  Mostly that means they are not installed, which is"
-                  " nothing to fix -- a package")
-        printInfo("  that is not there cannot have been built after anything."
-                  "  A name you know IS")
-        printInfo("  installed appearing there is worth reporting: it is an"
-                  " edge this cannot see.")
-    if nodate:
-        printInfo("%d package(s) have no pkg.lst and no install_last date"
-                  % len(nodate))
-    return 1 if problems else 0
-
 def cmd_errors(args):
     """Show which packages failed in the LAST install/update run, with their log
     locations.  With --all, show every package's result."""
@@ -6494,30 +5192,16 @@ def _versioned_script_in(home):
     That is the file a person is told to edit, and the one the copy that
     actually runs is made from -- so a failure has to be able to name it.
     """
-    # THE ONE THAT WAS LAST INSTALLED, NOT THE FIRST IN THE ALPHABET.
-    #
-    # A home keeps every version's script: p_mesa has install_Mesa-25.3.5
-    # and install_Mesa-26.1.7.  sorted() returned 25.3.5, so `script install
-    # mesa` ran the OLD version's install over a 26.1.7 build ("9" also sorts
-    # after "10").  install_last names the version last staged; take that
-    # file.  Without it, the newest by modification time.
     try:
-        cands = [f for f in os.listdir(home)
-                 if f.startswith("install_") and not f.endswith((".edited", ".bak"))
-                 and re.search(r"-\d[\w.]*$", f)]
-    except OSError:
-        return None
-    if not cands:
-        return None
-    try:
-        m = re.search(r"^name_version=['\"]([^'\"]+)['\"]",
-                      open(os.path.join(home, "install_last"),
-                           encoding="utf-8", errors="replace").read(), re.M)
-        if m and ("install_" + m.group(1)) in cands:
-            return os.path.join(home, "install_" + m.group(1))
+        for f in sorted(os.listdir(home)):
+            if not f.startswith("install_") or f.endswith((".edited", ".bak")):
+                continue
+            # install_wget-1.25.0 -- a version after the last dash
+            if re.search(r"-\d[\w.]*$", f):
+                return os.path.join(home, f)
     except OSError:
         pass
-    return max((os.path.join(home, f) for f in cands), key=os.path.getmtime)
+    return None
 
 
 def _unpacked_source_dir(home):
@@ -8710,16 +7394,14 @@ def _bootstrap_next_steps(st):
 
 
 def cmd_user_create(args):
-    if _resolve_shared_level(args) is None:
-        return 2
     u = _user_prefixed(args.name)
     if _user_exists(u):
         printInfo(f"{u}: already exists.")
     else:
         printHeader(f"Create shared user {u}")
         print()
-        cmd = find_add_package_user() + [u, u, str(APP_UID_MIN), str(APP_UID_MAX),
-                                         u, str(APP_UID_MIN), str(APP_UID_MAX)]
+        cmd = find_add_package_user() + [u, u, "10000", "20000",
+                                         u, "10000", "20000"]
         printInfo(f"Creating shared user: {' '.join(cmd)}")
         if not _run(cmd):
             return
@@ -8728,82 +7410,9 @@ def cmd_user_create(args):
     if args.groups:
         _add_groups(u, [g for g in re.split(r"[,\s]+", args.groups) if g])
 
-    # AN APPLICATION USER IS NOT A PACKAGE USER, AND ITS HOME IS NOT IN
-    # /usr/src.
-    #
-    # `add_package_user` is what creates the account -- it handles the uid
-    # range and the matching group -- and it puts the home where PACKAGE
-    # homes go:
-    #     /usr/src/u_claude, /usr/src/u_browser-mini, ...
-    # A package user's home is a build tree.  An application user's home is
-    # a home: it holds a browser profile, a .config, a Downloads directory.
-    # It belongs in /home, which is also where the shared-directory links
-    # and the XDG skeleton expect it.
-    _relocate_app_home(u)
-
     # An account on its own is not usable: you cannot become it, its home is
     # world-readable, and nothing launches the program.  Do the rest.
     _setup_application_user(u, args)
-
-
-def _relocate_app_home(u):
-    """Move an application user's home from the package tree to /home.
-
-    Only from the package-user base, only when the target does not already
-    exist, and with `usermod -m` so the contents come along.  Anything else
-    is left exactly as it is: a home someone has already set up elsewhere
-    is not this function's business.
-    """
-    cur = _home_of(u) or ""
-    root = appuser_home()
-    want = os.path.join(root, u)
-    if not cur or os.path.realpath(cur) == os.path.realpath(want):
-        return
-    # Moved from where these tools put it before, and nowhere else: the
-    # package tree, or /home/<user> (the old hard-coded place).  A home
-    # someone chose elsewhere is not this function's business.
-    base = os.path.realpath(BASE_DIR)
-    rc = os.path.realpath(cur)
-    if not (rc.startswith(base + os.sep)
-            or rc == os.path.realpath(os.path.join("/home", u))):
-        printInfo("  %s's home is %s -- left alone (not a place these tools"
-                  " put it)" % (u, cur))
-        return
-    if os.path.exists(want):
-        printWarning("  %s already exists -- not moving %s's home there"
-                     % (want, u))
-        printInfo("    check it, then:  usermod -d %s -m %s" % (want, u))
-        return
-    if not os.path.isdir(root):
-        _run(["install", "-d", "-o", "root", "-g", "root", "-m", "0755", root])
-    printInfo("  %s's home is %s -- application users live in %s"
-              % (u, cur, root))
-    if _run(["usermod", "-d", want, "-m", u]):
-        _run(["chmod", "0750", want])
-        printSuccess("  moved to %s (0750)" % want)
-        _repoint_shared_link(u, cur, want)
-    else:
-        printWarning("  could not move it (is %s logged in or running"
-                     " something?); by hand:" % u)
-        printInfo("    usermod -d %s -m %s && chmod 0750 %s" % (want, u, want))
-
-
-def _repoint_shared_link(u, old_home, new_home):
-    """~/Shared/<Name> of the main user pointed into the old home."""
-    mh = _home_of(main_user() or "") or ""
-    hub = os.path.join(mh, "Shared") if mh else ""
-    if not hub or not os.path.isdir(hub):
-        return
-    for n in os.listdir(hub):
-        p = os.path.join(hub, n)
-        if not os.path.islink(p):
-            continue
-        t = os.readlink(p)
-        if t.startswith(old_home.rstrip("/") + "/"):
-            nt = new_home.rstrip("/") + t[len(old_home.rstrip("/")):]
-            os.unlink(p)
-            os.symlink(nt, p)
-            printInfo("    %s -> %s" % (p, nt))
 
 
 def _xdg_runtime_dir_of(user):
@@ -8822,50 +7431,37 @@ def _xdg_runtime_dir_of(user):
     return None
 
 
-def xdg_runtime_group():
-    """The one group that opens the main user's session to shared accounts."""
-    return collector_prefix() + "xdg-runtime"
-
-
 def _join_xdg_runtime_group(main, u):
-    """Put an application user -- and the main user -- in the session group.
+    """Put an application user in the group that owns the session.
 
     A "shared user" is one that may reach the main user's XDG runtime
-    directory: the display socket (and pipewire's) live there, so without it
-    a graphical program starts and then cannot draw anything.
+    directory -- that is where the display socket, the session bus and the
+    audio socket live, so without it a graphical program starts and then
+    cannot draw anything.
 
-    THE GROUP IS NAMED, NOT READ OFF THE DIRECTORY.  This used to take
-    whatever group /tmp/xdg-<main> carried -- which is the main user's own
-    private group -- refuse, and say "set up a runtime group first", which
-    nothing did.  <prefix>_xdg-runtime is created here (collector range), the
-    main user joins it (a user may only chgrp to a group it is in) and so does
-    every shared account.  The directory is recreated at every boot, so its
-    group is applied by the session itself: /usr/bin/xdg-runtime-share and
-    /etc/profile.d/xdg-runtime-share.sh, written by `cfg app-users`.
-    """
-    g = xdg_runtime_group()
-    if not _create_collector_group(g):
-        printWarning(f"  could not create the session group {g} -- {u} will "
-                     f"not reach the session")
-        return
-    for who in (main, u):
-        _run(["usermod", "-a", "-G", g, who])
-    printInfo(f"  {main} and {u} are in '{g}' (the session group)")
+    The group is read from the directory rather than assumed: it is set up
+    once for the main user, and every shared account afterwards simply joins
+    whatever is there."""
     rt = _xdg_runtime_dir_of(main)
     if not rt:
-        printInfo(f"    no runtime directory for {main} right now -- the session "
-                  f"applies the group when it starts")
+        printWarning(f"  no XDG runtime directory found for {main} -- "
+                     f"{u} will not reach the session")
+        printInfo("    (looked for /run/user/<uid> and /tmp/xdg-<user>)")
         return
     try:
         import grp
-        cur = grp.getgrgid(os.stat(rt).st_gid).gr_name
+        grp_name = grp.getgrgid(os.stat(rt).st_gid).gr_name
     except (KeyError, ImportError, OSError):
-        cur = ""
-    if cur != g:
-        # root may do it now; the session does it on every later login
-        _run(["chgrp", g, rt])
-        _run(["chmod", "0750", rt])
-        printInfo(f"    {rt}: group {g}, 0750 (was {cur or '?'})")
+        printWarning(f"  cannot read the group on {rt}")
+        return
+    if grp_name in (main, "root"):
+        printWarning(f"  {rt} is group '{grp_name}', which is not a shared "
+                     f"group -- {u} was not added")
+        printInfo("    Set up a runtime group for the session first, then "
+                  "re-run this.")
+        return
+    _run(["usermod", "-a", "-G", grp_name, u])
+    printInfo(f"  {u} joined '{grp_name}' (the group on {rt})")
 
 
 XDG_SKEL = "/etc/pkgusr/skel-u_xdg/.bash_profile"
@@ -8909,9 +7505,7 @@ def _link_xdg_profile(main, u):
             printWarning(f"  could not write {XDG_SKEL}: {e}")
             return
 
-    # the ACCOUNT's home, not a package home: this linked
-    # /usr/src/u_claude/.bash_profile
-    home = _app_home(u)
+    home = pkgusr_home(u)
     target = os.path.join(home, ".bash_profile")
     if os.path.islink(target) and os.path.realpath(target) == \
             os.path.realpath(XDG_SKEL):
@@ -8938,7 +7532,7 @@ def _setup_application_user(u, args):
       * an optional shared directory both accounts can write
       * an optional launcher in ~/bin so the program runs as that user
     """
-    home = _app_home(u)
+    home = os.path.join(appuser_home(), u)
     main = main_user()
     if not main:
         printWarning("\nNo main user is set, so this account cannot be reached "
@@ -8970,74 +7564,36 @@ def _setup_application_user(u, args):
 
     # 5. a shared directory, when asked for
     if getattr(args, "share_dir", False):
-        share = os.path.join(_app_home(u), "Shared")
+        share = os.path.join(home, "Shared")
         _run(["mkdir", "-p", share])
         _run(["chown", f"{u}:{u}", share])
         _run(["chmod", "2770", share])   # setgid: new files keep the group
-        # ONE DIRECTORY OF LINKS, NAMED AFTER THE ACCOUNT.  These used to
-        # land as ~/<name>-shared, one per account, scattered through the
-        # home directory.  ~/Shared/<Name> keeps them together and gives the
-        # env file below something to enumerate.
-        _mh = _home_of(main) or ""
-        link = ""
-        if _mh:
-            _hub = os.path.join(_mh, "Shared")
-            if not os.path.isdir(_hub):
-                _run(["mkdir", "-p", _hub])
-                _run(["chown", f"{main}:{main}", _hub])
-            link = os.path.join(_hub, args.name[:1].upper() + args.name[1:])
-            if os.path.islink(link):
-                if os.path.realpath(link) != os.path.realpath(share):
-                    printWarning(f"  {link} already points at "
-                                 f"{os.path.realpath(link)} -- left alone")
-                    link = ""
-            elif os.path.exists(link):
-                # A REAL DIRECTORY IS NOT OURS TO REPLACE.
-                printWarning(f"  {link} exists and is not a symlink -- "
-                             f"left alone")
-                printInfo("    move it aside yourself if you want the link")
-                link = ""
-            else:
-                _run(["ln", "-s", share, link])
+        link = os.path.join(_home_of(main) or "", f"{args.name}-shared")
+        if link and not os.path.exists(link):
+            _run(["ln", "-s", share, link])
         printInfo(f"  shared directory: {share}")
         if link:
             printInfo(f"    reachable from your account as {link}")
-        _old = os.path.join(_mh, f"{args.name}-shared") if _mh else ""
-        if _old and os.path.islink(_old):
-            printInfo(f"    (the older link {_old} is still there; remove it "
-                      f"when you are ready)")
 
     # 6. a launcher and a menu entry, when the program is really there
     app = getattr(args, "app", None) or getattr(args, "name", None) \
         or u[len(user_prefix()):]
     import shutil as _sh
-    # AN APP CAN BE A COMMAND LINE.  `--app "/bin/browser-mini
-    # https://claude.ai/new"` is the whole point of a per-account browser,
-    # and `which` on that string finds nothing -- so the launcher and the
-    # menu entry were silently skipped for exactly the accounts that needed
-    # them most.  Look up the FIRST word; run the whole line.
-    _app_argv = app.split()
-    _app_cmd = _app_argv[0] if _app_argv else app
-    _app_base = os.path.basename(_app_cmd)
     want_launcher = getattr(args, "launcher", False)
     want_desktop = getattr(args, "desktop", False)
     if want_launcher or want_desktop:
         # Their original checked `which $app` first and skipped both when it
         # was missing -- a launcher for a program that is not installed is
         # just a broken command in your PATH.
-        if not (_sh.which(_app_cmd) or os.path.isfile(_app_cmd)):
-            printWarning(f"  no '{_app_cmd}' on PATH -- no launcher or menu "
-                         f"entry")
+        if not _sh.which(app):
+            printWarning(f"  no '{app}' on PATH -- no launcher or menu entry")
             printInfo(f"    (install it first, then: packagemanager user "
-                      f"setup {args.name} --launcher --desktop)")
+                      f"setup {app} --launcher --desktop)")
         else:
-            # the launcher is NAMED after the account, not after the command:
-            # two accounts can run the same browser with different arguments,
-            # and ~/bin/browser-mini cannot be both.
             if want_launcher:
-                _write_launcher(main, u, app, name=args.name)
+                _write_launcher(main, u, app)
             if want_desktop:
-                _write_desktop_entry(main, u, app, name=args.name)
+                _write_desktop_entry(main, u, app)
 
 
 def _home_of(user):
@@ -9080,61 +7636,9 @@ def _allow_su_via_pam(u, main):
     try:
         with open(pam, "w") as f:
             f.writelines(out)
-        # IT IS A SCRIPT pam EXECUTES.  Rewriting it must not drop the exec
-        # bit, and a file written 644 makes `su` ask for a password with
-        # nothing in the logs to say why.
-        _m = os.stat(pam).st_mode & 0o777
-        if not _m & 0o111:
-            os.chmod(pam, 0o755)
-            printInfo(f"  {pam} was not executable ({_m:o}) -- set to 755, "
-                      f"pam_exec.so runs it")
         printInfo(f"  {main} may now `su - {u}` without a password")
-        # ...AND pam ONLY READS IT IF /etc/pam.d/su SAYS SO.
-        _su = "/etc/pam.d/su"
-        _line = "auth      sufficient  pam_exec.so quiet %s" % pam
-        try:
-            _has = os.path.isfile(_su) and "su_u_user" in open(_su).read()
-        except OSError:
-            _has = False
-        if not _has:
-            printWarning(f"  {_su} does not call it, so su will still ask for"
-                         f" a password.")
-            printInfo("    add, above the other auth lines:")
-            printInfo("      %s" % _line)
-            printInfo("    `packagemanager stack services --only app-users "
-                      "--run` does it for you.")
     except OSError as e:
         printWarning(f"  could not write {pam}: {e}")
-
-
-def _resolve_shared_level(args):
-    """--shared-slim / --shared-full on top of the original --shared.
-
-    `--shared` joins the group on the XDG runtime directory -- the display,
-    the session bus and audio sockets live there, so without it a graphical
-    program cannot draw.  Audio and video are SEPARATE groups, and were only
-    reachable by spelling them out in --groups.
-    
-    An account that runs one browser window does not need a microphone.  So
-    the level is named: slim is the desktop alone, full adds audio and video.
-    """
-    slim = getattr(args, "shared_slim", False)
-    full = getattr(args, "shared_full", False)
-    if slim and full:
-        printError("--shared-slim and --shared-full are opposites; pick one")
-        return None
-    if slim or full:
-        args.shared = True
-    if full:
-        have = [g for g in (getattr(args, "groups", "") or "").split(",") if g]
-        for g in ("audio", "video"):
-            if g not in have:
-                have.append(g)
-        args.groups = ",".join(have)
-        printInfo("  --shared-full: desktop + groups %s" % ", ".join(have))
-    elif slim:
-        printInfo("  --shared-slim: desktop only (no audio, no video)")
-    return args
 
 
 def cmd_user_setup(args):
@@ -9144,8 +7648,6 @@ def cmd_user_setup(args):
     earlier -- or made by hand -- can be brought up to the same state.  Each
     step is idempotent, so running it again is safe and only fills in what is
     missing."""
-    if _resolve_shared_level(args) is None:
-        return 2
     u = _user_prefixed(args.name)
     if not _user_exists(u):
         printError(f"{u}: no such user.")
@@ -9153,387 +7655,59 @@ def cmd_user_setup(args):
         sys.exit(1)
     printHeader(f"Set up {u}")
     print()
-    # an account made before its home had a place is brought there too
-    _relocate_app_home(u)
     if args.groups:
         _add_groups(u, [g for g in re.split(r"[,\s]+", args.groups) if g])
     _setup_application_user(u, args)
 
 
-# BROWSERS THAT TAKE --app-id.  A window's app id is what sway matches rules
-# and the taskbar groups on; without one every account's browser is the same
-# "browser-mini" window.  A line that does not give one gets its launcher name.
-_APP_ID_PROGRAMS = ("browser-mini", "browser-big")
+def _write_desktop_entry(main, u, app):
+    """A menu entry that launches the program as the application user.
 
-# WHAT YOU TYPE, AND WHAT HAPPENS WHEN YOU TYPE NOTHING.
-#
-#   {}                 the word is the arguments / a search term
-#   {https://site/}    ...and this page when there are no arguments
-#
-# The braces are the placeholder; anything INSIDE them is the fallback.  It
-# cannot be spelled `{|url}`: `|` is app-users.conf's field separator.
-_TEMPLATE_RE = re.compile(r"\{[^{}]*\}")
-
-
-def _is_template(word):
-    """Does this word carry a {} placeholder (with or without a fallback)?"""
-    return bool(_TEMPLATE_RE.search(word))
-
-
-def _launcher_words(u, app, who):
-    """The command line as words, with ~/ made the ACCOUNT's home, and an
-    --app-id added for a browser that has none."""
-    import shlex as _shlex
-    try:
-        words = _shlex.split(app)
-    except ValueError:
-        words = app.split()
-    home = _app_home(u) or ""
-    words = [(home + w[1:]) if (w.startswith("~/") and home) else w for w in words]
-    if words and os.path.basename(words[0]) in _APP_ID_PROGRAMS \
-            and "--app-id" not in words:
-        words[1:1] = ["--app-id", who]
-    return words
-
-
-def _recolor_svg(path, color):
-    """Paint a one-colour SVG in `color`.
-
-    A brand icon is a single path with one fill (or none at all, inheriting
-    black).  simpleicons.org used to do this server-side -- /openai/38BDF8 --
-    but only for the icons it still carries, and it dropped `openai` and
-    `grok`.  Doing it here works on any monochrome SVG, wherever it came
-    from.  `fill="none"` is left alone: that is a hole, not a colour.  A
-    multi-colour logo comes out flat, which is why this only happens when a
-    colour is asked for.
-    """
-    try:
-        t = open(path, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return False
-    if "<svg" not in t:
-        return False
-    new = re.sub(r'fill="(?!none\b)[^"]*"', 'fill="%s"' % color, t)
-    new = re.sub(r'fill:\s*(?!none\b)[^;"\']+', 'fill:%s' % color, new)
-    if not re.search(r'<svg\b[^>]*\bfill=', new):
-        new = re.sub(r'<svg\b', '<svg fill="%s"' % color, new, count=1)
-    if new == t:
-        return False
-    try:
-        open(path, "w").write(new)
-    except OSError:
-        return False
-    return True
-
-
-def _fetch_icon(main, who, icon):
-    """The menu icon, fetched once into ~/.local/share/icons/lfs-apps.
-
-    icon: an http(s) URL -> that file; a word -> the simpleicons.org slug of
-    that name; empty -> the launcher name as the slug; "-" -> no icon.  A
-    trailing #RRGGBB paints a monochrome SVG that colour after it is
-    fetched.  A failed download is not an error: the entry falls back to the
-    program's own icon name.
-    """
-    if icon == "-":
-        return None
-    home = _home_of(main)
-    if not home:
-        return None
-    spec = icon or ""
-    # #RRGGBB AT THE END IS A COLOUR, NOT PART OF THE URL.  No URL these
-    # icons come from uses a fragment, and a colour has to be expressible for
-    # a plain slug too (`openai#38BDF8`), not just for a URL.
-    color = ""
-    m = re.search(r"#([0-9A-Fa-f]{3}|[0-9A-Fa-f]{6})$", spec)
-    if m:
-        color = "#" + m.group(1)
-        spec = spec[:m.start()]
-    url = spec if re.match(r"^https?://", spec) else \
-        "https://cdn.simpleicons.org/%s" % ((spec or who).lower())
-    ext = os.path.splitext(url.split("?")[0])[1].lower()
-    ext = ext if ext in (".svg", ".png", ".xpm") else ".svg"
-    d = os.path.join(home, ".local", "share", "icons", "lfs-apps")
-    path = os.path.join(d, who + ext)
-    stamp = path + ".from"
-    # the stamp records the WHOLE spec, so changing only the colour refetches
-    want = url + color
-    if os.path.isfile(path) and os.path.getsize(path) > 0:
-        try:
-            if open(stamp).read().strip() == want:
-                return path
-        except OSError:
-            pass
-    os.makedirs(d, exist_ok=True)
-    tmp = path + ".part"
-    r = subprocess.run(["curl", "-fsSL", "--max-time", "20", url, "-o", tmp],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if r.returncode != 0 or not os.path.isfile(tmp) or os.path.getsize(tmp) == 0:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        printWarning(f"  no icon for {who} from {url} -- the menu uses the program's")
-        if "cdn.simpleicons.org" in url:
-            printInfo("    (simpleicons.org has dropped several brands, `openai` "
-                      "and `grok` among them -- give the icon column a URL)")
-        return None
-    os.replace(tmp, path)
-    if color and ext == ".svg":
-        printInfo(f"  icon {who}: painted {color}" if _recolor_svg(path, color)
-                  else f"  icon {who}: {color} changed nothing (not a one-colour SVG)")
-    open(stamp, "w").write(want + "\n")
-    for f in (d, path, stamp):
-        _run(["chown", f"{main}:{main}", f])
-    printInfo(f"  icon: {path}  ({url})")
-    return path
-
-
-def _write_desktop_entry(main, u, app, name=None, icon=""):
-    """A menu entry that runs the launcher -- named after the LAUNCHER, so
-    one account can have several (google and duckduckgo run as u_browser)."""
+    Written next to the wrapper, so the program appears in the menu and starts
+    under the right account when clicked -- not just from a terminal."""
     home = _home_of(main)
     if not home:
         return
-    who = os.path.basename(name or app.split()[0])
     appdir = os.path.join(home, ".local", "share", "applications")
     os.makedirs(appdir, exist_ok=True)
-    path = os.path.join(appdir, f"{who}.desktop")
-    launcher = os.path.join(home, "bin", who)
-    words = _launcher_words(u, app, who)
-    prog = os.path.basename(words[0]) if words else who
-    icon_path = _fetch_icon(main, who, icon)
-    takes_args = any(_is_template(w) for w in words)
-    # A MENU NEEDS A CATEGORY.  An entry with none is "Other" at best and
-    # missing at worst, depending on the menu -- and these are the entries a
-    # person actually clicks.  Taken from the program, since that is what is
-    # known here.
-    if prog in _APP_ID_PROGRAMS:
-        cats = "Network;WebBrowser;"
-    elif prog in ("mpv", "vlc", "ffplay"):
-        cats = "AudioVideo;Video;Player;"
-    else:
-        cats = "Utility;"
-    text = ("[Desktop Entry]\n"
-            f"Name={who.capitalize()}\n"
+    path = os.path.join(appdir, f"{app}.desktop")
+    if os.path.exists(path) and not getattr(_write_desktop_entry, "_force", False):
+        printInfo(f"  {path} already exists -- left alone")
+        return
+    launcher = os.path.join(home, "bin", app)
+    with open(path, "w") as f:
+        f.write(
+            "[Desktop Entry]\n"
+            f"Name={app.capitalize()}\n"
             f"Comment=Runs as the application user {u}\n"
-            f"Exec={launcher}{' %U' if takes_args else ''}\n"
+            f"Exec={launcher} %U\n"
             "Terminal=false\n"
             "Type=Application\n"
-            f"Categories={cats}\n"
-            f"Icon={icon_path or prog}\n"
-            f"StartupWMClass={who if prog in _APP_ID_PROGRAMS else prog.capitalize()}\n")
-    if os.path.exists(path):
-        try:
-            cur = open(path, encoding="utf-8", errors="replace").read()
-        except OSError:
-            cur = ""
-        if cur == text:
-            return
-        if "Comment=Runs as the application user " not in cur:
-            printInfo(f"  {path} was not written by these tools -- left alone")
-            return
-        printInfo(f"  menu entry {path} was stale -- rewritten")
-    with open(path, "w") as f:
-        f.write(text)
+            f"Icon={app}\n"
+            f"StartupWMClass={app.capitalize()}\n")
     os.chmod(path, 0o644)
     _run(["chown", f"{main}:{main}", path])
     printInfo(f"  menu entry: {path}")
 
 
-_LAUNCHER_TEMPLATE = r'''#!/bin/bash
-# Runs @APP@ as the application user @USER@.
-# written by packagemanager user launcher -- rewritten when stale
-T=(@ARR@)
-enc() {   # URL-encode, byte by byte; a space becomes +
-    local LC_ALL=C s="$*" o="" c i
-    for ((i = 0; i < ${#s}; i++)); do
-        c="${s:i:1}"
-        case "$c" in
-            [a-zA-Z0-9._~-]) o+="$c" ;;
-            " ") o+="+" ;;
-            *) printf -v c "%%%02X" "'$c"; o+="$c" ;;
-        esac
-    done
-    printf "%s" "$o"
-}
-cmd=()
-for w in "${T[@]}"; do
-    if [ "$w" = "{}" ]; then
-        cmd+=("$@")                       # the arguments, one by one
-    elif [[ "$w" == *"{"*"}"* ]]; then
-        pre="${w%%\{*}"; rest="${w#*\{}"  # ...{ inner }...
-        inner="${rest%%\}*}"; post="${rest#*\}}"
-        if [ $# -gt 0 ]; then
-            cmd+=("$pre$(enc "$*")$post") # what you typed, URL-encoded
-        elif [ -n "$inner" ]; then
-            cmd+=("$inner")               # nothing typed: the default page
-        else
-            p="$pre"; case "$p" in *\?*) p="${p%\?*}" ;; esac
-            cmd+=("$p")                   # nothing typed, no default: cut at ?
-        fi
-    else
-        cmd+=("$w")
-    fi
-done
-# A MENU ENTRY HAS NO TERMINAL, AND su WANTS ONE.
-#
-# From a terminal this is the whole story: su authenticates through
-# /etc/pam.d/su_u_user and execs the program.  Started from a .desktop entry,
-# a hotkey or a launcher menu there is no tty at all -- su fails, its message
-# goes to a stderr nobody is reading, and the entry looks like it "does
-# nothing".  script(1) gives it a pty and nothing else; the typescript goes
-# to /dev/null and -e returns the program's own exit status.
-if [ -t 0 ] && [ -t 1 ]; then
-    exec su - @QUSER@ -c 'exec "$0" "$@"' -- "${cmd[@]}"
-fi
-script -qec "$(printf '%q ' su - @QUSER@ -c 'exec "$0" "$@"' -- "${cmd[@]}")" /dev/null
-rc=$?
-# ...and say so where it can be seen, since there is no terminal to print to
-if [ "$rc" != 0 ] && command -v notify-send >/dev/null 2>&1; then
-    notify-send "@WHO@" "did not start (exit $rc) -- run @WHO@ in a terminal to see why"
-fi
-exit $rc
-'''
-
-
-def _write_launcher(main, u, app, name=None):
-    """A wrapper in ~/bin, named after the LAUNCHER, that runs the command
-    line as the application account.
-
-    {} IN THE COMMAND LINE IS WHAT YOU TYPE.
-      a word that IS {}       -> the arguments, one by one ("browser-mini {}")
-      {} inside a word        -> the arguments as a URL-encoded search term
-                                 ("https://www.youtube.com/results?search_query={}")
-                                 and with no arguments the word is cut before
-                                 its ? (or before {}): the site's front page
-      {https://site/} in one  -> the same, but with nothing typed the word
-                                 becomes exactly what is inside the braces.
-                                 Cutting at the ? gives /search/ -- a search
-                                 page for a search nobody made.  This gives
-                                 the page you actually want to land on, and
-                                 it is per line: reddit's is the front page
-                                 today and may be your own profile tomorrow.
-      no {} at all            -> arguments are NOT passed: `claude foo` must
-                                 not hand browser-mini a second address
-
-    THE ARGUMENTS GO THROUGH AS ARGUMENTS.  The old writer built
-    su -c "app $(printf %q-each "$@")", which with no arguments produced one
-    EMPTY argument ("a second address:").  Here the final list is built in
-    the launcher and handed to su after --: bash gets $0 and "$@" exactly.
-    """
+def _write_launcher(main, u, app):
+    """A wrapper in ~/bin that runs <app> as the application user."""
     home = _home_of(main)
     if not home:
         return
     bindir = os.path.join(home, "bin")
     os.makedirs(bindir, exist_ok=True)
-    who = os.path.basename(name or app.split()[0])
-    path = os.path.join(bindir, who)
-    import shlex as _shlex
-    words = _launcher_words(u, app, who)
-    arr = " ".join(_shlex.quote(w) for w in words)
-    # A PLAIN TEMPLATE, NOT %-FORMATTING.  This body is bash full of `%02X`
-    # and `${w%%...}`, and every one of them had to be written `%%%%` here.
-    # One miscount and the launcher is subtly wrong, which is how the empty
-    # second address survived so long.  Three named slots, .replace(), done.
-    text = _LAUNCHER_TEMPLATE.replace("@APP@", app).replace("@USER@", u) \
-                             .replace("@QUSER@", _shlex.quote(u)) \
-                             .replace("@WHO@", who) \
-                             .replace("@ARR@", arr)
+    path = os.path.join(bindir, app)
     if os.path.exists(path):
-        try:
-            cur = open(path, encoding="utf-8", errors="replace").read()
-        except OSError:
-            cur = ""
-        # OURS AND STALE IS REWRITTEN; ANYTHING ELSE IS YOURS.
-        if cur == text:
-            printInfo(f"  launcher {path} is current")
-            return
-        if not re.search(r"^# Runs .* as the application user \S+\.$", cur, re.M):
-            # SAY WHAT TO DO ABOUT IT.  A launcher from an older version of
-            # these tools is not recognised either, so "left alone" quietly
-            # kept the OLD behaviour -- no default page, no --app-id -- on
-            # exactly the launchers the conf had just changed.
-            printInfo(f"  {path} exists and was not written by these tools -- left alone")
-            printInfo(f"    to take the generated one:  rm {path}  and run this again")
-            return
-        _was = re.search(r"su - (\S+)", cur)
-        printInfo(f"  launcher {path} was stale (ran as "
-                  f"{_was.group(1) if _was else '?'}) -- rewritten")
+        printInfo(f"  {path} already exists -- left alone")
+        return
     with open(path, "w") as f:
-        f.write(text)
+        f.write('#!/bin/bash\n'
+                '# Runs %s as the application user %s.\n'
+                'exec su - %s -c "%s $(printf \'%%q \' "$@")"\n' % (app, u, u, app))
     os.chmod(path, 0o755)
     _run(["chown", f"{main}:{main}", path])
     printInfo(f"  launcher: {path}")
-
-
-def cmd_user_launcher(args):
-    """One launcher (and menu entry) for an EXISTING application account.
-
-    Separate from `user setup` because an account can have several: the
-    `browser` account runs browser-mini, browser-big, google and duckduckgo.
-    """
-    u = _user_prefixed(args.account)
-    if not _user_exists(u):
-        printError(f"{u}: no such account -- `user create {args.account}` first")
-        return 1
-    main = main_user()
-    if not main:
-        printError("no main user set (packagemanager config --main-user <login>)")
-        return 1
-    who = args.name
-    import shutil as _sh
-    words = _launcher_words(u, args.app, who)
-    if not words or not (_sh.which(words[0]) or os.path.isfile(words[0])):
-        printWarning(f"  {who}: no '{words[0] if words else args.app}' on PATH "
-                     f"-- no launcher or menu entry")
-        return 0
-    _write_launcher(main, u, args.app, name=who)
-    if not args.no_desktop:
-        _write_desktop_entry(main, u, args.app, name=who, icon=args.icon or "")
-    return 0
-
-
-def _ours_for(path, marker):
-    try:
-        return marker in open(path, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return False
-
-
-def cmd_user_remove_launcher(args):
-    """Remove a launcher, its menu entry and icon -- only files these tools
-    wrote (a hand-made ~/bin/<name> is never touched)."""
-    main = main_user()
-    home = _home_of(main) if main else None
-    if not home:
-        printError("no main user set")
-        return 1
-    who = os.path.basename(args.name)
-    files = []
-    lp = os.path.join(home, "bin", who)
-    if os.path.isfile(lp) and _ours_for(lp, "as the application user"):
-        files.append(lp)
-    dp = os.path.join(home, ".local", "share", "applications", who + ".desktop")
-    if os.path.isfile(dp) and _ours_for(dp, "Comment=Runs as the application user "):
-        files.append(dp)
-    idir = os.path.join(home, ".local", "share", "icons", "lfs-apps")
-    if os.path.isdir(idir):
-        files += [os.path.join(idir, f) for f in os.listdir(idir)
-                  if f.startswith(who + ".")]
-    if not files:
-        printInfo(f"  {who}: no launcher, menu entry or icon of these tools")
-        return 0
-    for f in files:
-        printInfo(("  remove " if args.run else "  would remove ") + f)
-    if args.run:
-        for f in files:
-            os.unlink(f)
-    else:
-        printInfo("  dry run -- add --run")
-    printInfo(f"  and take its line out of /etc/pkgusr/stacks/app-users.conf, "
-              f"or the next `cfg app-users` writes it again")
-    return 0
 
 
 def cmd_user_allow(args):
@@ -9560,420 +7734,41 @@ def cmd_user_disallow(args):
             printInfo(f"{args.user} is not in {g}.")
 
 
-# WHAT AN ACCOUNT'S HOME HOLDS WHEN IT HAS NEVER RUN ANYTHING.
-# `user create` puts a .bash_profile symlink there (and keeps whatever was
-# there as .bash_profile.pkgusr), plus an empty Shared if the line asked for
-# one.  Nothing else is ours.
-_HOME_SCAFFOLD = {".bash_profile", ".bash_profile.pkgusr", ".bashrc",
-                  ".bash_logout", ".bash_history", ".profile", ".dircolors",
-                  "pkg.lst"}
-
-
-def _home_is_untouched(home):
-    """Is there anything in this home worth keeping?
-
-    The archive exists because a home holds a browser profile: logins,
-    cookies, history, downloads -- months of state that `userdel -r` would
-    take with it and nothing could give back.  A home that was created and
-    never used holds none of that, and a tarball of it is 200 bytes of
-    nothing in /root, one per account, fourteen more on the next purge.
-    """
-    try:
-        entries = os.listdir(home)
-    except OSError:
-        return False
-    for n in entries:
-        if n in _HOME_SCAFFOLD:
-            continue
-        p = os.path.join(home, n)
-        if n == "Shared" and os.path.isdir(p) and not os.path.islink(p) \
-                and not os.listdir(p):
-            continue
-        return False
-    return True
-
-
-def _shared_hub(main_home):
-    """The main user's ~/Shared, where the per-account links live."""
-    return os.path.join(main_home, "Shared") if main_home else ""
-
-
-def _stale_shared_links(main_home, home=""):
-    """Links in ~/Shared that point into `home`, plus every link there that
-    leads nowhere at all.  A dangling link is what keeps a SHARED_* variable
-    alive after the account behind it is gone."""
-    hub = _shared_hub(main_home)
-    out = []
-    if not hub or not os.path.isdir(hub):
-        return out
-    for f in sorted(os.listdir(hub)):
-        fp = os.path.join(hub, f)
-        if not os.path.islink(fp):
-            continue
-        if not os.path.exists(fp):              # dangling: nothing to keep
-            out.append(fp)
-        elif home and os.readlink(fp).startswith(home.rstrip("/") + "/"):
-            out.append(fp)
-    return out
-
-
-def _shared_vars_note(paths):
-    """Say what an open shell still thinks, and how to correct it.
-
-    /etc/profile.d/shared-dirs.sh runs at LOGIN.  Removing the link removes
-    tomorrow's variable; the shell you are typing in keeps today's until you
-    log in again -- so `cd $SHARED_BROWSER_MINI` still completes and still
-    fails, which reads like the removal did not work."""
-    names = [os.path.basename(p).upper().replace("-", "_") for p in paths]
-    if not names:
-        return
-    printInfo("  shells that are already open still export "
-              + ", ".join("SHARED_" + n for n in names))
-    printInfo("    they are read at login: log in again, or right now:")
-    printInfo("      unset " + " ".join("SHARED_" + n for n in names))
-
-
 def cmd_user_delete(args):
-    """Remove an application account SAFELY.
-
-    Only an application account: the user prefix, and a home under the
-    application-user root or the package tree.  Refused while it runs
-    anything.  Without --no-archive its home is packed first into
-    /root/<account>-home-<date>.tar.gz (0600).  Then: its launchers, menu
-    entries and icons (the ones these tools wrote that run as it), the
-    ~/Shared/<Name> link, its line in /etc/pam.d/su_u_user, the account, its
-    group, and the home (kept with --keep-home).
-    """
     u = _user_prefixed(args.name)
-    if not u.startswith(user_prefix()):
-        printError(f"{u}: not an application account ({user_prefix()}...) -- refused")
-        return 1
-    exists = _user_exists(u)
-    home = (pwd.getpwnam(u).pw_dir if (exists and pwd) else "") or _app_home(u)
-    roots = [os.path.realpath(appuser_home()), os.path.realpath(BASE_DIR)]
-    if home and not any(os.path.realpath(home).startswith(r.rstrip("/") + "/") for r in roots):
-        printError(f"{u}: home {home} is not under {' or '.join(roots)} -- refused")
-        return 1
-    main = main_user()
-    mh = _home_of(main) if main else None
-    # what goes
-    launchers = []
-    if mh:
-        for d, marker in ((os.path.join(mh, "bin"), f"as the application user {u}."),
-                          (os.path.join(mh, ".local", "share", "applications"),
-                           f"Comment=Runs as the application user {u}\n")):
-            if os.path.isdir(d):
-                for f in sorted(os.listdir(d)):
-                    fp = os.path.join(d, f)
-                    if os.path.isfile(fp) and _ours_for(fp, marker):
-                        launchers.append(fp)
-    icons = []
-    if mh:
-        idir = os.path.join(mh, ".local", "share", "icons", "lfs-apps")
-        names = {os.path.splitext(os.path.basename(f))[0] for f in launchers}
-        if os.path.isdir(idir):
-            icons = [os.path.join(idir, f) for f in sorted(os.listdir(idir))
-                     if f.split(".")[0] in names]
-    # THE LINK, AND ANY LINK THAT NO LONGER LEADS ANYWHERE.
-    #
-    # A link was only removed when it pointed inside THIS home, so a home
-    # moved after the link was made (usermod -d, or the move to
-    # /home/shared_user) left ~/Shared/<Name> behind, dangling.  Nothing
-    # then removed it -- and /etc/profile.d/shared-dirs.sh enumerates that
-    # directory, which is why $SHARED_BROWSER_MINI outlived the account.
-    links = _stale_shared_links(mh, home)
-    printHeader(f"Remove application account {u}")
-    print(f"  account : {u}" + ("" if exists else "  (already gone)"))
-    if home:
-        print(f"  home    : {home}" + ("  (kept: --keep-home)" if args.keep_home else ""))
-        if os.path.isdir(home) and not args.no_archive:
-            if _home_is_untouched(home):
-                print("  archive : none -- nothing in this home but the files "
-                      "these tools put there")
-            else:
-                print(f"  archive : /root/{u}-home-<date>.tar.gz first (0600)")
-    for f in launchers + icons + links:
-        print(f"  remove  : {f}")
-    print("  pam     : its line in /etc/pam.d/su_u_user")
-    if exists:
-        busy = subprocess.run(["pgrep", "-u", u], stdout=subprocess.DEVNULL).returncode == 0
-        if busy:
-            printError(f"  {u} is running something -- close it (pkill -u {u}) and try again")
-            return 1
+    home = pkgusr_home(u)
+    has_home = os.path.isdir(home)
+    if not _user_exists(u) and not has_home:
+        printInfo(f"{u}: does not exist.")
+        return
+    if _user_exists(u):
+        pw_dir = pwd.getpwnam(u).pw_dir if pwd else ""
+        if not pw_dir.startswith(BASE_DIR.rstrip("/") + "/"):
+            printError(f"{u}: user home {pw_dir} is not under {BASE_DIR}; "
+                       f"refusing to delete.")
+            return
+    printHeader(f"Delete shared user {u}")
+    print()
+    if _user_exists(u):
+        print(f"  user : {u} (uid {pwd.getpwnam(u).pw_uid})")
+    if has_home:
+        print(f"  home : {home}")
     if not args.run:
-        printInfo("\n  dry run -- nothing removed.  Remove:  "
-                  f"packagemanager user delete {args.name} --run")
-        printInfo("  and take its lines out of /etc/pkgusr/stacks/app-users.conf, "
-                  "or the next `cfg app-users` creates it again")
-        return 0
-    if not args.yes and not ask_yes_no(f"\nReally remove {u}?"):
+        printInfo("\nDry run -- re-run with --run to delete.")
+        return
+    if not args.yes and not ask_yes_no(f"\nReally delete {u}?"):
         printWarning("Aborted.")
-        return 1
-    if home and os.path.isdir(home) and not args.no_archive \
-            and not _home_is_untouched(home):
-        arch = f"/root/{u}-home-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz"
-        old_umask = os.umask(0o077)
-        ok_arch = _run(["tar", "-C", os.path.dirname(home), "-czf", arch,
-                        os.path.basename(home)])
-        os.umask(old_umask)
-        if not ok_arch:
-            printError(f"  could not archive {home} -- nothing removed")
-            return 1
-        _run(["chmod", "600", arch])
-        printInfo(f"  archived {home} -> {arch}")
-    for f in launchers + icons + links:
-        try:
-            os.unlink(f)
-            printInfo(f"  removed {f}")
-        except OSError as e:
-            printWarning(f"  {f}: {e}")
-    pam = "/etc/pam.d/su_u_user"
-    if os.path.isfile(pam):
-        try:
-            txt = open(pam).read()
-            new = re.sub(r"^\s*%s\)[^\n]*\n" % re.escape(u), "", txt, flags=re.M)
-            if new != txt:
-                open(pam, "w").write(new)
-                printInfo(f"  removed {u} from {pam}")
-        except OSError as e:
-            printWarning(f"  {pam}: {e}")
-    if exists:
+        return
+    if _user_exists(u):
         _run(["userdel", u])
     if _group_exists(u):
         _run(["groupdel", u])
-    if home and os.path.isdir(home) and not args.keep_home:
+    if has_home and os.path.isdir(home):
         try:
             shutil.rmtree(home)
-            printInfo(f"  removed {home}")
         except OSError as e:
             printError(f"  rmtree {home}: {e}")
-    # the hub is ours only while it holds our links: an empty ~/Shared is
-    # left-over furniture, a ~/Shared with something else in it is yours.
-    hub = _shared_hub(mh)
-    if hub and os.path.isdir(hub) and not os.listdir(hub):
-        try:
-            os.rmdir(hub)
-            printInfo(f"  removed {hub} (empty)")
-        except OSError:
-            pass
-    printSuccess(f"{u} removed.")
-    _shared_vars_note(links)
-    printInfo("  take its lines out of /etc/pkgusr/stacks/app-users.conf, "
-              "or the next `cfg app-users` creates it again")
-    return 0
-
-
-# =========================================================================== #
-# command: user purge -- undo the whole app-users setup            [IMPLEMENTED]
-# =========================================================================== #
-#
-# `user delete` removes ONE account.  What it cannot remove is everything the
-# accounts share, because the next account still needs it: the session group,
-# the two profile fragments, /usr/bin/xdg-runtime-share, the pam file and the
-# line in /etc/pam.d/su that calls it.  Left behind, those are what makes a
-# "deleted" setup still visible -- a group you are in, variables in every new
-# shell, an auth line pointing at a file that is gone.
-#
-# NOTHING HERE TOUCHES A FILE THESE TOOLS DID NOT WRITE.  Each file is read
-# first and only removed if it carries the marker `cfg app-users` writes.
-# The home archives in /root are never removed: they are the undo of the undo.
-
-APP_USERS_MARKER = "# written by stacks/app-users.sh -- safe to delete, regenerated"
-APP_USERS_CONF = "/etc/pkgusr/stacks/app-users.conf"
-
-
-def _conf_accounts(path):
-    """The account names in app-users.conf: column 1, both file formats."""
-    out = []
-    try:
-        lines = open(path, encoding="utf-8", errors="replace").read().splitlines()
-    except OSError:
-        return out
-    for raw in lines:
-        s = raw.strip()
-        if not s or s.startswith("#"):
-            continue
-        a = s.split("|")[0].strip()
-        if a in ("", "name", "user", "account") or re.search(r"[^a-z0-9_-]", a):
-            continue
-        if a not in out:
-            out.append(a)
-    return out
-
-
-def _ours(path, marker):
-    """A file that exists and says these tools wrote it."""
-    if not os.path.isfile(path):
-        return False
-    try:
-        return marker in open(path, encoding="utf-8", errors="replace").read()
-    except OSError:
-        return False
-
-
-def cmd_user_purge(args):
-    """Undo the application-account setup: the accounts, then what they share.
-
-    Dry run unless --run.  Homes are archived to /root first, exactly as
-    `user delete` does, and those archives stay.
-    """
-    conf = args.conf or APP_USERS_CONF
-    main = main_user()
-    mh = _home_of(main) if main else ""
-    accounts = _conf_accounts(conf)
-    if args.accounts:
-        accounts = [a for a in re.split(r"[,\s]+", args.accounts) if a]
-    # ACCOUNTS THE FILE NO LONGER MENTIONS ARE STILL OURS TO REMOVE.  That is
-    # exactly the browser-mini/browser-big case: the line was rewritten, the
-    # account stayed.  Found in passwd, not by listing a directory, so an
-    # account whose home is already gone is found too.
-    strays = []
-    if pwd:
-        root = os.path.realpath(appuser_home())
-        for e in pwd.getpwall():
-            if not e.pw_name.startswith(user_prefix()):
-                continue
-            a = e.pw_name[len(user_prefix()):]
-            if a in accounts or a in strays:
-                continue
-            if os.path.realpath(e.pw_dir or "").startswith(root.rstrip("/") + "/"):
-                strays.append(a)
-    strays.sort()
-    todo = [a for a in accounts + strays if _user_exists(_user_prefixed(a))]
-
-    printHeader("Undo the application-account setup")
-    print()
-    print("  accounts : " + (", ".join(user_prefix() + a for a in todo) or "none left"))
-    shared = []
-    for p in ("/etc/profile.d/shared-dirs.sh", "/etc/profile.d/xdg-runtime-share.sh",
-              "/usr/bin/xdg-runtime-share"):
-        if _ours(p, APP_USERS_MARKER):
-            shared.append(p)
-        elif os.path.exists(p):
-            printWarning(f"  {p} is not ours -- left alone")
-    pam_file = "/etc/pam.d/su_u_user"
-    pam_su = "/etc/pam.d/su"
-    # an ACTIVE auth line, not a comment that happens to name the file
-    pam_line = bool(os.path.isfile(pam_su) and re.search(
-        r"^\s*auth\s+sufficient\s+pam_exec\.so.*su_u_user",
-        open(pam_su, encoding="utf-8", errors="replace").read(), re.M))
-    for p in shared:
-        print(f"  remove   : {p}")
-    if os.path.isfile(pam_file):
-        print(f"  remove   : {pam_file}")
-    if pam_line:
-        print(f"  edit     : {pam_su} (drop the pam_exec line; backup kept)")
-    g = xdg_runtime_group()
-    if _group_exists(g):
-        print(f"  group    : {g} (removed; {main or 'you'} leaves it)")
-    print("  kept     : /root/" + user_prefix() + "*-home-*.tar.gz (the archives)")
-    print(f"  kept     : {conf} -- delete the lines you no longer want, or the")
-    print("             next `cfg app-users` builds all of this again")
-
-    if not args.run:
-        printInfo("\n  dry run -- nothing removed.  Undo it:  "
-                  "packagemanager user purge --run")
-        return 0
-    if not args.yes and not ask_yes_no("\nReally undo all of it?"):
-        printWarning("Aborted.")
-        return 1
-
-    # 1. the accounts, through the command that already knows how
-    import argparse as _ap
-    gone = 0
-    for a in todo:
-        rc = cmd_user_delete(_ap.Namespace(
-            name=a, run=True, yes=True,
-            keep_home=args.keep_home, no_archive=args.no_archive))
-        if rc:
-            printWarning(f"  {a}: not removed -- stopping before the shared parts")
-            printInfo("    (close what it is running, then run this again)")
-            return 1
-        gone += 1
-
-    # 2. anything left in ~/Shared that leads nowhere, then the hub itself
-    dead = _stale_shared_links(mh)
-    for p in dead:
-        try:
-            os.unlink(p)
-            printInfo(f"  removed {p}")
-        except OSError as e:
-            printWarning(f"  {p}: {e}")
-    hub = _shared_hub(mh)
-    if hub and os.path.isdir(hub) and not os.listdir(hub):
-        try:
-            os.rmdir(hub)
-            printInfo(f"  removed {hub} (empty)")
-        except OSError:
-            pass
-    idir = os.path.join(mh, ".local", "share", "icons", "lfs-apps") if mh else ""
-    if idir and os.path.isdir(idir) and not os.listdir(idir):
-        try:
-            os.rmdir(idir)
-            printInfo(f"  removed {idir} (empty)")
-        except OSError:
-            pass
-
-    # 3. the files every account shared
-    for p in shared:
-        try:
-            os.unlink(p)
-            printInfo(f"  removed {p}")
-        except OSError as e:
-            printWarning(f"  {p}: {e}")
-    if os.path.isfile(pam_file):
-        try:
-            os.unlink(pam_file)
-            printInfo(f"  removed {pam_file}")
-        except OSError as e:
-            printWarning(f"  {pam_file}: {e}")
-    # THE LINE IN /etc/pam.d/su GOES LAST AND WITH A BACKUP.  It is the one
-    # edit here that can cost you `su` if it goes wrong.
-    if pam_line:
-        bak = f"{pam_su}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
-        try:
-            txt = open(pam_su).read()
-            new = "\n".join(l for l in txt.splitlines()
-                            if not re.match(r"^\s*auth\s+sufficient\s+pam_exec\.so.*su_u_user",
-                                            l)) + "\n"
-            if new != txt:
-                shutil.copy2(pam_su, bak)
-                open(pam_su, "w").write(new)
-                printInfo(f"  {pam_su}: pam_exec line removed (backup {bak})")
-        except OSError as e:
-            printWarning(f"  {pam_su}: {e}")
-
-    # 3b. the directory the accounts lived in, if it is now empty
-    root = appuser_home()
-    if os.path.isdir(root) and not os.listdir(root):
-        try:
-            os.rmdir(root)
-            printInfo(f"  removed {root} (empty)")
-        except OSError:
-            pass
-
-    # 4. the session group -- last, when nothing is in it any more
-    if _group_exists(g):
-        _run(["groupdel", g])
-        printInfo(f"  removed group {g}")
-
-    printSuccess(f"undone: {gone} account(s) and everything they shared.")
-    _shared_vars_note(dead)
-    printInfo("  your session still has the old group until you log in again")
-    # THE ARCHIVES ARE THE ONE THING THIS DOES NOT REMOVE, so say what they
-    # are and how to be rid of them.  They only exist for a home that had
-    # something in it -- a browser profile, its logins and its downloads.
-    import glob as _glob
-    arch = sorted(_glob.glob(f"/root/{user_prefix()}*-home-*.tar.gz"))
-    if arch:
-        printInfo(f"  {len(arch)} home archive(s) kept in /root -- browser profiles, "
-                  f"nothing else can give them back")
-        printInfo(f"    look:    tar tzf {arch[-1]} | head")
-        printInfo(f"    or drop: rm /root/{user_prefix()}*-home-*.tar.gz")
-    if mh and os.path.isfile(os.path.join(mh, ".config", "sway", "config")):
-        printInfo("  and `exec xdg-runtime-share` is still in your sway config "
-                  "-- yours to remove")
-    return 0
+    printSuccess(f"{u} deleted.")
 
 
 # =========================================================================== #
@@ -10407,7 +8202,7 @@ def cmd_script_status(args):
         printWarning("the book named no file to check):")
         for n in _act:
             u = gather_user(n)
-            st, why = assess(u, None, run_cmd=False)
+            st, why = assess(u, versions.get(u.meta.get("name") or n))
             printWarning("  %-24s %-14s %s" % (n, st, why))
         # ONLY WHAT THIS COMMAND CAN ACTUALLY BUILD.
         #
@@ -10807,108 +8602,7 @@ def _warn_env_companions(vals):
                          % (other, _ENV_SUGGESTIONS.get(other, "...")))
 
 
-SYSTEM_ENV_FILE = "/etc/profile.d/pkgusr-system.sh"
-SYSTEM_ENV_MARKER = ("# written by `packagemanager env --system` -- "
-                     "regenerate, do not edit")
-
-
-def _system_env_values():
-    """This system's own facts, for anything that needs to ask.
-
-    Scripts, launchers and one-off commands keep rediscovering the same few
-    things -- who the human is, what prefixes this machine uses, where the
-    shared directories are -- and each rediscovery is a different guess:
-    `cat /etc/pkgusr/desktop-user` in one place, a hard-coded `u_` in
-    another, `$HOME/Shared` in a third.
-
-    NOT the PKGUSR_ namespace.  The tools READ PKGUSR_BASE, PKGUSR_CONFIG
-    and PKGUSR_LIB as overrides, so exporting that namespace system-wide
-    would reconfigure every tool in every shell -- a login that quietly
-    points the package manager at another tree.  PKGUSR_SYS_ is inert:
-    nothing consumes it, so writing it cannot change what anything does.
-    """
-    main = main_user() or ""
-    vals = {
-        "PKGUSR_SYS_MAIN_USER": main,
-        "PKGUSR_SYS_USER_PREFIX": user_prefix(),
-        "PKGUSR_SYS_PKG_PREFIX": pkgusr_prefix(),
-        "PKGUSR_SYS_COLLECTOR_PREFIX": collector_prefix(),
-    }
-    home = _home_of(main) if main else None
-    if home:
-        vals["PKGUSR_SYS_HOME"] = home
-        vals["PKGUSR_SYS_SHARED"] = os.path.join(home, "Shared")
-    return vals
-
-
-def cmd_env_system(args):
-    """Write, or show, the system-fact variables as a profile fragment."""
-    vals = _system_env_values()
-    missing = [k for k, v in vals.items() if not v]
-    body = [SYSTEM_ENV_MARKER,
-            "# This system's own facts.  Read them; do not set them here --",
-            "# `packagemanager config` is where they live and this file is",
-            "# generated from it.",
-            ""]
-    for k in sorted(vals):
-        if vals[k]:
-            body.append('export %s="%s"' % (k, vals[k]))
-    text = "\n".join(body) + "\n"
-
-    if not getattr(args, "run", False):
-        print(text, end="")
-        printInfo("  (dry run: --run writes %s)" % SYSTEM_ENV_FILE)
-        if missing:
-            printWarning("  not known yet, so not exported: %s"
-                         % ", ".join(missing))
-            printInfo("    packagemanager config --main-user <your-login>")
-        return 0
-
-    d = os.path.dirname(SYSTEM_ENV_FILE)
-    if not os.path.isdir(d):
-        printError("no %s -- nowhere to put a login-shell fragment" % d)
-        printInfo("  the values are above; export them from your own shell")
-        return 1
-    # NEVER OVERWRITE A FILE WE DID NOT WRITE.
-    if os.path.exists(SYSTEM_ENV_FILE):
-        try:
-            had = open(SYSTEM_ENV_FILE, encoding="utf-8",
-                       errors="replace").read()
-        except OSError:
-            had = ""
-        if SYSTEM_ENV_MARKER not in had:
-            printError("%s exists and is not ours -- left alone"
-                       % SYSTEM_ENV_FILE)
-            printInfo("  move it aside, or export these yourself:")
-            print(text, end="")
-            return 1
-    with open(SYSTEM_ENV_FILE, "w") as f:
-        f.write(text)
-    os.chmod(SYSTEM_ENV_FILE, 0o644)
-    # ROOT WROTE IT, SO ROOT OWNS IT.  Writing into an existing file keeps
-    # that file's owner, and this one was first created inside a package
-    # user's build window -- so it stayed p_gstreamer10's, a package owning a
-    # file no package installed, in a directory every login shell sources.
-    # Re-asserted on every write; a chown that cannot run is not fatal.
-    try:
-        if os.stat(SYSTEM_ENV_FILE).st_uid != 0:
-            _run(["chown", "root:root", SYSTEM_ENV_FILE])
-    except OSError:
-        pass
-    printSuccess("wrote %s" % SYSTEM_ENV_FILE)
-    for k in sorted(vals):
-        if vals[k]:
-            printInfo("  %-28s %s" % (k, vals[k]))
-    if missing:
-        printWarning("  not known yet: %s" % ", ".join(missing))
-    printInfo("  login shells read /etc/profile, which reads that directory.")
-    printInfo("  in this shell, now:  . %s" % SYSTEM_ENV_FILE)
-    return 0
-
-
 def cmd_env(args):
-    if getattr(args, "system", False):
-        return cmd_env_system(args)
     vals = _read_build_env()
     if args.set:
         for pair in args.set:
@@ -11037,46 +8731,8 @@ def _find_stack_file(name):
                                 "stacks", c))
     for c in out:
         if os.path.isfile(c):
-            found = os.path.abspath(c)
-            _warn_shadowed_stack(found)
-            return found
+            return os.path.abspath(c)
     return None
-
-
-def _warn_shadowed_stack(found):
-    """A stack file found BEFORE the installed one, that differs from it.
-
-    The path as given is tried first, so `packagemanager stack services` run
-    from ~/lfs read ~/lfs/services.stack -- and a `cfg` entry runs
-    <that directory>/<name>.sh.  An old shadow-pam.sh there ran instead of
-    the 1.14.262 one in /etc/pkgusr/stacks, printed the old "su and
-    system-auth are in place", and nothing said which file had run.  Say it
-    when the two differ; a checkout that matches is not worth a word."""
-    etc = "/etc/pkgusr/stacks"
-    if os.path.dirname(found) == etc:
-        return
-    inst = os.path.join(etc, os.path.basename(found))
-    if not os.path.isfile(inst):
-        return
-    try:
-        import filecmp
-        differ = not filecmp.cmp(found, inst, shallow=False)
-        # the cfg scripts beside it are what actually run
-        d = os.path.dirname(found)
-        scripts = [f for f in sorted(os.listdir(d)) if f.endswith(".sh")
-                   and os.path.isfile(os.path.join(etc, f))
-                   and not filecmp.cmp(os.path.join(d, f),
-                                       os.path.join(etc, f), shallow=False)]
-    except OSError:
-        return
-    if not differ and not scripts:
-        return
-    printWarning("  NOTE: using %s, not the installed %s" % (found, inst))
-    if scripts:
-        printWarning("        cfg scripts that differ from the installed ones and "
-                     "will run from %s: %s" % (d, ", ".join(scripts)))
-    printWarning("        run from another directory, or give the full path, "
-                 "to use the installed stack")
 
 
 def _parse_stack_file(path):
@@ -11085,15 +8741,7 @@ def _parse_stack_file(path):
     worse than one refused."""
     import shlex
     entries = []
-    kinds = ("book", "git", "tar", "check", "cfg", "avoid", "include")
-    # THE "INCLUDE ONCE" SET BELONGS TO THE WHOLE PARSE, not to one include
-    # line.  Owning it per line meant sway.stack's `include avoid` finished
-    # and cleared it, so `include media` started fresh and media's own
-    # `include avoid` spliced the 87 exclusions a second time -- and a third
-    # for the nesting: 332 entries where there are 158.
-    _top_parse = getattr(_parse_stack_file, "_spliced", None) is None
-    if _top_parse:
-        _parse_stack_file._spliced = {os.path.abspath(path)}
+    kinds = ("book", "git", "tar", "check", "cfg", "avoid")
     # A LINE MAY CONTINUE.
     #
     # Every entry had to be one line, so sway.stack's are 300 characters wide
@@ -11116,8 +8764,7 @@ def _parse_stack_file(path):
     if _buf:
         raise ValueError("%s:%d: line ends with a backslash and nothing follows"
                          % (path, _start))
-    try:
-      for n, raw in _joined:
+    for n, raw in _joined:
             line = raw.strip()
             if not line or line.startswith("#"):
                 continue
@@ -11133,58 +8780,6 @@ def _parse_stack_file(path):
             if kind not in kinds:
                 raise ValueError("%s:%d: unknown entry kind %r (one of %s)"
                                  % (path, n, kind, "/".join(kinds)))
-            # ONE LIST, TWO ENTRY POINTS.
-            #
-            # The media chain -- codecs, gstreamer, the WebRTC pieces,
-            # webkitgtk -- is worth updating on its own without replaying a
-            # whole desktop.  Copying those entries into a second stack file
-            # would give two lists of the same packages, and two lists drift:
-            # gst10-libav was added to one of them for three releases before
-            # anyone noticed the other.
-            #
-            # `include <name>` splices another stack's entries in at this
-            # point, in order.  The included file is a stack in its own right,
-            # so `packagemanager stack media --run` builds just that part.
-            if kind == "include":
-                if len(parts) != 2:
-                    raise ValueError("%s:%d: include takes one stack name"
-                                     % (path, n))
-                _inc = parts[1]
-                _p = _inc if os.path.sep in _inc else os.path.join(
-                    os.path.dirname(os.path.abspath(path)),
-                    _inc if _inc.endswith(".stack") else _inc + ".stack")
-                if not os.path.isfile(_p):
-                    raise ValueError("%s:%d: include %s: no such stack (%s)"
-                                     % (path, n, _inc, _p))
-                if os.path.abspath(_p) == os.path.abspath(path):
-                    raise ValueError("%s:%d: include %s includes itself"
-                                     % (path, n, _inc))
-                # A CYCLE WOULD RECURSE FOR EVER, and the error a reader gets
-                # from a RecursionError names none of the files involved.
-                _seen = getattr(_parse_stack_file, "_including", set())
-                if os.path.abspath(_p) in _seen:
-                    raise ValueError("%s:%d: include %s: circular include"
-                                     % (path, n, _inc))
-                # INCLUDE ONCE PER COMPOSITION.
-                #
-                # sway.stack includes `avoid` AND `media`, and media.stack
-                # includes `avoid` too -- so the 87 exclusions were spliced
-                # three times: 332 entries where there are 158, and every
-                # avoided package listed three times in the plan.  A second
-                # include of the same file adds nothing by definition, so
-                # skip it.
-                _sp = _parse_stack_file._spliced
-                if os.path.abspath(_p) in _sp:
-                    continue                     # already in this plan
-                _sp.add(os.path.abspath(_p))
-                _seen = _seen | {os.path.abspath(path)}
-                _parse_stack_file._including = _seen
-                try:
-                    entries.extend(_parse_stack_file(_p))
-                finally:
-                    _parse_stack_file._including = \
-                        _seen - {os.path.abspath(path)}
-                continue
             if len(parts) < 2:
                 raise ValueError("%s:%d: %r needs a target" % (path, n, kind))
             target = parts[1]
@@ -11207,11 +8802,8 @@ def _parse_stack_file(path):
             if kind == "tar" and ("url" not in opts or "pkg" not in opts):
                 raise ValueError("%s:%d: a tar entry needs url= and pkg=" % (path, n))
             entries.append({"kind": kind, "target": target, "opts": opts})
-      if not entries:
+    if not entries:
         raise ValueError("%s: the stack file has no entries" % path)
-    finally:
-        if _top_parse:
-            _parse_stack_file._spliced = None
     return entries
 
 
@@ -11398,97 +8990,7 @@ def _check_stack_refs(rows):
     return 1 if bad else 0
 
 
-def _list_stacks():
-    """`packagemanager stack` with no name: what stacks there are.
-
-    Every *.stack in /etc/pkgusr/stacks (and stacks/ beside this tool, when
-    that is a different directory), with its one-line description, how many
-    entries it has and how many the cache records as done, and whether a
-    newer shipped copy (.new) is waiting.  avoid.stack is a list of what is
-    never built, not something to run, and says so.
-    """
-    dirs = []
-    for d in ("/etc/pkgusr/stacks",
-              os.path.join(os.path.dirname(os.path.abspath(__file__)), "stacks")):
-        if os.path.isdir(d) and os.path.realpath(d) not in [os.path.realpath(x) for x in dirs]:
-            dirs.append(d)
-    if not dirs:
-        printError("no stack directory (/etc/pkgusr/stacks) -- `make install` puts them there")
-        return 1
-    any_behind = []
-    # DONE IS WHAT ANY STACK RECORDED.  sway includes media, so media's
-    # packages were built -- and recorded -- under sway, and `media` said
-    # "1/19 done" with all of it installed.
-    done_all = set()
-    for d in dirs:
-        for f in os.listdir(d):
-            if f.endswith(".stack"):
-                done_all |= _stack_done_set(os.path.join(d, f))
-    # INSTALLED IS NOT CURRENT.  The cache says an entry was built once; it
-    # never looks again.  Compare each book entry's installed version with
-    # the book, so "79/79 done" cannot hide a sway that is three releases
-    # behind.  One map for the whole book (cached); no book, no judgement.
-    try:
-        _bv = book_versions_all() or {}
-    except Exception:
-        _bv = {}
-    for d in dirs:
-        files = sorted(f for f in os.listdir(d) if f.endswith(".stack"))
-        printHeader("stacks in %s" % d)
-        if not files:
-            printInfo("  (none)")
-            continue
-        for f in files:
-            path = os.path.join(d, f)
-            name = f[:-len(".stack")]
-            desc = ""
-            try:
-                first = open(path, encoding="utf-8", errors="replace").readline()
-                if " -- " in first:
-                    desc = first.split(" -- ", 1)[1].strip()
-            except OSError:
-                pass
-            try:
-                # what it BUILDS: the included avoid list is not an entry
-                entries = [e for e in _parse_stack_file(path) if e["kind"] != "avoid"]
-            except (OSError, ValueError) as ex:
-                print("  %-10s  (does not parse: %s)" % (name, ex))
-                continue
-            behind = ""
-            if name == "avoid":
-                state = "never built"
-            else:
-                done = len(done_all
-                           & {"%s %s" % (e["kind"], e["target"]) for e in entries})
-                state = "%d/%d done" % (done, len(entries))
-                if _bv:
-                    old_n = 0
-                    for e in entries:
-                        if e["kind"] != "book":
-                            continue
-                        want = _bv.get(e["target"]) or _bv.get(e["target"].lower())
-                        have = gather_user(e["target"]).version if want else None
-                        if want and have and not _same_version(want, have):
-                            old_n += 1
-                    if old_n:
-                        behind = "   %d entr%s behind the book" % (old_n, "y" if old_n == 1 else "ies")
-                        any_behind.append(name)
-            new = "   (.new waiting: --take-new)" if os.path.isfile(path + ".new") else ""
-            print("  %-10s  %-15s %s%s%s" % (name, state, desc, behind, new))
-    print()
-    printInfo("  plan one:     packagemanager stack <name>")
-    printInfo("  where it is, and what is behind (dependencies too):"
-              "  packagemanager stack <name> --status")
-    if not _bv:
-        printInfo("  (no book on disk: versions not compared)")
-    printInfo("  (\"done\" means built once -- a stack run never updates; "
-              "packagemanager update --stack <name> does)")
-    return 0
-
-
 def cmd_stack(args):
-    if not args.name:
-        return _list_stacks()
     path = _find_stack_file(args.name)
     if not path:
         printError("no stack file for %r (looked in ., /etc/pkgusr/stacks, "
@@ -11550,40 +9052,15 @@ def cmd_stack(args):
                     sys.exit(1)
                 printSuccess("took the shipped stack file; yours is %s" % _bak)
                 entries = _parse_stack_file(path)
-                # THE SAME MEASURE THE HEADER USES.  This said "149 entries
-                # now" while the header two lines later said "(62 entries)":
-                # one counts every line of the file, the other the buildable
-                # plan after `avoid`.  Two numbers for one file, both called
-                # entries.
-                printInfo("  %d line(s) in the file; the plan below is what"
-                          " will be built." % len(entries))
+                printInfo("  %d entries now." % len(entries))
                 print()
                 _new = None
         if _new and os.path.isfile(_new):
-            # WHAT DIFFERS, NOT HOW MANY.  The notice printed
-            #     (149 entries, this file has 149)
-            # for two files that differ in every entry's options: the counts
-            # were equal, so its own evidence argued there was nothing to
-            # take.  An entry count cannot see a changed expect= or a
-            # reordered library.
             printWarning("a newer version of this stack ships beside it:")
-            printWarning("    %s" % _new)
-            try:
-                import difflib as _dl
-                a = open(path, encoding="utf-8", errors="replace").readlines()
-                b = open(_new, encoding="utf-8", errors="replace").readlines()
-                added = sum(1 for l in _dl.unified_diff(a, b, n=0)
-                            if l.startswith("+") and not l.startswith("+++"))
-                removed = sum(1 for l in _dl.unified_diff(a, b, n=0)
-                              if l.startswith("-") and not l.startswith("---"))
-                _same = (_n_entries == len(entries))
-                printWarning("    %d line(s) added, %d removed%s"
-                             % (added, removed,
-                                "; the entry count is the same, so the change"
-                                " is in the entries themselves"
-                                if _same and (added or removed) else ""))
-            except OSError:
-                pass
+            printWarning("    %s%s" % (_new,
+                         "" if _n_entries is None else
+                         "   (%d entries, this file has %d)"
+                         % (_n_entries, len(entries))))
             printInfo("  diff %s %s" % (path, _new))
             printInfo("  ...and take what you want; this run uses YOUR file.")
             print()
@@ -11712,23 +9189,6 @@ def cmd_stack(args):
         # (entries are already filtered to --only above; the old `only`
         #  variable was removed with the duplicate implementation, and this
         #  reference outlived it -- NameError on every stack run.)
-        # A CACHED cfg ENTRY IS RE-CHECKED WHEN IT CAN BE.
-        #
-        # app-users puts the pam_exec line into /etc/pam.d/su; shadow's
-        # configure phase later rewrote su without it, and every stack run
-        # after that said `cfg app-users  done (stack cache)` -- so
-        # `su - u_browser-mini` asked for a password and nothing re-ran the
-        # step that fixes it.  A cfg entry's expect= states what it keeps
-        # true; when that no longer holds, the cache is wrong, not the check.
-        if (e["_key"] in donekeys and e["kind"] == "cfg"
-                and e["opts"].get("expect")
-                and subprocess.run(["/bin/bash", "-c", e["opts"]["expect"]],
-                                   stdout=subprocess.DEVNULL,
-                                   stderr=subprocess.DEVNULL).returncode != 0):
-            donekeys.discard(e["_key"])
-            if not getattr(args, "status", False):
-                printWarning("  cfg %s is cached as done, but its check fails"
-                             " now -- running it again" % e["target"])
         if e["_key"] in donekeys:
             rows.append((e, "done (stack cache)"))
             if not getattr(args, "status", False):
@@ -11775,29 +9235,11 @@ def cmd_stack(args):
     notinbook = [e["target"] for e, st in rows if st == "NOT IN BOOK"]
     if notinbook:
         printWarning("\nnot in the book: " + ", ".join(notinbook)
-                     + "\n  WHY is the first question -- the page may be there under"
-                     "\n  another anchor, or this book may be a different one than"
-                     "\n  you think:"
-                     + "".join("\n      blfs debug %s" % t for t in notinbook)
-                     + "\n  then: rename the entry to the book's anchor, or make it a"
-                     "\n  tar/git entry with build=/install= commands.")
-        if args.run and not getattr(args, "skip_unknown", False):
-            # ONE BAD LINE MUST NOT COST THE OTHER EIGHT.  Refusing the whole
-            # plan is right by default -- a plan that silently drops entries
-            # is how a stack looks finished while a package is missing -- but
-            # an entry the book has no page for blocked the eight that build
-            # and the checks that report, with no way past it but editing the
-            # file.
-            printError("refusing to run a plan with unknown targets.")
-            printInfo("  to run the rest and come back to it:"
-                      "\n      packagemanager stack %s --run --skip-unknown"
-                      % os.path.basename(path))
-            sys.exit(1)
+                     + "\n  fix the entry (rename to the book's anchor, or make it"
+                     "\n  a git entry with build=/install= commands)")
         if args.run:
-            printWarning("  --skip-unknown: leaving %d entr%s out of this run"
-                         % (len(notinbook), "y" if len(notinbook) == 1 else "ies"))
-            entries = [e for e, st in rows if st != "NOT IN BOOK"]
-            rows = [(e, st) for e, st in rows if st != "NOT IN BOOK"]
+            printError("refusing to run a plan with unknown targets.")
+            sys.exit(1)
 
     missing = [e["target"] for e, st in rows if st == "MISSING SCRIPT"]
     if missing:
@@ -11839,31 +9281,11 @@ def cmd_stack(args):
                     pkgs.append((anchor, nv))
         done_pkgs = [(a, v) for a, v in pkgs if "not installed" not in install_tag(a, v)]
         todo = [(a, v) for a, v in pkgs if (a, v) not in set(done_pkgs)]
-        # DONE BY ANY STACK: media's entries are built through sway, which
-        # includes it, and recorded in sway's cache -- "1 of 19 done" with
-        # 189 of 215 packages installed.
-        _done_any = set()
-        for _sd in {os.path.dirname(path), "/etc/pkgusr/stacks"}:
-            if os.path.isdir(_sd):
-                for _sf in os.listdir(_sd):
-                    if _sf.endswith(".stack"):
-                        _done_any |= _stack_done_set(os.path.join(_sd, _sf))
-        done_n = sum(1 for e, st in rows
-                     if st == "done (stack cache)" or e.get("_key") in _done_any
-                     or ("%s %s" % (e["kind"], e["target"])) in _done_any)
-        _tags = {(a, v): install_tag(a, v) for a, v in done_pkgs}
-        behind = [a for (a, v), t in _tags.items() if "book is newer" in t]
+        done_n = sum(1 for _, st in rows if st == "done (stack cache)")
         printHeader("stack %s" % args.name)
         print("  entries : %d of %d done" % (done_n, len(rows)))
         if pkgs:
             print("  packages: %d of %d installed" % (len(done_pkgs), len(pkgs)))
-        if behind:
-            # INSTALLED IS NOT CURRENT, and --run never updates.  Say how many,
-            # and the one command that does.
-            print("  behind  : %d installed older than the book (%s%s)"
-                  % (len(behind), ", ".join(behind[:5]), " ..." if len(behind) > 5 else ""))
-            print("            update them, with what depends on them:  "
-                  "packagemanager update --stack %s" % args.name)
         if skipped_by_avoid:
             print("  avoided : %d named in the stack (%s%s)"
                   % (len(skipped_by_avoid),
@@ -11872,20 +9294,8 @@ def cmd_stack(args):
         nxt_entry = next((e["target"] for e, st in rows if st != "done (stack cache)"), None)
         print("  next    : %s" % (nxt_entry or "nothing left to do"))
         if todo:
-            # SAY WHAT A RUN WOULD DO, because the list above reads like a
-            # plan and is not one.  `--run` builds what is MISSING; it never
-            # updates a package that is installed, however far behind the
-            # book it is.  On a system built from an older book that is half
-            # the tree marked "(update available)", and it looked like
-            # `stack media --run` was about to rebuild glib2.
-            print("  to build (missing): " + ", ".join(a for a, _ in todo[:6])
+            print("  building next: " + ", ".join(a for a, _ in todo[:6])
                   + (" ..." if len(todo) > 6 else ""))
-            print("    %d missing in total.  Installed packages are NOT"
-                  " touched by --run," % len(todo))
-            print("    whatever the book now carries: \"book is newer\" is a"
-                  " report, not a plan.")
-            print("    one package, deliberately:  packagemanager update"
-                  " <name> --run")
         if getattr(args, "full", False):
             print()
             for a, v in pkgs:
@@ -12029,38 +9439,9 @@ def cmd_stack(args):
                 install_local(target, spath, True, args.yes, "install")
         else:   # check / cfg -- a root script through the one runner
             sp = _stack_root_script(e, stack_dir)
-            # THE SETTINGS COME FROM THE RESOLVER, NOT FROM EACH SCRIPT.
-            # power.sh parsed packagemanager.conf itself, with the lfs
-            # config's JSON syntax, on a key=value file -- so on the booted
-            # machine it found nothing and stopped the stack.  The resolver
-            # knows every source (lfs config, this conf, the collector
-            # groups on the system); a cfg script reads the environment.
-            # Order: environment, lfs config, packagemanager.conf (both via
-            # load_config, which lets the lfs config win), then what the
-            # system shows.  A built-in default is never exported.
-            _cenv = dict(os.environ)
-            _known = _adopt_existing_settings()
-            _file_keys = set()
-            try:
-                with open(CONFIG_PATH) as _cf:
-                    _file_keys = {l.split("=", 1)[0].strip() for l in _cf
-                                  if "=" in l and not l.lstrip().startswith("#")}
-            except OSError:
-                pass
-            for _key, _var in (("collector_prefix", "LFS_COLLECTOR_PREFIX"),
-                               ("main_user", "LFS_MAIN_USER")):
-                if _cenv.get(_var):
-                    continue
-                if _key in _known and _known[_key][1] == "the lfs config":
-                    _cenv[_var] = _known[_key][0]
-                elif _key in _file_keys and load_config().get(_key):
-                    _cenv[_var] = str(load_config()[_key]).rstrip("_")
-                elif _key in _known:
-                    _cenv[_var] = _known[_key][0]
             rc = subprocess.run(["lfs-helper", "run-script", "--user", "root",
                                  "--as-root", "--script", sp,
-                                 "--phase", "all", "--name", ""],
-                                env=_cenv).returncode
+                                 "--phase", "all", "--name", ""]).returncode
             if rc != 0:
                 printError("stack stopped at %s %r (exit %d, %d of %d done)."
                            % (kind, target, rc, done, len(rows)))
@@ -12072,146 +9453,14 @@ def cmd_stack(args):
         # installed (prog=/have=); if that is still absent after a build the
         # tools said succeeded, say so and leave the entry unrecorded rather
         # than hiding it forever.
-        # EXPECT: A FEATURE IS NOT PROVED BY A FILE EXISTING.
-        #
-        # ffmpeg and SDL3 autodetect ALSA.  Built before alsa-lib existed --
-        # which is what happens when a library is listed AFTER a package
-        # whose dependency plan pulls its consumers in -- they configure
-        # cleanly, install cleanly, pass have=, and have no sound.  Nothing
-        # in a build log says so, because nothing went wrong.
-        #
-        # expect="<shell>" runs after the entry and must succeed.  It is the
-        # only thing here that checks what was built rather than whether a
-        # build happened.
-        _expect = e["opts"].get("expect")
-        _expect_ok = True
-        if _expect:
-            printInfo("  checking what %s was built with: %s" % (target, _expect))
-            _erc = subprocess.run(["/bin/bash", "-c", _expect],
-                                  stdout=subprocess.DEVNULL,
-                                  stderr=subprocess.DEVNULL).returncode
-            if _erc != 0:
-                _expect_ok = False
-                printError("%s installed, but the feature check failed:" % target)
-                printError("    %s" % _expect)
-                if e["kind"] == "cfg":
-                    # A cfg STEP HAS NO OPTIONAL DEPENDENCIES.  Its check is
-                    # what the step keeps true; after running it, that is
-                    # still false -- the step's own output above says why.
-                    printWarning("  This is a configuration step: it ran, and what it"
-                                 " keeps true is still not true.")
-                    printWarning("  Read its output above for the part it could not"
-                                 " do, then run it again:")
-                    printInfo("      packagemanager stack %s --only %s --run"
-                              % (os.path.basename(path).replace(".stack", ""),
-                                 target))
-                    _expect_msg_done = True
-                else:
-                    _expect_msg_done = False
-            if _erc != 0 and not _expect_msg_done:
-                printWarning("  The package is built and installed -- it is"
-                             " MISSING A FEATURE, which almost always means")
-                printWarning("  its optional dependency was not installed yet"
-                             " when it configured.")
-                printInfo("  What the check says is missing is usually fixed by:")
-                printInfo("      packagemanager install <the dependency> --run")
-                # A STACK ENTRY DOES NOT REBUILD AN INSTALLED PACKAGE.
-                #
-                # This used to suggest `stack <file>.stack --only <pkg> --run`
-                # -- with the .stack suffix, which is not a stack name -- and
-                # that command runs `install`, which answers "everything is
-                # installed and up to date" and changes nothing.  Re-running
-                # it can never fix the feature, so recommending it was a loop.
-                # ...AND THE RIGHT COMMAND DEPENDS ON THE KIND OF ENTRY.
-                #
-                # `update --reinstall --regenerate` regenerates from the
-                # BOOK, and a git or tar entry has no book page -- for
-                # gst-plugins-rs that advice could not work at all.  Those
-                # are rebuilt by the stack itself, with --force.
-                if e["kind"] == "book":
-                    printInfo("      %s" % " ".join(_rebuild_cmd(target)))
-                    printInfo("  Re-running this stack entry will NOT rebuild"
-                              " it: the package is installed,")
-                    printInfo("  so the entry's install step has nothing to"
-                              " do.  The line above does.")
-                else:
-                    printInfo("      packagemanager stack %s --only %s --run"
-                              " --force"
-                              % (os.path.basename(path).replace(".stack", ""),
-                                 target))
-                    printInfo("  This is a %s entry, not a book page: there is"
-                              " nothing to regenerate" % e["kind"])
-                    printInfo("  from the book, and --force is what rebuilds"
-                              " it.  (`update --reinstall`")
-                    printInfo("  would look for a book page that does not"
-                              " exist.)")
-                # AND SAY WHAT have= PROVED, WHICH IS LESS THAN IT LOOKS.
-                # A part-installed package satisfies it: gst-plugins-rs's
-                # first run installed libgstrswebrtc.so and then died on the
-                # next plugin, so have= said "installed" and audiornnoise
-                # was never there.
-                _have_f = e["opts"].get("have")
-                if _have_f:
-                    printWarning("  NOTE: have=%s exists, which is why this"
-                                 " was skipped as installed --" % _have_f)
-                    printWarning("  but one file is not the whole package."
-                                 "  The probe is the better answer.")
-
-        # A BOOK ENTRY WAS RECORDED DONE WITHOUT BEING CHECKED AT ALL.
-        #
-        # The guard below covered git and tar only.  poppler -- a `book`
-        # entry -- came out `done (stack cache)` while `pkg-config
-        # --list-all | grep poppler` found nothing: not installed, and the
-        # stack skipped it on every later run, so zathura-pdf-poppler kept
-        # failing on a dependency the plan believed it had.
-        #
-        # Every kind gets the same question now: is it there AFTERWARDS?
-        # For a book package that is the package state, which is what
-        # `verify` reads -- an empty manifest is not an install.
-        _installed_now = True
-        _missing_what = ""
-        if e["kind"] in ("git", "tar"):
-            _installed_now = _git_installed(e)
-            _missing_what = (e["opts"].get("have")
-                             or e["opts"].get("prog") or target)
-        elif e["kind"] == "book":
-            _u_now = gather_user(target)
-            _st_now, _ = assess(_u_now, None, run_cmd=False)
-            _installed_now = _st_now in ("installed", "unvalidated")
-            _missing_what = "%s (%s)" % (target, _st_now)
-        if not _expect_ok:
-            pass
-        elif not _installed_now:
+        if e["kind"] in ("git", "tar") and not _git_installed(e):
             printWarning("%s finished, but %s is still missing -- NOT recording"
                          " it as done, so the next run tries again."
-                         % (target, _missing_what))
+                         % (target, e["opts"].get("have")
+                            or e["opts"].get("prog") or target))
         else:
             _stack_mark_done(path, e["_key"])
         done += 1
-    # A SECOND PASS IS PART OF THE JOB, not an afterthought.
-    #
-    # Optional features are decided at configure time, and a stack builds
-    # things in one order -- so anything whose optional dependency came later
-    # in the same run is installed without it.  Nothing fails, so this is the
-    # only place the question gets asked.
-    if done and not getattr(args, "status", False):
-        printInfo("")
-        printInfo("Optional features are decided when a package configures, so"
-                  " anything built")
-        printInfo("before a dependency it can use was built WITHOUT it. "
-                  " Check, and fix:")
-        printInfo("    packagemanager late-deps")
-        printInfo("    packagemanager late-deps --rebuild --run")
-
-    # A RUN THAT LEFT SOMETHING OUT DID NOT FINISH.  "all N entries done" with
-    # a skipped entry is exactly the sentence that makes a missing package
-    # invisible for a month.
-    if notinbook and getattr(args, "skip_unknown", False):
-        printWarning("\nstack %s: %d entries done, %d SKIPPED (not in the book): %s"
-                     % (args.name, done, len(notinbook), ", ".join(notinbook)))
-        printInfo("  the stack is not complete.  Why each one is missing:"
-                  + "".join("\n      blfs debug %s" % t for t in notinbook))
-        sys.exit(1)
     printSuccess("\nstack %s: all %d entries done." % (args.name, done))
 
 
@@ -12265,18 +9514,6 @@ def cmd_reclaim(args):
     if os.geteuid() != 0:
         printError("reclaim changes ownership; run it as root.")
         return 1
-    if getattr(args, "all", False):
-        # ONE ACCIDENT, EVERY PACKAGE.  A tree-wide chown -- lfs-kernel's
-        # headers step gave p_linux-headers all of /usr/include -- is not a
-        # per-package problem, and naming the victims one at a time means
-        # finding them first.
-        args.packages = sorted(_pkg_dirs())
-        printInfo("checking %d installed package(s) against their manifests"
-                  % len(args.packages))
-    elif not args.packages:
-        printError("name a package, or --all")
-        return 2
-
     rc = 0
     for name in args.packages:
         acct = pkgusr_name(name)
@@ -12284,11 +9521,6 @@ def cmd_reclaim(args):
         try:
             paths = [l.strip() for l in open(manifest) if l.strip()]
         except OSError as e:
-            # under --all a package with no manifest is not an error, it is
-            # a package that has not recorded one -- saying so 90 times
-            # buries the packages that DID lose files
-            if getattr(args, "all", False):
-                continue
             printError("%s: cannot read %s (%s)" % (acct, manifest, e))
             rc = 1
             continue
@@ -12653,20 +9885,6 @@ commands, by what you are doing:
     fix-group-dir / fix-install
                                repair permissions
 
-  a whole environment at once
-    stack <name>               replay a stack file: packages, order, options
-    stack <name> --only <pkg>  one entry of it
-    stack <name> --take-new    take the shipped stack beside your edited one
-    bootstrap                  get a freshly booted system to where this works
-    env                        build-time variables the book expects exported
-
-  features, not files
-    probe [<pkg>]              run the stacks' expect= checks against what is
-                               installed: is the FEATURE there, not the file
-    late-deps                  what was built before a dependency it can use
-    late-deps --rebuild --run  rebuild those, in dependency order
-    late-deps <pkg> --why      the edges it used, and which names resolved
-
   settings and housekeeping
     config                     show or change settings
     paths                      where everything lives
@@ -12674,8 +9892,6 @@ commands, by what you are doing:
     errors                     what went wrong in the last run
     plan                       what a run would do, before doing it
     reload-pkg-list            refresh the cached package list
-    reclaim <pkg> | --all      give a package back files another took from it
-    which-package <path>       which package installed it
     blfs ...                   pass a command straight to blfs
 
 LFS base packages are the `lfs` tool's job; BLFS packages are handled here.
@@ -12897,38 +10113,13 @@ def _file_md5(path):
         return None
 
 
-def _in_chroot():
-    """Is there a host at all?
-
-    The whole point of the staleness warning is "the copy outside is newer
-    than the copy in here", and outside stops existing the moment the system
-    boots on its own.  /proc/1/root is pid 1's root: in a chroot it is not
-    this root.
-    """
-    try:
-        return os.stat("/proc/1/root/.").st_ino != os.stat("/").st_ino \
-            or os.stat("/proc/1/root/.").st_dev != os.stat("/").st_dev
-    except OSError:
-        return False
-
-
 def warn_if_tools_are_stale():
-    """Tell the user when the CHROOT is running older tools than the host.
+    """Tell the user when the chroot is running older tools than the host.
 
     The tools are copied into the tree; edit them outside and the chroot keeps
     running the old copy until they are copied again.  That is a genuinely
     confusing failure mode -- behaviour that was fixed "yesterday" reappears --
-    so say so plainly.
-
-    ON A BOOTED SYSTEM THERE IS NO HOST.  The stamp then records what was
-    copied in during the build, so every later `make install` on the machine
-    itself made all seven tools "differ" and this printed, before every
-    command, an instruction to run sync-tools on a host that no longer
-    exists.  `make install` writes the stamp now; this says nothing unless
-    there is an outside to be behind.
-    """
-    if not _in_chroot():
-        return
+    so say so plainly."""
     stamp = "/usr/share/lfs/tool-stamps.json"
     if not os.path.isfile(stamp):
         return
@@ -13072,13 +10263,6 @@ def main():
     p.add_argument("-R", "--dependents", action="store_true",
                    help="also update everything that (recursively) depends on the "
                         "named package(s) -- rebuild reverse deps too")
-    p.add_argument("-v", "--verbose", action="store_true",
-                   help="show every requirement that differs, not the first 12")
-    p.add_argument("--stack", metavar="NAME",
-                   help="only the packages of that stack (media, sway, "
-                        "network, services, vision) -- 'what in the media "
-                        "chain has the book moved past', without typing the "
-                        "names.  Combine with --select to pick from them.")
     p.add_argument("--select", action="store_true",
                    help="interactively pick which packages of the plan to update "
                         "(all selected by default; combine with --run to update the "
@@ -13182,21 +10366,12 @@ def main():
     p.add_argument("--refresh", action="store_true",
                    help="drop scripts from an older blfs so the current "
                         "questions can be seen")
-    p.add_argument("--system", action="store_true",
-                   help="this system's own facts -- main user, the three "
-                        "prefixes, the Shared directory -- as PKGUSR_SYS_* "
-                        "in /etc/profile.d/pkgusr-system.sh, so a script can "
-                        "ask instead of guessing")
-    p.add_argument("--run", action="store_true",
-                   help="with --system: write the file (default: print it)")
     p.set_defaults(func=cmd_env)
 
     p = sub.add_parser(
         "stack",
         help="replay a stack file: one command, one whole environment")
-    p.add_argument("name", nargs="?",
-                   help="stack name or path (e.g. sway, ./sway.stack); "
-                        "without one, list the stacks there are")
+    p.add_argument("name", help="stack name or path (e.g. sway, ./sway.stack)")
     p.add_argument("--run", action="store_true",
                    help="actually build (default: print the plan)")
     p.add_argument("--yes", "-y", action="store_true",
@@ -13213,9 +10388,6 @@ def main():
     p.add_argument("--ignore-prereqs", action="store_true",
                    help="start entries even when a build tool or variable "
                         "their scripts need is missing")
-    p.add_argument("--skip-unknown", action="store_true",
-                   help="run the entries the book does have, and report the "
-                        "others (exits non-zero: the stack is NOT complete)")
     p.add_argument("--only", action="append", metavar="ENTRY",
                    help="run just these entries (repeatable or comma-separated); "
                         "they are rebuilt even if the cache says done")
@@ -13230,12 +10402,7 @@ def main():
     p = sub.add_parser("reclaim",
                        help="give a package back files another package took "
                             "from it (ownership only; nothing is rebuilt)")
-    p.add_argument("packages", nargs="*")
-    # ONE ACCIDENT, EVERY PACKAGE.  A tree-wide chown (lfs-kernel's headers
-    # step gave p_linux-headers all of /usr/include) is not a per-package
-    # problem, and naming the victims one at a time means finding them first.
-    p.add_argument("--all", action="store_true",
-                   help="every installed package, not a named list")
+    p.add_argument("packages", nargs="+")
     p.add_argument("--run", action="store_true",
                    help="actually change ownership (default: dry run)")
     p.set_defaults(func=cmd_reclaim)
@@ -13286,31 +10453,6 @@ def main():
                    help="after install, remove stale files from the old version "
                         "(configs and source tree kept)")
     p.set_defaults(func=cmd_script)
-
-    p = sub.add_parser("probe", help="run the stacks' expect= feature checks "
-                       "against what is installed")
-    p.add_argument("package", nargs="*", help="only these (default: all)")
-    p.set_defaults(func=cmd_probe)
-
-    p = sub.add_parser("late-deps", help="packages built BEFORE a dependency "
-                       "they can use (so its support was compiled out)")
-    p.add_argument("package", nargs="*", help="only these (default: all)")
-    p.add_argument("--kind", help="which dependency kinds to check "
-                   "(default recommended,optional; add required to include it)")
-    p.add_argument("--verbose", action="store_true",
-                   help="also list dependency names that could not be matched")
-    p.add_argument("--include-docs", action="store_true",
-                   help="include dependencies that only affect documentation "
-                        "or are build tools (graphviz, docutils, git ...)")
-    p.add_argument("--why", action="store_true",
-                   help="show the dependency edges actually used for the named "
-                        "package(s), and which names did not resolve")
-    p.add_argument("--rebuild", action="store_true",
-                   help="print the rebuild plan in dependency order; with "
-                        "--run, carry it out")
-    p.add_argument("--run", action="store_true",
-                   help="with --rebuild: actually rebuild")
-    p.set_defaults(func=cmd_late_deps)
 
     p = sub.add_parser("errors", help="show which packages failed in the last "
                        "install/update run (with log locations)")
@@ -13374,15 +10516,6 @@ def main():
                         formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("name")
     q.add_argument("--groups", help="also add these groups, e.g. audio,video")
-    q.add_argument("--shared-slim", dest="shared_slim", action="store_true",
-                   help="share the DESKTOP only: the account joins the group "
-                        "on your XDG runtime directory, so it can draw -- and "
-                        "gets no audio and no camera.  For an account that "
-                        "only ever runs a browser window.")
-    q.add_argument("--shared-full", dest="shared_full", action="store_true",
-                   help="the desktop AND audio and video: --shared-slim plus "
-                        "the audio and video groups, for anything that plays "
-                        "sound or uses a camera.")
     q.add_argument("--shared", action="store_true",
                    help="a SHARED user: joins the group on your XDG runtime "
                         "directory, so it can reach the display, the session "
@@ -13404,15 +10537,6 @@ def main():
                         formatter_class=argparse.RawDescriptionHelpFormatter)
     q.add_argument("name")
     q.add_argument("--groups", help="also add these groups, e.g. audio,video")
-    q.add_argument("--shared-slim", dest="shared_slim", action="store_true",
-                   help="share the DESKTOP only: the account joins the group "
-                        "on your XDG runtime directory, so it can draw -- and "
-                        "gets no audio and no camera.  For an account that "
-                        "only ever runs a browser window.")
-    q.add_argument("--shared-full", dest="shared_full", action="store_true",
-                   help="the desktop AND audio and video: --shared-slim plus "
-                        "the audio and video groups, for anything that plays "
-                        "sound or uses a camera.")
     q.add_argument("--shared", action="store_true",
                    help="join the group on your XDG runtime directory")
     q.add_argument("--share-dir", action="store_true",
@@ -13422,39 +10546,11 @@ def main():
     q.add_argument("--desktop", action="store_true", help="a menu entry")
     q.add_argument("--app", help="program to launch (default: <name>)")
     q.set_defaults(func=cmd_user_setup)
-    q = usub.add_parser("delete", help="remove an application account safely: its "
-                        "home archived first, launchers, pam line, account, group")
+    q = usub.add_parser("delete", help="delete an shared user + group + home")
     q.add_argument("name")
-    q.add_argument("--run", action="store_true", help="actually remove (default dry-run)")
+    q.add_argument("--run", action="store_true", help="actually delete (default dry-run)")
     q.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
-    q.add_argument("--keep-home", action="store_true", help="leave the home directory")
-    q.add_argument("--no-archive", action="store_true", help="do not archive the home first")
     q.set_defaults(func=cmd_user_delete)
-    q = usub.add_parser("purge", help="undo the whole application-account setup: "
-                        "every account, then the session group, the profile "
-                        "fragments and the pam wiring they shared")
-    q.add_argument("--run", action="store_true", help="actually remove (default dry-run)")
-    q.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
-    q.add_argument("--keep-home", action="store_true", help="leave the home directories")
-    q.add_argument("--no-archive", action="store_true", help="do not archive the homes")
-    q.add_argument("--accounts", help="only these accounts (comma separated), "
-                   "instead of every one in app-users.conf")
-    q.add_argument("--conf", help=f"read the account list here (default {APP_USERS_CONF})")
-    q.set_defaults(func=cmd_user_purge)
-    q = usub.add_parser("launcher", help="a launcher + menu entry for an existing "
-                        "application account (one account can have several)")
-    q.add_argument("account")
-    q.add_argument("name", help="the launcher's name: ~/bin/<name>, <name>.desktop")
-    q.add_argument("--app", required=True, help="command line; {} = what you type")
-    q.add_argument("--icon", default="", help="URL, simpleicons.org slug, or - for none "
-                   "(default: the launcher name as the slug)")
-    q.add_argument("--no-desktop", action="store_true", help="no menu entry")
-    q.set_defaults(func=cmd_user_launcher)
-    q = usub.add_parser("remove-launcher", help="remove a launcher, its menu entry and "
-                        "icon (only ones these tools wrote)")
-    q.add_argument("name")
-    q.add_argument("--run", action="store_true")
-    q.set_defaults(func=cmd_user_remove_launcher)
     q = usub.add_parser("allow", help="add supplementary group(s) to a user "
                         "(e.g. audio video)")
     q.add_argument("user")

@@ -11,7 +11,7 @@ HOME_USER="${LFS_DESKTOP_USER:-${LFS_HOME_USER:-}}"
 [ -n "$HOME_USER" ] && printf '%s\n' "$HOME_USER" > /etc/pkgusr/desktop-user
 HOME_DIR="/home/${HOME_USER:-nobody-set}"
 
-# 1. one launcher: the checks sway needs, then sway.
+# 1. one launcher: a dbus session around sway.
 #
 # The seat comes from seatd, not elogind: elogind only registers a session
 # through pam_elogind, and Linux-PAM is not on this system, so a tty login
@@ -19,8 +19,7 @@ HOME_DIR="/home/${HOME_USER:-nobody-set}"
 # means libseat does not try logind first and fail with a puzzling message.
 cat > /usr/bin/sway-session <<'LAUNCH'
 #!/bin/bash
-# start sway from a plain tty login.  The session bus and XDG_RUNTIME_DIR
-# are NOT set up here -- that is yours to arrange.
+# start sway inside a dbus session; run from a plain tty login
 export XDG_CURRENT_DESKTOP=sway
 export LIBSEAT_BACKEND=seatd
 
@@ -65,10 +64,11 @@ if [ -n "${XDG_VTNR:-}" ] && [ -r /sys/class/tty/tty0/active ]; then
     fi
 fi
 
-# THE SESSION BUS AND XDG_RUNTIME_DIR ARE DELIBERATELY NOT HANDLED HERE.
-# They are yours; this launcher only checks the seat, udev and the VT, and
-# then starts the compositor with whatever environment you gave it.
-exec sway "$@"
+if [ -z "${XDG_RUNTIME_DIR:-}" ]; then
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null && chmod 700 "$XDG_RUNTIME_DIR"
+fi
+exec dbus-run-session -- sway "$@"
 LAUNCH
 chmod 755 /usr/bin/sway-session
 
@@ -78,7 +78,7 @@ cat > /usr/bin/pipewire-start <<'PW'
 # start pipewire + wireplumber for this session, if not already up
 pgrep -x pipewire >/dev/null || { pipewire & disown; }
 pgrep -x wireplumber >/dev/null || { wireplumber & disown; }
-echo "# pipewire is up (its sockets go in \${XDG_RUNTIME_DIR:-<unset>})"
+echo "# pipewire is up (pipewire-pulse socket in $XDG_RUNTIME_DIR)"
 PW
 chmod 755 /usr/bin/pipewire-start
 

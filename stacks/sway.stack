@@ -1,12 +1,5 @@
 # sway.stack -- a working Sway desktop with a minimal WebKit browser.
-# stack-version: 1.14.292
-#
-# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
-# here: the exclusions are a property of the machine, not of one stack.
-# Without it, `stack media` planned 274 packages -- systemd, polkit, qt6,
-# cups -- because those exclusions lived in sway.stack alone.
-include avoid
-
+# stack-version: 1.13.67
 # Replay with:  packagemanager stack sway --run
 # Entries run top to bottom; book deps are resolved from the BLFS book,
 # installed entries are skipped, the first failure stops the run.
@@ -20,9 +13,33 @@ include avoid
 # libxml2) must not be dropped by a blanket rule.  These are the branches
 # this desktop does not want, named one at a time, and everything they alone
 # pull in goes with them.
+avoid  libreoffice
+avoid  asymptote
+avoid  biber
+avoid  qt6
+avoid  okular
+avoid  phonon
+avoid  phonon-backend-vlc
+avoid  vlc
+avoid  cups
+avoid  openjdk
+avoid  java
+avoid  apache-ant
+avoid  postgresql
+avoid  openldap
+avoid  unixodbc
+avoid  graphviz
+avoid  gegl
 # the KDE leaves okular pulls in: named individually, because a package can
 # have several parents and pruning by one of them drops shared dependencies
 # (graphite2 was lost that way)
+avoid  plasma-activities
+avoid  libkexiv2
+avoid  kwindowsystem
+avoid  libfm-qt
+avoid  xdg-desktop-portal-lxqt
+avoid  xdg-desktop-portal-gnome
+avoid  gnome-desktop
 
 # The desktop-portal tail.  The book makes xdg-desktop-portal REQUIRE all
 # four backends -- gtk, wlr, gnome AND lxqt -- so one recommendation from
@@ -30,21 +47,79 @@ include avoid
 # Sway needs none of it to run; screen sharing wants xdg-desktop-portal-wlr,
 # which can be built on its own later:
 #     packagemanager install xdg-desktop-portal-wlr --run
+avoid  xdg-desktop-portal
+avoid  xdg-desktop-portal-gtk
+avoid  xdg-desktop-portal-wlr
+avoid  xdg-desktop-portal-gnome
+avoid  xdg-desktop-portal-lxqt
+avoid  xfce4-panel
+avoid  xfce4-notifyd
+avoid  xfce4-dev-tools
+avoid  xfconf
+avoid  libxfce4util
+avoid  libxfce4ui
+avoid  libxfce4windowing
+avoid  exo
+avoid  garcon
+avoid  liblxqt
+avoid  lxqt-build-tools
+avoid  lxqt-notificationd
+avoid  lxqt-kwindowsystem
+avoid  libqtxdg
+avoid  polkit-qt
+avoid  libfm-qt
+avoid  menu-cache
+avoid  libwnck
+avoid  notification-daemon
 
 # Not this desktop either: a systemd package on a SysV system, phone modem
 # stacks, a mail/ssh server, spell-checking dictionaries.
-# openssh is AVOIDED here and INSTALLED by network.stack, where it belongs:
-# it is networking, not desktop.  Letting a dependency plan pull it in
-# mid-sway would put its system-account question in the middle of a graphics
-# build.
+avoid  systemd
+avoid  ModemManager
+avoid  libmbim
+avoid  libqmi
+avoid  geoclue2
+avoid  openssh
+avoid  ruby
+avoid  aspell
+avoid  enchant
+avoid  gnome-keyring
+avoid  gcr
+avoid  startup-notification
 
 # Tails of things already avoided.  Each of these is in the plan ONLY to
 # serve a package this stack does not build, and the tools cannot yet work
 # that out for themselves (see 1.12.83: pruning by the single parent that
 # `blfs order` reports dropped shared dependencies, and broke harfbuzz).
 # Checked one by one against the plan's parent column:
+avoid  libcupsfilters        # cups   (avoided)
+avoid  libppd                # cups
+avoid  cups-filters          # cups
+avoid  libkexiv2             # okular (avoided)
+avoid  exiv2                 # libkexiv2
+avoid  clucene               # libreoffice (avoided)
+avoid  redland               # libreoffice
+avoid  rasqal                # redland
+avoid  raptor                # rasqal
+avoid  jasper                # qt6    (avoided)
+avoid  libmng                # qt6
+avoid  double-conversion     # qt6
+avoid  poppler               # libcupsfilters -- its ONLY parent, avoided
+avoid  mupdf                 # libcupsfilters
+avoid  gs                    # libcupsfilters
+avoid  qpdf                  # libcupsfilters
+avoid  nss                   # poppler
+avoid  boost                 # poppler
+avoid  pdfio                 # libcupsfilters
+avoid  gpgmepp               # poppler
 # Checked against EVERY parent, not just the one the plan prints: these have
 # no parent left in the plan at all.
+avoid  colord                # cups (avoided) -- no live parent
+avoid  linux-pam             # systemd (avoided) -- no live parent
+avoid  xdg-utils             # cups -- no live parent
+avoid  freeglut              # mupdf (avoided) -- no live parent
+avoid  polkit                # colord + systemd (both avoided) -- no live parent
+avoid  libgusb               # colord
 # NOT avoided, though the plan labels them with an avoided parent: the label
 # shows only the FIRST parent.  gtk3 is really wanted by adwaita-icon-theme,
 # ffmpeg by mpv, polkit by colord... and pulseaudio by pipewire/sdl3/gst.
@@ -57,23 +132,6 @@ check  kernel-sway
 # 1. seat and session (SysV: elogind is the logind; seatd is not in the book)
 book   dbus
 book   elogind url=https://github.com/elogind/elogind ref=v255.17 prog=loginctl build="meson setup build --prefix=/usr --buildtype=release -Dcgroup-controller=elogind -Ddbuspolicydir=/etc/dbus-1/system.d; ninja -C build" install="ninja -C build install"
-
-# 1b. THE AUDIO FLOOR, BEFORE ANYTHING THAT LOOKS FOR IT.
-#
-# alsa-lib used to sit at entry 7, after mpv -- and ffmpeg is built inside
-# mesa's plan (entry 2) and SDL3 inside gstreamer's, both of which autodetect
-# ALSA.  They configured cleanly, installed cleanly, and had no ALSA support,
-# because the library did not exist yet.  Nothing failed, so nothing said so.
-#
-# This is the same rule the harfbuzz comment below states for libass: what an
-# earlier entry installed is simply there.  An optional dependency of
-# something built inside a plan can only be placed by entry order.
-book   alsa-lib
-
-# ffmpeg and SDL3 are named here, before mesa and gstreamer, so they are
-# built in THIS order rather than wherever a dependency plan reaches them --
-# and expect= proves the feature afterwards instead of trusting the order.
-book   ffmpeg expect="ffmpeg -hide_banner -devices 2>/dev/null | grep -qw alsa"
 
 # 2. graphics -- llvm feeds mesa; mesa options come from the machine
 #    (machine.conf wiring pending; book defaults until then)
@@ -103,40 +161,7 @@ book   harfbuzz        # text shaping: freetype recommends it,
 book   graphite2       #   and webkit/pango need both
 book   fontconfig
 
-# LIBGLVND, BEFORE MESA -- because machine.conf builds Mesa with
-# glvnd=enabled, and Mesa's configure needs it there.
-#
-# glvnd is the GL dispatcher: libGL, libEGL and libGLES are its, and
-# Mesa installs only its vendor libraries behind it (libGLX_mesa,
-# libEGL_mesa + 50_mesa.json).  It is what provides pkg-config `opengl`,
-# and what lets another GL driver (NVIDIA's) sit beside Mesa.
-#
-# NOT a BLFS page -- the 13.1 book only links to GLFS for it.  The canonical
-# repo is gitlab.freedesktop.org/glvnd/libglvnd; the NVIDIA GitHub copy is
-# the one reachable from where this was written.  CHECKED there: newest tag
-# v1.7.0, and the option names (all left at their defaults).
-#
-# SWITCHING AN EXISTING MACHINE: libglvnd and mesa must be done in ONE go.
-# Between the two, libGL.so.1 is glvnd's with no vendor behind it and every
-# GL program fails:
-#     packagemanager stack sway --only libglvnd,mesa --run
-# Programs already built keep working: the sonames (libGL.so.1, libEGL.so.1,
-# libGLESv2.so.2) do not change, only who provides them.
-git    libglvnd \
-       url=https://gitlab.freedesktop.org/glvnd/libglvnd.git \
-       ref=v1.7.0 \
-       needs=xorg7-lib \
-       have=/usr/lib/pkgconfig/opengl.pc \
-       build="rm -rf build; meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
-       install="ninja -C build install" \
-       expect="pkg-config --exists opengl && pkg-config --exists glx && test -e /usr/lib/libGLdispatch.so.0"
-
-# THE SOFTWARE RENDERER IS A SEPARATE DRIVER, and a hardware-only mesa
-# fails with "egl: failed to create dri2 screen" and no fallback.  The probe
-# wants both: radeonsi for the GPU, swrast_dri.so for llvmpipe.  (llvmpipe
-# installs as swrast_dri.so -- the file is named after the interface, not
-# the rasteriser, which is why looking for llvmpipe_dri.so finds nothing.)
-book   mesa expect="test -e /usr/lib/dri/swrast_dri.so -o -e /usr/lib/dri/kms_swrast_dri.so && test -e /usr/share/glvnd/egl_vendor.d/50_mesa.json && test -e /usr/lib/libGLX_mesa.so.0"
+book   mesa
 book   xwayland
 book   libinput
 book   libxkbcommon
@@ -164,33 +189,55 @@ book   adwaita-icon-theme   # cursors and the default icon set
 book   gtk4
 book   glib-networking  # TLS for libsoup, or the browser has no https
 book   libsoup3
-# The CODECS, before the plugins that look for them.  A WebRTC call
-# negotiates Opus for audio and VP8 for video; both plugins are autodetected
-# (opus in -base, vpx in -good), so a missing library means a call that
-# connects and carries nothing.
-# 6b. the media chain, in its own stack so it can be rebuilt on its own:
-# codecs, gstreamer, the WebRTC pieces, woff2, webkitgtk, mpv.
+book   gstreamer10
+book   gst10-plugins-base
+book   gst10-plugins-good
+# ---------------------------------------------------------------------
+# WebRTC and camera streaming.
 #
-# ONE LIST, TWO ENTRY POINTS.  `packagemanager stack media --run` builds
-# just that part; this include means the full desktop build is still one
-# command and the entries are written down once.  It sits HERE because
-# webkitgtk needs gtk4, pango and libsoup3 above, and mesa and ffmpeg from
-# further up.
-include media
+# BLFS 13.0 carries NONE of these, so they are git entries.  They must be
+# built BEFORE gst10-plugins-bad and webkitgtk, because webrtcbin -- the
+# element a browser uses for WebRTC -- is compiled into gst-plugins-bad only
+# if libnice is present, and webkitgtk links the result.  Adding them later
+# means recompiling both (hours).
+#
+# What each is for:
+#   libnice                 ICE: the NAT traversal WebRTC cannot work without
+#   libsrtp                 the encrypted media transport
+#   usrsctp                 WebRTC data channels
+#   webrtc-audio-processing echo cancellation for a microphone (the log's
+#                           "webrtc-audio-processing-2 found: NO")
+#
+# The camera side is already in this stack: v4l-utils for the device and
+# pipewire for routing it.
+#
+# UNTESTED -- the build lines follow each project's README, and none of these
+# has been built here.  Expect to adjust them; that is what the stack file is
+# for.
+git    libnice url=https://gitlab.freedesktop.org/libnice/libnice.git ref=0.1.22 have=/usr/lib/pkgconfig/nice.pc build="meson setup build --prefix=/usr --buildtype=release -Dgtk_doc=disabled; ninja -C build" install="ninja -C build install"
+git    libsrtp url=https://github.com/cisco/libsrtp.git ref=v2.6.0 have=/usr/lib/pkgconfig/libsrtp2.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+# ref: 1.0.0 does not exist upstream (checked: the tags are 0.9.3.0, 0.9.4.0,
+# 0.9.5.0).  0.9.5.0 has meson.build, so the build line below still applies.
+git    usrsctp url=https://github.com/sctplab/usrsctp.git ref=0.9.5.0 have=/usr/lib/pkgconfig/usrsctp.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+git    webrtc-audio-processing url=https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git ref=v2.1 have=/usr/lib/pkgconfig/webrtc-audio-processing-2.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
 
-# 7. audio: alsa-lib is entry 1b (it has to be); the tools can come later
+book   gst10-plugins-bad
+# No exclusions.  The book's dependency graph is built as the book states
+# it, recommendations included: a recommendation is there for a reason, and
+# skipping one is how texlive came to build before FreeType.  This costs
+# build time (texlive, LibreOffice and their tails are hours) and buys a
+# system that matches the book.
+book   webkitgtk
+book   mpv
+
+# 7. audio: ALSA is the floor; pipewire installed, started on demand
+book   alsa-lib
 book   alsa-utils
 book   pipewire
 book   wireplumber
 
-# 8. SDL3 for the Sw* tools.
-#
-# SDL3 dlopens libasound rather than linking it, so ldd says nothing; the
-# name it will dlopen is in the binary, and that is what to look for.
-# the glob matters: SDL3 installs libSDL3.so.0.<n> and a bare libSDL3.so
-# symlink only when the -devel side is there, so naming one path makes the
-# probe fail for the wrong reason
-book   sdl3 expect="strings /usr/lib/libSDL3.so* 2>/dev/null | grep -q libasound"
+# 8. SDL3 for the Sw* tools
+book   sdl3
 
 # 9. the nimbin2 family: make all && make PREFIX=/usr install
 
@@ -207,6 +254,7 @@ book   sdl3 expect="strings /usr/lib/libSDL3.so* 2>/dev/null | grep -q libasound
 # and asymptote/biber are avoided.
 #
 # To build it later, on its own:  packagemanager install texlive --run
+avoid  texlive
 
 
 # ---------------------------------------------------------------------
@@ -240,200 +288,7 @@ git    sway    url=https://github.com/swaywm/sway ref=1.11 prog=sway needs=json-
 git    swaybg  url=https://github.com/swaywm/swaybg ref=v1.2.1 prog=swaybg build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
 git    tllist  url=https://codeberg.org/dnkl/tllist ref=1.1.0 have=/usr/include/tllist.h build="meson setup build --prefix=/usr" install="ninja -C build install"
 git    fcft    url=https://codeberg.org/dnkl/fcft ref=3.3.2 have=/usr/include/fcft build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
-# light: backlight and keyboard brightness.  Not in the book.
-#
-# THE UPSTREAM MOVED.  haikarainen/light on GitHub is gone -- checked, and
-# `git ls-remote` on it fails while three other GitHub URLs in this stack
-# answer, so it was the path and not the network.  GitHub returns 401 for a
-# repository it does not have, which is why the clone asked for a username.
-#
-# gitlab.com/dpeukert/light is where it continued.  Checked on the machine
-# this runs on: the URL answers and `git ls-remote --tags` prints NOTHING --
-# the fork carries no tags at all, only `main`.  So `ref=main` is not
-# laziness here, it is the only ref there is, and it means this entry
-# follows upstream: the commit that built is the one worth writing down if
-# a build ever breaks.
-#
-#     git ls-remote --heads https://gitlab.com/dpeukert/light.git
-#
-# CFLAGS='-fcommon' IS NOT A WORKAROUND FOR A BROKEN PACKAGE.  light's
-# helpers.h declares `light_loglevel` without `extern`, which every C
-# compiler accepted until GCC 10 made -fno-common the default; each object
-# then defines it and the link fails with
-#     multiple definition of `light_loglevel'
-# -fcommon restores the pre-GCC-10 behaviour, which is what this code was
-# written against.  The alternative is patching the header, and that is
-# upstream's call, not this stack's.
-#
-# IT HAS TO BE IN THE ENVIRONMENT, NOT ON THE CONFIGURE LINE.  autogen.sh
-# here is not just autoreconf: it ends by running ./config.status --recheck
-# and then `make`, so the compile that fails happens BEFORE the ./configure
-# on this line is ever reached.  Passing CFLAGS to that configure fixed
-# nothing and the link failed exactly as before.  Exported, it reaches
-# autogen.sh's own configure run, which is the one that writes the Makefile.
-#
-# And `rm -f config.status` first: autogen.sh re-runs whatever config.status
-# is lying around, so a tree configured by hand earlier keeps its old flags
-# no matter what this line says.
-#
-# If that fails too, one of these:
-#   - the new URL, if light moved: just fix url= below.
-#   - the source you built from last time, as a tar entry:
-#       tar light url=file:///path/to/light-1.2.2.tar.gz pkg=light-1.2.2.tar.gz \
-#           have=/usr/bin/light build="./autogen.sh; ./configure --prefix=/usr \
-#           --with-udev; make" install="make install"
-#   - brightnessctl, which does the same job and DOES resolve (tag 0.5.1
-#     verified from here).  It uses the same udev/video-group approach:
-#       git brightnessctl url=https://github.com/Hummer12007/brightnessctl.git \
-#           ref=0.5.1 prog=brightnessctl build="make" \
-#           install="make install" expect="brightnessctl --version >/dev/null 2>&1"
-#
-# It writes to /sys/class/backlight/*/brightness, which root owns, so the
-# binary needs either setuid root or a udev rule putting those files in a
-# group you are in.  --with-udev installs 90-backlight.rules, which chgrps
-# them to `video`; that is the one to prefer, and it means the desktop user
-# must be in `video` (cfg power puts them in the power group, not this one).
-git    light url=https://gitlab.com/dpeukert/light.git ref=main prog=light \
-       build="export CFLAGS='-O2 -fcommon'; rm -f config.status; ./autogen.sh; ./configure --prefix=/usr --with-udev; make" \
-       install="make install" \
-       expect="light -V >/dev/null 2>&1"
-
-# jq.  Not in the book, so this entry is ours -- and it was BUILT to write
-# it, not guessed:
-#
-#   - jq-1.8.2 is the newest tag (jq-1.8.2rc1 exists too; the release
-#     tarball is the non-rc one), md5 e288a84cf2957ea2cfc643aa9e59b473
-#   - the release tarball ships `configure`, so no autogen.sh step
-#   - oniguruma is NOT on the system and does not need to be: configure says
-#     "Oniguruma was not found.  Will use the packaged oniguruma", builds the
-#     copy in vendor/, and `jq -n '"abc"|test("b")'` answers true.  That is
-#     the probe below -- `jq --version` would pass on a jq with no regex,
-#     which is the half of jq most scripts use.
-tar    jq url=https://github.com/jqlang/jq/releases/download/jq-1.8.2/jq-1.8.2.tar.gz \
-       pkg=jq-1.8.2.tar.gz prog=jq \
-       build="./configure --prefix=/usr; make" \
-       install="make install" \
-       expect="jq -n '\"abc\" | test(\"b\")' >/dev/null 2>&1"
-
-# wf-recorder: screen recording for a wlroots compositor.  Not in the book.
-#
-# CHECKED against the repo at v0.6.0 (newest tag; master and two feature
-# branches also exist):
-#
-#   * audio is CONDITIONAL.  meson_options.txt has `pulse` and `pipewire`
-#     as auto features and config.h.in has `#mesondefine HAVE_AUDIO`, which
-#     gates src/audio.cpp -- so with neither library found at configure
-#     time you get a recorder that cannot record sound.
-#   * and `--help` lists `-a, --audio` EITHER WAY: that text is not inside
-#     the #ifdef.  So the probe checks what the binary LINKS, which is the
-#     only honest answer to "was audio built in".
-#   * `meson build` (as in the by-hand script) still works, but `meson
-#     setup build` is the spelling meson documents now.
-#
-# Its codecs come from ffmpeg, which is entry 1b, and the default is
-# libx264 -- so gst10-plugins-ugly's x264 is not what it uses; ffmpeg's own
-# libx264 support is.
-git    wf-recorder url=https://github.com/ammen99/wf-recorder.git \
-       ref=v0.6.0 prog=wf-recorder \
-       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
-       install="ninja -C build install" \
-       expect="ldd /usr/bin/wf-recorder 2>/dev/null | grep -qE 'libpulse|libpipewire'"
-
-# VIEWERS: a document one and an image one.  Neither is in the BLFS book.
-#
-# CHECKED with git ls-remote, all four at once: girara, zathura and
-# zathura-pdf-poppler share the release tag **2026.07.18** (they are one
-# project, released together -- mixing tags is the usual way to get a
-# zathura that cannot open a PDF), and imv's newest is **v4.3.0**.
-# imv's repo answers on both github.com/exec64/imv and .../eXeC64/imv; the
-# lowercase spelling is used here.
-#
-# zathura is THREE packages: girara is its widget library, the core opens no
-# file formats at all, and the backend is a separate plugin.  A zathura with
-# no plugin starts, shows a grey window and says nothing -- which is what
-# the expect= below is for: it looks for the PLUGIN, not the binary.
-#
-# poppler (the backend's dependency) is a book page.  It was in avoid.stack
-# as libcupsfilters' child; it is wanted now.  mupdf stays avoided -- it is
-# the other backend and one is enough.
-book   poppler
-
-# girara installs **girara.pc**, not girara-gtk3.pc: its meson.build says
-# `pkg.generate(name: 'girara', ...)`.  The old guess made the stack refuse
-# to record a girara that had installed perfectly -- "finished, but
-# /usr/lib/pkgconfig/girara-gtk3.pc is still missing", which is the have=
-# check doing its job on a wrong have=.
-git    girara url=https://github.com/pwmt/girara.git ref=2026.07.18 \
-       have=/usr/lib/pkgconfig/girara.pc \
-       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
-       install="ninja -C build install"
-
-# xxHash, BEFORE zathura.  Mentioned eight times in the BLFS book and given
-# no page of its own, so this entry is ours.
-#
-# zathura 2026.07.18 takes it as a hard dependency:
-#     Run-time dependency libxxhash found: NO (tried pkgconfig and cmake)
-#     meson.build:57:9: ERROR: Dependency "libxxhash" not found
-#
-# CHECKED in the checkout: newest tag v0.8.3; it ships libxxhash.pc.in, so
-# the pkg-config module really is `libxxhash` -- the name meson asks for --
-# and `make install` runs install_libxxhash.pc among its targets.  A plain
-# Makefile, no cmake or meson: PREFIX and LIBDIR are what it takes.
-git    xxhash url=https://github.com/Cyan4973/xxHash.git ref=v0.8.3 \
-       have=/usr/lib/pkgconfig/libxxhash.pc \
-       build="make PREFIX=/usr LIBDIR=/usr/lib" \
-       install="make PREFIX=/usr LIBDIR=/usr/lib install" \
-       expect="pkg-config --exists libxxhash"
-
-# NO -Dsqlite: zathura has no such option.  Its meson.build takes sqlite as
-# an unconditional dependency -- `dependency('sqlite3', version: '>=3.35.0')`
-# -- and its only options are synctex, seccomp, landlock, manpages,
-# tests-x11, tests-wayland and convert-icon.  `-Dsqlite=enabled` stopped
-# meson dead with `Unknown option: "sqlite"`, which is what guessing an
-# option name earns.  sqlite3 is already installed here (p_sqlite).
-git    zathura url=https://github.com/pwmt/zathura.git ref=2026.07.18 \
-       prog=zathura \
-       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
-       install="ninja -C build install"
-
-git    zathura-pdf-poppler url=https://github.com/pwmt/zathura-pdf-poppler.git \
-       ref=2026.07.18 \
-       have=/usr/lib/zathura/libpdf-poppler.so \
-       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
-       install="ninja -C build install" \
-       expect="test -e /usr/lib/zathura/libpdf-poppler.so"
-
-# imv: wayland image viewer.  The binary is `imv`, which dispatches to
-# imv-wayland or imv-x11 -- so the probe wants the wayland one, or on this
-# machine it would pass on an imv that can only open windows under X.
-# -licuuc: imv links libicuio and CALLS libicuuc (ubrk_close), and its
-# link line carries -Wl,--no-undefined, so the indirect dependency is an
-# error rather than a warning:
-#     undefined reference to symbol 'ubrk_close_78'
-#     /lib/libicuuc.so.78: error adding symbols: DSO missing from command line
-# icu splits its API across libicuuc (common), libicui18n and libicuio;
-# imv's meson names only the one it uses directly.  Naming the other on the
-# link line is the whole fix -- nothing is patched.
-git    imv url=https://github.com/exec64/imv.git ref=v4.3.0 \
-       prog=imv \
-       build="meson setup build --prefix=/usr --buildtype=release -D c_link_args=-licuuc; ninja -C build" \
-       install="ninja -C build install" \
-       expect="command -v imv-wayland >/dev/null 2>&1 || ldd /usr/bin/imv 2>/dev/null | grep -q wayland"
-
-# wl-clipboard: wl-copy and wl-paste.  Not in the book either, and sway is
-# unusable without it once anything wants a clipboard from a script.
-git    wl-clipboard url=https://github.com/bugaevc/wl-clipboard ref=v2.2.1 \
-       prog=wl-copy \
-       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
-       install="ninja -C build install" \
-       expect="wl-paste --version >/dev/null 2>&1"
-
 git    foot    url=https://codeberg.org/dnkl/foot ref=1.28.0 prog=foot build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
-# the rest of the fonts: icons, a patched terminal font, and Noto for
-# everything DejaVu does not cover.  One step, because they are all "unpack
-# an archive into /usr/share/fonts and run fc-cache".
-cfg    fonts
-
 tar    dejavu-fonts url=https://downloads.sourceforge.net/dejavu/dejavu-fonts-ttf-2.37.tar.bz2 pkg=dejavu-fonts-ttf-2.37.tar.bz2 have=/usr/share/fonts/dejavu build="true" install="install -v -d -m755 /usr/share/fonts/dejavu; install -v -m644 ttf/*.ttf /usr/share/fonts/dejavu; fc-cache /usr/share/fonts/dejavu"
 git    sdl3-image url=https://github.com/libsdl-org/SDL_image ref=release-3.2.4 have=/usr/lib/libSDL3_image.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release; cmake --build build" install="cmake --install build"
 git    sdl3-ttf   url=https://github.com/libsdl-org/SDL_ttf ref=release-3.2.2 have=/usr/lib/libSDL3_ttf.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release; cmake --build build" install="cmake --install build"

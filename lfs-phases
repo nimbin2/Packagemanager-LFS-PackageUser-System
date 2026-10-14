@@ -34,7 +34,7 @@
 # scripts are also SOURCED by lfs-helper to read their metadata, and this file
 # comes along -- it must not shadow anything in the sourcing shell.
 
-PKGUSR_LIB_VERSION="1.14.299"
+PKGUSR_LIB_VERSION="1.14.146"
 
 _pp_build_id() {
     local f="${BASH_SOURCE[0]}"
@@ -189,30 +189,12 @@ _pp_mirrors_for() {
 }
 
 _pp_fetch() {
-    # SAVE IT AS THE NAME THE SCRIPT ASKS FOR.
-    #
-    # A GitHub archive URL ends in the TAG, not the project:
-    #   .../cisco/openh264/archive/refs/tags/v2.6.0.tar.gz
-    # so wget wrote v2.6.0.tar.gz, the unpack looked for the declared
-    # pkg=openh264-2.6.0.tar.gz, and the run said "no
-    # openh264-2.6.0.tar.gz ... and nowhere to fetch it from" one line under
-    # "'v2.6.0.tar.gz' saved [60302243]".  Both statements were true.
-    #
-    # `pkg` is what every later phase uses, and two projects can both
-    # publish a v2.6.0.tar.gz, so the file has to land under that name.
-    local url="$1" try u out="${2:-${pkg:-}}"
+    local url="$1" try u
     for try in 1 2 3; do
         while IFS= read -r u; do
             [ -n "$u" ] || continue
             [ "$u" = "$url" ] || _pp_say "trying mirror: $u"
-            if [ -n "$out" ]; then
-                wget -4 -c -O "$out" "$u" && return 0
-                # -O leaves an empty file behind on a 404, and -c would then
-                # "resume" it for ever
-                [ -s "$out" ] || rm -f "$out"
-            else
-                wget -4 -c "$u" && return 0
-            fi
+            wget -4 -c "$u" && return 0
         done <<< "$(_pp_mirrors_for "$url" | awk '!seen[$0]++')"
         [ "$try" = 3 ] && break
         _pp_say "every mirror failed (try $try/3) -- retrying in $((try * 15))s"
@@ -258,32 +240,10 @@ _pp_unpack() {
 
     if [ "${is_git:-}" = 1 ]; then
         pkg_dir="$name_version"
-        # GIT MUST NEVER ASK A QUESTION IN A BUILD.
-        #
-        # A URL that is not there gets a 401 from GitHub (it will not admit
-        # a repository is missing), so git asks for a username and the build
-        # ends with
-        #     fatal: could not read Username for 'https://github.com'
-        # ...which reads like a credentials problem on a public repository
-        # and, on a terminal, would simply hang.  Refuse the prompt and say
-        # what it means.
-        export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true GIT_SSH_COMMAND="ssh -oBatchMode=yes"
         if [ -d "$pkg_dir/.git" ]; then
             git -C "$pkg_dir" fetch --all --tags --prune
         else
-            rm -rf "$pkg_dir"
-            if ! git clone --recurse-submodules "$link" "$pkg_dir"; then
-                _pp_fail "could not clone $link"
-                echo "   git was refused, and was not allowed to ask for a" >&2
-                echo "   password (this is a build).  On a public URL that" >&2
-                echo "   almost always means the PATH IS WRONG: GitHub answers" >&2
-                echo "   401 for a repository that does not exist rather than" >&2
-                echo "   admitting it is missing." >&2
-                echo "   Check it, from here, before editing anything else:" >&2
-                echo "     git ls-remote $link | head -3" >&2
-                echo "   Then fix url= in the stack entry." >&2
-                return 1
-            fi
+            rm -rf "$pkg_dir" && git clone --recurse-submodules "$link" "$pkg_dir"
         fi
         # A REF THAT DOES NOT EXIST IS A TYPO IN THE STACK, NOT A BUILD ERROR.
         #
@@ -296,22 +256,10 @@ _pp_unpack() {
             _pp_fail "'$git_ref' is not a tag, branch or commit in $link"
             echo "   The stack entry (or this script) asks for a ref the" >&2
             echo "   repository does not have.  Recent tags:" >&2
-            # AN EMPTY LIST UNDER A HEADING IS A RIDDLE.  A fork with no
-            # tags printed "Recent tags:" and then nothing, which reads like
-            # the command failed rather than "there are none -- use a
-            # branch".
-            _pp_tags="$(git -C "$pkg_dir" tag --sort=-v:refname 2>/dev/null | head -8)"
-            if [ -n "$_pp_tags" ]; then
-                printf '%s\n' "$_pp_tags" | sed 's/^/     /' >&2
-            else
-                echo "     (none at all -- this repository is not tagged," >&2
-                echo "      so a branch is the only thing to ask for)" >&2
-            fi
+            git -C "$pkg_dir" tag --sort=-v:refname 2>/dev/null | head -8 \
+                | sed 's/^/     /' >&2
             echo "   Branches:" >&2
-            # HEAD and the bare remote name are not branches anyone can ask
-            # for: the list printed `origin` above `origin/main`.
             git -C "$pkg_dir" branch -r --format='%(refname:short)' 2>/dev/null \
-                | grep -vE '^[^/]+$|/HEAD$' | sed 's|^[^/]*/||' \
                 | head -5 | sed 's/^/     /' >&2
             echo "   Fix ref= in the stack entry for '${name:-$name_version}'," >&2
             echo "   or set git_ref= in this script, then run it again." >&2
@@ -339,36 +287,13 @@ _pp_unpack() {
             && _pp_say "# the build resumes in $_pp_prepared_in"
         return 0
     fi
-    _pp_stage_file "$pkg" || { [ -n "${link:-}" ] && _pp_fetch "$link" "$pkg"; }
-    if [ ! -f "$pkg" ]; then
-        _pp_fail "no $pkg in $BUILD_ROOT and nowhere to fetch it from"
-        # SAY WHAT DID ARRIVE.  This fired one line under a successful
-        # download and read as "the fetch failed", when the fetch had
-        # worked and only the NAME differed.
-        local _got
-        _got="$(ls -1t *.tar.* *.tgz *.zip 2>/dev/null | head -3)"
-        if [ -n "$_got" ]; then
-            echo "   what IS here, newest first:" >&2
-            printf '     %s\n' $_got >&2
-            echo "   if one of those is it, the entry's pkg= does not match the" >&2
-            echo "   name it arrived under -- a GitHub archive URL ends in the" >&2
-            echo "   TAG, not the project." >&2
-        fi
-        return 1
-    fi
+    _pp_stage_file "$pkg" || { [ -n "${link:-}" ] && _pp_fetch "$link"; }
+    [ -f "$pkg" ] || { _pp_fail "no $pkg in $BUILD_ROOT and nowhere to fetch it from"; return 1; }
     _pp_check_md5 || return 1
     local li f
-    # EACH EXTRA UNDER ITS OWN NAME.  _pp_fetch saves to its second
-    # argument, else to $pkg -- and this call passed none, so LLVM's patch
-    # was fetched with `wget -c -O llvm-project-22.1.8.src.tar.xz`.  The
-    # tarball was bigger, wget answered 416 "already fully retrieved", and
-    # the build stopped on
-    #     patch: **** Can't open patch file ../llvm-22.1.8-upstream_fix-1.patch
-    # (An extra LARGER than the tarball would have been appended onto it.)
     for li in "${additional_links[@]}"; do
         f="${li##*/}"
-        _pp_stage_file "$f" || _pp_fetch "$li" "$f" || return 1
-        [ -s "$f" ] || { _pp_fail "fetched $li, and there is no $f"; return 1; }
+        _pp_stage_file "$f" || _pp_fetch "$li" || return 1
     done
     if [ "${pkg_unpack:-yes}" = "no" ]; then
         _pp_say "fetched $pkg (the page's own commands unpack it)"

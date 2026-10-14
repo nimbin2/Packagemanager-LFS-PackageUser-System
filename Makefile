@@ -23,7 +23,7 @@ SYSCONFDIR  ?= $(DESTDIR)/etc
 # The four tools, the book merger, and the phase runner every generated
 # install script sources (it goes in bin so `. lfs-phases` finds it on PATH,
 # on the host, in the chroot and on the built system alike).
-TOOLS       := lfs lfs-helper packagemanager blfs lfs-sysvbook lfs-phases lfs-kernel lfs-backup
+TOOLS       := lfs lfs-helper packagemanager blfs lfs-sysvbook lfs-phases lfs-kernel
 COMPLETION  := lfs-completion.bash
 TESTS       := test_lfs_crosschain.sh
 
@@ -60,10 +60,6 @@ install:
 	    rm -f "$(BINDIR)/packagemanager_install" \
 	        && echo "    removed retired packagemanager_install"; \
 	fi
-	@# lfs-config is retired (1.14.291): lfs-backup replaces it.
-	@if [ -e "$(BINDIR)/lfs-config" ]; then \
-	    rm -f "$(BINDIR)/lfs-config" && echo "    removed retired lfs-config (now lfs-backup)"; \
-	fi
 	@for t in $(TOOLS); do \
 	    if [ -f "$$t" ]; then \
 	        $(INSTALL) -m 755 "$$t" "$(BINDIR)/$$t" && echo "    $$t"; \
@@ -71,16 +67,6 @@ install:
 	        echo "    !! missing: $$t" >&2; exit 1; \
 	    fi; \
 	done
-	@# THE STAMP RECORDS WHAT IS INSTALLED, so whoever installs writes it.
-	@# It was written only by `lfs build-system install-tools`, which runs
-	@# on a host against a chroot -- so on a BOOTED system every later
-	@# `make install` left the stamp describing the old copies, and
-	@# packagemanager announced "these tools differ from the copies on the
-	@# host" and told the reader to run sync-tools on a host that no longer
-	@# exists.
-	@$(MKDIR) $(DESTDIR)/usr/share/lfs
-	@{ echo '{'; 	   first=1; 	   for t in $(TOOLS); do 	       [ -f "$$t" ] || continue; 	       m=$$(md5sum "$$t" | cut -d' ' -f1); 	       [ $$first = 1 ] || echo ','; first=0; 	       printf '  "%s": "%s"' "$$t" "$$m"; 	   done; echo; echo '}'; } > $(DESTDIR)/usr/share/lfs/tool-stamps.json
-	@echo "    recorded $(DESTDIR)/usr/share/lfs/tool-stamps.json"
 	@echo "==> stacks -> $(DESTDIR)/etc/pkgusr/stacks"
 	$(MKDIR) $(DESTDIR)/etc/pkgusr/stacks
 	@# A STACK FILE IS THE USER'S.  This overwrote it unconditionally, so
@@ -120,17 +106,6 @@ install:
 	@# kernel.conf is a file to EDIT BEFORE building, so it is installed
 	@# rather than written on first run -- and, like a stack file, an
 	@# edited one is kept and the new one lands beside it.
-	@# backup.conf: what lfs-backup carries.  Yours is kept, like kernel.conf.
-	@if [ -f backup.conf ]; then \
-	    $(MKDIR) "$(DESTDIR)/etc/pkgusr"; \
-	    d="$(DESTDIR)/etc/pkgusr/backup.conf"; \
-	    if [ ! -e "$$d" ] || cmp -s backup.conf "$$d"; then \
-	        $(INSTALL) -m 644 backup.conf "$$d" && echo "    backup.conf"; \
-	    else \
-	        $(INSTALL) -m 644 backup.conf "$$d.new" \
-	        && echo "    backup.conf -> KEPT YOURS ($$d.new)"; \
-	    fi; \
-	fi
 	@if [ -f kernel.conf ]; then \
 	    d="$(DESTDIR)/etc/pkgusr/kernel.conf"; \
 	    if [ ! -e "$$d" ] || cmp -s kernel.conf "$$d"; then \
@@ -209,7 +184,7 @@ uninstall:
 	@echo "Left alone (they are yours):"
 	@echo "    $(SYSCONFDIR)/pkgusr/skel-u_xdg/.bash_profile"
 	@echo "    /usr/share/lfs        books, settings, snapshots"
-	@echo "    /etc/pkgusr           packagemanager settings, kernel.conf, backup.conf"
+	@echo "    /etc/pkgusr           packagemanager settings"
 
 check:
 	@bash $(TESTS) ./lfs

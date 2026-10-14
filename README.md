@@ -70,7 +70,6 @@ lfs build-system session      # the interview: partition, prefixes, locale, logi
 lfs run                       # everything up to the chroot, then enter it
 lfs-helper build-all          # inside: chapters 7-9
 packagemanager bootstrap --run   # wget, Python modules, BLFS book, certificates
-packagemanager stack            # list the stacks
 packagemanager stack sway --run  # then network, services
 lfs-kernel                    # the kernel, from /etc/pkgusr/kernel.conf
 ```
@@ -195,28 +194,6 @@ packagemanager user create firefox --shared --share-dir --launcher
 The session group is read from the runtime directory, not assumed. Set it up
 once for your own account; every shared user then joins whatever is there.
 
-Many accounts at once come from `/etc/pkgusr/stacks/app-users.conf`, one line
-per launcher, applied by `packagemanager stack services --only app-users
---run`. Undoing them:
-
-| Command | Removes |
-|---|---|
-| `packagemanager user remove-launcher <name> --run` | one launcher, its menu entry and icon |
-| `packagemanager user delete <account> --run` | the account; its home is archived to `/root` first |
-| `packagemanager user purge --run` | all of them, plus the session group, the profile fragments and the PAM wiring |
-
-A home with a browser profile in it is archived to `/root/u_<name>-home-<date>.tar.gz`
-(0600) before the account goes — logins, cookies and downloads that nothing
-else can give back. A home that was never used is not archived. Drop the
-archives when you no longer want them: `rm /root/u_*-home-*.tar.gz`.
-
-Each is a dry run without `--run`. `$SHARED_*` comes from
-`/etc/profile.d/shared-dirs.sh`. `/etc/profile.d` is read by **login** shells
-only, so a terminal opened inside your session shows what it inherited at
-login. The step also sources the fragment from `/etc/bashrc`; any shell can
-refresh itself with `. /etc/profile.d/shared-dirs.sh`, which also drops the
-variables whose directory is gone.
-
 ---
 
 ## When ownership starts
@@ -247,13 +224,6 @@ Everything is dry-run by default. `--run` applies.
 | `lfs-helper which-package <path>` | Which package installed this |
 | `lfs-helper manifests` | What each package installed |
 | `lfs-helper sort-users --run` | Sort passwd and group by id |
-| `lfs-helper setid [--run]` | Setuid/setgid bits the build refused (`su`, `passwd`, ...) |
-| `lfs-backup create --run` | Back up the files in `/etc/pkgusr/backup.conf` (modes, owners) |
-| `lfs-backup restore <archive> [--skip accounts,ssh] [--run]` | Put them on a new system: creates missing files, writes `.new` for the rest |
-| `lfs-backup plan <archive> [file]` | A restore plan to edit: skip files, or send them elsewhere |
-| `lfs-backup restore <archive> --plan <file> [--run]` | Restore by that plan |
-| `lfs-backup merge <archive>` | Go through the `.new` files: diff, keep live, take backup, or edit |
-| `lfs-backup clean <archive> [--run]` | Remove those `.new` files after merging (edited ones are kept) |
 
 ---
 
@@ -327,7 +297,6 @@ lfs-kernel list          # what kernel.org offers
 lfs-kernel               # build the version in /etc/pkgusr/kernel.conf
 lfs-kernel 6.12.40       # that version, once
 lfs-kernel verify        # is everything installed?
-lfs-kernel firmware --missing [--fix]   # firmware this machine wants and lacks
 ```
 
 Everything it does is configured in `/etc/pkgusr/kernel.conf`, which is
@@ -355,19 +324,15 @@ enter it.
 ## Tests
 
 ```sh
-bash test_lfs_crosschain.sh ./lfs          # all of it
-bash test_lfs_crosschain.sh --list         # numbered blocks
-bash test_lfs_crosschain.sh --from 300 --to 340 ./lfs
-bash test_lfs_crosschain.sh --only firmware ./lfs
+bash test_lfs_crosschain.sh ./lfs
 ```
 
 Each test encodes a bug that actually happened, with a comment explaining
 what broke.
 
-Run it from a directory holding all the tools — about 100 tests skip without
-them. A selection re-executes a generated subset (preamble + chosen blocks +
-summary); a block that needs something an earlier one computed says so
-instead of passing quietly.
+Run it from a directory holding all the tools — about 100 tests skip
+without them. It no longer fits one sandbox slot; on a real machine run it
+whole, or one block at a time (each starts `# ---- <title>`).
 
 ---
 
