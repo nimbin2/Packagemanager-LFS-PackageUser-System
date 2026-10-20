@@ -34,11 +34,25 @@
 # scripts are also SOURCED by lfs-helper to read their metadata, and this file
 # comes along -- it must not shadow anything in the sourcing shell.
 
-PKGUSR_LIB_VERSION="1.14.146"
+PKGUSR_LIB_VERSION="1.14.369"
 
 _pp_build_id() {
     local f="${BASH_SOURCE[0]}"
     [ -r "$f" ] && md5sum "$f" 2>/dev/null | cut -c1-7
+}
+
+# ------------------------------------------------------------- dev source ----
+# packagemanager dev <pkg> <checkout>: one line per package account in
+# /etc/pkgusr/dev-sources.conf.  Matched by the account running this, or by
+# the package name when a root run has no account.
+_pp_dev_source() {
+    local f="${PKGUSR_DEV_SOURCES:-/etc/pkgusr/dev-sources.conf}" me
+    [ -r "$f" ] || return 0
+    me="$(id -un 2>/dev/null)"
+    awk -v a="$me" -v n="${name:-}" '
+        { sub(/#.*/, ""); sub(/[ \t]+<-.*/, "") }
+        NF >= 2 && ($1 == a || (n != "" && $1 == n)) {
+            $1 = ""; sub(/^ +/, ""); print; exit }' "$f"
 }
 
 # ----------------------------------------------------------------- output ----
@@ -189,12 +203,30 @@ _pp_mirrors_for() {
 }
 
 _pp_fetch() {
-    local url="$1" try u
+    # SAVE IT AS THE NAME THE SCRIPT ASKS FOR.
+    #
+    # A GitHub archive URL ends in the TAG, not the project:
+    #   .../cisco/openh264/archive/refs/tags/v2.6.0.tar.gz
+    # so wget wrote v2.6.0.tar.gz, the unpack looked for the declared
+    # pkg=openh264-2.6.0.tar.gz, and the run said "no
+    # openh264-2.6.0.tar.gz ... and nowhere to fetch it from" one line under
+    # "'v2.6.0.tar.gz' saved [60302243]".  Both statements were true.
+    #
+    # `pkg` is what every later phase uses, and two projects can both
+    # publish a v2.6.0.tar.gz, so the file has to land under that name.
+    local url="$1" try u out="${2:-${pkg:-}}"
     for try in 1 2 3; do
         while IFS= read -r u; do
             [ -n "$u" ] || continue
             [ "$u" = "$url" ] || _pp_say "trying mirror: $u"
-            wget -4 -c "$u" && return 0
+            if [ -n "$out" ]; then
+                wget -4 -c -O "$out" "$u" && return 0
+                # -O leaves an empty file behind on a 404, and -c would then
+                # "resume" it for ever
+                [ -s "$out" ] || rm -f "$out"
+            else
+                wget -4 -c "$u" && return 0
+            fi
         done <<< "$(_pp_mirrors_for "$url" | awk '!seen[$0]++')"
         [ "$try" = 3 ] && break
         _pp_say "every mirror failed (try $try/3) -- retrying in $((try * 15))s"
@@ -240,10 +272,104 @@ _pp_unpack() {
 
     if [ "${is_git:-}" = 1 ]; then
         pkg_dir="$name_version"
+        # GIT MUST NEVER ASK A QUESTION IN A BUILD.
+        #
+        # A URL that is not there gets a 401 from GitHub (it will not admit
+        # a repository is missing), so git asks for a username and the build
+        # ends with
+        #     fatal: could not read Username for 'https://github.com'
+        # ...which reads like a credentials problem on a public repository
+        # and, on a terminal, would simply hang.  Refuse the prompt and say
+        # what it means.
+        export GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true GIT_SSH_COMMAND="ssh -oBatchMode=yes"
+        # A DEV SOURCE: a program developed on this machine is built from the
+        # developer's own checkout (packagemanager dev), not from url=.  The
+        # checkout belongs to someone else, which git refuses to read
+        # ("detected dubious ownership") unless THIS account's own config
+        # names it -- `-c safe.directory=` does not reach the process that
+        # reads the other repository (git clears it), and the entry must be
+        # the .git path, not the work tree.  --no-local: nothing is
+        # hardlinked across the two owners.
+        _pp_dev="$(_pp_dev_source)"
+        if [ -n "$_pp_dev" ]; then
+            link="$_pp_dev"
+            _pp_say "# dev source: $link -- its committed state, not the working tree"
+        fi
+        _pp_gc=(); _pp_cl=()
+        case "$link" in
+            /*|file://*)
+                _pp_cl=(--no-local)
+                _pp_p="${link#file://}"
+                for _pp_sd in "$_pp_p" "$_pp_p/.git"; do
+                    git config --global --get-all safe.directory 2>/dev/null \
+                        | grep -qxF "$_pp_sd" \
+                        || git config --global --add safe.directory "$_pp_sd"
+                done ;;
+        esac
         if [ -d "$pkg_dir/.git" ]; then
-            git -C "$pkg_dir" fetch --all --tags --prune
+            # the clone follows whatever link= says NOW -- a dev source set or
+            # dropped since it was made must not keep fetching the old place
+            if [ "$(git -C "$pkg_dir" remote get-url origin 2>/dev/null)" != "$link" ]; then
+                _pp_say "# origin: $(git -C "$pkg_dir" remote get-url origin 2>/dev/null) -> $link"
+                git -C "$pkg_dir" remote set-url origin "$link"
+            fi
+            git "${_pp_gc[@]}" -C "$pkg_dir" fetch --all --tags --prune
         else
-            rm -rf "$pkg_dir" && git clone --recurse-submodules "$link" "$pkg_dir"
+            rm -rf "$pkg_dir"
+            if ! git "${_pp_gc[@]}" clone "${_pp_cl[@]}" --recurse-submodules "$link" "$pkg_dir"; then
+                _pp_fail "could not clone $link"
+                echo "   git was refused, and was not allowed to ask for a" >&2
+                echo "   password (this is a build).  On a public URL that" >&2
+                echo "   almost always means the PATH IS WRONG: GitHub answers" >&2
+                echo "   401 for a repository that does not exist rather than" >&2
+                echo "   admitting it is missing." >&2
+                echo "   Check it, from here, before editing anything else:" >&2
+                echo "     git ls-remote $link | head -3" >&2
+                echo "   Then fix url= in the stack entry." >&2
+                return 1
+            fi
+        fi
+        # THE PACKAGE'S CLONE IS A BUILD TREE, NOT A WORKSPACE.
+        #
+        # swas's clone had edits to Makefile, README.md, config.example and
+        # swas.c -- made by hand, before there was a checkout of its own to
+        # work in -- and the checkout of the moved branch refused:
+        #     error: Your local changes to the following files would be
+        #     overwritten by checkout
+        # Every update would stop there.  They may be real work, so they are
+        # SAVED as a patch in the package's home before the reset, never
+        # thrown away.  Untracked files (build output) are left alone.
+        if [ -n "$(git -C "$pkg_dir" status --porcelain --untracked-files=no 2>/dev/null)" ]; then
+            _pp_patch="$HOME/${name:-$pkg_dir}-local-changes-$(date +%Y%m%d-%H%M%S).patch"
+            if git -C "$pkg_dir" diff HEAD > "$_pp_patch" 2>/dev/null && [ -s "$_pp_patch" ]; then
+                _pp_say "# the clone had uncommitted edits ($(git -C "$pkg_dir" diff HEAD --name-only | tr '\n' ' '))"
+                _pp_say "#   saved: $_pp_patch"
+                _pp_say "#   (keep them: cd <your checkout> && git apply $_pp_patch)"
+                git -C "$pkg_dir" reset -q --hard || { _pp_fail "could not reset $pkg_dir"; return 1; }
+            else
+                _pp_fail "the clone has uncommitted edits and they could not be saved to $_pp_patch -- not discarding them"
+                return 1
+            fi
+        fi
+        # ...AND FILES GIT DOES NOT TRACK.  The browser's clone also held a
+        # hand-made HANDOVER.md; a later commit added a tracked one, and
+        #     error: The following untracked working tree files would be
+        #     overwritten by checkout: HANDOVER.md
+        # stopped the update the same way.  Untracked, NOT ignored files are
+        # either hand-made or build output the project forgot to ignore --
+        # both go into a tar beside the patch, then the clone is cleaned.
+        # Ignored files (the project's own build output) stay.
+        _pp_untr="$(git -C "$pkg_dir" ls-files --others --exclude-standard 2>/dev/null)"
+        if [ -n "$_pp_untr" ]; then
+            _pp_tar="$HOME/${name:-$pkg_dir}-untracked-$(date +%Y%m%d-%H%M%S).tar"
+            if printf '%s\n' "$_pp_untr" | tar -C "$pkg_dir" -cf "$_pp_tar" -T - 2>/dev/null; then
+                _pp_say "# the clone had files git does not track ($(printf '%s' "$_pp_untr" | head -n 5 | tr '\n' ' ')$([ "$(printf '%s\n' "$_pp_untr" | wc -l)" -gt 5 ] && echo '...'))"
+                _pp_say "#   saved: $_pp_tar   (look: tar tf $_pp_tar)"
+                git -C "$pkg_dir" clean -fdq || { _pp_fail "could not clean $pkg_dir"; return 1; }
+            else
+                _pp_fail "the clone has untracked files and they could not be saved to $_pp_tar -- not removing them"
+                return 1
+            fi
         fi
         # A REF THAT DOES NOT EXIST IS A TYPO IN THE STACK, NOT A BUILD ERROR.
         #
@@ -252,14 +378,60 @@ _pp_unpack() {
         # which reads like a build failure and sends people to the log.  The
         # repository is right here and knows what it does have; show it, and
         # say where the wrong value came from.
-        if [ -n "${git_ref:-}" ] && ! git -C "$pkg_dir" checkout "$git_ref"; then
+        # A BRANCH IS NOT A POINT IN TIME, AND `checkout` DOES NOT MOVE IT.
+        #
+        # On an existing clone the fetch above brings the new commits in, and
+        # `git checkout master` then says "Already on 'master'" and stays
+        # exactly where it was.  So a package pinned to a branch rebuilt the
+        # SAME commit for ever: `update <pkg>` fetched, compiled and installed
+        # a version it already had, and said it had updated it.  A tag or a
+        # commit is a point in time and must NOT move -- those are checked out
+        # detached, which is what they are.
+        _pp_ref="${git_ref:-}"
+        if [ -z "$_pp_ref" ]; then
+            # no ref: whatever the remote calls its default branch
+            _pp_ref="$(git -C "$pkg_dir" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null)"
+            _pp_ref="${_pp_ref#origin/}"
+            [ -n "$_pp_ref" ] && _pp_say "# no ref given -- following origin's default branch ($_pp_ref)"
+        fi
+        if [ -n "$_pp_ref" ] \
+           && git -C "$pkg_dir" show-ref --verify --quiet "refs/remotes/origin/$_pp_ref"; then
+            _pp_before="$(git -C "$pkg_dir" rev-parse --short HEAD 2>/dev/null)"
+            if ! git -C "$pkg_dir" checkout -B "$_pp_ref" "origin/$_pp_ref"; then
+                _pp_fail "could not put $pkg_dir on branch $_pp_ref"
+                return 1
+            fi
+            _pp_after="$(git -C "$pkg_dir" rev-parse --short HEAD 2>/dev/null)"
+            if [ -n "$_pp_before" ] && [ "$_pp_before" != "$_pp_after" ]; then
+                _pp_say "# $_pp_ref: $_pp_before -> $_pp_after ($(git -C "$pkg_dir" rev-list --count "$_pp_before..$_pp_after" 2>/dev/null) new commit(s))"
+            else
+                _pp_say "# $_pp_ref is already at $_pp_after"
+            fi
+            git -C "$pkg_dir" submodule update --init --recursive
+            echo "$pkg_dir" > "$_pp_dir_marker"
+            _pp_say "checked out into $BUILD_ROOT/$pkg_dir"
+            return 0
+        fi
+        if [ -n "${git_ref:-}" ] && ! git -C "$pkg_dir" checkout --detach "$git_ref"; then
             _pp_fail "'$git_ref' is not a tag, branch or commit in $link"
             echo "   The stack entry (or this script) asks for a ref the" >&2
             echo "   repository does not have.  Recent tags:" >&2
-            git -C "$pkg_dir" tag --sort=-v:refname 2>/dev/null | head -8 \
-                | sed 's/^/     /' >&2
+            # AN EMPTY LIST UNDER A HEADING IS A RIDDLE.  A fork with no
+            # tags printed "Recent tags:" and then nothing, which reads like
+            # the command failed rather than "there are none -- use a
+            # branch".
+            _pp_tags="$(git -C "$pkg_dir" tag --sort=-v:refname 2>/dev/null | head -8)"
+            if [ -n "$_pp_tags" ]; then
+                printf '%s\n' "$_pp_tags" | sed 's/^/     /' >&2
+            else
+                echo "     (none at all -- this repository is not tagged," >&2
+                echo "      so a branch is the only thing to ask for)" >&2
+            fi
             echo "   Branches:" >&2
+            # HEAD and the bare remote name are not branches anyone can ask
+            # for: the list printed `origin` above `origin/main`.
             git -C "$pkg_dir" branch -r --format='%(refname:short)' 2>/dev/null \
+                | grep -vE '^[^/]+$|/HEAD$' | sed 's|^[^/]*/||' \
                 | head -5 | sed 's/^/     /' >&2
             echo "   Fix ref= in the stack entry for '${name:-$name_version}'," >&2
             echo "   or set git_ref= in this script, then run it again." >&2
@@ -287,13 +459,36 @@ _pp_unpack() {
             && _pp_say "# the build resumes in $_pp_prepared_in"
         return 0
     fi
-    _pp_stage_file "$pkg" || { [ -n "${link:-}" ] && _pp_fetch "$link"; }
-    [ -f "$pkg" ] || { _pp_fail "no $pkg in $BUILD_ROOT and nowhere to fetch it from"; return 1; }
+    _pp_stage_file "$pkg" || { [ -n "${link:-}" ] && _pp_fetch "$link" "$pkg"; }
+    if [ ! -f "$pkg" ]; then
+        _pp_fail "no $pkg in $BUILD_ROOT and nowhere to fetch it from"
+        # SAY WHAT DID ARRIVE.  This fired one line under a successful
+        # download and read as "the fetch failed", when the fetch had
+        # worked and only the NAME differed.
+        local _got
+        _got="$(ls -1t *.tar.* *.tgz *.zip 2>/dev/null | head -3)"
+        if [ -n "$_got" ]; then
+            echo "   what IS here, newest first:" >&2
+            printf '     %s\n' $_got >&2
+            echo "   if one of those is it, the entry's pkg= does not match the" >&2
+            echo "   name it arrived under -- a GitHub archive URL ends in the" >&2
+            echo "   TAG, not the project." >&2
+        fi
+        return 1
+    fi
     _pp_check_md5 || return 1
     local li f
+    # EACH EXTRA UNDER ITS OWN NAME.  _pp_fetch saves to its second
+    # argument, else to $pkg -- and this call passed none, so LLVM's patch
+    # was fetched with `wget -c -O llvm-project-22.1.8.src.tar.xz`.  The
+    # tarball was bigger, wget answered 416 "already fully retrieved", and
+    # the build stopped on
+    #     patch: **** Can't open patch file ../llvm-22.1.8-upstream_fix-1.patch
+    # (An extra LARGER than the tarball would have been appended onto it.)
     for li in "${additional_links[@]}"; do
         f="${li##*/}"
-        _pp_stage_file "$f" || _pp_fetch "$li" || return 1
+        _pp_stage_file "$f" || _pp_fetch "$li" "$f" || return 1
+        [ -s "$f" ] || { _pp_fail "fetched $li, and there is no $f"; return 1; }
     done
     if [ "${pkg_unpack:-yes}" = "no" ]; then
         _pp_say "fetched $pkg (the page's own commands unpack it)"
@@ -461,9 +656,66 @@ _pp_warn_unbuilt() {
     return 0
 }
 
+# DOCUMENTATION THAT WAS NEVER BUILT IS NOT A FAILED INSTALL.
+#
+# parted's page ends with the book's doc block:
+#     install -v -m644 doc/{FAT,API,parted.{html,txt,pdf,ps,dvi}} \
+#             /usr/share/doc/parted-3.7
+# parted.pdf, parted.ps, parted.dvi and API are built only when texlive is
+# installed, and texlive is in avoid.stack.  So `install` stopped on
+#     install: cannot stat 'doc/parted.pdf': No such file or directory
+# after the package itself -- 97 files, every binary and library -- was
+# already on disk.  A missing PDF is not a failed install.
+#
+# Only for a destination under share/doc, only after the command has been
+# tried EXACTLY as the book wrote it, and only for sources that are not
+# there: everything else is passed through to /usr/bin/install untouched.
+# The function is defined inside this phase, which runs in a child process
+# of its own, so nothing outside it ever sees an `install` that is not the
+# real one.
+_pp_install_docs() {
+    local last="" a; for a in "$@"; do last="$a"; done
+    case "$last" in
+        */share/doc/*|*/share/doc|*/share/gtk-doc/*) ;;
+        *) command install "$@"; return $? ;;
+    esac
+    command install "$@" 2>/dev/null && return 0
+    local rc=$?
+    local keep=() prev="" i=0 n=$# missing="" have=0
+    for a in "$@"; do
+        i=$((i + 1))
+        if [ "$i" -eq "$n" ]; then keep+=("$a"); continue; fi
+        case "$prev" in
+            -m|-o|-g|-t|--mode|--owner|--group|--target-directory)
+                keep+=("$a"); prev=""; continue ;;
+        esac
+        case "$a" in -*) keep+=("$a"); prev="$a"; continue ;; esac
+        prev=""
+        if [ -e "$a" ] || [ -L "$a" ]; then
+            keep+=("$a"); have=$((have + 1))
+        else
+            missing="$missing $a"
+        fi
+    done
+    # nothing missing -> the failure is a real one, and it is the book's
+    # command that must be reported, not ours
+    if [ -z "$missing" ]; then
+        command install "$@"
+        return $?
+    fi
+    if [ "$have" -gt 0 ]; then
+        command install "${keep[@]}" || { command install "$@"; return $?; }
+    fi
+    _pp_note "not installed, because this build did not produce them:$missing"
+    _pp_note "   they are documentation (the book's doc block builds them"
+    _pp_note "   only with texlive and friends); the package itself is in."
+    return 0
+}
+
 _pp_phase_install() {
     _pp_enter_build || return 1
     _pp_warn_unbuilt
+    install() { _pp_install_docs "$@"; }
     install_pkg
 }
 

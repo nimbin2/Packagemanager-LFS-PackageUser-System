@@ -43,20 +43,49 @@ have_any() {
 [ -r "$CONF" ] || { warn "no $CONF to read"; exit 1; }
 
 # ---- 1. the unpacked blfs-bootscripts tree --------------------------------
-# It is a `tar` entry in services.stack, so its source sits in its package
-# user's home like any other.  Newest wins: an older copy must not.
+# WHERE THE RUNNER PUTS IT, not where it seems it should be.  lfs-phases
+# builds in BUILD_ROOT, which is `$HOME/src` when the package user has one --
+# /usr/src/p_blfs-bootscripts/SRC/blfs-bootscripts-<date>, one level deeper
+# than the home.  Looking only in the home found nothing and told the reader
+# to unpack a tree that was already there.
+SOURCES="${LFS_SOURCES_DIR:-/sources}"
+TMPTREE=""
 if [ -z "$SRC" ]; then
-    for d in "$BASE"/*/blfs-bootscripts-* "$BASE"/blfs-bootscripts-*; do
+    for d in "$BASE"/*/src/blfs-bootscripts-* "$BASE"/*/blfs-bootscripts-* \
+             "$BASE"/blfs-bootscripts-* "$SOURCES"/blfs-bootscripts-*; do
         [ -f "$d/Makefile" ] || continue
         if [ -z "$SRC" ] || [ "$d" -nt "$SRC" ]; then SRC="$d"; fi
     done
 fi
+if [ -z "$SRC" ]; then
+    # anything those four patterns did not think of, bounded so this can
+    # never turn into a walk of the whole package tree
+    d="$(find "$BASE" -maxdepth 4 -type d -name 'blfs-bootscripts-*' 2>/dev/null \
+         | sort | tail -n1)"
+    [ -n "$d" ] && [ -f "$d/Makefile" ] && SRC="$d"
+fi
+if [ -z "$SRC" ]; then
+    # THE TARBALL IS ENOUGH.  A build tree can be cleaned away; the sources
+    # directory keeps the tarball, and these targets only copy files.
+    tb="$(ls -1t "$SOURCES"/blfs-bootscripts-*.tar.* 2>/dev/null | head -n1)"
+    if [ -n "$tb" ]; then
+        TMPTREE="$(mktemp -d)"
+        if tar -xf "$tb" -C "$TMPTREE" 2>/dev/null; then
+            SRC="$(ls -d "$TMPTREE"/blfs-bootscripts-* 2>/dev/null | head -n1)"
+            note "no build tree left -- unpacked $tb"
+            note "   (installing from a temporary copy, so these files land"
+            note "    owned by root rather than by the bootscripts package user)"
+        fi
+    fi
+fi
 if [ -z "$SRC" ] || [ ! -f "$SRC/Makefile" ]; then
-    warn "no unpacked blfs-bootscripts tree under $BASE -- nothing to install from"
-    note "   unpack it again:"
+    warn "no blfs-bootscripts tree and no tarball -- nothing to install from"
+    note "   looked in: $BASE/*/src, $BASE/*, $BASE, $SOURCES"
+    note "   fetch and unpack it again:"
     note "     packagemanager stack services --only blfs-bootscripts --run --force"
     exit 1
 fi
+trap '[ -n "$TMPTREE" ] && rm -rf "$TMPTREE"' EXIT
 note "bootscripts: $SRC"
 
 # ---- 2. what is missing ---------------------------------------------------

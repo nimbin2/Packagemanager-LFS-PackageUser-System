@@ -1,8 +1,33 @@
-# diag.stack -- GPU diagnostic tools: glxinfo, eglinfo, vulkaninfo, vainfo, nvtop.
-# stack-version: 1.14.292
+# diag.stack -- what the hardware is (lsusb, lspci) and what the GPU does
+# (glxinfo, eglinfo, vulkaninfo, vainfo, nvtop), and what input devices
+# send (evtest).
+# stack-version: 1.14.368
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack.
 include avoid
+
+# WHAT HARDWARE IS THERE AT ALL.  `lsusb` is the first command for a USB
+# device that did not appear -- it says whether the machine sees the device
+# before any question about drivers or firmware makes sense.  lspci is its
+# counterpart for the cards inside, and both are one small BLFS page each.
+book   usbutils \
+       expect="command -v lsusb >/dev/null"
+book   pciutils \
+       expect="command -v lspci >/dev/null"
+
+# WHAT AN INPUT DEVICE SENDS.  evtest lists /dev/input/event* with their
+# names, then prints every event of the one picked: the key code a strange
+# key really sends, whether the touchpad reports at all, which device a
+# button belongs to.  Not in BLFS; one C file, no libraries (it reads the
+# kernel's input headers).  The man page is built only when asciidoc and
+# xmlto are there -- without them configure skips it, nothing fails.
+# Run it as root (or as a member of the `input` group): evtest
+git    evtest \
+       url=https://gitlab.freedesktop.org/libevdev/evtest.git \
+       ref=evtest-1.35 \
+       prog=evtest \
+       build="./autogen.sh --prefix=/usr && make" \
+       install="make install"
 
 #
 # Replay with:  packagemanager stack diag --run

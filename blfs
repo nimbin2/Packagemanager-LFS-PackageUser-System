@@ -17,6 +17,7 @@ Subcommands
   blfs books                       list known/cached books and the default
   blfs books --discover            probe the live site for available versions
   blfs set-default <selector|url>  choose the default book
+  blfs path [selector]             the local file a book reads (for scripts)
   blfs search <name>               find packages, including python modules
   blfs script <name|url> [-o dir]  write install_<name-version> (install/update)
   blfs deps   <name> [--tree] [--no-recommended] [--optional]
@@ -41,6 +42,7 @@ index step markedly faster.
 """
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -128,7 +130,7 @@ CACHE_VERSION = 56   # v56: a skipped build variant does not keep its install st
 # tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
 # of generated install scripts changes (phases, dispatcher, ...), and
 # CACHE_VERSION when the parsed/cached data structure changes.
-BLFS_VERSION = "1.14.146"
+BLFS_VERSION = "1.14.369"
 
 
 def _build_id():
@@ -146,7 +148,7 @@ def _build_id():
     except OSError:
         return "unknown"
 
-SCRIPT_VERSION = 17   # v17: the runner moved out into lfs-phases
+SCRIPT_VERSION = 19   # v19: a test line chained into the build block is dropped
 
 
 def _tty_out():
@@ -756,6 +758,20 @@ def ensure_book(selector, quiet=False):
         build_combined_book(local, combined)
         _save_meta(combined, {"url": url, "selector": selector, "version": version,
                               "is_svn": True, "fetched": time.time()})
+        # THE OLD DOWNLOADS ARE NOT BOOKS.  Each day's svn tarball is only the
+        # source of the combined book, which was just rebuilt from the newest
+        # one -- four of them sat in the store as "? version ?" entries.  Keep
+        # the newest (the next refresh compares its name), drop the rest.
+        _stem = re.sub(r"-\d{4}-\d{2}-\d{2}\.tar\.\w+$", "", os.path.basename(local))
+        for _old in glob.glob(os.path.join(books_dir(), _stem + "-*.tar.*")):
+            if os.path.abspath(_old) != os.path.abspath(local) \
+                    and not _old.endswith(".part"):
+                try:
+                    os.remove(_old)
+                    if not quiet:
+                        print(f"Removed the older download {os.path.basename(_old)}")
+                except OSError:
+                    pass
         if not quiet:
             print(f"Ready: {combined}")
         return combined
@@ -838,8 +854,17 @@ def cache_dir():
 
 
 def _book_stamp(path):
+    # THE CODE THAT EXTRACTED THE DATA IS PART OF THE KEY.
+    #
+    # The key was the book's size and mtime plus CACHE_VERSION, a number to
+    # bump by hand.  Three fixes to the extractors -- 1.14.212, both halves
+    # of the poppler pair-skip, and the first try at shadow's pam.d blocks --
+    # were each "proved" by regenerating a script that came out byte-identical
+    # and then reverted, because the script was rendered from a cache built
+    # by the OLD code.  The edits never ran.  _build_id changes whenever this
+    # file does, so an edited extractor re-indexes once, by construction.
     st = os.stat(path)
-    return f"{st.st_size}:{int(st.st_mtime)}:v{CACHE_VERSION}"
+    return f"{st.st_size}:{int(st.st_mtime)}:v{CACHE_VERSION}:{_build_id()}"
 
 
 def _cache_file_for(path):
@@ -990,6 +1015,30 @@ def build_index(soup):
         anchor = a.get("id") or a.get("name")
         if anchor and anchor not in idx:
             idx[anchor] = header
+    # THE ID IS NOT ALWAYS INSIDE THE HEADER.
+    #
+    # A page whose anchor sits on the section DIV rather than on an <a> inside
+    # its title header is invisible to the loop above -- it is not "missing
+    # from the book", it is missing from the index, and the two look identical
+    # from outside: `packagemanager stack network` said NOT IN BOOK for
+    # dhcpcd, whose page is right there in basicnet.
+    #
+    # Only ids that name a section carrying a Package Information block are
+    # added, and only when nothing already claims the anchor, so this can add
+    # pages and can never move an existing one.
+    for div in soup.select("div.sect1[id], div.sect2[id]"):
+        anchor = div.get("id")
+        if not anchor or anchor in idx:
+            continue
+        if div.find("div", class_="package", recursive=False) is None:
+            continue
+        # the DIV is what gets indexed, not its header: for this shape the
+        # header sits INSIDE the section, so the "titlepage then sibling
+        # sect" walk that resolves the common shape finds div.package next
+        # and gives up.  resolve_package takes a section div directly.
+        if div.find(lambda t: t.name in H_TAGS
+                    and (_header_classes(t) & set(HEADER_CLASSES))) is not None:
+            idx[anchor] = div
     return idx
 
 
@@ -1013,6 +1062,18 @@ def resolve_package(soup, anchor):
     header = get_index(soup).get(anchor)
     if header is None:
         return None
+    # A SECTION DIV THAT CARRIES THE ID IS ALREADY THE CONTENT.  build_index
+    # adds these (see there); they are whole pages whose anchor is an
+    # attribute of the section rather than an <a> in its title.
+    if getattr(header, "name", None) == "div":
+        h = _content_title_header(header)
+        title = " ".join(h.get_text().split()) if h is not None else anchor
+        if header.find("div", class_="package", recursive=False) is None:
+            return None
+        if not extract_link(header).strip():
+            return None
+        return {"anchor": anchor, "title": title, "content": header,
+                "is_module": "sect1" not in _header_classes(header)}
     classes = _header_classes(header)
     title = " ".join(header.get_text().split())
 
@@ -1057,7 +1118,7 @@ def resolve_package(soup, anchor):
     # This rejects in-package subsection anchors (foo-kernel "Kernel
     # Configuration", foo-config "Configuring foo", ...) that would otherwise
     # resolve to their enclosing package's data.
-    if sect_anchor(content) != anchor:
+    if sect_anchor(content) != anchor and content.get("id") != anchor:
         return None
     return {"anchor": anchor, "title": title, "content": content,
             "is_module": is_module}
@@ -1396,6 +1457,28 @@ def extract_commands(sec, selector):
     if not elements:
         return ""
     out = []
+    _emit_command_elements(elements, out, nested=False)
+    return "\n".join(out)
+
+
+# A SUB-SECTION IS PART OF THE SECTION.
+#
+# Shadow's configure phase came out as prose and a bare `:` -- no
+# /etc/pam.d/login, passwd, chage or the ten admin tools -- so `passwd` said
+# `pam_start() failed, error 26` and login `PAM Failure, aborting`.  Every one
+# of those blocks is on the page, one level down:
+#     div.configuration > div.sect3 > div.sect4 > pre.root
+# and this walk read the children of sect3 and dropped any div that was not a
+# note.  linux-pam's four system-* files sit directly in its sect3, which is
+# why those four existed and shadow's sixteen did not.
+#
+# So a nested div.sect4/sect5 is walked with the same rules, and its title is
+# kept as a comment.  The TOP level is unchanged byte for byte: its own
+# titlepage divs were never emitted and still are not.
+_NESTED_SECT_CLASSES = {"sect4", "sect5"}
+
+
+def _emit_command_elements(elements, out, nested):
     for el in elements:
         name = getattr(el, "name", None)
         if name == "h2":
@@ -1419,10 +1502,16 @@ def extract_commands(sec, selector):
                 # A conditional block is conditional wherever it appears.
                 _g = _conditional_guard(el)
                 if _g:
-                    out.append("## OPTIONAL, skipped -- the book says: " + _g)
+                    out.append(SKIP_MARK + _g)
                     out.append(_commented(text))
                 else:
-                    out.append(text)
+                    text, _dropped = _strip_test_lines(text)
+                    if _dropped:
+                        out.append(SKIP_MARK + "the test suite, chained into "
+                                   "this block -- `--test` runs it")
+                        out.append(_commented("\n".join(_dropped)))
+                    if text.strip():
+                        out.append(text)
         elif name == "div":
             classes = list(el.get("class", []))
             if "admon" in classes:
@@ -1442,7 +1531,13 @@ def extract_commands(sec, selector):
                                     lines.append(child)
                         out.append("## " + " ".join(lines).replace(" , ", ", "))
                         out.append("")
-    return "\n".join(out)
+            elif _NESTED_SECT_CLASSES & set(classes):
+                _emit_command_elements(el.find_all(True, recursive=False),
+                                       out, nested=True)
+            elif nested and "titlepage" in classes:
+                title = " ".join(el.get_text().split())
+                if title:
+                    out.append("\n\n## " + title)
 
 
 # The book's conditionals live in PROSE: "If you wish to build and install
@@ -1470,8 +1565,147 @@ _COND_GUARD_RE = re.compile(r"^(if\b|optionally\b|should you\b)", re.I)
 # a failing command was ignored; the moment the dispatcher started honouring
 # set -e it would fail every such package.  Tests belong to `test`
 # (PM_TEST=1), not to a build.
+# ...AND THE BOOK DOES NOT ALWAYS START THE SENTENCE WITH "To test".
+# numpy's is
+#     "The installation can be tested with the following commands:"
+# which this matched none of, so a venv, `pip3 install hypothesis attrs`
+# and `numpy.test()` were generated into the INSTALL phase.  numpy itself
+# installed (1320 files) and then the package failed on
+#     ModuleNotFoundError: No module named 'pytest'
+# -- a test dependency, in an install.  So these are searched for anywhere
+# in the introducing sentence, not just at its start.
 _TEST_BLOCK_RE = re.compile(
-    r"^(to test\b|to check\b|the test suite\b|tests? (can|may) be run\b)", re.I)
+    r"^(to test\b|to check\b|the test suite\b|tests? (can|may) be run\b)"
+    r"|\bcan be tested\b|\bto test the (results|installation|build)\b"
+    r"|\bto run the test"
+    # LVM2 13.0: "If you wish to run the tests, install a minimal set of
+    # ... first" -- an INSTALL command that is part of the test suite, and
+    # the only thing marking it as such is the sentence above it.
+    r"|\bif you (wish|want) to run the test"
+    r"|\bbefore running the test"
+    r"|\bfor the test suite\b", re.I)
+
+# THE COMMANDS SAY WHAT THEY ARE, AND PROSE IS A SECOND-HAND ACCOUNT.
+#
+# 1.14.211 widened the sentence match so numpy's "The installation can be
+# tested with the following commands" would be recognised -- and the
+# regenerated script STILL had the venv, `pip3 install hypothesis attrs`
+# and `numpy.test()` in its install phase, because the book being read on
+# that machine is 13.0 and words or nests it differently again.
+#
+# Chasing the prose is a losing game: `numpy.test()` IS a test suite
+# whatever sentence introduces it.  These patterns match the block's own
+# commands, so a rewording upstream cannot bring the bug back.
+_TEST_CONTENT_RE = re.compile(
+    r"""(?mx)
+      ^\s*(\w+=\S*\s+)*(make|ninja)\s+(-\w+\s+)*(check|test)\b
+                                                    # make check / ninja test
+    | ^\s*(\w+=\S*\s+)*(make|ninja)\s+(-\w+\s+)*(check|test)[_-]\w+
+                                                    # LC_ALL=... make check_local
+                                                    # (the old pattern needed a
+                                                    #  word boundary after
+                                                    #  "check", which
+                                                    #  "check_local" has not --
+                                                    #  and no env assignment in
+                                                    #  front, which LVM2's page
+                                                    #  has)
+    | ^\s*meson\s+test\b
+    | ^\s*ctest\b
+    | ^\s*py\.test\b | ^\s*pytest\b
+    | ^\s*python3?\s+-m\s+(pytest|unittest)\b
+    | \.test\(\)                                    # numpy.test()
+    | ^\s*python3?\s+-m\s+venv\b                    # a throwaway test venv
+    | ^\s*source\s+\S*testenv/bin/activate
+    """)
+
+
+# A COMMAND THAT ONLY ROOT CAN RUN IS NOT AN INSTALL STEP.
+#
+# LVM2's page (13.0) puts three blocks between the build and the install:
+# a partial install for the test suite, then
+#     mount -o remount,dev /tmp
+# and then `make check_local`.  The middle one is not about installing
+# anything -- it prepares /tmp so the tests may create device nodes -- and
+# it ran in the install phase, as the package user:
+#     mount: /tmp: must be superuser to use mount.
+#     !! phase 'install' FAILED (exit 32)
+# A package user cannot mount, load a module or make a device node, and no
+# BLFS page needs it to: those commands belong to the system, not to the
+# package.  (`make check_local` was missed too -- the test pattern required
+# a word boundary after "check", and "check_local" has none.)
+_ROOT_ONLY_RE = re.compile(
+    r"""(?mx)
+      ^\s*mount\b | ^\s*umount\b
+    | ^\s*modprobe\b | ^\s*insmod\b
+    | ^\s*mknod\b
+    | ^\s*swapon\b | ^\s*swapoff\b
+    """)
+
+
+def _root_only_reason(pre):
+    """Why this block cannot run as the package user, or None."""
+    m = _ROOT_ONLY_RE.search(pre.get_text())
+    if not m:
+        return None
+    hit = " ".join(m.group(0).split())
+    return ("it needs root and the system, not this package (`%s`) -- run it "
+            "yourself if you want it" % hit)
+
+
+# A TEST COMMAND CHAINED INTO THE BUILD BLOCK.
+#
+# Every Perl module in BLFS uses "the standard build and installation
+# instructions", which are ONE block:
+#     perl Makefile.PL &&
+#     make &&
+#     make test
+# So the test suite is not a block to skip -- it is the last line of the
+# block that builds the package, joined with &&.  XML::Parser's tests fail
+# on this machine (62 files, 60 of them cannot even load the module) and
+# took the whole gparted chain down in the BUILD phase; Class::Inspector's
+# passed, which is why nobody noticed the tests were running at all.
+#
+# Tests run here only when they are asked for (PKGUSR_TESTS=1, which is
+# `--test`), and then the runner runs them ITSELF, in the test phase.  So
+# the line comes out of the build, with the book's own text left in a
+# comment, and the trailing && of the line before it goes too.
+_TEST_LINE_RE = re.compile(
+    r"""^\s*(\w+=\S*\s+)*(make|ninja|meson|ctest|py\.test|pytest)\b[^&|;]*?
+         \b(check|test)([_-]\w+)?\b[^&|;]*$""", re.X)
+
+
+def _strip_test_lines(text):
+    """Drop `make test` / `make check` lines from a block that also builds.
+
+    Returns (text, dropped-lines).  A block that is ONLY tests comes back
+    empty and its caller keeps treating it as a test block."""
+    lines = text.splitlines()
+    keep, dropped = [], []
+    for ln in lines:
+        if _TEST_LINE_RE.match(ln.strip()) and not re.search(r"\binstall\b", ln):
+            dropped.append(ln.strip())
+            continue
+        keep.append(ln)
+    if not dropped:
+        return text, []
+    # the line before a dropped last line ends in `&&` (or `;`) that now
+    # chains to nothing -- and `make &&` on its own is a syntax error
+    while keep and not keep[-1].strip():
+        keep.pop()
+    if keep:
+        keep[-1] = re.sub(r"\s*(&&|\|\||;)\s*$", "", keep[-1])
+    return "\n".join(keep), dropped
+
+
+def _test_content_reason(pre):
+    """Why this block is a test suite, judged by its commands, or None."""
+    txt = pre.get_text()
+    m = _TEST_CONTENT_RE.search(txt)
+    if not m:
+        return None
+    hit = " ".join(m.group(0).split())
+    return "it IS the test suite -- these commands run it (`%s`)" % hit
+
 
 def _conditional_guard(pre):
     """The conditional sentence introducing this <pre>, or None if the block
@@ -1489,12 +1723,16 @@ def _conditional_guard(pre):
         Mixing local libtiff with shared libjpeg not supported
     "optional" wins over both: an optional tool is exactly what we do not
     install."""
+    # content first: it does not depend on the book's wording or nesting
+    _by_content = _root_only_reason(pre) or _test_content_reason(pre)
+    if _by_content:
+        return _by_content
     prev = pre.find_previous(["p", "pre", "h3", "h4"])
     if prev is None or prev.name != "p":
         return None
     txt = " ".join(prev.get_text().split())
-    if _TEST_BLOCK_RE.match(txt):
-        return txt                      # a test, never part of installing
+    if _TEST_BLOCK_RE.search(txt):
+        return "the book says: " + txt  # a test, never part of installing
     if not _COND_GUARD_RE.match(txt):
         return None
     low = txt.lower()
@@ -1506,7 +1744,7 @@ def _conditional_guard(pre):
         return None
     if "optional" not in low and ("recommended" in low or "required" in low):
         return None                     # our contract satisfies it
-    return txt
+    return "the book says: " + txt
 
 
 def _commented(text):
@@ -1585,8 +1823,16 @@ def extract_commands_phased(sec):
             is_root = "root" in classes and not guard
             stream = install if (is_root or install) else build
             if guard:
-                stream.append("## OPTIONAL, skipped -- the book says: " + guard)
+                stream.append(SKIP_MARK + guard)
                 stream.append(_commented(text))
+                continue
+            text, _dropped = _strip_test_lines(text)
+            if _dropped:
+                stream.append(SKIP_MARK + "the test suite, chained into this "
+                              "block with && -- run it with `--test`, which "
+                              "runs it in the test phase")
+                stream.append(_commented("\n".join(_dropped)))
+            if not text.strip():
                 continue
             stream.append(text)
         else:                                            # h3 / h4
@@ -2500,6 +2746,61 @@ _CONFIG_TEST_INTRO_RE = re.compile(
     r"|test your installation", re.I)
 
 
+# A SITE CONFIGURATION FILE IS NOT AN INSTALL STEP.
+#
+# The dhcpcd page ends with an example interface file:
+#     cat > /etc/sysconfig/ifconfig.eth0 << "EOF"
+#     ONBOOT="yes"
+#     IFACE="eth0"
+#     SERVICE="dhcpcd"
+#     ...
+# Run as a configure phase by p_dhcpcd it died with
+#     /etc/sysconfig/ifconfig.eth0: Permission denied
+# -- correctly: /etc/sysconfig is drwxrwxr-t root:install and that file is
+# root's.  Granting the package user a collector group for /etc/sysconfig
+# would "fix" it by letting a package write the machine's network
+# configuration, which is worse than the failure.
+#
+# And the content is wrong anyway: `eth0` is the book's placeholder, and this
+# machine's interfaces are `enp5s0` and `wlp3s0`.  A file naming an interface
+# that does not exist does nothing, or shadows the one you meant.
+_SITE_CONFIG_RE = re.compile(
+    r"/etc/sysconfig/(ifconfig\.|network-devices|wpa_supplicant)"
+    r"|/etc/wpa_supplicant"
+    r"|/etc/sysconfig/console|/etc/sysconfig/clock", re.I)
+
+
+def _comment_site_config_writes(cmds, name=""):
+    """Comment out writes to files that hold THIS machine's settings."""
+    out, skipping, heredoc = [], False, None
+    for line in (cmds or "").splitlines():
+        st = line.strip()
+        # PROSE IS NOT CODE: a comment mentioning the path is not a write.
+        if st.startswith("#") and not heredoc:
+            out.append(line)
+            continue
+        if heredoc is not None:
+            out.append("# " + line if skipping else line)
+            if st == heredoc or st == heredoc.strip('"\''):
+                heredoc, skipping = None, False
+            continue
+        if _SITE_CONFIG_RE.search(st) and re.search(r">|tee |install |cp |mv ", st):
+            out.append("## SKIPPED -- this writes a file that belongs to the"
+                       " MACHINE, not to the package:")
+            out.append("##   %s" % st[:120])
+            out.append("## The interface name in the book is a placeholder, and"
+                       " /etc/sysconfig is root's.")
+            out.append("## Write yours by hand; what is missing is reported by:")
+            out.append("##   packagemanager stack network --only net-wifi --run")
+            out.append("# " + line)
+            m = re.search(r"<<-?\s*([\"']?)([A-Za-z_][A-Za-z0-9_]*)\1", st)
+            if m:
+                heredoc, skipping = m.group(2), True
+            continue
+        out.append(line)
+    return "\n".join(out)
+
+
 def _comment_config_tests(cmds):
     out, skipping = [], False
     for line in (cmds or "").splitlines():
@@ -3040,6 +3341,21 @@ def _drop_orphaned_variant_install(cmds):
     return "\n".join(out)
 
 
+# ONE MARKER, ONE CONSTANT.  `_enable_one_alternative` looked for
+# "## OPTIONAL, skipped" and 1.14.212 renamed the marker to "## SKIPPED --"
+# -- so the picker silently stopped firing, and webkitgtk's script came out
+# with BOTH build blocks commented: a build phase of `:` and an install
+# phase that runs `ninja install` against a directory with no build.ninja.
+# Two strings for one fact, drifting apart, exactly as the rule says.
+SKIP_MARK = "## SKIPPED -- "
+
+
+def _is_skip_line(line):
+    """A skipped-block header, under either spelling this tool has used."""
+    st = line.strip()
+    return st.startswith(SKIP_MARK.strip()) or st.startswith("## OPTIONAL, skipped")
+
+
 def _enable_one_alternative(cmds):
     """A page that offers a CHOICE must still build something.
 
@@ -3058,8 +3374,7 @@ def _enable_one_alternative(cmds):
     if any(l.strip() and not l.strip().startswith("#") and l.strip() != ":"
            for l in lines):
         return cmds
-    starts = [i for i, l in enumerate(lines)
-              if l.strip().startswith("## OPTIONAL, skipped")]
+    starts = [i for i, l in enumerate(lines) if _is_skip_line(l)]
     if not starts:
         return cmds
     i = starts[0]
@@ -3067,8 +3382,11 @@ def _enable_one_alternative(cmds):
     out = lines[:i]
     out.append("## Every build block on this page is conditional, so none "
                "would have run.")
-    out.append("## ENABLED HERE: %s"
-               % lines[i].split("the book says:", 1)[-1].strip()[:110])
+    _why = lines[i]
+    for _sep in ("the book says:", SKIP_MARK.strip()):
+        if _sep in _why:
+            _why = _why.split(_sep, 1)[-1]
+    out.append("## ENABLED HERE: %s" % _why.strip()[:110])
     out.append("## If you want one of the page's other variants instead, "
                "comment these")
     out.append("## lines and uncomment that block.")
@@ -3131,6 +3449,7 @@ def render_script(data, source_url, book_version=""):
     config_cmds = _comment_profile_sourcing(data.get("config_cmds") or "")
     config_cmds = _comment_bootscript_installs(config_cmds, data.get("name"))
     config_cmds = _comment_config_tests(config_cmds)
+    config_cmds = _comment_site_config_writes(config_cmds, data.get("name"))
     data["config_cmds"] = config_cmds
     build_cmds = _comment_profile_sourcing(build_cmds)
     install_root = _comment_profile_sourcing(install_root)
@@ -3331,8 +3650,10 @@ def cmd_fetch(args):
     # `blfs fetch stable-sysv` printed the routine "no book matched
     # 'stable-sysv'; using the cached ...-systemd" note and then "cached." --
     # so a request that fetched NOTHING reported success, and the user
-    # reasonably believed they now had the sysv book.  There is no 13.0 sysv
-    # book to have: BLFS stopped publishing the sysv edition after 12.4.
+    # reasonably believed they now had the sysv book.  There is no STABLE
+    # 13.0 sysv book to have.  (The development book, `svn`, IS the SysV
+    # edition -- r13.1-245 on 2026-09-23 -- so `blfs fetch svn` is the way
+    # to a current SysV book.)
     avail = load_available()
     if sel not in avail and not sel.startswith(("http://", "https://")) \
             and not os.path.isfile(sel):
@@ -3349,10 +3670,35 @@ def cmd_fetch(args):
         if _sysv:
             sys.stderr.write("  The editions that exist:  blfs books\n")
             sys.stderr.write("  Newest SysV edition:      %s\n" % _sysv[-1])
+        sys.stderr.write("  The development book is SysV and current:"
+                         "  blfs fetch svn\n")
         sys.stderr.write("  Nothing was fetched.\n")
         sys.exit(1)
     path = ensure_book(sel)
     print("cached: %s" % path)
+
+
+def cmd_path(args):
+    """Print the local book file a selector reads -- for other tools.
+
+    packagemanager asks this once per run for every book it needs (the
+    default, a stack's `from-book svn`).  Resolving `svn` through
+    resolve_book asks the website every time, and a planner that passes
+    `--book svn` to each of its hundred blfs calls would ask a hundred
+    times.  A cached book is answered from disk; only a book that was never
+    fetched goes to the network (or fails, with --offline)."""
+    sel = args.selector or getattr(args, "book", None) or default_selector()
+    if os.path.isfile(sel):
+        print(os.path.abspath(sel))
+        return
+    p = _cached_for_selector(sel)
+    if not (p and os.path.isfile(p)):
+        if getattr(args, "offline", False):
+            sys.stderr.write("no cached book for '%s' (blfs fetch %s)\n"
+                             % (sel, sel))
+            sys.exit(1)
+        p = ensure_book(sel, quiet=True)
+    print(p)
 
 
 def cmd_import(args):
@@ -3471,8 +3817,8 @@ def cmd_diff_init(args):
             continue
         # ACROSS VERSIONS, ALMOST EVERYTHING DIFFERS.
         #
-        # There is no 13.0 sysv book (BLFS stopped after 12.4), so the only
-        # comparison available is 12.4-sysv against 13.0-systemd -- where most
+        # There is no stable 13.0 sysv book, so a stable-vs-stable comparison
+        # is 12.4-sysv against 13.0-systemd -- where most
         # pages differ for version reasons that have nothing to do with init.
         # Default to the differences that MENTION init, which is what the
         # question is; --all for the rest.
@@ -3529,13 +3875,31 @@ def cmd_books(args):
             continue
         found = True
         meta = _load_meta(os.path.join(books_dir(), f))
-        sel = meta.get("selector", "?")
-        ver = meta.get("version", "?")
-        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(meta.get("fetched", 0)))
+        # NO .meta IS NOT "?".  A book imported by hand, or a dated svn
+        # download, has no record -- but its NAME says what it is, and the
+        # file's date says when it came.
+        _fv, _fi = parse_book_filename(f)
+        _tm = re.search(r"html-(\d{4}-\d{2}-\d{2})\.tar\.", f)
+        if _tm:
+            _gs, _gv = "(svn source)", _tm.group(1)
+        elif _fv != "unknown":
+            _gs, _gv = _fv + ("-systemd" if _fi == "systemd" else ""), _fv
+        else:
+            _gs, _gv = "?", "?"
+        sel = meta.get("selector", _gs)
+        ver = meta.get("version", _gv)
+        try:
+            _mt = meta.get("fetched") or os.path.getmtime(os.path.join(books_dir(), f))
+        except OSError:
+            _mt = 0
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(_mt))
         mark = " (default)" if sel == default else ""
         print(f"  {sel:<18} version {ver:<8} fetched {when}{mark}  [{f}]")
     if not found:
         print("  (none yet)")
+    else:
+        print("  (which of these anything reads, and removing the rest:"
+              " packagemanager books)")
 
     # --brief is the wrapper's contract: the Default line and the cached
     # list, NOTHING live.  packagemanager reads the book name through this,
@@ -3816,18 +4180,69 @@ def cmd_debug(args):
     anchor = anchor_from_input(args.target)
     print(f"input          : {args.target}")
     print(f"anchor         : {anchor}")
+    # WHICH BOOK AM I EVEN READING.  The first question when a page that
+    # plainly exists upstream is "not in the book" is whether this is the
+    # book you think it is, and how much of it parsed.
+    try:
+        _st = os.stat(book.path)
+        print("book           : %s" % book.path)
+        print("                 %.1f MB, modified %s"
+              % (_st.st_size / 1048576.0,
+                 time.strftime("%Y-%m-%d %H:%M", time.localtime(_st.st_mtime))))
+    except OSError:
+        print("book           : %s (cannot stat it)" % book.path)
+    print("pages parsed   : %d" % len(book.packages))
 
     anchor = resolve_anchor(book, anchor)
     data = book.get(anchor)
     if data is None:
-        # not a package in the cache -- parse the soup to explain why
+        # NAME THE TEST THAT FAILED.  "not an installable package (no package
+        # block + download link)" covered three different causes with three
+        # different fixes, and told you which of them applied: none.
         soup = book.soup
+        in_index = anchor in get_index(soup)
         node = soup.find(attrs={"id": anchor}) or soup.find("a", attrs={"name": anchor})
+        print("in page index  : %s" % ("yes" if in_index else "no"))
         if node is None:
-            print("resolve        : NOT FOUND (no element with this id/name)")
+            print("resolve        : NOT FOUND -- no element in this book carries "
+                  "that id or name")
+            near = sorted({(e.get("id") or e.get("name"))
+                           for e in soup.find_all(attrs={"id": True})
+                           if anchor in (e.get("id") or "")}
+                          | {a.get("name") for a in soup.find_all("a", attrs={"name": True})
+                             if anchor in (a.get("name") or "")})
+            near = [n for n in near if n and n != anchor][:8]
+            if near:
+                print("similar ids    : %s" % ", ".join(near))
+                print("hint           : the page is there under another anchor; "
+                      "use one of those")
+            elif re.search(re.escape(anchor), soup.get_text(" ", strip=True)[:4000000],
+                           re.IGNORECASE):
+                print("hint           : the NAME appears in the text but no anchor "
+                      "matches -- likely a different book edition")
+            else:
+                print("hint           : this book really does not have it.  A tar or "
+                      "git entry with build=/install= is the way in.")
         else:
-            print(f"resolve        : found <{node.name} id={node.get('id')}> but it is "
-                  f"not an installable package (no package block + download link)")
+            print("resolve        : found <%s id=%s>, and it is not accepted as a "
+                  "package.  Which test fails:" % (node.name, node.get("id")))
+            content = node if node.name == "div" else node.find_parent(
+                "div", class_=["sect1", "sect2", "sect3", "sect4", "sect5"])
+            if content is None:
+                print("  content      : no enclosing section div")
+            else:
+                pkg_div = content.find("div", class_="package", recursive=False)
+                print("  package block: %s" % ("present" if pkg_div is not None
+                                               else "MISSING (a direct child "
+                                                    "<div class=package> is required)"))
+                link = extract_link(content).strip() if pkg_div is not None else ""
+                if pkg_div is not None:
+                    print("  download link: %s" % (link or "MISSING (no upstream tarball url)"))
+                sa = sect_anchor(content)
+                print("  titles it    : %s" % ("yes" if (sa == anchor
+                                               or content.get("id") == anchor)
+                                               else "no -- %r titles that section, so "
+                                                    "this is a subsection anchor" % sa))
         print("hint           : blfs search " + anchor)
         return
 
@@ -3923,6 +4338,13 @@ def main():
     p = sub.add_parser("fetch", help="download a book into the cache")
     p.add_argument("selector", nargs="?", help="e.g. stable-systemd, 12.4, svn")
     p.set_defaults(func=cmd_fetch)
+
+    p = sub.add_parser("path", help="print the local file a book selector "
+                       "reads (cached: no network)")
+    p.add_argument("selector", nargs="?", help="e.g. svn; default: the default")
+    p.add_argument("--offline", action="store_true",
+                   help="fail instead of fetching a book that is not cached")
+    p.set_defaults(func=cmd_path)
 
     p = sub.add_parser("import", help="add a local book file (no network)")
     p.add_argument("file")

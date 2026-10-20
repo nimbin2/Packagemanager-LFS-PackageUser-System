@@ -1,11 +1,23 @@
-# media.stack -- codecs, gstreamer, the WebRTC chain, webkitgtk, mpv.
-# stack-version: 1.14.292
+# media.stack -- codecs, gstreamer, the WebRTC chain, webkitgtk, mpv, yt-dlp.
+# stack-version: 1.14.345
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
 # Without it, `stack media` planned 274 packages -- systemd, polkit, qt6,
 # cups -- because those exclusions lived in sway.stack alone.
 include avoid
+
+# THE DEVELOPMENT BOOK.  Codecs, gstreamer and webkitgtk move faster than a
+# stable book, so the book entries below read svn: versions, dependencies,
+# scripts.  Dependencies OUTSIDE this file stay on the default book (built if
+# missing, never upgraded to svn's page).  Per entry: from-book=default.
+# `packagemanager stack media` refreshes the svn book once per run.
+#
+# svn IS THE SYSV EDITION.  /blfs/view/svn/ is "Beyond Linux From Scratch
+# (System V Edition)", r13.1-245 on 2026-09-23 -- so for this machine it is
+# the better book, not just the newer one: its pages carry SysV commands,
+# not systemctl.  (/blfs/view/systemd/ is the systemd development book.)
+from-book svn
 
 #
 # Everything that decides whether a browser can PLAY and PUBLISH: audio and
@@ -21,7 +33,7 @@ include avoid
 # an evening at most, and usually minutes.
 #
 # ORDER MATTERS, AND THIS IS NOT THE FIRST STACK.  It needs, from
-# sway.stack: alsa-lib and ffmpeg (entry 1b -- the audio floor and the
+# wayland.stack: alsa-lib and ffmpeg (entry 1b -- the audio floor and the
 # codecs), llvm and mesa, wayland, and gtk4 with pango and libsoup3.
 # webkitgtk links all of them.  sway.stack pulls this file in with
 # `include media` at exactly the right point, so the full desktop build is
@@ -29,7 +41,7 @@ include avoid
 #
 # WHAT IS *NOT* HERE, deliberately:
 #   * ffmpeg, alsa-lib -- the audio and codec floor: too many things below
-#     them in sway.stack depend on them being early.
+#     them in wayland.stack depend on them being early.
 #   * x264, x265, dav1d, libaom, svt-av1, fdk-aac, lame -- they arrive as
 #     ffmpeg's own dependencies, so the book's plan builds them.  x264enc
 #     (the ELEMENT) comes from gst10-plugins-ugly, which IS here.
@@ -215,3 +227,37 @@ book   webkitgtk \
        expect="ldd /usr/lib/libwebkitgtk-6.0.so.4 2>/dev/null | grep -q woff2"
 book   mpv
 
+
+# yt-dlp -- NOT a BLFS page; upstream's release tarball.
+#
+# The RELEASE ASSET, not the git tree and not the GitHub "source code"
+# archive: those lack what the wheel's shared-data section names (the man
+# page, README.txt, the shell completions, lazy_extractors.py), all
+# generated at release time -- hatchling stops on the first one missing.
+# Checked here: this tarball builds with the book's own wheel recipe and
+# `yt-dlp --version` answers 2026.08.19.
+#
+# hatchling is the build backend (>= 1.27) and is NOT an entry here.  It is
+# already on a machine that has built any python module, and a `book
+# hatchling` line does not mean "make sure it is there": it asked the book,
+# planned a chain of newer python modules (vcs_versioning, which wants a
+# newer `packaging`) and stopped before yt-dlp ever started (1.14.314).  If
+# it IS missing, the build stops on `BackendUnavailable: Cannot import
+# 'hatchling.build'`, which lfs-helper recognises and names the page for.
+# ffmpeg is
+# not a build dependency but yt-dlp needs it at RUNTIME to merge separate
+# video and audio streams -- it comes from wayland.stack.  With yt-dlp on PATH,
+# mpv plays a URL directly:  mpv https://www.youtube.com/watch?v=...
+#
+# YOUTUBE BREAKS OLD VERSIONS WITHIN WEEKS.  A tag is pinned so a replay
+# builds what was tested; move it when downloads start failing:
+#     git ls-remote --tags https://github.com/yt-dlp/yt-dlp | tail -3
+# then edit the two version strings below and
+#     packagemanager stack media --only yt-dlp --run
+tar    yt-dlp \
+       url=https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.tar.gz \
+       pkg=yt-dlp-2026.08.19.tar.gz \
+       have=/usr/bin/yt-dlp \
+       build="pip3 wheel -w dist --no-build-isolation --no-deps --no-cache-dir ." \
+       install="pip3 install --no-index --find-links=dist --no-cache-dir --no-user --no-deps --force-reinstall yt-dlp" \
+       expect="yt-dlp --version >/dev/null 2>&1"

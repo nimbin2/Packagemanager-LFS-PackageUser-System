@@ -1,12 +1,46 @@
 #!/bin/bash
 # lfs-kernel -- build and install a kernel.
 #
-#   lfs-kernel                 build and install the configured version
+#   lfs-kernel                 what a build would do (nothing is built)
+#   lfs-kernel --run           build and install the configured version
+#   lfs-kernel load <module> [--boot]
+#                              load it now, and at every boot with --boot
 #   lfs-kernel list            what kernel.org offers right now
-#   lfs-kernel 6.12.40         that version, once (config untouched)
-#   lfs-kernel latest          the newest stable, once
+#   lfs-kernel 6.12.40 --run   that version, once (config untouched)
+#   lfs-kernel latest --run    the newest stable, once
 #   lfs-kernel detect-esp      print the EFI directory this would use
 #   lfs-kernel verify [ver]    check that everything is installed
+#   lfs-kernel firmware        install what FIRMWARE_ONLY names, no kernel build
+#   lfs-kernel status          how far the last build got, what is installed
+#   lfs-kernel promote [ver] [--run]
+#                              make the test kernel (vmlinuz_new) the one that
+#                              boots; the current one stays as vmlinuz_old
+#   lfs-kernel enable --list   hardware this tool knows by name
+#   lfs-kernel enable ath9k-htc
+#                              put what that hardware needs into kernel.conf
+#   lfs-kernel modules [text]  what this kernel has, and what is loaded
+#   lfs-kernel config          what the next build's .config comes from
+#   lfs-kernel config list     the saved configs (the last two that BOOTED)
+#   lfs-kernel config diff [a] [b]
+#                              what changed between two saved configs
+#   lfs-kernel config search <text>
+#                              which symbols that text means, and their state
+#   lfs-kernel config set SYM=y|m|n [...]
+#                              add them to CONFIG_SET in kernel.conf
+#   lfs-kernel config save [--good]
+#                              keep the running config; --good: it BOOTS
+#   lfs-kernel config from last-good
+#                              build from that config, not from the running
+#                              kernel
+#   lfs-kernel config unset SYM [...]
+#                              take them out again
+#   lfs-kernel firmware --missing [--fix] [--all]
+#                              firmware this machine asks for and has not got,
+#                              from the boot log, this tree's modules and the
+#                              config; --fix installs it at exactly the path
+#                              the driver asked for, --all includes the files
+#                              a module merely DECLARES (other chips' -- large
+#                              and mostly unused)
 #
 # Settings: /etc/pkgusr/kernel.conf, INSTALLED by `make install` so it can be
 # edited before the first run.  The build commands are in one block below,
@@ -38,6 +72,24 @@ _detect_esp() {
     findmnt -rn -t vfat,msdos -o TARGET 2>/dev/null | head -n1
 }
 
+# A BUILD IS NOT SOMETHING YOU START BY TYPING FOUR WORDS.
+#
+# `lfs-kernel` alone compiled a kernel, installed it over the one the
+# machine boots, installed the modules, fetched firmware and copied the
+# Documentation -- an hour, from a bare command.  Every other tool here
+# prints the plan and waits for --run; this one now does too.  --run is
+# taken from anywhere on the line, so `lfs-kernel 7.2.6 --run` and
+# `lfs-kernel --run` both read naturally.
+_RUN=0
+_rest=()
+for _a in "$@"; do
+    case "$_a" in
+        --run) _RUN=1 ;;
+        *) _rest+=("$_a") ;;
+    esac
+done
+set -- ${_rest[@]+"${_rest[@]}"}
+
 case "${1:-}" in
     list)
         echo "# kernel.org offers:"
@@ -47,12 +99,78 @@ case "${1:-}" in
     detect-esp)
         printf '%s\n' "$(_detect_esp)"; exit 0 ;;
     verify)
-        shift; _VERIFY=1; VERSION="${1:-}" ;;
+        shift; _VERIFY=1; _CLI_VERSION="${1:-}" ;;
+    enable)
+        # hardware by name: what symbols it needs, written into kernel.conf
+        shift; _ENABLE=1; _ENARGS=("$@") ;;
+    modules|mods)
+        # what this kernel actually has, and what is loaded
+        shift; _MODCMD=1; _MODARGS=("$@") ;;
+    load|unload)
+        # load a module now, and (--boot) at every boot
+        _LOADCMD="$1"; shift; _LOADARGS=("$@") ;;
+    status|state)
+        # how far the last build got, and what is installed -- reads only
+        shift; _STATUS=1 ;;
+    promote)
+        # the test kernel becomes the default one (vmlinuz_new -> vmlinuz)
+        shift; _PROMOTE=1; _PROMOTE_ARG="${1:-}" ;;
+    config)
+        # the config, without building anything: what it will be made of,
+        # what the last two booted kernels used, and the one place this
+        # machine's own answers are written down (CONFIG_SET)
+        shift; _CFGCMD=1; _CFGARGS=("$@") ;;
+    firmware)
+        # firmware alone, with no kernel build: the blobs are a separate
+        # package and a missing one is a run-time problem, so fixing it must
+        # not mean rebuilding a kernel that is already installed and booted.
+        shift; _FWONLY=1; _FWARG=""; _FWFIX=0; _FWALL=0
+        for _a in "$@"; do
+            case "$_a" in
+                --fix) _FWFIX=1 ;;
+                --all) _FWALL=1 ;;
+                --missing|missing) _FWARG="--missing" ;;
+                *) echo "!! lfs-kernel firmware: unknown argument '$_a'"; exit 1 ;;
+            esac
+        done
+        [ "$_FWFIX" = 1 ] || [ "$_FWALL" = 1 ] && _FWARG="--missing" ;;
     -h|--help)
-        sed -n '2,14p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        # the slice is the header above, which grew: derive the end from
+        # the header itself rather than hard-coding a line number that a
+        # new command silently pushes out of range.
+        sed -n '2,/^# Settings:/p' "$0" | sed '$d' | sed 's/^# \?//'; exit 0 ;;
     "") ;;
+    search|find)
+        # `lfs-kernel search AR9271` is what a person types, and it used to
+        # mean "build the kernel called search" -- see the version check
+        # below for what that really did.  It is the config search.
+        shift; _CFGCMD=1; _CFGARGS=("search" "$@") ;;
+    set)
+        shift; _CFGCMD=1; _CFGARGS=("set" "$@") ;;
     -*) echo "!! unknown option: $1  (try: lfs-kernel --help)"; exit 1 ;;
-    *)  VERSION="$1" ;;
+    *)
+        # A WORD THAT IS NOT A VERSION IS NOT A VERSION.
+        #
+        # Anything unrecognised became the version to build, and the version
+        # from kernel.conf then overwrote it (below) -- so a typo, or a
+        # subcommand this tool does not have, silently started a FULL BUILD
+        # of the configured kernel.  `lfs-kernel search AR9271` rebuilt and
+        # reinstalled 7.2.6, fetched the firmware and said nothing about the
+        # word `search` at all.
+        case "$1" in
+            latest|[0-9]*.[0-9]*) _CLI_VERSION="$1" ;;
+            *)  echo "!! lfs-kernel: '$1' is neither a command nor a version."
+                echo "   commands: status, list, enable, modules, load,"
+                echo "             config, search, firmware, verify, detect-esp"
+                echo "   a version looks like 7.2.6, or the word latest."
+                case "$1" in
+                    conf*|cfg)  echo "   did you mean:  lfs-kernel config" ;;
+                    mod*|lsmod) echo "   did you mean:  lfs-kernel modules" ;;
+                    en*|add)    echo "   did you mean:  lfs-kernel enable --list" ;;
+                    fw|firm*)   echo "   did you mean:  lfs-kernel firmware --missing" ;;
+                esac
+                exit 1 ;;
+        esac ;;
 esac
 
 # The config is INSTALLED, not written on first run: it is a file to edit
@@ -65,6 +183,13 @@ if [ ! -f "$CONF" ]; then
     exit 1
 fi
 . "$CONF"
+
+# THE COMMAND LINE WINS.  `lfs-kernel 6.12.40` sets VERSION, and then this
+# file -- sourced after it -- set VERSION=latest straight over the top: the
+# documented "that version, once" built whatever kernel.conf said instead,
+# and `verify 7.2.4` reported on another kernel entirely.  Re-apply it here,
+# where nothing can overwrite it again.
+[ -n "${_CLI_VERSION:-}" ] && VERSION="$_CLI_VERSION"
 
 # A CONFIG FROM AN OLDER RELEASE.
 #
@@ -111,8 +236,23 @@ _latest_stable() { _releases | awk '$1=="stable"{print $2; exit}'; }
 # "latest" would ask kernel.org for a version it is never going to look at,
 # and fail on a machine with no network while reporting on one that is
 # perfectly installed.
-if [ "${_VERIFY:-0}" = 1 ]; then
+if [ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
+   || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
+   || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ] \
+   || [ "${_PROMOTE:-0}" = 1 ]; then
     :
+elif [ "${_FWONLY:-0}" = 1 ] && [ "$VERSION" = latest ]; then
+    # A FIRMWARE REPORT IS ABOUT THIS MACHINE, NOT ABOUT KERNEL.ORG.
+    #
+    # `lfs-kernel firmware --missing` asked the website which kernel is
+    # newest -- for a question answered entirely by /lib/modules and the
+    # boot log -- printed "newest stable on kernel.org", and on a machine
+    # with no network it EXITED instead of reporting.
+    VERSION="$(uname -r | sed "s/-.*//")"
+    if [ ! -d "/lib/modules/$VERSION" ] && [ ! -d "/lib/modules/$(uname -r)" ]; then
+        VERSION="$(_latest_stable)"
+        [ -n "$VERSION" ] || { echo "!! no /lib/modules for the running kernel, and kernel.org is unreachable"; exit 1; }
+    fi
 elif [ "$VERSION" = latest ]; then
     VERSION="$(_latest_stable)"
     [ -n "$VERSION" ] || { echo "!! could not reach $MIRROR_JSON -- set VERSION in $CONF"; exit 1; }
@@ -127,12 +267,24 @@ fi
 acct="p_$PKG"
 # `verify` must not CREATE anything -- a report that makes an account is not
 # a report.  It only reads $acct's home below.
-if [ "${_VERIFY:-0}" != 1 ] && ! id "$acct" >/dev/null 2>&1; then
+if [ "${_VERIFY:-0}" != 1 ] && [ "${_CFGCMD:-0}" != 1 ] \
+   && [ "${_ENABLE:-0}" != 1 ] && [ "${_MODCMD:-0}" != 1 ] \
+   && [ "${_STATUS:-0}" != 1 ] && [ -z "${_LOADCMD:-}" ] \
+   && [ "${_PROMOTE:-0}" != 1 ] \
+   && ! id "$acct" >/dev/null 2>&1; then
     packagemanager add-user "$PKG" || { echo "!! could not create $acct"; exit 1; }
 fi
-[ "${_VERIFY:-0}" = 1 ] || lfs-helper fix-home "$acct" --run >/dev/null 2>&1 || true
+[ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
+    || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
+    || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ] \
+    || [ "${_PROMOTE:-0}" = 1 ] \
+    || lfs-helper fix-home "$acct" --run >/dev/null 2>&1 || true
 SRC="$(getent passwd "$acct" 2>/dev/null | cut -d: -f6)/src"
-[ "${_VERIFY:-0}" = 1 ] || install -d -o "$acct" -g "$acct" -m 755 "$SRC"
+[ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
+    || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
+    || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ] \
+    || [ "${_PROMOTE:-0}" = 1 ] \
+    || install -d -o "$acct" -g "$acct" -m 755 "$SRC"
 
 # Everything that touches the tree runs AS THE PACKAGE USER: a root-owned
 # file left in its home would break the next build and every rule about who
@@ -142,6 +294,830 @@ _as_pkg() { su - "$acct" -c "cd '$tree' 2>/dev/null || cd '$SRC'; $*"; }
 tree="$SRC/linux-$VERSION"
 tarball="$SRC/linux-$VERSION.tar.xz"
 major="${VERSION%%.*}"
+
+# --------------------------------------------------------------------------
+# THE CONFIGS ARE KEPT, OUTSIDE THE TREE.
+#
+# A .config lives in a source tree, and a source tree is deleted by hand or
+# by `packagemanager remove linux`, which takes the account's home,
+# and a failed build can leave one unusable.  What is lost with it is the
+# only record of every answer this machine has ever given -- hours of
+# menuconfig, and the difference between a kernel that boots and one that
+# does not.
+#
+# So every config this tool builds with is copied to $KCFG_DIR, which is
+# root's, small (a config is ~200 kB) and has nothing to do with the tree:
+#
+#     config-<version>-<date>   every build, newest CONFIG_KEEP kept
+#     last-good.config          the config of the kernel that BOOTED
+#     prev-good.config          the one before that
+#
+# The last two are the ones worth having: they are known to work on this
+# hardware.  CONFIG_FROM=last-good starts from one, `config diff` says what
+# changed between them, and `config set` is how an answer is added without
+# hand-editing a file that the next build overwrites.
+# --------------------------------------------------------------------------
+KCFG_DIR="${KCFG_DIR:-/etc/pkgusr/kernel-configs}"
+: "${CONFIG_KEEP:=5}"
+
+_kcfg_readable() {   # a config file with something in it
+    [ -s "$1" ] && grep -q '^CONFIG_' "$1" 2>/dev/null
+}
+
+_kcfg_newest() {     # the newest archived build config, or empty
+    ls -1t "$KCFG_DIR"/config-* 2>/dev/null | head -n1
+}
+
+_kcfg_ver() {        # the kernel version a config file was built for
+    sed -n 's/^# Linux\/[^ ]* \([0-9][^ ]*\) Kernel Configuration.*/\1/p' "$1" \
+        2>/dev/null | head -n1
+}
+
+_kcfg_archive() {    # <config> <version> -- keep a copy of what we built with
+    local src="$1" ver="$2" dst
+    _kcfg_readable "$src" || return 0
+    install -d -m 755 "$KCFG_DIR" || return 0
+    dst="$KCFG_DIR/config-$ver-$(date +%Y%m%d-%H%M%S)"
+    cp "$src" "$dst" 2>/dev/null || return 0
+    chmod 644 "$dst"
+    echo "# config kept as $dst"
+    # PRUNE THE BUILD SNAPSHOTS ONLY.  last-good/prev-good are not in this
+    # pattern and are never deleted here.
+    ls -1t "$KCFG_DIR"/config-* 2>/dev/null | tail -n +"$((CONFIG_KEEP + 1))" \
+        | while read -r _old; do rm -f "$_old"; done
+}
+
+_kcfg_mark_good() {  # <config> <version> -- this kernel has booted
+    local src="$1" ver="$2"
+    _kcfg_readable "$src" || return 0
+    install -d -m 755 "$KCFG_DIR" || return 0
+    # the same version again is the same kernel: refresh it, do not push the
+    # OTHER working config out with a copy of this one
+    if [ -f "$KCFG_DIR/last-good.config" ] \
+       && [ "$(_kcfg_ver "$KCFG_DIR/last-good.config")" != "$ver" ]; then
+        cp "$KCFG_DIR/last-good.config" "$KCFG_DIR/prev-good.config" 2>/dev/null
+        chmod 644 "$KCFG_DIR/prev-good.config" 2>/dev/null
+    fi
+    cp "$src" "$KCFG_DIR/last-good.config" 2>/dev/null || return 0
+    chmod 644 "$KCFG_DIR/last-good.config"
+    echo "# the config of $ver is now $KCFG_DIR/last-good.config"
+}
+
+# THE CONFIG THIS MACHINE IS RUNNING ON, wherever it can be read from.
+_kcfg_current() {
+    local c
+    for c in "$tree/.config" "$KCFG_DIR/last-good.config" "$(_kcfg_newest)"; do
+        [ -n "$c" ] && _kcfg_readable "$c" && { printf '%s' "$c"; return 0; }
+    done
+    if [ -r /proc/config.gz ]; then
+        c="$(mktemp)"; gunzip < /proc/config.gz > "$c" 2>/dev/null \
+            && { printf '%s' "$c"; return 0; }
+        rm -f "$c"
+    fi
+    return 1
+}
+
+_kcfg_state() {      # <config> <SYMBOL> -- what that symbol is, in words
+    local f="$1" sym="CONFIG_${2#CONFIG_}" l
+    l="$(grep -E "^($sym=|# $sym is not set)" "$f" 2>/dev/null | head -n1)"
+    [ -n "$l" ] || { printf 'absent'; return; }
+    case "$l" in "# $sym is not set") printf 'not set' ;; *) printf '%s' "${l#*=}" ;; esac
+}
+
+# ONE WRITER FOR kernel.conf.  `config set`, `config from` and `enable` all
+# change one KEY="value" line in a file the user edits by hand, so they all
+# back it up the same way and none of them rewrites anything else.
+_conf_set_var() {   # <KEY> <value>
+    local key="$1" val="$2" bak tmp
+    bak="$CONF.bak-$(date +%Y%m%d-%H%M%S)"
+    cp -p "$CONF" "$bak" || { echo "!! could not back up $CONF"; return 1; }
+    if grep -qE "^[[:space:]]*$key=" "$CONF"; then
+        tmp="$(mktemp)"
+        awk -v v="$key=\"$val\"" -v k="^[[:space:]]*$key=" '
+            $0 ~ k && !done { print v; done = 1; next }
+            { print }' "$CONF" > "$tmp" && cat "$tmp" > "$CONF"
+        rm -f "$tmp"
+    else
+        printf '\n%s="%s"\n' "$key" "$val" >> "$CONF"
+    fi
+    echo "# $CONF (backup: $(basename "$bak"))"
+    echo "#   $key=\"$val\""
+}
+
+# WHAT A SYMBOL IS, ACCORDING TO THE TREE: bool, tristate, or unknown --
+# which decides whether `enable` may say =m.
+_ksym_type() {   # <SYMBOL>
+    local sym="${1#CONFIG_}"
+    [ -d "$tree" ] || return 0
+    grep -rhA3 --include='Kconfig*' -E "^[[:space:]]*(menu)?config[[:space:]]+$sym\$" \
+         "$tree" 2>/dev/null \
+      | grep -m1 -oE '^[[:space:]]*(bool|tristate|string|int|hex)' \
+      | tr -d '[:space:]'
+}
+
+# THE SYMBOLS A KCONFIG FILE DEFINES, with their prompt -- the only way a
+# search can say "ATH9K_HTC: Atheros HTC based wireless cards" instead of
+# printing every symbol in a file that happens to mention the word.
+_ksym_scan() {   # <pattern> -- SYMBOL<TAB>type<TAB>prompt, for matches only
+    local pat="$1"
+    [ -d "$tree" ] || return 0
+    grep -rlis --include='Kconfig*' -- "$pat" "$tree" 2>/dev/null | head -n 40 \
+      | xargs -r awk -v pat="$pat" '
+          function low(x) { return tolower(x) }
+          /^[[:space:]]*(menu)?config[[:space:]]+[A-Za-z0-9_]+/ {
+              sym = $2; next }
+          sym != "" && /^[[:space:]]*(bool|tristate|string|int|hex)([[:space:]]|$)/ {
+              type = $1
+              p = $0
+              # the prompt is the FIRST quoted string on the line, if any:
+              # `tristate "Atheros HTC based wireless cards support"`
+              if (match(p, /"[^"]*"/))
+                  p = substr(p, RSTART + 1, RLENGTH - 2)
+              else
+                  p = ""
+              if (index(low(sym), low(pat)) || index(low(p), low(pat)))
+                  print sym "\t" type "\t" p
+              sym = ""; next }
+          { if ($0 ~ /^[[:space:]]*$/) sym = "" }' 2>/dev/null \
+      | sort -u
+}
+
+# THE MODULES THIS KERNEL HAS: which version's /lib/modules to read.
+_kmod_ver() {
+    local r; r="$(uname -r)"
+    [ -d "/lib/modules/$r" ] && { printf '%s' "$r"; return 0; }
+    ls -1 /lib/modules 2>/dev/null | sort -V | tail -n1
+}
+
+# THE NEWEST SOURCE TREE, for a `config` command that names no version.
+_kcfg_tree() {
+    [ -d "${SRC:-}" ] || return 0
+    ls -1d "$SRC"/linux-*/ 2>/dev/null | grep -v '\-headers' | sort -V | tail -n1 \
+        | sed 's:/$::'
+}
+
+if [ "${_CFGCMD:-0}" = 1 ]; then
+    [ -d "$tree" ] || tree="$(_kcfg_tree)"
+    _sub="${_CFGARGS[0]-show}"
+    case "$_sub" in
+    show|"")
+        echo "# the next build's .config"
+        echo "#   CONFIG_FROM    = $CONFIG_FROM"
+        echo "#   CONFIG_REFRESH = ${CONFIG_REFRESH:-olddefconfig}"
+        echo "#   CONFIG_SET     = ${CONFIG_SET:-(nothing)}"
+        echo "#   kept in         $KCFG_DIR  (CONFIG_KEEP=$CONFIG_KEEP builds)"
+        echo
+        for _f in last-good prev-good; do
+            if [ -f "$KCFG_DIR/$_f.config" ]; then
+                printf '#   %-16s %s  (%s)\n' "$_f.config" \
+                    "$(_kcfg_ver "$KCFG_DIR/$_f.config")" \
+                    "$(date -r "$KCFG_DIR/$_f.config" '+%Y-%m-%d %H:%M')"
+            else
+                printf '#   %-16s -- none yet\n' "$_f.config"
+            fi
+        done
+        echo
+        echo "# add an option:      lfs-kernel config set NET_VENDOR_ATHEROS=y"
+        echo "# find its name:      lfs-kernel config search atheros"
+        echo "# then build:         lfs-kernel"
+        exit 0 ;;
+    list|ls)
+        if [ ! -d "$KCFG_DIR" ]; then
+            echo "# no saved configs yet ($KCFG_DIR) -- the next build writes one"
+            exit 0
+        fi
+        echo "# $KCFG_DIR"
+        for _f in "$KCFG_DIR"/last-good.config "$KCFG_DIR"/prev-good.config; do
+            [ -f "$_f" ] && printf '  %-34s %-10s %s\n' "$(basename "$_f")" \
+                "$(_kcfg_ver "$_f")" "$(date -r "$_f" '+%Y-%m-%d %H:%M')"
+        done
+        ls -1t "$KCFG_DIR"/config-* 2>/dev/null | while read -r _f; do
+            printf '  %-34s %-10s %s\n' "$(basename "$_f")" \
+                "$(_kcfg_ver "$_f")" "$(date -r "$_f" '+%Y-%m-%d %H:%M')"
+        done
+        echo "# start from one:  CONFIG_FROM=file:<path>  in $CONF"
+        echo "#   or CONFIG_FROM=last-good / prev-good / saved"
+        exit 0 ;;
+    diff)
+        _a="${_CFGARGS[1]:-$KCFG_DIR/prev-good.config}"
+        _b="${_CFGARGS[2]:-$KCFG_DIR/last-good.config}"
+        [ -f "$_a" ] || _a="$KCFG_DIR/$_a"
+        [ -f "$_b" ] || _b="$KCFG_DIR/$_b"
+        for _f in "$_a" "$_b"; do
+            [ -f "$_f" ] || { echo "!! no such config: $_f"; echo "   lfs-kernel config list"; exit 1; }
+        done
+        echo "# $_a ($(_kcfg_ver "$_a"))  ->  $_b ($(_kcfg_ver "$_b"))"
+        echo "#   < only in the first, > only in the second"
+        diff <(grep -E '^(CONFIG_|# CONFIG_)' "$_a" | sort) \
+             <(grep -E '^(CONFIG_|# CONFIG_)' "$_b" | sort) \
+            | grep -E '^[<>]' | sort -k2 || echo "#   identical"
+        exit 0 ;;
+    search|find)
+        _pat="${_CFGARGS[1]:-}"
+        [ -n "$_pat" ] || { echo "!! lfs-kernel config search <text>"; exit 1; }
+        _cfg="$(_kcfg_current || true)"
+        if [ -n "$_cfg" ]; then
+            echo "# '$_pat' in $_cfg"
+            grep -iE "^(CONFIG_[A-Z0-9_]*${_pat}[A-Z0-9_]*=|# CONFIG_[A-Z0-9_]*${_pat}[A-Z0-9_]* is not set)" \
+                 "$_cfg" | head -n 25 | sed 's/^/    /'
+        fi
+        echo
+        if [ -d "$tree" ]; then
+            # BY NAME OR BY PROMPT, NOT BY FILE.  Listing every symbol of
+            # every Kconfig that mentions the word gave 40 lines of MIPS
+            # console options for "atheros".  A symbol is a hit when its own
+            # name or its prompt says so, and the prompt is what tells you
+            # which one you want.
+            echo "# symbols in $tree  (state, type, what it is)"
+            _hits="$(_ksym_scan "$_pat")"
+            if [ -n "$_hits" ]; then
+                printf '%s\n' "$_hits" | head -n 30 | while IFS="$(printf '\t')" read -r _sym _ty _pr; do
+                    printf '    %-26s %-9s %-9s %s\n' "$_sym" \
+                        "$( [ -n "$_cfg" ] && _kcfg_state "$_cfg" "$_sym" )" \
+                        "$_ty" "$_pr"
+                done
+                _n="$(printf '%s\n' "$_hits" | wc -l)"
+                [ "$_n" -gt 30 ] && echo "    ... $((_n - 30)) more"
+            else
+                echo "    (nothing whose name or prompt says '$_pat')"
+            fi
+        else
+            echo "# no kernel tree here to search; unpack one with: lfs-kernel <version>"
+        fi
+        echo
+        echo "# a NET_VENDOR_* / WLAN_VENDOR_* symbol only opens the submenu:"
+        echo "#   the DRIVER under it has to be set too."
+        echo "# known hardware, by name:  lfs-kernel enable --list"
+        echo "# set a symbol:             lfs-kernel config set ATH9K_HTC=m"
+        [ -d "$tree" ] \
+            && echo "# read the help text:       cd $tree && make menuconfig   (/ searches)"
+        exit 0 ;;
+    save)
+        # SEED THE ARCHIVE WITHOUT A BUILD.  Before the first build there is
+        # nothing saved, so CONFIG_FROM=last-good has nothing to read -- and
+        # the config worth keeping is already on this machine.
+        _src="${_CFGARGS[1]:-}"
+        _good=0
+        for _a in ${_CFGARGS[@]+"${_CFGARGS[@]}"}; do
+            [ "$_a" = "--good" ] && _good=1
+        done
+        [ "$_src" = "--good" ] && _src=""
+        if [ -z "$_src" ]; then
+            if [ -r /proc/config.gz ]; then
+                _src="$(mktemp)"; gunzip < /proc/config.gz > "$_src"
+                _what="the running kernel"
+            elif _kcfg_readable "$tree/.config"; then
+                _src="$tree/.config"; _what="$tree"
+            else
+                echo "!! nothing to save: no /proc/config.gz and no .config in a tree"
+                exit 1
+            fi
+        else
+            _what="$_src"
+        fi
+        _kcfg_readable "$_src" || { echo "!! $_src is not a kernel config"; exit 1; }
+        _ver="$(_kcfg_ver "$_src")"
+        [ -n "$_ver" ] || _ver="$(uname -r | sed 's/-.*//')"
+        echo "# saving $_what  (kernel $_ver)"
+        _kcfg_archive "$_src" "$_ver"
+        if [ "$_good" = 1 ]; then
+            _kcfg_mark_good "$_src" "$_ver"
+        else
+            echo "#   it is a build snapshot, not a known-good config."
+            echo "#   --good marks it as one (use it for a kernel that BOOTS)."
+        fi
+        echo "# start from it next time:  lfs-kernel config from last-good"
+        exit 0 ;;
+    from)
+        _val="${_CFGARGS[1]:-}"
+        case "$_val" in
+            running|last-good|good|prev-good|prev|saved|last|keep|file:*) ;;
+            "") echo "# CONFIG_FROM = $CONFIG_FROM"
+                echo "#   running | last-good | prev-good | saved | keep | file:<path>"
+                exit 0 ;;
+            *)  echo "!! CONFIG_FROM=$_val is not one of:"
+                echo "   running last-good prev-good saved keep file:<path>"; exit 1 ;;
+        esac
+        case "$_val" in
+            last-good|good) _kcfg_readable "$KCFG_DIR/last-good.config" \
+                || { echo "!! there is no $KCFG_DIR/last-good.config yet."
+                     echo "   Make one from the kernel running now:"
+                     echo "     lfs-kernel config save --good"; exit 1; } ;;
+        esac
+        _conf_set_var CONFIG_FROM "$_val" || exit 1
+        exit 0 ;;
+    set|unset)
+        _items=("${_CFGARGS[@]:1}")
+        [ "${#_items[@]}" -gt 0 ] || {
+            echo "!! lfs-kernel config $_sub SYMBOL[=VALUE] ..."; exit 1; }
+        # the current list, as words
+        _new=""
+        for _w in ${CONFIG_SET:-}; do
+            _keep=1
+            for _i in "${_items[@]}"; do
+                _isym="CONFIG_${_i%%=*}"; _isym="CONFIG_${_isym#CONFIG_}"
+                _wsym="CONFIG_${_w%%=*}"; _wsym="CONFIG_${_wsym#CONFIG_}"
+                [ "$_isym" = "$_wsym" ] && _keep=0
+            done
+            [ "$_keep" = 1 ] && _new="$_new $_w"
+        done
+        if [ "$_sub" = set ]; then
+            for _i in "${_items[@]}"; do
+                case "$_i" in
+                    *=*) ;;
+                    *) echo "!! '$_i' has no value -- SYMBOL=y|m|n|<number>|\"text\""; exit 1 ;;
+                esac
+                _val="${_i#*=}"
+                case "$_val" in
+                    y|m|n|[0-9]*|\"*) ;;
+                    *) echo "# note: '$_val' is taken as a string value" ;;
+                esac
+                _new="$_new ${_i#CONFIG_}"
+            done
+        fi
+        _new="$(printf '%s' "$_new" | sed 's/^ *//')"
+        _conf_set_var CONFIG_SET "$_new" || exit 1
+        echo
+        echo "# nothing is built yet.  Apply it:"
+        echo "#     lfs-kernel                 # rebuild and install"
+        echo "#   Each entry is read back from the final .config: one the"
+        echo "#   kernel refuses (missing dependency, no such symbol) is"
+        echo "#   named and stops the build."
+        exit 0 ;;
+    *)  echo "!! lfs-kernel config: show | list | diff | search | set | unset"
+        echo "                      | save [--good] | from <source>"
+        exit 1 ;;
+    esac
+fi
+
+# --------------------------------------------------------------------------
+# HARDWARE BY NAME.
+#
+# "I have an AR9271 USB adapter" is the question; CONFIG_ATH9K_HTC plus
+# WLAN_VENDOR_ATH plus the htc_9271 firmware is the answer, and nothing on
+# the machine connects the two.  menuconfig will not either: it wants the
+# symbol you do not know yet.
+#
+# Each line is:  <name>|<symbols>|<firmware>|<what it is>
+# `enable <name>` puts the symbols into CONFIG_SET and the firmware into
+# FIRMWARE_ONLY, both in kernel.conf, both backed up.  A symbol this kernel
+# refuses is reported by the build, which reads every CONFIG_SET entry back.
+_KDEV_TABLE='
+ath9k-htc|WLAN_VENDOR_ATH=y ATH9K_HTC=m|ath9k_htc htc_9271*|Atheros AR9271/AR7010 USB wifi (TP-Link TL-WN722N v1, Alfa AWUS036NHA)
+ath9k|WLAN_VENDOR_ATH=y ATH9K=m ATH9K_PCI=y|ath9k_htc|Atheros AR9xxx PCI/PCIe wifi
+ath10k|WLAN_VENDOR_ATH=y ATH10K=m ATH10K_PCI=m|ath10k|Qualcomm Atheros QCA988x PCI wifi
+ath11k|WLAN_VENDOR_ATH=y ATH11K=m ATH11K_PCI=m|ath11k|Qualcomm QCA6390/WCN685x wifi
+alx|NET_VENDOR_ATHEROS=y ALX=m|-|Atheros AR816x/AR817x, Killer E2200 ethernet
+atl1c|NET_VENDOR_ATHEROS=y ATL1C=m|-|Atheros AR813x/AR815x ethernet
+iwlwifi|WLAN_VENDOR_INTEL=y IWLWIFI=m IWLMVM=m|intel iwlwifi-*.ucode|Intel wifi (AX200 and friends)
+rtl8xxxu|WLAN_VENDOR_REALTEK=y RTL8XXXU=m|rtlwifi rtw88|Realtek RTL8188/8192 USB wifi
+bluetooth-usb|BT=m BT_HCIBTUSB=m BT_RFCOMM=m BT_BNEP=m|rtl_bt intel|USB Bluetooth (most laptop and dongle radios)
+btrfs|BTRFS_FS=m BTRFS_FS_POSIX_ACL=y|-|the btrfs filesystem (stack: btrfs-progs)
+exfat|EXFAT_FS=m|-|exFAT, the usual format of big SD cards
+fuse|FUSE_FS=m|-|FUSE, userspace filesystems (ntfs-3g, sshfs)
+ntfs3|NTFS3_FS=m NTFS3_LZX_XPRESS=y|-|NTFS read/write (the in-kernel driver)
+nvme|BLK_DEV_NVME=y|-|NVMe SSDs
+usb-serial|USB_SERIAL=m USB_SERIAL_CP210X=m USB_SERIAL_FTDI_SIO=m USB_SERIAL_CH341=m|-|USB serial adapters (CP210x, FTDI, CH340)
+v4l2-usb|MEDIA_SUPPORT=m MEDIA_USB_SUPPORT=y USB_VIDEO_CLASS=m|-|USB webcams (UVC)
+'
+
+_kdev_line() {   # <name> -- the table line, or empty
+    printf '%s\n' "$_KDEV_TABLE" | awk -F'|' -v n="$1" 'NF && $1 == n {print; exit}'
+}
+
+_kdev_list() {
+    echo "# hardware this tool knows by name:"
+    printf '%s\n' "$_KDEV_TABLE" | awk -F'|' 'NF { printf "    %-15s %s\n", $1, $4 }'
+    echo
+    echo "# enable one:   lfs-kernel enable ath9k-htc"
+    echo "# or a symbol:  lfs-kernel enable ATH9K_HTC"
+    echo "# what is set:  lfs-kernel config show        modules: lfs-kernel modules"
+}
+
+if [ "${_ENABLE:-0}" = 1 ]; then
+    [ -d "$tree" ] || tree="$(_kcfg_tree)"
+    _args=("${_ENARGS[@]}")
+    if [ "${#_args[@]}" = 0 ] || [ "${_args[0]}" = "--list" ] || [ "${_args[0]}" = "list" ]; then
+        _kdev_list; exit 0
+    fi
+    _syms=""; _fw=""; _unknown=""
+    for _a in "${_args[@]}"; do
+        _row="$(_kdev_line "$_a")"
+        if [ -n "$_row" ]; then
+            _syms="$_syms $(printf '%s' "$_row" | cut -d'|' -f2)"
+            _f="$(printf '%s' "$_row" | cut -d'|' -f3)"
+            [ "$_f" = "-" ] || _fw="$_fw $_f"
+            echo "# $_a: $(printf '%s' "$_row" | cut -d'|' -f4)"
+            continue
+        fi
+        # not a name in the table: take it as a symbol, and ask the tree
+        # whether it can be a module before saying =m
+        case "$_a" in
+            *=*) _syms="$_syms ${_a#CONFIG_}"; continue ;;
+        esac
+        _sym="$(printf '%s' "${_a#CONFIG_}" | tr '[:lower:]' '[:upper:]')"
+        case "$(_ksym_type "$_sym")" in
+            tristate) _syms="$_syms $_sym=m"
+                      echo "# $_sym: a tristate symbol -- set to m (a module)" ;;
+            bool)     _syms="$_syms $_sym=y"
+                      echo "# $_sym: a bool symbol -- set to y (built in)" ;;
+            "")       _unknown="$_unknown $_a" ;;
+            *)        _syms="$_syms $_sym=y" ;;
+        esac
+    done
+    if [ -n "$_unknown" ]; then
+        echo "!! not a name I know, and not a symbol in this tree:$_unknown"
+        echo "   lfs-kernel enable --list            # the names"
+        echo "   lfs-kernel config search <text>     # the symbols"
+        echo "   lfs-kernel enable SYM=m             # if you are sure"
+        exit 1
+    fi
+    # merge into CONFIG_SET, last value wins, order kept
+    _new=""
+    for _w in ${CONFIG_SET:-}; do
+        _keep=1
+        for _i in $_syms; do
+            [ "CONFIG_${_i%%=*}" = "CONFIG_${_w%%=*}" ] && _keep=0
+        done
+        [ "$_keep" = 1 ] && _new="$_new $_w"
+    done
+    for _i in $_syms; do _new="$_new $_i"; done
+    _new="$(printf '%s' "$_new" | sed 's/^ *//')"
+    _conf_set_var CONFIG_SET "$_new" || exit 1
+    # the firmware, if this hardware needs some and it is not already named
+    if [ -n "$_fw" ] && [ "${FIRMWARE_FROM:-none}" != none ]; then
+        _fwnew="${FIRMWARE_ONLY:-}"
+        if [ -n "$_fwnew" ]; then      # empty means "everything": leave it
+            for _f in $_fw; do
+                case " $_fwnew " in *" $_f "*) ;; *) _fwnew="$_fwnew $_f" ;; esac
+            done
+            [ "$_fwnew" = "${FIRMWARE_ONLY:-}" ] \
+                || _conf_set_var FIRMWARE_ONLY "$_fwnew"
+        fi
+    fi
+    echo
+    echo "# nothing is built yet.  Apply it:"
+    echo "#     lfs-kernel                 # rebuild, install, and the firmware"
+    echo "#   then, after the reboot:"
+    echo "#     lfs-kernel modules ${_args[0]}"
+    echo "#     lfs-kernel firmware --missing"
+    exit 0
+fi
+
+if [ "${_MODCMD:-0}" = 1 ]; then
+    _mver="$(_kmod_ver)"
+    [ -n "$_mver" ] || { echo "!! no /lib/modules -- no kernel is installed here"; exit 1; }
+    _md="/lib/modules/$_mver"
+    _pat="${_MODARGS[0]-}"
+    _loaded="$(cut -d' ' -f1 /proc/modules 2>/dev/null | tr '_' '-' | sort -u)"
+    _all="$(find "$_md" -name '*.ko' -o -name '*.ko.*' 2>/dev/null \
+            | sed 's:.*/::; s:\.ko.*::' | tr '_' '-' | sort -u)"
+    _builtin="$(sed 's:.*/::; s:\.ko.*::' "$_md/modules.builtin" 2>/dev/null \
+                | tr '_' '-' | sort -u)"
+    _nall="$(printf '%s\n' "$_all" | grep -c . || true)"
+    _nld="$(printf '%s\n' "$_loaded" | grep -c . || true)"
+    _nbi="$(printf '%s\n' "$_builtin" | grep -c . || true)"
+    echo "# kernel $_mver: $_nall module(s) built, $_nld loaded, $_nbi built in"
+    [ "$_mver" = "$(uname -r)" ] \
+        || echo "#   (the running kernel is $(uname -r) -- this is another one)"
+    if [ -z "$_pat" ]; then
+        echo "# loaded now:"
+        printf '%s\n' "$_loaded" | grep . | tr '\n' ' ' | fold -s -w 72 | sed 's/^/    /'
+        echo
+        echo "# one subject:   lfs-kernel modules ath"
+        echo "# not built yet: lfs-kernel config search ath9k"
+        exit 0
+    fi
+    _hit="$(printf '%s\n' "$_all" "$_builtin" | sort -u \
+            | grep -i -- "$(printf '%s' "$_pat" | tr '_' '-')" || true)"
+    if [ -z "$_hit" ]; then
+        echo "# no module of this kernel is called anything like '$_pat'."
+        echo "#   is it even configured?   lfs-kernel config search $_pat"
+        echo "#   what it would be called: lfs-kernel enable --list"
+        exit 1
+    fi
+    echo "# modules matching '$_pat'"
+    printf '%s\n' "$_hit" | while read -r _m; do
+        _st="built"
+        printf '%s\n' "$_builtin" | grep -qx -- "$_m" && _st="built-in"
+        printf '%s\n' "$_loaded" | grep -qx -- "$_m" && _st="LOADED"
+        _desc="$(modinfo -F description "$(printf '%s' "$_m" | tr '-' '_')" \
+                 2>/dev/null | head -n1)"
+        printf '    %-24s %-9s %s\n' "$_m" "$_st" "${_desc:-}"
+    done
+    echo
+    echo "# load one now:   lfs-kernel load <name>"
+    echo "# and at boot:    lfs-kernel load <name> --boot"
+    echo "#   (a USB device loads its driver when you plug it in, if udev runs)"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# WHERE ARE WE?
+#
+# A kernel build is long enough to be interrupted -- Ctrl-C, a reboot, a
+# session that timed out -- and afterwards nothing on the machine says how
+# far it got.  The tree holds a .config that may or may not carry your
+# answers, object files that may or may not be a finished image, and
+# /lib/modules and the ESP each hold a kernel from some earlier day.
+#
+# `lfs-kernel status` reads all four and says, in order: what is running,
+# what the tree has, what is installed, and what to do next.  It builds
+# nothing, needs no network, and does not care whether the ESP is mounted.
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# PROMOTE: THE TEST KERNEL BECOMES THE ONE THAT BOOTS.
+#
+# With KERNEL_NAME=vmlinuz_new every build lands beside the working kernel,
+# so a bad one cannot cost the machine -- and the machine keeps booting the
+# old one until someone copies files around on the ESP by hand, which is
+# where a vmlinuz_new_old and a vmlinuz.back come from.  This is that copy,
+# checked: the image's own version (read from its header, as file(1) does),
+# its modules present, the previous default kept as vmlinuz_old.
+# --------------------------------------------------------------------------
+_kimg_version() {   # <bzImage> -> its kernel release, or nothing
+    local f="$1" off
+    [ -s "$f" ] || return 0
+    off="$(od -An -tu2 -j526 -N2 "$f" 2>/dev/null | tr -d ' ')"
+    [ -n "$off" ] || return 0
+    dd if="$f" bs=1 skip=$((off + 512)) count=128 2>/dev/null \
+        | tr '\0' '\n' | head -n1 | awk '{print $1}'
+}
+if [ "${_PROMOTE:-0}" = 1 ]; then
+    _def="vmlinuz"
+    [ -n "${ESP:-}" ] || ESP="$(_detect_esp)"
+    [ -d "${ESP:-}" ] || { echo "!! no ESP directory: ${ESP:-(not set, none found)} (is it mounted?)"; exit 1; }
+    case "$_PROMOTE_ARG" in
+        "")       _src="$ESP/${KERNEL_NAME}" ;;
+        */*)      _src="$_PROMOTE_ARG" ;;
+        [0-9]*)   _src=""
+                  for _c in "$ESP/${KERNEL_NAME}-$_PROMOTE_ARG" "$ESP/vmlinuz_new-$_PROMOTE_ARG" \
+                            "$ESP/vmlinuz-$_PROMOTE_ARG"; do
+                      [ -s "$_c" ] && { _src="$_c"; break; }
+                  done ;;
+        *)        _src="$ESP/$_PROMOTE_ARG" ;;
+    esac
+    if [ -z "$_src" ] || [ ! -s "$_src" ]; then
+        echo "!! nothing to promote: ${_src:-no image for $_PROMOTE_ARG} is not there"
+        echo "   kernels on the ESP:"
+        for _k in "$ESP"/vmlinuz*; do
+            [ -s "$_k" ] && printf '     %-28s %s\n' "${_k##*/}" "$(_kimg_version "$_k")"
+        done
+        exit 1
+    fi
+    _sv="$(_kimg_version "$_src")"
+    _dv="$(_kimg_version "$ESP/$_def")"
+    echo "# promote ${_src##*/} ($_sv) to $_def"
+    echo "    now booting by default: $_def (${_dv:-none})"
+    echo "    running:                $(uname -r)"
+    [ -n "$_sv" ] || { echo "!! ${_src##*/} has no readable kernel version -- not a bzImage?"; exit 1; }
+    if [ "$_src" = "$ESP/$_def" ] || { [ -f "$ESP/$_def" ] && cmp -s "$_src" "$ESP/$_def"; }; then
+        echo "# $_def already is $_sv -- nothing to do"
+        exit 0
+    fi
+    if [ ! -d "/lib/modules/$_sv" ]; then
+        echo "!! /lib/modules/$_sv is missing -- that kernel would boot without"
+        echo "   its modules.  Install them first (lfs-kernel $_sv --run)."
+        exit 1
+    fi
+    echo "    plan:"
+    [ -f "$ESP/$_def" ] && echo "      $_def -> ${_def}_old   (your way back: pick it in the boot menu)"
+    echo "      ${_src##*/} -> $_def"
+    echo "      ${_src##*/} -> $_def-$_sv (so verify finds it)"
+    _strays=""
+    for _x in vmlinuz- config- System.map-; do
+        [ -e "$ESP/$_x" ] && _strays="$_strays $ESP/$_x"
+    done
+    if [ "$_RUN" != 1 ]; then
+        echo "# dry run -- add --run"
+    else
+        if [ -f "$ESP/$_def" ]; then
+            cp -a "$ESP/$_def" "$ESP/${_def}_old" || { echo "!! could not keep $_def as ${_def}_old"; exit 1; }
+        fi
+        cp -a "$_src" "$ESP/$_def.tmp" && mv -f "$ESP/$_def.tmp" "$ESP/$_def" \
+            || { echo "!! could not write $ESP/$_def"; exit 1; }
+        [ -f "$ESP/$_def-$_sv" ] || cp -a "$_src" "$ESP/$_def-$_sv"
+        if cmp -s "$_src" "$ESP/$_def"; then
+            echo "# $_def is now $_sv; the previous default is ${_def}_old"
+        else
+            echo "!! $ESP/$_def does not match ${_src##*/} after the copy"; exit 1
+        fi
+    fi
+    if [ "$KERNEL_NAME" != "$_def" ]; then
+        echo "# future builds still land as $KERNEL_NAME.  To install them as the"
+        echo "#   default directly (previous kept as ${_def}_old), in $CONF:"
+        echo "#     KERNEL_NAME=$_def"
+    fi
+    if [ -n "$_strays" ]; then
+        echo "# left over from a run with no version (safe to delete):"
+        echo "#   rm$_strays"
+    fi
+    exit 0
+fi
+
+if [ "${_STATUS:-0}" = 1 ]; then
+    [ -d "$tree" ] || tree="$(_kcfg_tree)"
+    _ver="$(basename "${tree:-}" 2>/dev/null | sed 's/^linux-//')"
+    _run="$(uname -r)"; _runv="$(echo "$_run" | sed 's/-.*//')"
+    echo "### lfs-kernel status"
+    echo
+    echo "# running now"
+    echo "    kernel        $_run"
+    if [ -s /etc/pkgusr/kernel.last-good ]; then
+        echo "    known to boot $(cat /etc/pkgusr/kernel.last-good)"
+    else
+        echo "    known to boot -- nothing recorded yet"
+    fi
+    if [ -d "/lib/modules/$_run" ]; then
+        echo "    its modules   /lib/modules/$_run"
+    else
+        echo "    its modules   MISSING (/lib/modules/$_run is not there)"
+    fi
+    echo
+    echo "# the config"
+    echo "    CONFIG_FROM   $CONFIG_FROM"
+    for _f in last-good prev-good; do
+        if [ -f "$KCFG_DIR/$_f.config" ]; then
+            echo "    $_f     $(_kcfg_ver "$KCFG_DIR/$_f.config")  ($(date -r "$KCFG_DIR/$_f.config" '+%Y-%m-%d %H:%M'))"
+        else
+            echo "    $_f     -- none"
+        fi
+    done
+    # DOES THE TREE'S CONFIG CARRY WHAT YOU ASKED FOR?  This is the question
+    # after an interrupted run: the answers are applied BEFORE the compile,
+    # so they are in the file even when no kernel came out of it.
+    if [ -n "${CONFIG_SET:-}" ] && [ -f "${tree:-}/.config" ]; then
+        _miss=""
+        for _cs in $CONFIG_SET; do
+            _sym="CONFIG_${_cs%%=*}"; _sym="CONFIG_${_sym#CONFIG_}"; _val="${_cs#*=}"
+            case "$_val" in
+                n) grep -qE "^$_sym=(y|m)" "$tree/.config" && _miss="$_miss $_cs" ;;
+                *) grep -qx "$_sym=$_val" "$tree/.config" || _miss="$_miss $_cs" ;;
+            esac
+        done
+        if [ -z "$_miss" ]; then
+            echo "    CONFIG_SET    all $(echo $CONFIG_SET | wc -w) in $tree/.config"
+        else
+            echo "    CONFIG_SET    NOT in the tree's .config:$_miss"
+            echo "                  (the next build applies them)"
+        fi
+    fi
+    echo
+    echo "# the tree"
+    if [ -z "${tree:-}" ] || [ ! -d "$tree" ]; then
+        echo "    none in $SRC -- nothing has been unpacked here"
+    else
+        echo "    $tree"
+        _bz="$tree/arch/x86/boot/bzImage"
+        if [ ! -f "$tree/.config" ]; then
+            echo "    config        none yet"
+        elif [ -f "$_bz" ] && [ "$_bz" -nt "$tree/.config" ]; then
+            echo "    build         FINISHED -- bzImage is newer than .config"
+            echo "                  $(date -r "$_bz" '+%Y-%m-%d %H:%M')"
+        elif [ -f "$tree/vmlinux" ] || find "$tree" -maxdepth 2 -name '*.o' -print -quit 2>/dev/null | grep -q .; then
+            echo "    build         UNFINISHED -- object files, no current image"
+            echo "                  (an interrupted make; lfs-kernel continues"
+            echo "                   from here, it does not start over)"
+        else
+            echo "    build         not started"
+        fi
+        _nko="$(find "$tree" -name '*.ko' 2>/dev/null | wc -l)"
+        echo "    modules built $_nko in the tree"
+    fi
+    echo
+    echo "# installed"
+    if [ -n "$_ver" ] && [ -d "/lib/modules/$_ver" ]; then
+        echo "    /lib/modules/$_ver  $(test -s "/lib/modules/$_ver/modules.dep" && echo "(depmod has run)" || echo "-- NO modules.dep")"
+        echo "                  $(find "/lib/modules/$_ver" -name '*.ko*' 2>/dev/null | wc -l) module(s)"
+    elif [ -n "$_ver" ]; then
+        echo "    /lib/modules/$_ver -- not there: this kernel was never installed"
+    fi
+    if [ -d "${ESP:-}" ]; then
+        if [ -f "$ESP/$KERNEL_NAME" ]; then
+            echo "    $ESP/$KERNEL_NAME  $(date -r "$ESP/$KERNEL_NAME" '+%Y-%m-%d %H:%M')"
+        fi
+        for _k in "$ESP/$KERNEL_NAME"-*; do
+            [ -f "$_k" ] && echo "    $(basename "$_k")"
+        done
+        if [ -n "$_ver" ] && [ -f "$ESP/config-$_ver" ] && [ -f "$tree/.config" ]; then
+            if cmp -s "$ESP/config-$_ver" "$tree/.config"; then
+                echo "    the installed kernel was built from the tree's CURRENT config"
+            else
+                echo "    the installed config DIFFERS from the tree's .config --"
+                echo "      what is in the tree has not been built and installed yet"
+            fi
+        fi
+    else
+        echo "    $ESP is not mounted -- cannot say what is on the EFI partition"
+    fi
+    echo
+    echo "# next"
+    if [ -n "$_ver" ] && [ -f "$tree/.config" ] \
+       && { [ ! -f "$ESP/config-$_ver" ] || ! cmp -s "$ESP/config-$_ver" "$tree/.config"; }; then
+        echo "    lfs-kernel                 # build and install what the tree now has"
+        echo "      an interrupted build continues; nothing is thrown away."
+    else
+        echo "    nothing owed: the tree, /lib/modules and the ESP agree."
+    fi
+    echo "    lfs-kernel modules ath     # is a driver there, is it loaded"
+    echo "    lfs-kernel config show     # what the next build would use"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# LOADING A MODULE, NOW AND AT EVERY BOOT.
+#
+# A driver built as a module does nothing until something loads it.  For a
+# USB device udev does that when you plug it in; for everything else, and
+# on a machine where udev is not running, it is modprobe -- and then the
+# same name in /etc/sysconfig/modules, which is the file LFS's `modules`
+# bootscript reads.  Two places, one command.
+# --------------------------------------------------------------------------
+if [ -n "${_LOADCMD:-}" ]; then
+    _MODFILE="${MODULES_FILE:-/etc/sysconfig/modules}"
+    _boot=0; _names=()
+    for _a in ${_LOADARGS[@]+"${_LOADARGS[@]}"}; do
+        case "$_a" in
+            --boot) _boot=1 ;;
+            -*) echo "!! lfs-kernel $_LOADCMD: unknown option '$_a'"; exit 1 ;;
+            *) _names+=("$_a") ;;
+        esac
+    done
+    if [ "${#_names[@]}" = 0 ]; then
+        echo "!! lfs-kernel $_LOADCMD <module> [...] [--boot]"
+        echo "   which modules there are:  lfs-kernel modules <text>"
+        exit 1
+    fi
+    _rc=0
+    for _m in "${_names[@]}"; do
+        _m="$(printf '%s' "$_m" | tr '-' '_')"
+        if [ "$_LOADCMD" = unload ]; then
+            if modprobe -r "$_m" 2>&1; then
+                echo "# $_m: unloaded"
+            else
+                echo "!! $_m: could not be unloaded (in use? lsmod | grep $_m)"
+                _rc=1
+            fi
+            if [ -f "$_MODFILE" ] && grep -qE "^[[:space:]]*$_m([[:space:]]|$)" "$_MODFILE"; then
+                cp -p "$_MODFILE" "$_MODFILE.bak-$(date +%Y%m%d-%H%M%S)"
+                _t="$(mktemp)"
+                grep -vE "^[[:space:]]*$_m([[:space:]]|$)" "$_MODFILE" > "$_t" \
+                    && cat "$_t" > "$_MODFILE"
+                rm -f "$_t"
+                echo "#   and taken out of $_MODFILE"
+            fi
+            continue
+        fi
+        if grep -qE "^${_m}[[:space:]]" /proc/modules 2>/dev/null; then
+            echo "# $_m: already loaded"
+        elif modprobe "$_m" 2>&1; then
+            if grep -qE "^${_m}[[:space:]]" /proc/modules 2>/dev/null; then
+                echo "# $_m: loaded"
+            else
+                # BUILT IN IS NOT A FAILURE.  modprobe succeeds silently for
+                # a symbol that is =y; the module simply never appears in
+                # /proc/modules because it is part of the image.
+                echo "# $_m: modprobe returned success but it is not in"
+                echo "#   /proc/modules -- it is probably built INTO the kernel"
+                echo "#   (lfs-kernel modules $_m says which)"
+            fi
+        else
+            echo "!! $_m: modprobe refused it."
+            echo "   is it built?   lfs-kernel modules $_m"
+            echo "   is it set?     lfs-kernel config search $_m"
+            _rc=1
+            continue
+        fi
+        # WHAT THE KERNEL SAID ABOUT IT, which is where a missing firmware
+        # blob or an unsupported device id turns up.
+        if command -v dmesg >/dev/null 2>&1; then
+            _say="$(dmesg 2>/dev/null | tail -n 40 \
+                    | grep -iE "${_m}|${_m//_/-}|firmware" | tail -n 5)"
+            [ -n "$_say" ] && printf '%s\n' "$_say" | sed 's/^/    /'
+        fi
+        if [ "$_boot" = 1 ]; then
+            if [ -f "$_MODFILE" ] && grep -qE "^[[:space:]]*$_m([[:space:]]|$)" "$_MODFILE"; then
+                echo "#   $_MODFILE already lists it"
+            else
+                [ -f "$_MODFILE" ] \
+                    && cp -p "$_MODFILE" "$_MODFILE.bak-$(date +%Y%m%d-%H%M%S)"
+                if [ ! -f "$_MODFILE" ]; then
+                    install -d "$(dirname "$_MODFILE")"
+                    {
+                        echo "# /etc/sysconfig/modules -- one module per line,"
+                        echo "# loaded at boot by the 'modules' bootscript."
+                        echo "# Arguments may follow the name."
+                    } > "$_MODFILE"
+                fi
+                printf '%s\n' "$_m" >> "$_MODFILE"
+                echo "#   added to $_MODFILE (loaded at every boot)"
+            fi
+        else
+            echo "#   at every boot as well:  lfs-kernel load $_m --boot"
+        fi
+    done
+    exit $_rc
+fi
 
 # --------------------------------------------------------------------------
 # the ESP has to be the EFI partition, not a directory of the same name.
@@ -314,91 +1290,6 @@ if [ "${_VERIFY:-0}" = 1 ]; then
     exit 1
 fi
 
-echo "# kernel $VERSION -> $ESP   (tree $tree, $JOBS)"
-
-# --------------------------------------------------------------------------
-# THE COMMANDS.  Everything above chooses the version and checks the paths;
-# everything below is the build, and is meant to be read.
-# --------------------------------------------------------------------------
-install -d "$SRC"
-if [ ! -d "$tree" ]; then
-    [ -f "$tarball" ] || {
-        echo "# fetching $MIRROR_TAR/v$major.x/linux-$VERSION.tar.xz"
-        wget -q --show-progress -O "$tarball.part" \
-             "$MIRROR_TAR/v$major.x/linux-$VERSION.tar.xz" \
-          && mv "$tarball.part" "$tarball" \
-          || { rm -f "$tarball.part"
-               echo "!! download failed -- KERNEL_LIST=1 shows what exists"; exit 1; }
-    }
-    tar -xf "$tarball" -C "$SRC" || exit 1
-    chown -R "$acct:$acct" "$tree" "$tarball" 2>/dev/null || true
-fi
-[ -d "$tree" ] || { echo "!! $tree is missing"; exit 1; }
-
-# boot logo (optional)
-if [ -n "${BOOTLOGO:-}" ]; then
-    logo="$SRC/$(basename "$BOOTLOGO")"
-    [ -f "$logo" ] || { wget -qO "$logo" "$BOOTLOGO" && chown "$acct:$acct" "$logo"; } || logo=""
-    [ -n "$logo" ] && _as_pkg "cp -v '$logo' drivers/video/logo/logo_linux_clut224.ppm"
-fi
-
-# .config
-case "$CONFIG_FROM" in
-    running) _as_pkg "gunzip < /proc/config.gz > .config" || {
-                 echo "!! /proc/config.gz unreadable -- set CONFIG_FROM=file:<path>"; exit 1; } ;;
-    file:*)  _as_pkg "cp -v '${CONFIG_FROM#file:}' .config" || exit 1 ;;
-    keep)    [ -f "$tree/.config" ] || { echo "!! no .config in $tree"; exit 1; } ;;
-    *)       echo "!! CONFIG_FROM=$CONFIG_FROM not understood"; exit 1 ;;
-esac
-# ---- refreshing the config for a NEW kernel ------------------------------
-#
-# A config from one kernel is never complete for another: every version adds
-# symbols the old file has no answer for.  Something must decide them, and
-# which something matters:
-#
-#   olddefconfig  take the DEFAULT for each new symbol, no questions.  The
-#                 right choice for an unattended run, and what this tool has
-#                 always done -- but the defaults are upstream's, not yours.
-#   oldconfig     ask about each new symbol, one at a time.  Slow, and needs
-#                 someone at the terminal, but nothing is decided silently.
-#   menuconfig    open the editor and decide everything at once.
-#   none          use the .config exactly as it is; `make` will then ask, or
-#                 fail, depending on what is missing.
-#
-# It also says how many symbols the refresh had to answer, because "47 new
-# symbols were set to their defaults" is worth knowing before a boot.
-: "${CONFIG_REFRESH:=olddefconfig}"
-_cfg_before="$(mktemp)"; cp "$tree/.config" "$_cfg_before" 2>/dev/null || true
-case "$CONFIG_REFRESH" in
-    none) echo "# not refreshing the config (CONFIG_REFRESH=none)" ;;
-    olddefconfig|oldconfig|menuconfig|*config)
-        echo "# refreshing the config for $VERSION (make $CONFIG_REFRESH) ..."
-        _as_pkg "make $CONFIG_REFRESH" || exit 1 ;;
-    *)  echo "!! CONFIG_REFRESH=$CONFIG_REFRESH is not understood"; exit 1 ;;
-esac
-if [ -s "$_cfg_before" ] && [ "$CONFIG_REFRESH" != none ]; then
-    _newsym="$(diff <(sort "$_cfg_before") <(sort "$tree/.config") 2>/dev/null \
-               | grep -c '^>' || true)"
-    [ "${_newsym:-0}" -gt 0 ] \
-        && echo "#   $_newsym config line(s) differ from the config you started from"
-fi
-rm -f "$_cfg_before"
-
-# what a Wayland compositor needs; a warning, not a refusal
-for opt in CONFIG_DRM CONFIG_DRM_FBDEV_EMULATION CONFIG_INPUT_EVDEV CONFIG_SYSVIPC; do
-    grep -qE "^$opt=(y|m)" "$tree/.config" || echo "!! $opt is not set (sway needs it)"
-done
-# Drivers that need firmware are no use without the driver.  These are the
-# ones a laptop misses most often; the firmware for each is in FIRMWARE_ONLY.
-for opt in CONFIG_IWLWIFI:"Intel wireless (AX200 and friends)" \
-           CONFIG_IWLMVM:"the AX200's own MVM firmware layer" \
-           CONFIG_BT_HCIBTUSB:"USB Bluetooth (the AX200's other half)" \
-           CONFIG_DRM_AMDGPU:"AMD graphics"; do
-    _o="${opt%%:*}"; _why="${opt#*:}"
-    grep -qE "^$_o=(y|m)" "$tree/.config" \
-        || echo "!! $_o is not set -- no $_why"
-done
-
 # ---- firmware, as its own package ----------------------------------------
 #
 # The drivers need it at RUN time and CONFIG_EXTRA_FIRMWARE needs it at BUILD
@@ -426,6 +1317,9 @@ _sparse_args() {
             out="$out $e"
         fi
     done
+    # WHENCE lists the flat-name links (see _fw_whence_links).  Cone mode
+    # always checks out top-level files; pattern mode only what it is told.
+    [ -n "$mode" ] && out="$out /WHENCE"
     printf '%s' "${out# }"
 }
 
@@ -447,7 +1341,11 @@ _firmware_not_found() {
     # the question actually being asked.
     local _hits=""
     if [ -d "$src/.git" ]; then
-        _hits="$(git -C "$src" ls-files 2>/dev/null | grep -i -- "$stem" | head -12)"
+        _hits="$(_fw_index "$src" | grep -i -- "$stem" | head -12)"
+        if [ -n "$_FW_INDEX_ERR" ]; then
+            echo "   (could not read the repository index, so this is what is on"
+            echo "    disk only: $_FW_INDEX_ERR)"
+        fi
     fi
     [ -n "$_hits" ] || _hits="$(find "$src" -maxdepth 2 -iname "*$stem*" \
                                 -printf '%P\n' 2>/dev/null | head -12)"
@@ -464,6 +1362,64 @@ _firmware_not_found() {
                 | sed 's/^/     /'
         fi
     fi
+}
+
+# THE REGULATORY DATABASE IS NOT IN linux-firmware.
+#
+# cfg80211 asks the loader for regulatory.db, linux-firmware does not carry
+# it, and no FIRMWARE_ONLY entry can conjure it -- worse, an entry naming it
+# makes the whole firmware install FAIL, because a pattern matching nothing
+# in the repository is an error.  It is released on its own as
+# wireless-regdb, and it belongs to the same package user as the rest of
+# /lib/firmware: one directory, one owner.
+REGDB_BASE="${REGDB_BASE:-https://www.kernel.org/pub/software/network/wireless-regdb}"
+_install_regdb() {
+    local acct=p_linux-firmware home tar url ver work
+    case "${REGDB:-yes}" in yes|1|true) ;; *) return 0 ;; esac
+    [ -e /lib/firmware/regulatory.db ] && [ "${1:-}" != force ] && return 0
+    id "$acct" >/dev/null 2>&1 || packagemanager add-user linux-firmware || return 1
+    home="$(getent passwd "$acct" | cut -d: -f6)"
+    # ASK, DO NOT ASSUME A VERSION: the directory listing names the releases,
+    # and a hard-coded date goes stale between them.
+    ver="$(wget -qO- "$REGDB_BASE/" 2>/dev/null \
+           | sed -n 's/.*wireless-regdb-\([0-9.]*\)\.tar\.xz.*/\1/p' \
+           | sort -V | tail -n1)"
+    if [ -z "$ver" ]; then
+        echo "!! could not read $REGDB_BASE/ -- no network, or the layout moved."
+        echo "   Fetch a wireless-regdb tarball by hand, then:"
+        echo "     su - $acct -c 'cp regulatory.db regulatory.db.p7s /lib/firmware/'"
+        return 1
+    fi
+    url="$REGDB_BASE/wireless-regdb-$ver.tar.xz"
+    tar="$home/src/wireless-regdb-$ver.tar.xz"
+    install -d -o "$acct" -g "$acct" -m 755 "$home/src" 2>/dev/null
+    # CONFIRM THE DIRECTORY BEFORE DOWNLOADING INTO IT.  `install -d -o` on
+    # an account that does not exist fails quietly, and the next line then
+    # reports a download failure for a URL that was never the problem.
+    [ -d "$home/src" ] || {
+        echo "!! $home/src does not exist and could not be created"
+        echo "   (does the account $acct have that home?  lfs-helper fix-home $acct --run)"
+        return 1; }
+    echo "# wireless-regdb $ver (the regulatory database, not in linux-firmware)"
+    [ -s "$tar" ] || su - "$acct" -c "wget -qO '$tar' '$url'" || {
+        echo "!! could not download $url"; rm -f "$tar"; return 1; }
+    work="$home/src/wireless-regdb-$ver"
+    su - "$acct" -c "cd '$home/src' && tar -xf '$tar'" || return 1
+    [ -s "$work/regulatory.db" ] || {
+        echo "!! $tar unpacked without a regulatory.db in it"; return 1; }
+    install -d -m 755 /lib/firmware 2>/dev/null
+    [ "$(stat -c %U /lib/firmware 2>/dev/null)" = "$acct" ] \
+        || chown "$acct:$acct" /lib/firmware 2>/dev/null
+    su - "$acct" -c "cp -a '$work/regulatory.db' '$work/regulatory.db.p7s' /lib/firmware/" \
+        || { echo "!! could not install the database as $acct"; return 1; }
+    if [ -s /lib/firmware/regulatory.db ]; then
+        echo "#   installed /lib/firmware/regulatory.db ($(stat -c %s /lib/firmware/regulatory.db) bytes)"
+        echo "#             /lib/firmware/regulatory.db.p7s"
+        packagemanager reload-pkg-list linux-firmware >/dev/null 2>&1 || true
+        return 0
+    fi
+    echo "!! /lib/firmware/regulatory.db is absent after the copy"
+    return 1
 }
 
 _install_firmware() {
@@ -538,14 +1494,49 @@ _install_firmware() {
         su - "$acct" -c "cp -a '$src'/* /lib/firmware/" || return 1
     else
         for d in $only; do
+            # AN ENTRY FOR SOMETHING THIS REPOSITORY DOES NOT HAVE IS NOT AN
+            # ERROR WHEN WE KNOW WHERE IT DOES LIVE.  `regulatory.db*` in
+            # FIRMWARE_ONLY failed the entire firmware install, and the
+            # message blamed the pattern.
+            _skip=0
+            while IFS='|' read -r _ep _epkg _eurl; do
+                [ -n "${_ep:-}" ] || continue
+                case "$_ep" in
+                    $d) _skip=1 ;;
+                esac
+            done < <(_fw_elsewhere)
+            if [ "$_skip" = 1 ]; then
+                echo "# '$d' is not in linux-firmware -- it is wireless-regdb;"
+                echo "#   installing that instead (REGDB=${REGDB:-yes})"
+                _install_regdb || echo "#   ...which did not work; see above"
+                continue
+            fi
             # a pattern matches files at the top level; a name is a directory
             case "$d" in
                 *[*?[]*)
-                    if ! su - "$acct" -c "ls -d $src/$d >/dev/null 2>&1"; then
+                    # A PATTERN MATCHES AT ANY DEPTH, AND A LINK NAME COUNTS.
+                    #
+                    # linux-firmware moved iwlwifi-*.ucode into intel/iwlwifi/
+                    # and keeps the flat names the driver asks for as `Link:`
+                    # lines in WHENCE.  The sparse checkout (gitignore rules)
+                    # already fetched them at their new depth; this looked
+                    # only at the top level and stopped the kernel build.
+                    local _hits _links
+                    _hits="$(cd "$src" && find . -name .git -prune -o \( -type f -o -type l \) -name "$d" -print 2>/dev/null | sed 's|^\./||')"
+                    _links="$(_fw_whence_link_names "$src" | while IFS= read -r _ln; do
+                                  case "$_ln" in $d) echo "$_ln" ;; esac; done)"
+                    if [ -z "$_hits" ] && [ -z "$_links" ]; then
                         _firmware_not_found "$src" "$d"; return 1
                     fi
-                    echo "# installing firmware: $d"
-                    su - "$acct" -c "cp -a $src/$d /lib/firmware/" || return 1 ;;
+                    echo "# installing firmware: $d ($(printf '%s\n' "$_hits" | grep -c .) file(s)$([ -n "$_links" ] && printf ', %s flat link(s) from WHENCE' "$(printf '%s\n' "$_links" | grep -c .)"))"
+                    # --parents, and from inside the checkout: `cp -a
+                    # $src/intel/iwlwifi /lib/firmware/` dropped the intel/
+                    # and landed as /lib/firmware/iwlwifi, where nothing
+                    # looks for it.  An entry keeps its path.
+                    if [ -n "$_hits" ]; then
+                        printf '%s\n' "$_hits" \
+                            | su - "$acct" -c "cd '$src' && xargs -r -d '\\n' cp -a --parents -t /lib/firmware/" || return 1
+                    fi ;;
                 *)
                     # ...the same help for a NAME.  Only the pattern case
                     # searched, so `iwlwifi` (a directory that does not
@@ -553,13 +1544,709 @@ _install_firmware() {
                     # the reader exactly where the pattern had.
                     [ -e "$src/$d" ] || { _firmware_not_found "$src" "$d"; return 1; }
                     echo "# installing firmware: $d"
-                    su - "$acct" -c "cp -a '$src/$d' /lib/firmware/" || return 1 ;;
+                    su - "$acct" -c "cd '$src' && cp -a --parents '$d' /lib/firmware/" || return 1 ;;
             esac
         done
     fi
+    [ -n "$only" ] && _fw_whence_links "$src" "$acct"
+    _install_regdb || true
     packagemanager reload-pkg-list linux-firmware >/dev/null 2>&1 || true
     return 0
 }
+
+# WHENCE's `Link: <name> -> <target>` lines are how linux-firmware keeps the
+# names drivers ask for after moving a blob (iwlwifi-cc-a0-77.ucode ->
+# intel/iwlwifi/iwlwifi-cc-a0-77.ucode).  Its own copy-firmware.sh makes
+# them; a selective install has to as well.  The target is relative to the
+# link's directory.
+_fw_whence_link_names() {
+    [ -r "$1/WHENCE" ] || return 0
+    sed -n 's/^Link:[[:space:]]*\([^[:space:]]*\)[[:space:]]*->.*/\1/p' "$1/WHENCE"
+}
+_fw_whence_links() {
+    local src="$1" acct="$2" name target made=0
+    [ -r "$src/WHENCE" ] || { echo "#   (no WHENCE in the checkout -- flat firmware names not linked)"; return 0; }
+    while read -r name target; do
+        [ -n "$name" ] && [ -n "$target" ] || continue
+        # only for blobs that were installed, and never over a real file
+        [ -e "/lib/firmware/$(dirname "$name")/$target" ] || continue
+        [ -e "/lib/firmware/$name" ] || [ -L "/lib/firmware/$name" ] && continue
+        su - "$acct" -c "mkdir -p '/lib/firmware/$(dirname "$name")' && ln -s '$target' '/lib/firmware/$name'" \
+            && made=$((made + 1))
+    done < <(sed -n 's/^Link:[[:space:]]*\([^[:space:]]*\)[[:space:]]*->[[:space:]]*\([^[:space:]]*\).*/\1 \2/p' "$src/WHENCE")
+    [ "$made" -gt 0 ] && echo "# linked $made flat firmware name(s) from WHENCE"
+    return 0
+}
+
+# REPORT WHAT YOU FOUND, NOT WHAT YOU EXPECTED.
+#
+# FIRMWARE_ONLY="... intel" installed intel/, and the AX200 still had no
+# firmware, because the driver asks for a FLAT path:
+#     iwlwifi 0000:03:00.0: Direct firmware load for iwlwifi-cc-a0-77.ucode failed
+#     iwlwifi 0000:03:00.0: no suitable firmware found!
+# Four releases went into guessing linux-firmware's layout from the outside.
+# The running kernel already knows the answer -- it printed the exact path it
+# wanted -- and the checkout's git index knows where that file lives.  So ask
+# both, instead of reasoning about directory names.
+_fw_requests() {
+    # every firmware path THIS boot asked for and did not get
+    dmesg 2>/dev/null | sed -n \
+        -e 's/.*Direct firmware load for \([^ ]*\) failed.*/\1/p' \
+        -e 's/.*firmware: failed to load \([^ ]*\).*/\1/p' \
+        | sed 's/[,:]$//' | sort -u
+}
+
+# ASK THE INDEX -- AND NOTICE WHEN THE ASKING FAILED.
+#
+# `git -C "$src" ls-files 2>/dev/null` returned nothing and rc 128, because
+# the repository belongs to p_linux-firmware and this runs as root:
+#     fatal: detected dubious ownership in repository at '...'
+# The empty output was then reported as a FACT -- "linux-firmware does not
+# have a file by that name at all" -- about a file that is right there.  An
+# error hidden behind 2>/dev/null becomes a confident wrong answer.
+_FW_INDEX_ERR=""
+_fw_index() {   # _fw_index <repo> [<basename to match>]
+    local src="$1" want="${2:-}" out="" err=""
+    _FW_INDEX_ERR=""
+    if [ -d "$src/.git" ]; then
+        # -c safe.directory: the checkout is the firmware account's and this
+        # runs as root, which git refuses to touch without being told.
+        # the scratch file goes in /tmp, not in the repository: leaving
+        # untracked files in someone else's checkout is not this tool's business
+        local tmp; tmp="$(mktemp)"
+        # ls-TREE, not ls-files.  With a sparse index git collapses every
+        # excluded directory into one entry, so `ls-files` answered `intel/`
+        # and every nested blob under it looked absent -- 56 files reported
+        # as "this checkout has no file by that name" while they were all
+        # right there.  ls-tree reads the commit, which no sparse setting
+        # touches.
+        err="$(git -c "safe.directory=$src" -C "$src" ls-tree -r --name-only HEAD 2>&1 >"$tmp")"
+        if [ -n "$err" ] && [ ! -s "$tmp" ]; then
+            _FW_INDEX_ERR="$err"
+            rm -f "$tmp"
+            return 1
+        fi
+        out="$(cat "$tmp")"
+        rm -f "$tmp"
+    else
+        out="$(cd "$src" && find . -type f -printf '%P\n' 2>/dev/null)"
+    fi
+    if [ -n "$want" ]; then
+        printf '%s\n' "$out" | grep -- "\(^\|/\)$want$"
+    else
+        printf '%s\n' "$out"
+    fi
+}
+
+_fw_repo() {   # the linux-firmware checkout, or empty
+    local home
+    home="$(getent passwd p_linux-firmware 2>/dev/null | cut -d: -f6)"
+    case "$FIRMWARE_FROM" in
+        copy:*) printf '%s' "${FIRMWARE_FROM#copy:}" ;;
+        *)      [ -n "$home" ] && printf '%s' "$home/src/linux-firmware" ;;
+    esac
+}
+
+# WHICH KERNEL'S MODULES?  In a chroot the running kernel is the host's, so
+# `uname -r` is the wrong answer.  Prefer the version this tool is configured
+# for, then whatever is installed under /lib/modules, and SAY which one.
+_fw_modver() {
+    local v
+    for v in "${VERSION:-}" "$(uname -r)"; do
+        [ -n "$v" ] && [ -d "/lib/modules/$v" ] && { printf '%s' "$v"; return 0; }
+    done
+    ls -1d /lib/modules/*/ 2>/dev/null | sed 's|.*/modules/||; s|/$||' \
+        | sort -V | tail -n1
+}
+
+# Firmware that is NOT in linux-firmware, so "not in the checkout" is the
+# right answer and updating the checkout will never help.
+_fw_elsewhere() {
+    cat <<'ELSE'
+regulatory.db|wireless-regdb|https://kernel.org/pub/software/network/wireless-regdb/
+regulatory.db.p7s|wireless-regdb|https://kernel.org/pub/software/network/wireless-regdb/
+ELSE
+}
+
+# WHAT WILL BE ASKED FOR -- from sources that also work in a chroot.
+#
+# dmesg answers "what did the kernel that is running ask for", which in a
+# chroot is the host's boot: it reported one missing file for 7.2.0 while the
+# kernel of interest was 7.2.4, and said nothing about the wireless at all.
+# The tree can be asked directly instead: the modules it installed declare
+# their firmware (modinfo -F firmware), and the hardware is right here in
+# /sys, so the two together give the list for THIS machine and THIS kernel
+# without booting it.
+#
+# Prints "<source>|<path>" so every line can say where the fact came from.
+_fw_wanted() {   # _fw_wanted <modules-version>
+    local ver="${1:-}" a m f cfg
+    # 1. the boot that is running -- _fw_requests is the one dmesg parser
+    _fw_requests | sed 's/^/boot|/'
+    # 2. this tree's modules, for the hardware that is actually present
+    if [ -n "$ver" ] && [ -d "/lib/modules/$ver" ] \
+       && command -v modinfo >/dev/null 2>&1; then
+        find /sys/devices -name modalias -print 2>/dev/null \
+            | xargs -r cat 2>/dev/null | sort -u \
+            | while IFS= read -r a; do
+                  [ -n "$a" ] || continue
+                  # modprobe resolves an alias through the TREE's
+                  # modules.alias when told which version to use
+                  modprobe -S "$ver" -R -- "$a" 2>/dev/null || true
+              done | sort -u \
+            | while IFS= read -r m; do
+                  [ -n "$m" ] || continue
+                  # the MODULE's name travels with the request: a module
+                  # declares firmware for every chip it supports, so these
+                  # are candidates, and which module they came from is the
+                  # only thing that makes them readable
+                  modinfo -k "$ver" -F firmware -- "$m" 2>/dev/null \
+                      | sed "s|^|modules:$m\||"
+              done
+    fi
+    # 3. what the config embeds -- those must be on disk to BUILD, and are
+    #    the one part a running kernel never complains about
+    for cfg in "$ESP/config-$ver" "/boot/config-$ver" /proc/config.gz; do
+        [ -r "$cfg" ] || continue
+        case "$cfg" in
+            *.gz) zcat "$cfg" 2>/dev/null ;;
+            *)    cat "$cfg" ;;
+        esac | sed -n 's/^CONFIG_EXTRA_FIRMWARE="\(.*\)"$/\1/p' \
+             | tr ' ' '\n' | sed '/^$/d; s/^/config|/'
+        break
+    done
+}
+
+# A MODULE DECLARES FIRMWARE FOR EVERY CHIP IT SUPPORTS.
+#
+# The first version of the modules scan printed 56 lines of "MISSING", each
+# with its own remedy: amdgpu blobs for Vega, Sienna Cichlid and Aldebaran,
+# iwlwifi blobs for five RF families this laptop does not have.  Every one of
+# them was a fact -- `modinfo -F firmware amdgpu` really does list them --
+# and the conclusion drawn from them ("56 missing") was wrong: the driver
+# loads what its own chip needs and ignores the rest.  So a boot failure and
+# a module declaration are not the same kind of statement and must not be
+# printed the same way.
+# WHAT IS THERE, NEXT TO WHAT IS NOT.
+#
+# `iwlwifi-cc-a0-77.ucode` missing, on a machine whose wifi worked under the
+# previous kernel, means one of two things -- the file is on disk under
+# another directory, or an OLDER API version of it is installed and the new
+# driver will not take it -- and the report said neither.  Both are one
+# `find` and one glob away, and both change what you do next.
+_FW_LOCAL=""
+_fw_neighbours() {   # _fw_neighbours <requested-path> [<repo>]
+    # THE EXPLANATION GOES TO THE READER, THE PATH GOES IN A VARIABLE.
+    # Returning the path on stdout meant the caller's `$(...)` swallowed
+    # every line of the explanation with it, and the report said only
+    # "installed" with no word about where the file had been.
+    local req="$1" src="${2:-}" base stem ext found sib _api
+    _FW_LOCAL=""
+    base="$(basename "$req")"
+    # 1. the same file, somewhere else under /lib/firmware.  FIRMWARE_ONLY
+    #    entries keep the repository's path, and a driver asks the loader for
+    #    its own -- so `intel` installs intel/iwlwifi/x.ucode while the
+    #    driver wants x.ucode at the top.
+    found="$(find /lib/firmware -name "$base" -printf '%P\n' 2>/dev/null \
+             | grep -v "^$req$" | head -3)"
+    if [ -n "$found" ]; then
+        echo "          it IS on disk, at another path:"
+        printf '            /lib/firmware/%s\n' $found
+        echo "          the loader asks for /lib/firmware/$req and nothing else,"
+        echo "          so --fix puts a copy there."
+        _FW_LOCAL="$(printf '%s' "$found" | head -n1)"
+        return 0
+    fi
+    # 2. an API-versioned sibling: iwlwifi-cc-a0-72.ucode when -77 is asked
+    #    for.  The number is the firmware API the driver demands, so an older
+    #    one on disk is the whole story: this kernel needs a newer blob.
+    case "$base" in
+        *-[0-9][0-9].*|*-[0-9][0-9][0-9].*)
+            ext="${base##*.}"
+            stem="${base%-*}"
+            sib="$(ls -1 "/lib/firmware/$(dirname "$req")/$stem"-*."$ext" \
+                   2>/dev/null | xargs -r -n1 basename | tr '\n' ' ')"
+            [ -n "$sib" ] && {
+                echo "          installed already, for the same device but an older"
+                echo "          firmware API: $sib"
+                _api="${base##*-}"; _api="${_api%.*}"
+                echo "          This kernel's driver requires API $_api and will not"
+                echo "          fall back, so the checkout needs to be newer."; }
+            if [ -n "$src" ] && [ -d "$src" ]; then
+                sib="$(_fw_index "$src" | grep -- "\(^\|/\)$stem-[0-9]*\.$ext$" \
+                       | xargs -r -n1 basename | sort -V | tail -3 | tr '\n' ' ')"
+                [ -n "$sib" ] && echo "          the checkout has: $sib"
+            fi ;;
+    esac
+    return 1
+}
+
+_firmware_missing() {
+    local fix="${1:-0}" all="${2:-0}" src req f hits n=0 gone=0 fixed=0 failed=0
+    local sugg="" ver source chroot=0 _rr _tr seen="" cand=0 cdir mod
+    src="$(_fw_repo)"
+    ver="$(_fw_modver)"
+    cdir="$(mktemp -d)"
+    _rr="$(stat -c %d:%i /proc/1/root/. 2>/dev/null || true)"
+    _tr="$(stat -c %d:%i / 2>/dev/null || true)"
+    [ -n "$_rr" ] && [ -n "$_tr" ] && [ "$_rr" != "$_tr" ] && chroot=1
+
+    echo "### firmware this machine will ask for, and has not got"
+    echo "#   modules scanned: ${ver:-(none installed under /lib/modules)}"
+    echo "#   running kernel:  $(uname -r)$([ "$chroot" = 1 ] && printf ' (the HOST kernel -- this is a chroot)')"
+    if [ "$chroot" = 1 ]; then
+        echo "#   in a chroot, 'boot' lines describe the HOST's boot -- possibly"
+        echo "#   another distribution on other hardware, in which case they can"
+        echo "#   neither confirm nor deny anything about this tree.  'modules'"
+        echo "#   and 'config' lines are this tree's."
+    fi
+    [ -z "$ver" ] && echo "#   no modules to scan, so only the running boot can be asked."
+    echo
+    while IFS='|' read -r source req; do
+        [ -n "${req:-}" ] || continue
+        case "$req" in */) continue ;; esac
+        case " $seen " in *" $req "*) continue ;; esac
+        seen="${seen:-} $req"
+        n=$((n + 1))
+        if [ -e "/lib/firmware/$req" ]; then
+            # SAY WHAT IS SATISFIED, especially here.  A boot line that is
+            # now present is the answer to "will this work when I boot it",
+            # and it was skipped silently -- so a run with everything in
+            # place looked identical to one that had not looked at all.
+            case "$source" in
+                modules:*) printf '%s\n' "$req" >> "$cdir/${source#modules:}.ok" ;;
+                *) echo "  ok      $req   ($source) -- installed now" ;;
+            esac
+            continue
+        fi
+        # A DECLARATION IS A CANDIDATE, NOT A FAILURE.  Collected per module
+        # and summarised below; only boot and config lines are treated as
+        # things that must be fixed.
+        case "$source" in
+            modules:*)
+                mod="${source#modules:}"
+                printf '%s\n' "$req" >> "$cdir/$mod"
+                cand=$((cand + 1))
+                [ "$all" = 1 ] || continue ;;
+        esac
+        gone=$((gone + 1))
+        echo "  MISSING /lib/firmware/$req   ($source)"
+        while IFS='|' read -r _ep _epkg _eurl; do
+            [ "$_ep" = "$req" ] || continue
+            echo "          not part of linux-firmware: it is released as $_epkg"
+            echo "            $_eurl"
+            if [ "$fix" = 1 ] && [ "$_epkg" = wireless-regdb ]; then
+                _install_regdb force && fixed=$((fixed + 1))
+            else
+                echo "          install it:  lfs-kernel firmware --missing --fix"
+                echo "          (without it cfg80211 falls back to the most"
+                echo "           conservative channels and power -- wifi still works)"
+            fi
+            continue 2
+        done < <(_fw_elsewhere)
+        # WHAT IS THERE, before what is not: a copy under another path, or an
+        # older API version, answers the question without the repository.
+        _fw_neighbours "$req" "$src"
+        if [ -n "$_FW_LOCAL" ] && [ -e "/lib/firmware/$_FW_LOCAL" ]; then
+            if [ "$fix" = 1 ]; then
+                _fw_place "/lib/firmware" "$req" "$_FW_LOCAL" \
+                    && fixed=$((fixed + 1))
+            fi
+            continue
+        fi
+        if [ -z "$src" ] || [ ! -d "$src" ]; then
+            echo "          no linux-firmware checkout to look in"
+            echo "          (FIRMWARE_FROM=$FIRMWARE_FROM; run lfs-kernel firmware first)"
+            continue
+        fi
+        hits="$(_fw_index "$src" "$(basename "$req")" | head -4)"
+        if [ -n "$_FW_INDEX_ERR" ]; then
+            echo "          could not read the repository, so where this file"
+            echo "          lives is UNKNOWN -- not absent:"
+            printf '            %s\n' "$_FW_INDEX_ERR"
+            failed=$((failed + 1))
+            continue
+        fi
+        if [ -z "$hits" ]; then
+            echo "          this checkout has no file by that name."
+            echo "            su - p_linux-firmware -c 'git -C $src pull'"
+            continue
+        fi
+        printf '          the repository has it at: %s\n' $hits
+        for f in $hits; do
+            if [ "$f" = "$req" ]; then
+                case "$f" in
+                    */) ;;
+                    */*) sugg="$sugg ${f%/*}" ;;
+                    *)   sugg="$sugg $f" ;;
+                esac
+            else
+                echo "          no FIRMWARE_ONLY entry can express this: the"
+                echo "          repository keeps it at '$f', the driver asks for"
+                echo "          '$req'.  --fix installs it where the loader looks."
+            fi
+        done
+        [ "$fix" = 1 ] && _fw_place "$src" "$req" "$(echo $hits | cut -d" " -f1)" \
+            && fixed=$((fixed + 1))
+    done < <(_fw_wanted "$ver")
+
+    [ "$gone" = 0 ] && [ "$n" -gt 0 ] \
+        && echo "  nothing that has actually been asked for is missing."
+
+    # ---- the candidates, per module, in a few lines rather than fifty ----
+    if [ "$cand" -gt 0 ] && [ "$all" != 1 ]; then
+        echo
+        echo "Declared but not installed -- CANDIDATES, not failures.  A module"
+        echo "declares firmware for every chip it supports; yours loads only"
+        echo "the ones it needs, and never asks for the others:"
+        for f in "$cdir"/*; do
+            [ -f "$f" ] || continue
+            case "$f" in *.ok) continue ;; esac
+            mod="$(basename "$f")"
+            echo "    $mod: $(grep -c . "$f") of $(( $(grep -c . "$f") \
+                 + $( [ -f "$cdir/$mod.ok" ] && grep -c . "$cdir/$mod.ok" || echo 0) )) \
+declared file(s) not installed, e.g. $(head -n1 "$f")"
+        done
+        if [ "$chroot" = 1 ]; then
+            echo "  If a driver you need is silent, boot THIS kernel and run this"
+            echo "  again there: the 'boot' list above is the host's, and says"
+            echo "  nothing about the driver you are asking about."
+        else
+            echo "  If a driver you need is silent, look at what it actually asked"
+            echo "  for -- the 'boot' list above, which is this kernel's."
+        fi
+        echo "  To install every declared file anyway (large, mostly unused):"
+        echo "      lfs-kernel firmware --missing --fix --all"
+    fi
+
+    # WHICH FILE A DRIVER PICKS IS DECIDED AT RUN TIME.  iwlwifi derives the
+    # name from the RF and CRF ids it reads off the card, so no amount of
+    # looking at modules and directories can promise it will find one.  Say
+    # that, rather than implying a green run is a working driver.
+    if [ "$cand" -gt 0 ] || [ "$gone" -gt 0 ]; then
+        echo
+        echo "  Only a boot of THIS kernel settles it: a driver derives the"
+        echo "  firmware name from the ids it reads off the card, so what is"
+        echo "  installed can be checked here, and what will be asked for"
+        echo "  cannot."
+    fi
+    rm -rf "$cdir"
+    echo
+    if [ "$n" = 0 ]; then
+        echo "Nothing asks for firmware here: no failed load in this boot, and"
+        echo "no module under /lib/modules${ver:+/$ver} declares any."
+        return 0
+    fi
+    if [ "$gone" = 0 ]; then
+        return 0
+    fi
+    if [ "$fix" = 1 ]; then
+        echo "Placed $fixed of $gone file(s) at the exact path the driver asked for."
+        if [ -n "$sugg" ]; then
+            echo "Make it survive the next full run -- in $CONF:"
+            echo "    FIRMWARE_ONLY=\"$FIRMWARE_ONLY$(printf '%s' "$sugg")\""
+        fi
+        [ "$fixed" -gt 0 ] && {
+            echo "Then load the driver again (or reboot):"
+            echo "    modprobe -r <driver>      # iwlwifi, amdgpu, ..."; }
+        if [ "$failed" -gt 0 ]; then
+            echo "$failed lookup(s) failed, so nothing is known about those files."
+            return 1
+        fi
+        [ "$fixed" = "$gone" ] && return 0
+        echo "Still missing: $((gone - fixed))."
+        return 1
+    fi
+    echo "Nothing was changed.  Install what linux-firmware has:"
+    echo "    lfs-kernel firmware --missing --fix"
+    if [ -n "$sugg" ]; then
+        echo "or add them to FIRMWARE_ONLY in $CONF and re-run lfs-kernel firmware:"
+        echo "    FIRMWARE_ONLY=\"$FIRMWARE_ONLY$(printf '%s' "$sugg")\""
+    fi
+    return 1
+}
+
+# Install ONE blob at the path the driver actually asked for.  The driver's
+# path and the repository's path are not the same thing (iwlwifi asks for a
+# flat name; the repository may keep it under a directory), and it is the
+# driver's that has to exist.
+#
+# ONE FILE MEANS ONE FILE.  The first version widened the sparse checkout,
+# and fell back to `sparse-checkout disable` when the add was refused -- in
+# cone mode a file path is refused, so the fallback would have materialised
+# the whole of linux-firmware: over ten gigabytes, to fix one 2 MB blob.
+# `git show HEAD:<path>` reads exactly one blob out of the repository and
+# needs no sparse mode at all (in a partial clone it fetches that blob and
+# nothing else).
+_fw_place() {   # <src-repo> <requested-path> <repo-path>
+    local src="$1" req="$2" rel="$3" acct=p_linux-firmware
+    # SEPARATE STATEMENT.  `local a="$2" d="/lib/firmware/$a"` reads $a before
+    # this local has assigned it, and `set -u` kills the function:
+    #     lfs-kernel: line ...: req: unbound variable
+    local dst="/lib/firmware/$req"
+    id "$acct" >/dev/null 2>&1 || packagemanager add-user linux-firmware || return 1
+    # /lib/firmware is this package's directory (the full run hands it over);
+    # the account has to be able to write the file it is about to own.
+    install -d -m 755 /lib/firmware 2>/dev/null
+    [ "$(stat -c %U /lib/firmware 2>/dev/null)" = "$acct" ] \
+        || chown "$acct:$acct" /lib/firmware 2>/dev/null
+    case "$req" in
+        */*) install -d -o "$acct" -g "$acct" -m 755 "/lib/firmware/$(dirname "$req")" \
+                 2>/dev/null || true ;;
+    esac
+    if [ -e "$src/$rel" ]; then
+        local _cerr
+        _cerr="$(su - "$acct" -c "cp -a '$src/$rel' '$dst'" 2>&1)" || {
+            echo "          !! could not copy it as $acct:"
+            printf '            %s\n' "${_cerr:-(no message)}"; return 1; }
+    elif [ -d "$src/.git" ]; then
+        echo "          reading it out of the repository (it is in the index,"
+        echo "          not in the sparse checkout)"
+        local _gerr
+        # git's own message, not a guess about what went wrong: "does not
+        # exist in HEAD" and "unable to read sha1 file" (a partial clone with
+        # no network) need different answers from the reader.
+        _gerr="$(su - "$acct" -c "git -c 'safe.directory=$src' -C '$src' show 'HEAD:$rel' > '$dst'" 2>&1)" || {
+            echo "          !! git could not produce $rel:"
+            printf '            %s\n' "${_gerr:-(no message)}"
+            echo "             a partial clone fetches the blob on demand, so"
+            echo "             this needs the network; check with:"
+            echo "               su - $acct -c 'git -C $src fetch --depth 1'"
+            rm -f "$dst"; return 1; }
+    else
+        echo "          !! $rel is not in $src"
+        return 1
+    fi
+    # CONFIRM YOUR OWN EFFECT: a failed `git show` can leave an empty file
+    # behind, which looks exactly like a successful install.
+    if [ -s "$dst" ]; then
+        echo "          installed $dst ($(stat -c %s "$dst") bytes)"
+        packagemanager reload-pkg-list linux-firmware >/dev/null 2>&1 || true
+        return 0
+    fi
+    echo "          !! $dst is empty or absent after the copy"
+    rm -f "$dst"
+    return 1
+}
+
+# ---- firmware without a kernel build --------------------------------------
+if [ "${_FWONLY:-0}" = 1 ]; then
+    case "${_FWARG:-}" in
+        --missing|missing)
+            _firmware_missing "${_FWFIX:-0}" "${_FWALL:-0}"; exit $? ;;
+        "")
+            [ "$FIRMWARE_FROM" = none ] \
+                && { echo "!! FIRMWARE_FROM=none in $CONF -- nothing to install."; exit 1; }
+            _install_firmware || exit 1
+            echo "# firmware installed; no kernel was built or touched."
+            exit 0 ;;
+        *)  echo "!! lfs-kernel firmware takes --missing [--fix] or nothing"; exit 1 ;;
+    esac
+fi
+
+echo "# kernel $VERSION -> $ESP   (tree $tree, $JOBS)"
+
+# ---- the plan, when --run was not given ----------------------------------
+if [ "${_RUN:-0}" != 1 ]; then
+    echo
+    echo "### what a build would do  (nothing has been built)"
+    echo "    version       $VERSION"
+    if [ -d "$tree" ]; then
+        _bz="$tree/arch/x86/boot/bzImage"
+        if [ -f "$tree/.config" ] && [ -f "$_bz" ] && [ "$_bz" -nt "$tree/.config" ]; then
+            echo "    tree          $tree (already built -- make would do little)"
+        elif [ -f "$tree/.config" ]; then
+            echo "    tree          $tree (a build was started; make CONTINUES)"
+        else
+            echo "    tree          $tree (unpacked, not configured)"
+        fi
+    else
+        echo "    tree          $tree -- would be fetched and unpacked"
+    fi
+    echo "    config from   $CONFIG_FROM, refreshed with ${CONFIG_REFRESH:-olddefconfig}"
+    [ -n "${CONFIG_SET:-}" ] && echo "    then set      $CONFIG_SET"
+    echo "    installs      $ESP/$KERNEL_NAME (previous kept as ${KERNEL_NAME}_old)"
+    echo "                  /lib/modules/$VERSION, and the config beside the image"
+    case "${FIRMWARE_FROM:-none}" in
+        none) echo "    firmware      not touched (FIRMWARE_FROM=none)" ;;
+        *)    echo "    firmware      ${FIRMWARE_FROM}: ${FIRMWARE_ONLY:-everything}" ;;
+    esac
+    [ "${HEADERS:-no}" = yes ] \
+        && echo "    headers       /usr/include, as ${HEADERS_PKG:-linux-headers}"
+    case "${V4L2LOOPBACK:-no}" in yes|1|true)
+        echo "    also          v4l2loopback, built against this tree" ;;
+    esac
+    echo
+    echo "    This is an hour of compiling on most machines, and it REPLACES"
+    echo "    what $ESP/$KERNEL_NAME boots."
+    echo "    Go ahead:   lfs-kernel${_CLI_VERSION:+ $_CLI_VERSION} --run"
+    echo "    Where we are: lfs-kernel status"
+    exit 0
+fi
+
+# --------------------------------------------------------------------------
+# THE COMMANDS.  Everything above chooses the version and checks the paths;
+# everything below is the build, and is meant to be read.
+# --------------------------------------------------------------------------
+install -d "$SRC"
+if [ ! -d "$tree" ]; then
+    [ -f "$tarball" ] || {
+        echo "# fetching $MIRROR_TAR/v$major.x/linux-$VERSION.tar.xz"
+        wget -q --show-progress -O "$tarball.part" \
+             "$MIRROR_TAR/v$major.x/linux-$VERSION.tar.xz" \
+          && mv "$tarball.part" "$tarball" \
+          || { rm -f "$tarball.part"
+               echo "!! download failed -- KERNEL_LIST=1 shows what exists"; exit 1; }
+    }
+    tar -xf "$tarball" -C "$SRC" || exit 1
+    chown -R "$acct:$acct" "$tree" "$tarball" 2>/dev/null || true
+fi
+[ -d "$tree" ] || { echo "!! $tree is missing"; exit 1; }
+
+# boot logo (optional)
+if [ -n "${BOOTLOGO:-}" ]; then
+    logo="$SRC/$(basename "$BOOTLOGO")"
+    [ -f "$logo" ] || { wget -qO "$logo" "$BOOTLOGO" && chown "$acct:$acct" "$logo"; } || logo=""
+    [ -n "$logo" ] && _as_pkg "cp -v '$logo' drivers/video/logo/logo_linux_clut224.ppm"
+fi
+
+# .config
+#   running     /proc/config.gz -- the kernel carrying the machine
+#   last-good   the config of the last kernel that BOOTED  ($KCFG_DIR)
+#   prev-good   the one before it -- the way back from a bad answer
+#   saved       the newest config this tool built with, booted or not
+#   file:<path> any file;  keep  the tree's own .config
+_cfg_src=""
+case "$CONFIG_FROM" in
+    running)
+        if [ -r /proc/config.gz ]; then
+            _as_pkg "gunzip < /proc/config.gz > .config" || exit 1
+        elif _kcfg_readable "$KCFG_DIR/last-good.config"; then
+            # NOT A FAILURE WORTH STOPPING FOR.  A kernel built without
+            # CONFIG_IKCONFIG_PROC has no /proc/config.gz, and the config of
+            # the last kernel that booted is the same answer from a file.
+            echo "# /proc/config.gz is not readable (no CONFIG_IKCONFIG_PROC?)"
+            _cfg_src="$KCFG_DIR/last-good.config"
+        else
+            echo "!! /proc/config.gz unreadable, and no saved config either."
+            echo "   Set CONFIG_FROM=file:<path> in $CONF, or see:"
+            echo "     lfs-kernel config list"
+            exit 1
+        fi ;;
+    last-good|good)  _cfg_src="$KCFG_DIR/last-good.config" ;;
+    prev-good|prev)  _cfg_src="$KCFG_DIR/prev-good.config" ;;
+    saved|last)      _cfg_src="$(_kcfg_newest)" ;;
+    file:*)  _as_pkg "cp -v '${CONFIG_FROM#file:}' .config" || exit 1 ;;
+    keep)    [ -f "$tree/.config" ] || { echo "!! no .config in $tree"; exit 1; } ;;
+    *)       echo "!! CONFIG_FROM=$CONFIG_FROM not understood"; exit 1 ;;
+esac
+if [ -n "$_cfg_src" ]; then
+    _kcfg_readable "$_cfg_src" || {
+        echo "!! CONFIG_FROM=$CONFIG_FROM, but $_cfg_src is not a config."
+        echo "   lfs-kernel config list       # what there is"
+        exit 1; }
+    echo "# starting from $_cfg_src  (kernel $(_kcfg_ver "$_cfg_src"))"
+    _as_pkg "cp '$_cfg_src' .config" || exit 1
+fi
+# ---- refreshing the config for a NEW kernel ------------------------------
+#
+# A config from one kernel is never complete for another: every version adds
+# symbols the old file has no answer for.  Something must decide them, and
+# which something matters:
+#
+#   olddefconfig  take the DEFAULT for each new symbol, no questions.  The
+#                 right choice for an unattended run, and what this tool has
+#                 always done -- but the defaults are upstream's, not yours.
+#   oldconfig     ask about each new symbol, one at a time.  Slow, and needs
+#                 someone at the terminal, but nothing is decided silently.
+#   menuconfig    open the editor and decide everything at once.
+#   none          use the .config exactly as it is; `make` will then ask, or
+#                 fail, depending on what is missing.
+#
+# It also says how many symbols the refresh had to answer, because "47 new
+# symbols were set to their defaults" is worth knowing before a boot.
+: "${CONFIG_REFRESH:=olddefconfig}"
+_cfg_before="$(mktemp)"; cp "$tree/.config" "$_cfg_before" 2>/dev/null || true
+case "$CONFIG_REFRESH" in
+    none) echo "# not refreshing the config (CONFIG_REFRESH=none)" ;;
+    olddefconfig|oldconfig|menuconfig|*config)
+        echo "# refreshing the config for $VERSION (make $CONFIG_REFRESH) ..."
+        _as_pkg "make $CONFIG_REFRESH" || exit 1 ;;
+    *)  echo "!! CONFIG_REFRESH=$CONFIG_REFRESH is not understood"; exit 1 ;;
+esac
+if [ -s "$_cfg_before" ] && [ "$CONFIG_REFRESH" != none ]; then
+    _newsym="$(diff <(sort "$_cfg_before") <(sort "$tree/.config") 2>/dev/null \
+               | grep -c '^>' || true)"
+    [ "${_newsym:-0}" -gt 0 ] \
+        && echo "#   $_newsym config line(s) differ from the config you started from"
+fi
+rm -f "$_cfg_before"
+
+# ---- CONFIG_SET: this machine's own answers, applied last ----------------
+#
+# The config comes from the running kernel (or a file), then a refresh
+# answers the new symbols.  An option you decided on has to survive both, so
+# it is applied AFTER them, resolved once more (olddefconfig -- a forced
+# symbol can pull or drop others), and READ BACK: `scripts/config` writes
+# what it is told, and the resolve then silently reverts anything whose
+# dependencies are not met.
+if [ -n "${CONFIG_SET:-}" ]; then
+    _cs_args=""
+    for _cs in $CONFIG_SET; do
+        _sym="${_cs%%=*}"; _val="${_cs#*=}"; _sym="${_sym#CONFIG_}"
+        [ "$_sym" != "$_cs" ] || { echo "!! CONFIG_SET entry '$_cs' has no '=' -- SYMBOL=VALUE"; exit 1; }
+        case "$_val" in
+            y) _cs_args="$_cs_args --enable $_sym" ;;
+            m) _cs_args="$_cs_args --module $_sym" ;;
+            n) _cs_args="$_cs_args --disable $_sym" ;;
+            [0-9]*) _cs_args="$_cs_args --set-val $_sym $_val" ;;
+            *) _cs_args="$_cs_args --set-str $_sym ${_val//\"/}" ;;
+        esac
+    done
+    echo "# applying CONFIG_SET: $CONFIG_SET"
+    _as_pkg "./scripts/config $_cs_args && make olddefconfig" >/dev/null || exit 1
+    _cs_bad=""
+    for _cs in $CONFIG_SET; do
+        _sym="${_cs%%=*}"; _val="${_cs#*=}"; _sym="CONFIG_${_sym#CONFIG_}"
+        case "$_val" in
+            n) grep -qE "^$_sym=(y|m)" "$tree/.config" && _cs_bad="$_cs_bad $_sym=n" ;;
+            y|m) grep -qx "$_sym=$_val" "$tree/.config" || _cs_bad="$_cs_bad $_sym=$_val" ;;
+            *) grep -qx "$_sym=$_val" "$tree/.config" \
+                   || grep -qx "$_sym=\"${_val//\"/}\"" "$tree/.config" \
+                   || _cs_bad="$_cs_bad $_sym=$_val" ;;
+        esac
+    done
+    if [ -n "$_cs_bad" ]; then
+        echo "!! CONFIG_SET did not take -- the kernel reverted these:"
+        for _cs in $_cs_bad; do
+            echo "     $_cs   (now: $(grep -E "^(# )?${_cs%%=*}[= ]" "$tree/.config" | head -1))"
+        done
+        echo "   a dependency is missing, or $VERSION has no such symbol."
+        echo "   Look it up:  cd $tree && make menuconfig   (then / and the name)"
+        exit 1
+    fi
+    echo "#   all $(echo $CONFIG_SET | wc -w) set, read back from .config"
+fi
+
+# THE CONFIG IS KEPT BEFORE ANYTHING IS COMPILED.  It is finished here --
+# source, refresh and CONFIG_SET all applied -- and a build that dies at
+# hour two must not take the answers with it.
+_kcfg_archive "$tree/.config" "$VERSION"
+
+# what a Wayland compositor needs; a warning, not a refusal
+for opt in CONFIG_DRM CONFIG_DRM_FBDEV_EMULATION CONFIG_INPUT_EVDEV CONFIG_SYSVIPC; do
+    grep -qE "^$opt=(y|m)" "$tree/.config" || echo "!! $opt is not set (sway needs it)"
+done
+# Drivers that need firmware are no use without the driver.  These are the
+# ones a laptop misses most often; the firmware for each is in FIRMWARE_ONLY.
+for opt in CONFIG_IWLWIFI:"Intel wireless (AX200 and friends)" \
+           CONFIG_IWLMVM:"the AX200's own MVM firmware layer" \
+           CONFIG_BT_HCIBTUSB:"USB Bluetooth (the AX200's other half)" \
+           CONFIG_DRM_AMDGPU:"AMD graphics"; do
+    _o="${opt%%:*}"; _why="${opt#*:}"
+    grep -qE "^$_o=(y|m)" "$tree/.config" \
+        || echo "!! $_o is not set -- no $_why"
+done
 
 # FIRMWARE TROUBLE SHOULD NOT COST YOU THE KERNEL.
 #
@@ -630,6 +2317,15 @@ _as_pkg "make modules_install" || exit 1
 # KERNEL_NAME is what the boot manager loads (rEFInd reads the file name);
 # with ESP it is the pair that decides whether this is a test kernel or the
 # real one.
+# THE VERSION OF WHAT WAS BUILT, NOT OF WHAT WAS ASKED FOR.  An empty
+# VERSION installed `vmlinuz-`, `config-` and `System.map-` beside the real
+# ones.  The tree knows its own release once it has compiled.
+_built="$(cat "$tree/include/config/kernel.release" 2>/dev/null)"
+if [ -n "$_built" ] && [ "$_built" != "$VERSION" ]; then
+    [ -n "$VERSION" ] && echo "# the tree says $_built (asked for $VERSION) -- installing as $_built"
+    VERSION="$_built"
+fi
+[ -n "$VERSION" ] || { echo "!! no kernel version known for $tree -- not installing it under an empty name"; exit 1; }
 [ -f "$ESP/$KERNEL_NAME" ] && cp -v "$ESP/$KERNEL_NAME" "$ESP/${KERNEL_NAME}_old"
 cp -v "$tree/arch/x86/boot/bzImage" "$ESP/$KERNEL_NAME"
 cp -v "$tree/arch/x86/boot/bzImage" "$ESP/$KERNEL_NAME-$VERSION"
@@ -661,7 +2357,8 @@ depmod -a "$VERSION" || exit 1
 # perfectly installed.  The kernel is on disk at this point; record it.
 # (Run again after the headers, which add /usr/include.)
 _record() {
-    echo "# recording what $acct owns (scans the filesystem; this is slow) ..."
+    echo "# recording what $acct owns (a scan AS $acct, skipping /proc, the"
+    echo "#   package source trees and the caches; --root if something is missed)"
     packagemanager reload-pkg-list "$PKG" >/dev/null 2>&1 || return 0
     local _h; _h="$(getent passwd "$acct" | cut -d: -f6)"
     echo "# recorded $(grep -c . "$_h/pkg.lst" 2>/dev/null) file(s) for $acct"
@@ -735,12 +2432,32 @@ case "$HEADERS" in
         # what makes the files the headers package's.  Same shape as the ESP
         # copies and the setuid bit.
         echo "# installing headers into /usr/include (as root, owned by $_hacct) ..."
+        # WHAT IT INSTALLED, NOT WHERE IT INSTALLED.
+        #
+        # `chown -R $_hacct /usr/include` gave this package every header on
+        # the system.  /usr/include/gstreamer-1.0/gst/mse then belonged to
+        # p_linux-headers, so gst-plugins-bad could not install into its own
+        # directory, the repair handed it one file per round, and after three
+        # rounds the bundled-copy heuristic concluded meson was vendoring
+        # linux-headers.  Every step of that was correct reasoning from a
+        # wrong fact.
+        #
+        # So: copy, remember exactly which paths came out of the tree, and
+        # chown only those.
+        _hlist="$(mktemp)"
+        ( cd "$tree/usr/include" && find . -mindepth 1 -printf '%P\n' ) > "$_hlist"
         cp -r "$tree/usr/include" /usr || {
             echo "!! could not install the headers into /usr/include"
             echo "   if some of them belong to a third package:"
             echo "     packagemanager reclaim $HEADERS_PKG --run"
-            exit 1; }
-        chown -R "$_hacct:$_hacct" /usr/include 2>/dev/null || true
+            rm -f "$_hlist"; exit 1; }
+        ( cd /usr/include && tr '\n' '\0' < "$_hlist" \
+            | xargs -0 -r chown -h "$_hacct:$_hacct" ) 2>/dev/null || true
+        # the directory itself stays root's: it is shared by every package
+        # that ships a header, and one owner for it is what caused this
+        echo "#   $(grep -c . "$_hlist") path(s) now owned by $_hacct;"
+        echo "#   /usr/include itself left as $(stat -c %U /usr/include)"
+        rm -f "$_hlist"
         packagemanager reload-pkg-list "$HEADERS_PKG" >/dev/null 2>&1 || true
         echo "# headers installed and recorded for $_hacct" ;;
     *)  echo "# headers: skipped (HEADERS=$HEADERS)" ;;
@@ -751,8 +2468,9 @@ esac
 # A kernel that boots is the only way back from one that does not, and its
 # TREE is what you need to rebuild or bisect -- not just the bzImage.  The
 # version that is running right now is recorded as last-good before this one
-# is; nothing here ever removes that tree, and `lfs-kernel prune` (below)
-# refuses to.
+# is; nothing here ever removes that tree.  (An older comment here promised
+# a `lfs-kernel prune`; there is none, and before 1.14.324 typing it started
+# a full build instead of saying so.)
 # ONLY A KERNEL THAT HAS BOOTED IS KNOWN TO BOOT.
 #
 # The old `elif` wrote the version just built into last-good whenever the
@@ -767,9 +2485,12 @@ if [ "$_running" = "$VERSION" ]; then
     # the kernel just built is the one running: it demonstrably boots
     printf '%s\n' "$VERSION" > "$_lastgood"
     echo "# $VERSION is running, so it is now the kernel known to boot"
+    _kcfg_mark_good "$tree/.config" "$VERSION"
 elif [ -d "$SRC/linux-$_running" ]; then
     printf '%s\n' "$_running" > "$_lastgood"
     echo "# keeping $SRC/linux-$_running as the last kernel known to boot"
+    # ...and ITS config is the one known to work, not the one just built
+    _kcfg_mark_good "$SRC/linux-$_running/.config" "$_running"
 else
     echo "# the running kernel is $_running, and there is no tree for it here,"
     echo "#   so nothing is recorded as known-good.  $VERSION will be recorded"
@@ -785,5 +2506,6 @@ echo "# $VERSION installed as $ESP/$KERNEL_NAME"
 echo "#   previous kernel kept as $ESP/${KERNEL_NAME}_old"
 echo "#   its source kept at    $SRC/linux-$(cat "$_lastgood" 2>/dev/null)"
 echo "#   owned by              $acct  (packagemanager verify | grep $PKG)"
+echo "#   its config kept in    $KCFG_DIR  (lfs-kernel config list)"
 echo "# running kernel is $(uname -r) -- reboot to use $VERSION"
 [ "$_fw_ok" = 1 ] || echo "# NOTE: firmware was NOT installed (see the message above)"

@@ -201,13 +201,19 @@ echo
 [ -r "$CONF" ] || { warn "no $CONF -- cannot restore the setuid bits"; exit 1; }
 
 applied=0 checked=0
-while IFS='|' read -r path mode owner group; do
+# FIVE COLUMNS.  This read four, so since the package column arrived
+# (1.14.310) `group` held "- | shadow" -- "-|shadow" once the blanks were
+# gone -- and every chown below asked for group "-|shadow" and failed.
+while IFS='|' read -r path mode owner group _pkg; do
     path="$(printf '%s' "${path:-}" | tr -d '[:space:]')"
     case "$path" in ""|\#*) continue ;; esac
     mode="$(printf '%s' "${mode:-}" | tr -d '[:space:]')"
     owner="$(printf '%s' "${owner:-}" | tr -d '[:space:]')"
     group="$(printf '%s' "${group:-}" | tr -d '[:space:]')"
     [ -n "$mode" ] || { warn "$path: no mode in $CONF"; continue; }
+    # "-": keep the mode the file has (a line that exists only so the lease
+    # may hand the file to its package) -- nothing for this script to set
+    [ "$mode" = "-" ] && continue
     if [ ! -e "$path" ]; then
         # NOT AN ERROR.  Not every package here installs every file --
         # unix_chkpwd only exists once Linux-PAM is in.

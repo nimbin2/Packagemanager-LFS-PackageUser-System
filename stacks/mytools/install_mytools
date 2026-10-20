@@ -42,7 +42,7 @@ SOURCES=(
 'raw|sway_start|https://git.christianimmanuel.de/scripts/raw/Administration/sway_start|/usr/bin|'
 'tar|seatd-user|https://git.christianimmanuel.de/sway/seatd-user/archive/seatd-user.tar.gz|/usr/bin|gcc seatd-user.c -DSEATD_USER=$DESKTOP_USER -o $OUT/seatd-$DESKTOP_USER'
 # The sway helpers.  They are separate package users today; move them here by
-# uncommenting, then `packagemanager remove swas swov swbr minibrowser`.
+# uncommenting, then `packagemanager remove swas swov swbr browser`.
 #'git|swas|https://git.christianimmanuel.de/sway/SwAS|/usr/bin|make'
 #'git|swov|https://git.christianimmanuel.de/sway/SWOv|/usr/bin|make'
 #'git|swbr|https://git.christianimmanuel.de/sway/SwBr|/usr/bin|make'

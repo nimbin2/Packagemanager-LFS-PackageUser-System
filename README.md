@@ -70,12 +70,21 @@ lfs build-system session      # the interview: partition, prefixes, locale, logi
 lfs run                       # everything up to the chroot, then enter it
 lfs-helper build-all          # inside: chapters 7-9
 packagemanager bootstrap --run   # wget, Python modules, BLFS book, certificates
-packagemanager stack sway --run  # then network, services
-lfs-kernel                    # the kernel, from /etc/pkgusr/kernel.conf
+packagemanager stack            # list the stacks
+packagemanager stack sway --run  # then network, services; apps and tools when wanted
+lfs-kernel --run              # the kernel, from /etc/pkgusr/kernel.conf
 ```
 
 `lfs run` and `build-all` continue from wherever they stopped. Run them again
 after a reboot, a failure, or a cancel.
+
+An entry can carry `when="<shell>"`: it is built only where that command
+succeeds. `btrfs-progs` in services.stack is built on btrfs machines only.
+
+A stack can read its packages from another book. `from-book svn` in a stack
+file puts every book entry below it on the development book. Dependencies
+outside the stack stay on the default book. `packagemanager stack <name>
+--avoided` lists what the stack never builds; the plan shows only the count.
 
 | Command | Does |
 |---|---|
@@ -169,12 +178,49 @@ dependency failed is skipped, not attempted. Run it again after fixing
 anything; it does only what is left.
 
 ```sh
-packagemanager install <pkg> --recursive --run
+packagemanager install <pkg> --recursive --run   # missing deps only; installed ones are left alone
 packagemanager update <pkg> --run
+packagemanager install <gitpkg> --reinstall --clean --run   # git packages: no book lookup
 packagemanager which-package /usr/bin/foo
 blfs order <pkg>                     # build order, dependencies first
 blfs sources <pkg>                   # download URLs
+packagemanager books                 # every cached book and who reads it
+packagemanager books --prune --run   # remove the ones nothing reads
 ```
+
+### Programs you develop yourself
+
+You work in your own checkout. A bare copy in `/srv/git` is what gets installed.
+
+New project, once:
+
+```sh
+packagemanager dev swas --hub ~/Git/SwAS --run   # as root; ~ = your desktop user
+```
+
+It creates `/srv/git/SwAS.git`, adds the remote `local` to your checkout, and
+builds `p_swas` from it. Your home stays closed to package users.
+
+Update, every time:
+
+```sh
+git commit -am "..."         # in ~/Git/SwAS, as you
+git push local main
+packagemanager update swas --run
+```
+
+Rename a package (account, home, script, stack entry, records):
+
+```sh
+packagemanager rename minibrowser browser --run
+```
+
+`packagemanager dev` shows per project: installed commit, pushed commit,
+unpushed commits, uncommitted files. Only pushed commits are ever installed.
+
+`packagemanager stack <name>` shows, per entry: installed version, book
+version, which book, and the verdict. `--run` builds only what is **not
+installed**; **update available** is `packagemanager update --stack <name> --run`.
 
 ### Application users
 
@@ -193,6 +239,81 @@ packagemanager user create firefox --shared --share-dir --launcher
 
 The session group is read from the runtime directory, not assumed. Set it up
 once for your own account; every shared user then joins whatever is there.
+
+Many accounts at once come from `/etc/pkgusr/stacks/app-users.conf`, one line
+per launcher, applied by `packagemanager stack services --only app-users
+--run`. A line `@setup <account|*> <command | URL | script>` runs extra
+setup as that account, once; a changed line runs again. Undoing them:
+
+| Command | Removes |
+|---|---|
+| `packagemanager user remove-launcher <name> --run` | one launcher, its menu entry and icon |
+| `packagemanager user delete <account> --run` | the account; its home is archived to `/root` first |
+| `packagemanager user purge --run` | all of them, plus the session group, the profile fragments and the PAM wiring |
+
+A home with a browser profile in it is archived to `/root/u_<name>-home-<date>.tar.gz`
+(0600) before the account goes — logins, cookies and downloads that nothing
+else can give back. A home that was never used is not archived. Drop the
+archives when you no longer want them: `rm /root/u_*-home-*.tar.gz`.
+
+Each is a dry run without `--run`. `$SHARED_*` comes from
+`/etc/profile.d/shared-dirs.sh`. `/etc/profile.d` is read by **login** shells
+only, so a terminal opened inside your session shows what it inherited at
+login. The step also sources the fragment from `/etc/bashrc`; any shell can
+refresh itself with `. /etc/profile.d/shared-dirs.sh`, which also drops the
+variables whose directory is gone.
+
+### Networking
+
+`packagemanager network` is the one report: every interface with its state
+and address, the `/etc/sysconfig/ifconfig.<iface>` file that belongs to it
+(or the absence of one), whether it comes up at boot, which daemons are
+running, where the wpa service looks for its configuration, and whether the
+`network` script is linked into a runlevel at all. Read-only.
+
+dhcpcd has no init script of its own — BLFS ships none, and the `dhcpcd` in
+blfs-bootscripts is an **ifup service**, not a daemon you enable. It runs
+only because an interface's file says `SERVICE="dhcpcd"` (or because the wpa
+service hands off to it). So "dhcpcd does not start at boot" is always a
+question about those files and the `network` service.
+
+### Wireless
+
+`packagemanager stack network --only net-wifi --run` reports what a wireless
+link still needs and, with `WRITE=yes` in
+`/etc/pkgusr/stacks/net-wifi.conf`, writes the parts that hold no secret: an
+`/etc/sysconfig/ifconfig.<iface>` per wireless interface, and a udev rule
+that gives a USB adapter the same name in every port. `PREFER` names the
+interfaces best first — the first one present gets the low route metric, so
+an external antenna is used while it is plugged in. The wpa_supplicant
+config is never written (it holds your passphrase), but an existing one is
+copied to a new interface when `COPY_WPA=yes`.
+
+---
+
+## Services
+
+SysV, so a service is an init script in `/etc/rc.d/init.d` plus S/K symlinks
+in `/etc/rc.d/rc<N>.d`. **Starting is not enabling** — `start` runs the script
+now, whatever the links say.
+
+```sh
+packagemanager service                     # what exists, at boot, running
+packagemanager service sshd start          # now, enabled or not
+packagemanager service sshd enable         # at boot, without starting it
+packagemanager service sshd disable        # boot only; it keeps running
+```
+
+`disable` records the links it removed, so `enable` puts back exactly what was
+there — the priority number lives in the blfs-bootscripts Makefile and is the
+one thing that cannot be worked out again. With no record, the runlevels come
+from the script's own `Default-Start`. `status` exits 0 when running, 3 when
+not, so it works in an `if`.
+
+The scripts themselves come from blfs-bootscripts, one `make install-<target>`
+per service. `packagemanager stack services --only bootscripts --run` installs
+the ones whose package is here and whose script is not, from the mapping in
+`/etc/pkgusr/stacks/bootscripts.conf`.
 
 ---
 
@@ -224,6 +345,13 @@ Everything is dry-run by default. `--run` applies.
 | `lfs-helper which-package <path>` | Which package installed this |
 | `lfs-helper manifests` | What each package installed |
 | `lfs-helper sort-users --run` | Sort passwd and group by id |
+| `lfs-helper setid [--run]` | Setuid/setgid bits the build refused (`su`, `passwd`, ...) |
+| `lfs-backup create --run` | Back up the files in `/etc/pkgusr/backup.conf` (modes, owners) |
+| `lfs-backup restore <archive> [--skip accounts,ssh] [--run]` | Put them on a new system: creates missing files, writes `.new` for the rest |
+| `lfs-backup plan <archive> [file]` | A restore plan to edit: skip files, or send them elsewhere |
+| `lfs-backup restore <archive> --plan <file> [--run]` | Restore by that plan |
+| `lfs-backup merge <archive>` | Go through the `.new` files: diff, keep live, take backup, or edit |
+| `lfs-backup clean <archive> [--run]` | Remove those `.new` files after merging (edited ones are kept) |
 
 ---
 
@@ -294,10 +422,30 @@ own package (`p_linux-firmware`) and the headers update the package that owns
 
 ```sh
 lfs-kernel list          # what kernel.org offers
-lfs-kernel               # build the version in /etc/pkgusr/kernel.conf
-lfs-kernel 6.12.40       # that version, once
+lfs-kernel               # what a build would do (nothing is built)
+lfs-kernel --run         # build the version in /etc/pkgusr/kernel.conf
+lfs-kernel 6.12.40 --run # that version, once
+lfs-kernel load ath9k_htc --boot        # load a module now and at every boot
 lfs-kernel verify        # is everything installed?
+lfs-kernel firmware --missing [--fix]   # firmware this machine wants and lacks
+lfs-kernel status               # how far the last build got, what is installed
+lfs-kernel promote --run        # the test kernel (vmlinuz_new) becomes vmlinuz; old one kept as vmlinuz_old
+lfs-kernel enable --list        # hardware this tool knows by name
+lfs-kernel enable ath9k-htc     # its symbols into CONFIG_SET, its firmware
+                                # into FIRMWARE_ONLY -- kernel.conf, backed up
+lfs-kernel modules [text]       # what this kernel has, and what is loaded
+lfs-kernel config               # where the next .config comes from
+lfs-kernel config search atheros           # symbols by name or prompt
+lfs-kernel config save --good   # keep the running config as a known-good one
+lfs-kernel config from last-good           # build from it, not from /proc
+lfs-kernel config diff          # prev-good -> last-good
 ```
+
+Every config the tool builds with is copied to `/etc/pkgusr/kernel-configs`,
+outside the source tree, so removing the package cannot take it: the last
+`CONFIG_KEEP` builds, plus
+`last-good.config` and `prev-good.config` — the two that booted.
+`CONFIG_FROM=last-good` starts from one of them.
 
 Everything it does is configured in `/etc/pkgusr/kernel.conf`, which is
 installed rather than generated so it can be edited first. `ESP` and
@@ -324,15 +472,19 @@ enter it.
 ## Tests
 
 ```sh
-bash test_lfs_crosschain.sh ./lfs
+bash test_lfs_crosschain.sh ./lfs          # all of it
+bash test_lfs_crosschain.sh --list         # numbered blocks
+bash test_lfs_crosschain.sh --from 300 --to 340 ./lfs
+bash test_lfs_crosschain.sh --only firmware ./lfs
 ```
 
 Each test encodes a bug that actually happened, with a comment explaining
 what broke.
 
-Run it from a directory holding all the tools — about 100 tests skip
-without them. It no longer fits one sandbox slot; on a real machine run it
-whole, or one block at a time (each starts `# ---- <title>`).
+Run it from a directory holding all the tools — about 100 tests skip without
+them. A selection re-executes a generated subset (preamble + chosen blocks +
+summary); a block that needs something an earlier one computed says so
+instead of passing quietly.
 
 ---
 

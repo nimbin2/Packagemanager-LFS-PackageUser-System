@@ -1,302 +1,217 @@
-# sway.stack -- a working Sway desktop with a minimal WebKit browser.
-# stack-version: 1.13.67
+# sway.stack -- the Sway desktop: the compositor, its tools, your programs.
+# stack-version: 1.14.366
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
+# here: the exclusions are a property of the machine, not of one stack.
+include avoid
+
 # Replay with:  packagemanager stack sway --run
 # Entries run top to bottom; book deps are resolved from the BLFS book,
 # installed entries are skipped, the first failure stops the run.
 # git refs are pinned to releases -- true them up if a clone fails.
-
-# Never built by this stack, however they are reached.  harfbuzz RECOMMENDS
-# texlive and LibreOffice; a sway desktop with a webkit browser wants
-# neither, and texlive alone is hours of build time and a /opt tree.
-# NOT BUILT BY THIS STACK.  The book's recommendations are followed --
-# a recommendation the build actually needs (curl for cmake, icu for
-# libxml2) must not be dropped by a blanket rule.  These are the branches
-# this desktop does not want, named one at a time, and everything they alone
-# pull in goes with them.
-avoid  libreoffice
-avoid  asymptote
-avoid  biber
-avoid  qt6
-avoid  okular
-avoid  phonon
-avoid  phonon-backend-vlc
-avoid  vlc
-avoid  cups
-avoid  openjdk
-avoid  java
-avoid  apache-ant
-avoid  postgresql
-avoid  openldap
-avoid  unixodbc
-avoid  graphviz
-avoid  gegl
-# the KDE leaves okular pulls in: named individually, because a package can
-# have several parents and pruning by one of them drops shared dependencies
-# (graphite2 was lost that way)
-avoid  plasma-activities
-avoid  libkexiv2
-avoid  kwindowsystem
-avoid  libfm-qt
-avoid  xdg-desktop-portal-lxqt
-avoid  xdg-desktop-portal-gnome
-avoid  gnome-desktop
-
-# The desktop-portal tail.  The book makes xdg-desktop-portal REQUIRE all
-# four backends -- gtk, wlr, gnome AND lxqt -- so one recommendation from
-# gtk4 drags in the whole of xfce and lxqt, gnome-desktop and libfm-qt.
-# Sway needs none of it to run; screen sharing wants xdg-desktop-portal-wlr,
-# which can be built on its own later:
-#     packagemanager install xdg-desktop-portal-wlr --run
-avoid  xdg-desktop-portal
-avoid  xdg-desktop-portal-gtk
-avoid  xdg-desktop-portal-wlr
-avoid  xdg-desktop-portal-gnome
-avoid  xdg-desktop-portal-lxqt
-avoid  xfce4-panel
-avoid  xfce4-notifyd
-avoid  xfce4-dev-tools
-avoid  xfconf
-avoid  libxfce4util
-avoid  libxfce4ui
-avoid  libxfce4windowing
-avoid  exo
-avoid  garcon
-avoid  liblxqt
-avoid  lxqt-build-tools
-avoid  lxqt-notificationd
-avoid  lxqt-kwindowsystem
-avoid  libqtxdg
-avoid  polkit-qt
-avoid  libfm-qt
-avoid  menu-cache
-avoid  libwnck
-avoid  notification-daemon
-
-# Not this desktop either: a systemd package on a SysV system, phone modem
-# stacks, a mail/ssh server, spell-checking dictionaries.
-avoid  systemd
-avoid  ModemManager
-avoid  libmbim
-avoid  libqmi
-avoid  geoclue2
-avoid  openssh
-avoid  ruby
-avoid  aspell
-avoid  enchant
-avoid  gnome-keyring
-avoid  gcr
-avoid  startup-notification
-
-# Tails of things already avoided.  Each of these is in the plan ONLY to
-# serve a package this stack does not build, and the tools cannot yet work
-# that out for themselves (see 1.12.83: pruning by the single parent that
-# `blfs order` reports dropped shared dependencies, and broke harfbuzz).
-# Checked one by one against the plan's parent column:
-avoid  libcupsfilters        # cups   (avoided)
-avoid  libppd                # cups
-avoid  cups-filters          # cups
-avoid  libkexiv2             # okular (avoided)
-avoid  exiv2                 # libkexiv2
-avoid  clucene               # libreoffice (avoided)
-avoid  redland               # libreoffice
-avoid  rasqal                # redland
-avoid  raptor                # rasqal
-avoid  jasper                # qt6    (avoided)
-avoid  libmng                # qt6
-avoid  double-conversion     # qt6
-avoid  poppler               # libcupsfilters -- its ONLY parent, avoided
-avoid  mupdf                 # libcupsfilters
-avoid  gs                    # libcupsfilters
-avoid  qpdf                  # libcupsfilters
-avoid  nss                   # poppler
-avoid  boost                 # poppler
-avoid  pdfio                 # libcupsfilters
-avoid  gpgmepp               # poppler
-# Checked against EVERY parent, not just the one the plan prints: these have
-# no parent left in the plan at all.
-avoid  colord                # cups (avoided) -- no live parent
-avoid  linux-pam             # systemd (avoided) -- no live parent
-avoid  xdg-utils             # cups -- no live parent
-avoid  freeglut              # mupdf (avoided) -- no live parent
-avoid  polkit                # colord + systemd (both avoided) -- no live parent
-avoid  libgusb               # colord
-# NOT avoided, though the plan labels them with an avoided parent: the label
-# shows only the FIRST parent.  gtk3 is really wanted by adwaita-icon-theme,
-# ffmpeg by mpv, polkit by colord... and pulseaudio by pipewire/sdl3/gst.
-# (rust and llvm STAY: glycin genuinely requires rust, and llvm is a stack
-#  entry in its own right for mesa.)
-
-# 0. verify the kernel (DRM/amdgpu, evdev, snd, seccomp, user ns, render node)
-check  kernel-sway
-
-# 1. seat and session (SysV: elogind is the logind; seatd is not in the book)
-book   dbus
-book   elogind url=https://github.com/elogind/elogind ref=v255.17 prog=loginctl build="meson setup build --prefix=/usr --buildtype=release -Dcgroup-controller=elogind -Ddbuspolicydir=/etc/dbus-1/system.d; ninja -C build" install="ninja -C build install"
-
-# 2. graphics -- llvm feeds mesa; mesa options come from the machine
-#    (machine.conf wiring pending; book defaults until then)
-# cmake (pulled in by llvm and others) has NO required dependencies and four
-# recommended ones -- and its own build turns on the system libraries, so a
-# missing curl is a hard failure:
-#     CMAKE_USE_SYSTEM_CURL is ON but a curl is not found!
-# This is the trade-off, and the answer is the same one: name
-# what the build actually needs.
-book   nghttp2
-book   curl
-book   libarchive
-book   libuv
-book   llvm
-# glslang provides glslangValidator, which mesa needs ONLY because
-# machine.conf turns on the Vulkan drivers -- the book does not list it as a
-# mesa dependency, so no dependency order can place it.  A machine option
-# that creates a dependency has to name it here.
-book   glslang
-# The font stack goes BEFORE mesa.
 #
-# libass (built inside mesa's plan, via ffmpeg) hard-requires harfbuzz in its
-# configure, and the book's libass page does not list it -- so no dependency
-# order can place it.  What CAN place it is entry order: anything an earlier
-# entry installed is simply there.
-book   harfbuzz        # text shaping: freetype recommends it,
-book   graphite2       #   and webkit/pango need both
-book   fontconfig
-
-book   mesa
-book   xwayland
-book   libinput
-book   libxkbcommon
-
-# 3. wayland core, then the compositor from git (not in the book)
-book   wayland
-book   wayland-protocols
-
-# 4. a terminal (foot, wayland-native) and its two small deps
-
-# 5. fonts and 2D
+# THREE FILES, ONE COMMAND (1.14.320).  This stack begins with the two it
+# stands on, in the order they have to be built:
 #
-# From here on the entries are the RECOMMENDATIONS worth having, named
-# instead of inherited: with the book's suggestions no longer
-# arrive by themselves, which is the point -- LibreOffice, OpenJDK, CUPS,
-# Qt6/okular/VLC, texlive and the xfce/lxqt portals are not part of this
-# desktop.  Anything missed shows up as a clean "not found" at configure
-# time and becomes one more line here.
+#   wayland.stack   session, graphics, wayland, GTK4, seatd, wlroots
+#   media.stack     codecs, gstreamer, WebRTC, webkitgtk, mpv, yt-dlp
+#
+# and then does what only a Sway desktop needs.  The applications that used
+# to live here (zathura, imv) are apps.stack now, and jq is in tools.stack:
+# none of them is part of the desktop, and none needs rebuilding with it.
+include wayland
 
-# 6. GTK4 + WebKitGTK (6.0 API), gstreamer (bad included -- wanted), mpv
-book   pango            # GTK4 text layout
-book   gdk-pixbuf      # GTK4 image loading
-book   hicolor-icon-theme
-book   adwaita-icon-theme   # cursors and the default icon set
-book   gtk4
-book   glib-networking  # TLS for libsoup, or the browser has no https
-book   libsoup3
-book   gstreamer10
-book   gst10-plugins-base
-book   gst10-plugins-good
-# ---------------------------------------------------------------------
-# WebRTC and camera streaming.
+# 6b. the media chain, in its own stack so it can be rebuilt on its own.
 #
-# BLFS 13.0 carries NONE of these, so they are git entries.  They must be
-# built BEFORE gst10-plugins-bad and webkitgtk, because webrtcbin -- the
-# element a browser uses for WebRTC -- is compiled into gst-plugins-bad only
-# if libnice is present, and webkitgtk links the result.  Adding them later
-# means recompiling both (hours).
-#
-# What each is for:
-#   libnice                 ICE: the NAT traversal WebRTC cannot work without
-#   libsrtp                 the encrypted media transport
-#   usrsctp                 WebRTC data channels
-#   webrtc-audio-processing echo cancellation for a microphone (the log's
-#                           "webrtc-audio-processing-2 found: NO")
-#
-# The camera side is already in this stack: v4l-utils for the device and
-# pipewire for routing it.
-#
-# UNTESTED -- the build lines follow each project's README, and none of these
-# has been built here.  Expect to adjust them; that is what the stack file is
-# for.
-git    libnice url=https://gitlab.freedesktop.org/libnice/libnice.git ref=0.1.22 have=/usr/lib/pkgconfig/nice.pc build="meson setup build --prefix=/usr --buildtype=release -Dgtk_doc=disabled; ninja -C build" install="ninja -C build install"
-git    libsrtp url=https://github.com/cisco/libsrtp.git ref=v2.6.0 have=/usr/lib/pkgconfig/libsrtp2.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
-# ref: 1.0.0 does not exist upstream (checked: the tags are 0.9.3.0, 0.9.4.0,
-# 0.9.5.0).  0.9.5.0 has meson.build, so the build line below still applies.
-git    usrsctp url=https://github.com/sctplab/usrsctp.git ref=0.9.5.0 have=/usr/lib/pkgconfig/usrsctp.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
-git    webrtc-audio-processing url=https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git ref=v2.1 have=/usr/lib/pkgconfig/webrtc-audio-processing-2.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+# It sits HERE because webkitgtk needs gtk4, pango and libsoup3 from
+# wayland.stack, and mesa and ffmpeg from further up.
+include media
 
-book   gst10-plugins-bad
-# No exclusions.  The book's dependency graph is built as the book states
-# it, recommendations included: a recommendation is there for a reason, and
-# skipping one is how texlive came to build before FreeType.  This costs
-# build time (texlive, LibreOffice and their tails are hours) and buys a
-# system that matches the book.
-book   webkitgtk
-book   mpv
 
-# 7. audio: ALSA is the floor; pipewire installed, started on demand
-book   alsa-lib
+# 7. audio: alsa-lib is wayland.stack's entry 1b (it has to be early);
+#    the server comes after media.stack, so pipewire finds gstreamer
 book   alsa-utils
 book   pipewire
 book   wireplumber
 
-# 8. SDL3 for the Sw* tools
-book   sdl3
-
-# 9. the nimbin2 family: make all && make PREFIX=/usr install
-
-# 10. wire the session together (root step)
-
-
-# TeX is NOT built by this stack.
+# 8. SDL3 for the Sw* tools.
 #
-# Putting `book texlive` last only moved the ENTRY: texlive is harfbuzz's
-# recommendation, so it was still pulled into an early entry's plan and
-# failed there (its configure wants freetype-config, which FreeType removed
-# years ago -- an upstream problem, not this desktop's).  Nothing here needs
-# TeX: the book's `make ... pdf ps` manual builds are commented out (1.12.87)
-# and asymptote/biber are avoided.
-#
-# To build it later, on its own:  packagemanager install texlive --run
-avoid  texlive
+# SDL3 dlopens libasound rather than linking it, so ldd says nothing; the
+# name it will dlopen is in the binary, and that is what to look for.
+# the glob matters: SDL3 installs libSDL3.so.0.<n> and a bare libSDL3.so
+# symlink only when the -devel side is there, so naming one path makes the
+# probe fail for the wrong reason
+book   sdl3 expect="strings /usr/lib/libSDL3.so* 2>/dev/null | grep -q libasound"
 
 
 # ---------------------------------------------------------------------
-# Everything from here needs GIT, or is a plain tarball: kept to the END.
-#
-# A git entry failed with "git: command not found" -- git is itself a BLFS
-# package, so anything cloned has to come after it is built.  Grouping them
-# here also means the desktop is finished before the extras start, and
-# `--no-git` can skip the lot.
+# THE COMPOSITOR AND ITS TOOLS
 # ---------------------------------------------------------------------
-book   git
-
-# -Dserver=enabled: seatd-user execs /usr/bin/seatd, so the BINARY must
-# exist even though no daemon runs at boot.  -Dlibseat-seatd=enabled is what
-# libseat needs for LIBSEAT_BACKEND=seatd; logind stays enabled as a fallback
-# but is unusable here (no pam_elogind).
-git    seatd   url=https://git.sr.ht/~kennylevinsen/seatd ref=0.9.1 prog=seatd build="meson setup build --prefix=/usr --buildtype=release -Dserver=enabled -Dlibseat-seatd=enabled -Dlibseat-logind=elogind; ninja -C build" install="ninja -C build install"
-# wlroots' DRM backend needs libdisplay-info; without it meson DISABLES drm
-# at configure time and says so only in a summary line, and sway then dies at
-# runtime with "Cannot create DRM backend: disabled at compile-time".
-book   libdisplay-info
-
-# -Dbackends=drm,libinput,... is explicit on purpose: an auto-detected
-# backend list is a silent dependency, and this is the dependency that was
-# silently missing.
-git    wlroots url=https://gitlab.freedesktop.org/wlroots/wlroots.git ref=0.19.2 have=/usr/lib/pkgconfig/wlroots-0.19.pc build="meson setup build --prefix=/usr --buildtype=release -Dbackends=drm,libinput,x11 -Dsession=enabled; ninja -C build" install="ninja -C build install"
+# scdoc: the man-page generator every sway-family project uses.  Not in
+# BLFS; SLFS has it (scdoc-1.11.5, from git.sr.ht -- the host seatd already
+# comes from).  It was assumed present because sway's line below asks for
+# -Dman-pages=enabled; it was not, and grim stopped on
+#     doc/meson.build:1:8: ERROR: Program 'scdoc' not found or not executable
+# Before sway, so a replay of this stack meets it in order.  No dependencies.
+git    scdoc   url=https://git.sr.ht/~sircmpwn/scdoc ref=1.11.5 prog=scdoc build="make PREFIX=/usr" install="make PREFIX=/usr install"
 # needs=: book packages a git entry depends on -- nothing in the book orders
 # anything before a git build, so its dependencies must be named here.
 # the author's own options: man pages, swaybar, swaynag, bash completions
 git    sway    url=https://github.com/swaywm/sway ref=1.11 prog=sway needs=json-c,cairo,pango build="meson setup build --prefix=/usr --buildtype=release -Dman-pages=enabled -Dswaybar=true -Dswaynag=true -Dbash-completions=true; ninja -C build" install="ninja -C build install"
 git    swaybg  url=https://github.com/swaywm/swaybg ref=v1.2.1 prog=swaybg build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+
+# SCREENSHOTS AND IDLE: grim, slurp, swayidle.  None is a BLFS page; grim and
+# slurp are SLFS pages (the Sway book), swayidle is swaywm's own.  Refs checked:
+#   grim     v1.5.0  -- SLFS 1.5.0 fetches it from gitlab.freedesktop.org.
+#                       NOT github.com/emersion/grim: that mirror stopped at
+#                       v1.4.0 in 2022 when grim moved away from GitHub.
+#   slurp    v1.5.0  -- git ls-remote on github.com/emersion/slurp; SLFS agrees
+#   swayidle v1.9.0  -- git ls-remote on github.com/swaywm/swayidle
+# needs=libjpeg, not libjpeg-turbo: that is the book's ANCHOR for
+# libjpeg-turbo-3.2.0 (`packagemanager search jpeg` shows both).
+# Their options are asked for, not autodetected: jpeg (grim -t jpeg) and man
+# pages (scdoc is here already: sway builds its man pages with it).
+#
+#   grim -g "$(slurp)" ~/shot.png        a region, picked with the mouse
+#
+# swayidle -Dlogind=disabled: its logind half (before-sleep, lock on
+# `loginctl lock-session`) needs a logind SESSION, and sway here gets its
+# seat from seatd-<user>, not elogind -- so auto-detection would find
+# libelogind, build it in, and have nothing to talk to at runtime.  Timeouts
+# (`swayidle timeout 300 'swaymsg "output * power off"' resume ...`) are the
+# part that works without it.
+git    grim     url=https://gitlab.freedesktop.org/emersion/grim.git ref=v1.5.0 prog=grim needs=libpng,pixman,libjpeg build="meson setup build --prefix=/usr --buildtype=release -Djpeg=enabled -Dman-pages=enabled -Dbash-completions=true; ninja -C build" install="ninja -C build install"
+git    slurp    url=https://github.com/emersion/slurp ref=v1.5.0 prog=slurp needs=cairo,libxkbcommon build="meson setup build --prefix=/usr --buildtype=release -Dman-pages=enabled; ninja -C build" install="ninja -C build install"
+# wl-mirror: one output shown in a window -- the laptop screen on a
+# projector you are looking away from, or one display shared into a call.
+# Not in the book.  Its wayland-protocols and wlr-protocols are git
+# submodules, which the clone recurses into, so nothing extra is needed for
+# them.  WITH_GBM: frames come as dmabufs from mesa instead of being copied.
+# The example script wl-present is left out: it needs pipectl, which is not
+# here.
+git    wl-mirror url=https://github.com/Ferdi265/wl-mirror ref=v0.18.5 prog=wl-mirror needs=mesa,libdrm build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DINSTALL_DOCUMENTATION=ON -DWITH_GBM=ON -DWITH_LIBDECOR=OFF; cmake --build build" install="cmake --install build"
+git    swayidle url=https://github.com/swaywm/swayidle ref=v1.9.0 prog=swayidle build="meson setup build --prefix=/usr --buildtype=release -Dlogind=disabled -Dman-pages=enabled -Dbash-completions=true -Dzsh-completions=false -Dfish-completions=false; ninja -C build" install="ninja -C build install"
+# wl-clipboard: wl-copy and wl-paste.  Not in the book either, and sway is
+# unusable without it once anything wants a clipboard from a script.
+git    wl-clipboard url=https://github.com/bugaevc/wl-clipboard ref=v2.2.1 \
+       prog=wl-copy \
+       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
+       install="ninja -C build install" \
+       expect="wl-paste --version >/dev/null 2>&1"
+
+# wf-recorder: screen recording for a wlroots compositor.  Not in the book.
+#
+# CHECKED against the repo at v0.6.0 (newest tag; master and two feature
+# branches also exist):
+#
+#   * audio is CONDITIONAL.  meson_options.txt has `pulse` and `pipewire`
+#     as auto features and config.h.in has `#mesondefine HAVE_AUDIO`, which
+#     gates src/audio.cpp -- so with neither library found at configure
+#     time you get a recorder that cannot record sound.
+#   * and `--help` lists `-a, --audio` EITHER WAY: that text is not inside
+#     the #ifdef.  So the probe checks what the binary LINKS, which is the
+#     only honest answer to "was audio built in".
+#   * `meson build` (as in the by-hand script) still works, but `meson
+#     setup build` is the spelling meson documents now.
+#
+# Its codecs come from ffmpeg, which is entry 1b, and the default is
+# libx264 -- so gst10-plugins-ugly's x264 is not what it uses; ffmpeg's own
+# libx264 support is.
+git    wf-recorder url=https://github.com/ammen99/wf-recorder.git \
+       ref=v0.6.0 prog=wf-recorder \
+       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
+       install="ninja -C build install" \
+       expect="ldd /usr/bin/wf-recorder 2>/dev/null | grep -qE 'libpulse|libpipewire'"
+
+# light: backlight and keyboard brightness.  Not in the book.
+#
+# THE UPSTREAM MOVED.  haikarainen/light on GitHub is gone -- checked, and
+# `git ls-remote` on it fails while three other GitHub URLs in this stack
+# answer, so it was the path and not the network.  GitHub returns 401 for a
+# repository it does not have, which is why the clone asked for a username.
+#
+# gitlab.com/dpeukert/light is where it continued.  Checked on the machine
+# this runs on: the URL answers and `git ls-remote --tags` prints NOTHING --
+# the fork carries no tags at all, only `main`.  So `ref=main` is not
+# laziness here, it is the only ref there is, and it means this entry
+# follows upstream: the commit that built is the one worth writing down if
+# a build ever breaks.
+#
+#     git ls-remote --heads https://gitlab.com/dpeukert/light.git
+#
+# CFLAGS='-fcommon' IS NOT A WORKAROUND FOR A BROKEN PACKAGE.  light's
+# helpers.h declares `light_loglevel` without `extern`, which every C
+# compiler accepted until GCC 10 made -fno-common the default; each object
+# then defines it and the link fails with
+#     multiple definition of `light_loglevel'
+# -fcommon restores the pre-GCC-10 behaviour, which is what this code was
+# written against.  The alternative is patching the header, and that is
+# upstream's call, not this stack's.
+#
+# IT HAS TO BE IN THE ENVIRONMENT, NOT ON THE CONFIGURE LINE.  autogen.sh
+# here is not just autoreconf: it ends by running ./config.status --recheck
+# and then `make`, so the compile that fails happens BEFORE the ./configure
+# on this line is ever reached.  Passing CFLAGS to that configure fixed
+# nothing and the link failed exactly as before.  Exported, it reaches
+# autogen.sh's own configure run, which is the one that writes the Makefile.
+#
+# And `rm -f config.status` first: autogen.sh re-runs whatever config.status
+# is lying around, so a tree configured by hand earlier keeps its old flags
+# no matter what this line says.
+#
+# If that fails too, one of these:
+#   - the new URL, if light moved: just fix url= below.
+#   - the source you built from last time, as a tar entry:
+#       tar light url=file:///path/to/light-1.2.2.tar.gz pkg=light-1.2.2.tar.gz \
+#           have=/usr/bin/light build="./autogen.sh; ./configure --prefix=/usr \
+#           --with-udev; make" install="make install"
+#   - brightnessctl, which does the same job and DOES resolve (tag 0.5.1
+#     verified from here).  It uses the same udev/video-group approach:
+#       git brightnessctl url=https://github.com/Hummer12007/brightnessctl.git \
+#           ref=0.5.1 prog=brightnessctl build="make" \
+#           install="make install" expect="brightnessctl --version >/dev/null 2>&1"
+#
+# It writes to /sys/class/backlight/*/brightness, which root owns, so the
+# binary needs either setuid root or a udev rule putting those files in a
+# group you are in.  --with-udev installs 90-backlight.rules, which chgrps
+# them to `video`; that is the one to prefer, and it means the desktop user
+# must be in `video` (cfg power puts them in the power group, not this one).
+git    light url=https://gitlab.com/dpeukert/light.git ref=main prog=light \
+       build="export CFLAGS='-O2 -fcommon'; rm -f config.status; ./autogen.sh; ./configure --prefix=/usr --with-udev; make" \
+       install="make install" \
+       expect="light -V >/dev/null 2>&1"
+
+# foot, the terminal, and its two small libraries
 git    tllist  url=https://codeberg.org/dnkl/tllist ref=1.1.0 have=/usr/include/tllist.h build="meson setup build --prefix=/usr" install="ninja -C build install"
 git    fcft    url=https://codeberg.org/dnkl/fcft ref=3.3.2 have=/usr/include/fcft build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
 git    foot    url=https://codeberg.org/dnkl/foot ref=1.28.0 prog=foot build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+# the rest of the fonts: icons, a patched terminal font, and Noto for
+# everything DejaVu does not cover.  One step, because they are all "unpack
+# an archive into /usr/share/fonts and run fc-cache".
+cfg    fonts
+
 tar    dejavu-fonts url=https://downloads.sourceforge.net/dejavu/dejavu-fonts-ttf-2.37.tar.bz2 pkg=dejavu-fonts-ttf-2.37.tar.bz2 have=/usr/share/fonts/dejavu build="true" install="install -v -d -m755 /usr/share/fonts/dejavu; install -v -m644 ttf/*.ttf /usr/share/fonts/dejavu; fc-cache /usr/share/fonts/dejavu"
+
+# ---------------------------------------------------------------------
+# YOUR OWN PROGRAMS: the Sw* tools and the browser.  SDL3's image and font
+# libraries are here because only these use them.
+# ---------------------------------------------------------------------
 git    sdl3-image url=https://github.com/libsdl-org/SDL_image ref=release-3.2.4 have=/usr/lib/libSDL3_image.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release; cmake --build build" install="cmake --install build"
 git    sdl3-ttf   url=https://github.com/libsdl-org/SDL_ttf ref=release-3.2.2 have=/usr/lib/libSDL3_ttf.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release; cmake --build build" install="cmake --install build"
-# Browser builds two programs, browser-mini and browser-big; the entry keeps
-# its old name because p_minibrowser is the account already on disk.
-git    minibrowser url=https://git.christianimmanuel.de/web-tools/Browser  prog=browser-mini
+# Browser builds two programs, browser-mini and browser-big.  It was the
+# entry `minibrowser` until 1.14.357; an existing p_minibrowser is renamed
+# with:  packagemanager rename minibrowser browser --run
+git    browser     url=https://git.christianimmanuel.de/web-tools/Browser  prog=browser-mini
 git    swbr        url=https://git.christianimmanuel.de/sway/SwBr     prog=swbr
 git    swov        url=https://git.christianimmanuel.de/sway/SWOv     prog=swov
 git    swas        url=https://git.christianimmanuel.de/sway/SwAS     prog=swas
+# gitsync (repository Git-Server): publishes the projects listed in
+# ~/.config/gitsync/gitsync.conf to the git server.  Only the laptop script
+# is installed -- index.php, apache/ and cron/ belong to the server.  It is a
+# bash script: nothing to compile; git, rsync and ssh when it runs.
+# The repository is flat: gitsync, gitsync.conf and the Makefile at the top.
+# After the first run:  packagemanager dev gitsync --hub ~/Git/Git-Server --run
+#                       make -C ~/Git/Git-Server/gitsync config   (as you)
+git    gitsync     url=https://git.christianimmanuel.de/web-tools/Git-Server.git prog=gitsync needs=rsync,openssh build="true" install="make PREFIX=/usr install"
 
 cfg    sway-session

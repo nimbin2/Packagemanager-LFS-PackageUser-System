@@ -1,4 +1,11 @@
 # services.stack -- the boot-time services a SysV desktop needs.
+# stack-version: 1.14.369
+#
+# WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
+# here: the exclusions are a property of the machine, not of one stack.
+# Without it a dependency plan walks into systemd, qt6, cups and texlive.
+include avoid
+
 #
 # /etc/init.d after an LFS build holds only LFS's own scripts; nothing starts
 # dbus, alsa, bluetooth or a cron daemon.  Those scripts live in
@@ -34,13 +41,152 @@ git    bash-completion url=https://github.com/scop/bash-completion ref=2.18.0 \
        build="autoreconf -i && ./configure --prefix=/usr --sysconfdir=/etc" \
        install="make install"
 
-# coloured ls, the BLFS /etc/bashrc, and `su <tab>` over the package users.
-# The Bash Shell Startup Files page is CONFIG, not a package, so no package
-# stack ever ran it.
-cfg    shell-env
+# coloured ls, the BLFS /etc/bashrc, `su <tab>` over the package users, and
+# $LANG.  The Bash Shell Startup Files page is CONFIG, not a package, so no
+# package stack ever ran it.
+#
+# expect= is what this step keeps true, re-checked even when the entry is
+# cached (see shadow-pam).  Without it a machine that ran this step before
+# the locale was part of it stays at `done` for ever -- and a terminal keeps
+# saying `'C' is not a UTF-8 locale`, with nothing to say why.
+cfg    shell-env \
+       expect='test -f /etc/bashrc && test -f /etc/locale.conf && { test ! -d /etc/profile.d || test -f /etc/profile.d/i18n.sh; }'
+
+# BTRFS, ON A BTRFS MACHINE ONLY.  `btrfs check`, `scrub`, `balance`,
+# subvolumes and snapshots all come from btrfs-progs, and without it a btrfs
+# root can be mounted and nothing else -- no repair, no snapshot, and
+# mkinitramfs/fsck have no helper.  when= asks the machine: a filesystem
+# mounted now, or a partition on any disk (so it is also right in a chroot
+# whose target is btrfs and in the installer, before the mount).
+book   btrfs-progs \
+       when="grep -qw btrfs /proc/mounts || lsblk -no FSTYPE 2>/dev/null | grep -qx btrfs || blkid -t TYPE=btrfs >/dev/null 2>&1" \
+       expect="command -v btrfs >/dev/null && btrfs --version >/dev/null"
+
+# EXFAT, WHICH ARRIVES IN A POCKET.  mkfs.exfat / fsck.exfat / exfatlabel
+# for the cards and sticks that come formatted that way -- no when= test,
+# because the medium is not in the machine when the stack runs.
+#
+# NOT A BLFS PAGE.  The book carries no exFAT package at all (checked
+# against the stable index, 1.14.330); what it links to in passing is
+# relan/exfat, the FUSE implementation -- a different thing.  This is the
+# userspace for the KERNEL driver, which is the modern path and the one
+# this machine uses:
+#     lfs-kernel enable exfat        # EXFAT_FS=m, then lfs-kernel --run
+# relan/exfat (mount.exfat-fuse) is only worth having on a kernel without
+# that driver.
+#
+# The release tarball is an autotools dist, so ./configure is in it; the
+# build line falls back to autogen.sh if a future tarball is a bare export.
+tar    exfatprogs \
+       url=https://github.com/exfatprogs/exfatprogs/releases/download/1.4.2/exfatprogs-1.4.2.tar.xz \
+       pkg=exfatprogs-1.4.2.tar.xz \
+       prog=mkfs.exfat \
+       build="test -x ./configure || ./autogen.sh; ./configure --prefix=/usr --sbindir=/usr/sbin; make" \
+       install="make install" \
+       expect="command -v mkfs.exfat >/dev/null && command -v fsck.exfat >/dev/null"
+
+# NTFS: the disks Windows formatted.  The kernel's ntfs3 driver mounts them
+# (lfs-kernel enable ntfs3); ntfs-3g brings what it does not: mkntfs,
+# ntfsfix, ntfsresize, ntfslabel -- which is what gparted calls to create,
+# repair and resize an NTFS partition -- and the FUSE mount.ntfs-3g as the
+# fallback driver.  The book builds it against its own bundled FUSE
+# (--with-fuse=internal), so the only other need is the kernel's:
+#     lfs-kernel enable fuse         # FUSE_FS=m, then lfs-kernel --run
+book   ntfs-3g \
+       expect="command -v mkntfs >/dev/null && command -v ntfsfix >/dev/null"
 
 book   acpid                    # power/lid/button events -- what a laptop needs
+
+# ONE GROUP CARRIES THE PRIVILEGE.  halt/poweroff/reboot must become root, so
+# they are root's with a group deciding who may run them, and the kernel's
+# power interface is re-grouped on every boot (/sys does not survive one).
+# Set POWER_GROUP to override the <collector_prefix>_power default.
+# linux-pam, BEFORE the accounts that need it.
+#
+# `su - u_claude` without a password works through pam_exec.so reading
+# /etc/pam.d/su_u_user -- which needs Linux-PAM, and LFS installs neither pam
+# nor a pam-aware shadow.  Without it the accounts, groups, shared
+# directories and launchers all still work; only PASSWORDLESS su does not.
+#
+# This entry installs the LIBRARY, which on its own changes nothing: until
+# shadow is rebuilt against it, nothing reads /etc/pam.d at all.  That
+# rebuild is deliberately NOT here:
+#
+#     packagemanager update shadow --reinstall --regenerate --run --yes
+#
+# It is the one step in this whole system that can leave you unable to `su`
+# or log in, so it wants a root shell open, the book's Shadow page read, and
+# a moment when nothing else is running.  `cfg app-users` prints the same
+# thing when it finds no /etc/pam.d.
+#
+# It was in avoid.stack until 1.14.235 -- as systemd's dependency, which is
+# not why it is here now.  With `install`/`update` honouring the avoid list
+# (also 1.14.234), asking for it no longer drags systemd in behind it.
+book   linux-pam
+
+# ...AND THE REBUILD THAT MAKES IT MEAN ANYTHING, immediately after it.
+#
+# Linux-PAM above installs a library and changes nothing: until shadow is
+# rebuilt against it, nothing reads /etc/pam.d, so `su - u_claude` keeps
+# asking for a password however right su_u_user is.  The book's Linux-PAM
+# page ends with "You should now reinstall the Shadow package" -- so this
+# step does, and then puts back the setuid bits that the rebuild strips
+# (the BLFS Shadow page never sets them; the LFS one does).
+#
+# It is idempotent and checks its own effect: pam linkage with ldd, the
+# modes by reading them back.  With no Linux-PAM installed it says so and
+# does nothing.
+#
+# expect= is what this step keeps true, and it is re-checked on every run even
+# when the entry is cached: shadow's configure phase or a rebuild can undo it
+# later, and a cached "done" then hides it (1.14.275).
+cfg    shadow-pam \
+       expect='test -u /usr/bin/su && test "$(stat -c %U /usr/bin/su)" = root && { test ! -d /etc/pam.d || { test -f /etc/pam.d/login && test -f /etc/pam.d/passwd && test -f /etc/pam.d/system-auth; }; }'
+
+# THE APPLICATION ACCOUNTS, from a file rather than a command line.
+#
+# Each line of app-users.conf becomes a `packagemanager user setup` call, and
+# this step also does the two things no per-account command can: merge
+# /etc/pam.d/su_u_user (one file listing every account that may be entered
+# without a password) and write /etc/profile.d/shared-dirs.sh (one file
+# exporting SHARED_<NAME> for each link in the hub,
+# /home/Shared -- your ~/Shared links there).
+#
+# Needs a main user: `packagemanager config --main-user <your-login>`.
+# Nothing of yours is edited -- no .bashrc, no .bash_profile -- and the PAM
+# file is backed up before it is touched.
+#
+# Re-checked on every run (see shadow-pam): the accounts IT MANAGES (the
+# names in app-users.conf -- not every u_*: a hand-made u_test is not its
+# business) are not directly in /home, su calls su_u_user, root owns it, and
+# it checks the caller, not the target.  And (1.14.312) your ~/Shared is
+# the link to the hub, not a directory of links: a machine set up before the
+# hub existed re-runs this step once and moves them.
+cfg    app-users \
+       expect='test -x /usr/bin/xdg-runtime-share && ! awk -F"|" "\$1 !~ /^[[:space:]]*(#|name[[:space:]]|\$)/ { gsub(/[[:space:]]/, \"\", \$1); print \"u_\" \$1 }" /etc/pkgusr/stacks/app-users.conf | while read -r u; do getent passwd "$u" | cut -d: -f6; done | grep -qE "^/home/[^/]+\$" && { test ! -f /etc/pam.d/su || grep -qE "^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_exec[.]so.*su_u_user" /etc/pam.d/su; } && { test ! -e /etc/pam.d/su_u_user || { test "$(stat -c %U:%a /etc/pam.d/su_u_user)" = root:755 && ! grep -qF -e "=~ \"\$PAM_USER\"" /etc/pam.d/su_u_user; }; } && { m="$(grep "^main_user=" /etc/pkgusr/packagemanager.conf 2>/dev/null | head -n1 | cut -d= -f2)"; h="$(getent passwd "$m" 2>/dev/null | cut -d: -f6)"; [ -z "$h" ] || [ ! -d "$h/Shared" ] || [ -L "$h/Shared" ]; }'
+
+# WHO MAY TURN THE MACHINE OFF.  A package user owns files, not identity:
+# halt, poweroff and reboot have to BECOME root, so they stay root's and a
+# group decides who may run them -- 4550 root:<collector>_power, with the
+# desktop user in that group.  The same step writes the power-perms boot
+# script, because /sys/power/state is made fresh at every boot and its group
+# has to be re-applied there.
+#
+# expect= matters more here than almost anywhere else.  Without it this entry
+# was cached "done" for ever, and the modes it set are exactly the kind that
+# get destroyed silently: a sysvinit rebuild reinstalls halt without the
+# setuid bit, and a `chown` -- from anything, including this project's own
+# ownership sweep before 1.14.308 -- clears setuid as a side effect the
+# kernel never reports.  Then poweroff stops working for the user and nothing
+# says why.  Re-checked on every run: the group, the mode and owner of halt,
+# and the boot script.
+cfg    power \
+       expect='g="${POWER_GROUP:-}"; if [ -z "$g" ]; then p="$(grep "^collector_prefix=" /etc/pkgusr/packagemanager.conf 2>/dev/null | head -n1 | cut -d= -f2)"; g="${p%_}_power"; fi; h=/usr/bin/halt; [ -f "$h" ] || h=/sbin/halt; getent group "$g" >/dev/null 2>&1 && test -f /etc/rc.d/init.d/power-perms && test "$(stat -Lc "%a %U:%G" "$h" 2>/dev/null)" = "4550 root:$g"'
 book   fcron                    # the cron daemon; make-ca's weekly update needs one
+# ...and what its page sets up after the install, as root: /usr/bin/run-parts
+# and /etc/cron.{hourly,daily,weekly,monthly}, which the system table calls.
+cfg    fcron-periodic \
+       expect="test -x /usr/bin/run-parts && test -d /etc/cron.weekly"
 
 # blfs-bootscripts: 20250225 is the FINAL release (BLFS has stopped shipping
 # the SysV edition).  Only the scripts for services this system actually has
@@ -55,9 +201,30 @@ book   fcron                    # the cron daemon; make-ca's weekly update needs
 #   iptables     restores the firewall ruleset at boot
 #   random       seeds /dev/urandom from the saved pool
 #   service-wpa  the `wpa` helper `ifup` uses for a wireless interface
+# install-service-dhcpcd WAS MISSING.  The dhcpcd PACKAGE installs no service
+# script; /lib/services/dhcpcd comes from here, and `SERVICE=dhcpcd` (or a
+# wpa hand-off to it) silently has nothing to run without it.  Adding a
+# package to the network stack was only half the job.
 tar    blfs-bootscripts \
        url=https://anduin.linuxfromscratch.org/BLFS/blfs-bootscripts/blfs-bootscripts-20250225.tar.xz \
        pkg=blfs-bootscripts-20250225.tar.xz \
        have=/etc/rc.d/init.d/dbus \
        build="true" \
-       install="make install-dbus install-alsa install-bluetooth install-acpid install-fcron install-iptables install-random install-service-wpa"
+       install="make install-dbus install-alsa install-bluetooth install-acpid install-fcron install-iptables install-random install-service-wpa install-service-dhcpcd install-sshd"
+
+# ...AND THE SAME LIST AS A MAPPING, so it cannot go stale again.
+#
+# The install= line above is a list written on one day.  Add a package to a
+# stack afterwards and its bootscript is simply not installed: the daemon is
+# there, nothing starts it, and nothing says so.  `cfg bootscripts` reads
+# bootscripts.conf -- package | proof | targets | creates -- and installs the
+# targets whose package IS here and whose script is NOT, then checks the disk
+# rather than make's exit status.  It also writes the one thing a bootscript
+# cannot supply: /etc/sysconfig/ifconfig.<iface> for a WIRED interface, which
+# is what actually makes dhcpcd run at boot (there is no init.d/dhcpcd in
+# BLFS at all).  Wireless is left to `check net-wifi`: that file needs an SSID.
+#
+# expect= is re-checked even when the entry is cached, so a package installed
+# later is noticed on the next run.
+cfg    bootscripts \
+       expect='! command -v dhcpcd >/dev/null 2>&1 || { { test -e /lib/services/dhcpcd || test -e /usr/lib/services/dhcpcd; } && ls /etc/sysconfig/ifconfig.* >/dev/null 2>&1; }'

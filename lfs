@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.146"
+LFS_VERSION = "1.14.369"
 
 
 def _build_id():
@@ -235,11 +235,11 @@ LAYOUT_DEFAULTS = {
     # the system being built
     "target_pkgusr_home":  "/usr/src/pkgusr",
     "target_cfguser_home": "/usr/src/cfg",
-    "target_appuser_home": "/usr/src",              # or /home/shared_users
+    "target_appuser_home": "/home/shared_user",     # one subdir, not /home itself
     # this machine
     "pkgusr_home":         "/usr/src/pkgusr",
     "cfguser_home":        "/usr/src/cfg",
-    "appuser_home":        "/usr/src",
+    "appuser_home":        "/home/shared_user",
 }
 
 
@@ -266,7 +266,10 @@ def _accounts_root(kind):
                   target=True).rstrip("/")
     _c = {}
     try:
-        _c = read_config() or {}
+        # load_config, the function that exists: `read_config` did not, and
+        # the NameError was swallowed below -- a configured pkgusr_subdir /
+        # cfguser_subdir was silently ignored in favour of the default
+        _c = load_config() or {}
     except Exception:
         _c = {}
     sub = str(_c.get("pkgusr_subdir" if kind == "pkgusr" else "cfguser_subdir")
@@ -406,6 +409,113 @@ def _download_to(url, dest):
         f.write(data)
     _make_world_readable(dest)
     return len(data)
+
+
+_IPV4_ONLY = False
+
+
+def _force_ipv4():
+    """From now on, resolve names to IPv4 only (this process)."""
+    global _IPV4_ONLY
+    if _IPV4_ONLY:
+        return
+    import socket
+    _orig = socket.getaddrinfo
+
+    def _v4(host, port, family=0, *a, **k):
+        return _orig(host, port, socket.AF_INET, *a, **k)
+    socket.getaddrinfo = _v4
+    _IPV4_ONLY = True
+    print("\n  (IPv6 is not usable from here -- Errno 99 -- downloading over"
+          " IPv4 from now on)", flush=True)
+
+
+def _alt_urls(url):
+    """Other places that serve the same file.
+
+    ftp.gnu.org is overloaded and refuses often; ftpmirror.gnu.org is GNU's
+    own redirector to a mirror near you, with the same paths below /gnu/.
+    download.savannah.gnu.org (acl, attr) has a mirror host of its own."""
+    out = []
+    for pre, alt in (("https://ftp.gnu.org/gnu/", "https://ftpmirror.gnu.org/"),
+                     ("http://ftp.gnu.org/gnu/", "https://ftpmirror.gnu.org/"),
+                     ("https://download.savannah.gnu.org/releases/",
+                      "https://download-mirror.savannah.gnu.org/releases/"),
+                     ("https://download.savannah.nongnu.org/releases/",
+                      "https://download-mirror.savannah.gnu.org/releases/")):
+        if url.startswith(pre):
+            out.append(alt + url[len(pre):])
+    return out
+
+
+def _wget_to(url, dest):
+    """The host's wget, when Python's own fetch keeps failing: it has its own
+    address fallback and retry logic, and it is what got through by hand."""
+    import shutil as _sh
+    w = _sh.which("wget")
+    if not w:
+        return None
+    part = dest + ".part"
+    r = subprocess.run([w, "-q", "--tries=3", "--timeout=30", "-O", part, url])
+    if r.returncode == 0 and os.path.getsize(part) > 0:
+        os.replace(part, dest)
+        _make_world_readable(dest)
+        return os.path.getsize(dest)
+    try:
+        os.remove(part)
+    except OSError:
+        pass
+    return None
+
+
+def _fetch_first(sources, dest, tries=3):
+    """Download from the first source that has the file: (bytes, src, err).
+
+    ONE TRY WAS NOT ENOUGH.  The GNU servers drop connections often enough
+    that a whole run came back with
+        acl-2.4.0.tar.xz: FAILED: <urlopen error [Errno 99] Cannot assign
+        requested address>
+    for half the GNU tarballs, while the next file from the same host came
+    through.  A network error is retried with a pause; an HTTP answer (404:
+    this mirror does not carry the file) is final for THAT source and the
+    next one is asked at once -- the mirror miss for a self-made book label
+    like 13.1-sysv costs nothing."""
+    import urllib.error
+    import errno as _errno
+    err = None
+    srcs = list(sources)
+    for s_ in list(srcs):
+        for alt in _alt_urls(s_):
+            if alt not in srcs:
+                srcs.append(alt)
+    for src in srcs:
+        attempt = 0
+        while attempt < tries:
+            try:
+                return _download_to(src, dest), src, None
+            except urllib.error.HTTPError as e:
+                err = e
+                break
+            except Exception as e:                    # URLError, timeout, reset
+                err = e
+                # IPv6 WITHOUT A USABLE ADDRESS.  Errno 99 on connect means
+                # the resolver handed out an IPv6 address this machine cannot
+                # send from; Python reports that FIRST error and hides what
+                # IPv4 did.  Switch to IPv4 and retry at once, uncounted.
+                _r = getattr(e, "reason", e)
+                if getattr(_r, "errno", None) in (_errno.EADDRNOTAVAIL,
+                                                  _errno.ENETUNREACH) \
+                        and not _IPV4_ONLY:
+                    _force_ipv4()
+                    continue
+                attempt += 1
+                if attempt < tries:
+                    time.sleep(3 if attempt == 1 else 8)
+    for src in srcs:                                  # last resort: wget
+        n = _wget_to(src, dest)
+        if n:
+            return n, src, None
+    return None, None, err
 
 
 DEFAULT_MIRROR = "https://lfs.gnlug.org/pub/lfs/lfs-packages/{book}"
@@ -1477,7 +1587,7 @@ _SESSION_KEYS = [
                          "/usr/src"),
     ("target_appuser_home",
                          "where application users live on the BUILT system",
-                         "/usr/src"),
+                         "/home/shared_user"),
     ("locale",           "system locale (see 'locale -a')", "en_US.UTF-8"),
     ("paper_size",       "paper size for groff: A4 or letter", "A4"),
     # Everything below is a decision the build used to discover halfway
@@ -1732,6 +1842,20 @@ def _setup_lfs_env(args, run):
     lfs = os.environ.get("LFS")
     if lfs:                                            # pin LFS= to the real path
         combined = re.sub(r"^LFS=\S+", f"LFS={lfs}", combined, flags=re.M)
+    # ...AND THE CONFIGURED TRIPLET AND JOBS.  The book's text went in as
+    # written: LFS_TGT=$(uname -m)-lfs-linux-gnu and MAKEFLAGS=-j$(nproc), on
+    # a tree configured for x86_64-nimgnu-linux-gnu and -j14.  The build
+    # itself never reads this file (run_as_lfs sets the variables), but a
+    # `su - lfs` to redo a step by hand would quietly cross-compile for the
+    # wrong target.
+    _cfg = load_config()
+    if _cfg.get("lfs_tgt"):
+        combined = re.sub(r"^LFS_TGT=.*$", "LFS_TGT=%s" % _cfg["lfs_tgt"],
+                          combined, flags=re.M)
+    if _cfg.get("makeflags"):
+        combined = re.sub(r"^export MAKEFLAGS=.*$",
+                          "export MAKEFLAGS=%s" % _cfg["makeflags"],
+                          combined, flags=re.M)
     print("# === 4.4 Setting Up the Environment (writes ~lfs config; does NOT "
           "start it) ===")
     print(combined)
@@ -2028,7 +2152,8 @@ def cmd_bs_get_sources(args):
         return
     os.makedirs(srcdir, exist_ok=True)
     _run_bash(f'chmod -v a+wt "{srcdir}" 2>/dev/null || true')
-    got, skip, fail = 0, 0, 0
+    got, skip, nfail = 0, 0, 0
+    _failed = []
     total = len(urls)
     for i, u in enumerate(urls, 1):
         fname = u.split("/")[-1]
@@ -2046,27 +2171,52 @@ def cmd_bs_get_sources(args):
         if mb:
             sources.append(mb.rstrip("/") + "/" + fname)
         sources.append(u)
-        n, err = None, None
-        for src in sources:
-            try:
-                n = _download_to(src, dest)
-                break
-            except Exception as e:
-                err = e
+        n, src, err = _fetch_first(sources, dest)
         if n is not None:
             got += 1
             via = " (mirror)" if mb and src == sources[0] else ""
             print(f"{_human_size(n)} in {time.time() - t0:.1f}s{via}", flush=True)
         else:
-            fail += 1
+            _failed.append((fname, dest, sources))
+            nfail += 1
             print(f"FAILED: {err}", flush=True)
-    print(f"\ndownloaded {got}, skipped {skip}, failed {fail}")
+    # A SECOND ROUND for what failed: a server that refused three times in a
+    # row a minute ago often answers now.
+    if _failed:
+        print(f"\n{len(_failed)} file(s) failed -- one more round in 20s ...",
+              flush=True)
+        time.sleep(20)
+        for fname, dest, srcs in list(_failed):
+            print(f"  {fname}: downloading ...", end=" ", flush=True)
+            n, src, err = _fetch_first(srcs, dest)
+            if n is not None:
+                got += 1
+                nfail -= 1
+                _failed.remove((fname, dest, srcs))
+                print(_human_size(n), flush=True)
+            else:
+                print(f"FAILED: {err}", flush=True)
+    print(f"\ndownloaded {got}, skipped {skip}, failed {nfail}")
+    if nfail:
+        print("  still missing: " + ", ".join(f for f, _d, _s in _failed))
+        print("  run it again -- files already here are skipped:")
+        print("      lfs build-system get-sources --run")
     # Book 3.1, second half: `chown root:root $LFS/sources/*`.  Whatever ran
     # the download owns the files, and that uid means nothing in the built
     # system -- worse, it can collide with a real package user.  Do it now,
     # while the set of files is exactly what was just fetched.
     _normalize_sources(lfs, run=True)
     md5 = md5sums_path(ver)
+    # THE COUNTER WAS CALLED `fail`, like the function below that prints and
+    # stops -- so with any file missing, the md5 step called an int:
+    #     TypeError: 'int' object is not callable
+    # And a MISSING file is not a mismatch: the old message blamed a mirror
+    # serving error pages for 34 files that simply were not there.
+    if nfail:
+        fail("\n! %d source file(s) could not be downloaded (named above)."
+             "\n  Nothing is wrong with the ones that are here.  Run again:"
+             "\n      lfs build-system get-sources --run" % nfail)
+        sys.exit(1)
     if os.path.isfile(md5):
         import shutil
         shutil.copy(md5, os.path.join(srcdir, "md5sums"))
@@ -2079,7 +2229,7 @@ def cmd_bs_get_sources(args):
             fail('\n! some downloads do not match their md5sum.\n  The lines above name them.  A mirror returning an error\n  page with status 200 looks exactly like this.\n  Delete those files and run get-sources again.')
             sys.exit(1)
         print("all md5sums OK")
-    if fail:
+    if nfail:
         sys.exit(1)
 
 
@@ -3295,6 +3445,38 @@ def _handover_build_user_only(lfs, run=True):
     """
     uid = _build_user_uid()
     if uid is None:
+        return 0
+    # THE HOST'S lfs UID CAN BE A PACKAGE USER'S UID IN THE TREE.
+    #
+    # This selects files by NUMBER, because that is the only thing that means
+    # the same on both sides of the chroot.  Book 4.3 pins no uid for `lfs`,
+    # so the host's is whatever was free -- 10753 on one machine -- and
+    # package users here are created in the 10000-20000 range.  If those
+    # numbers ever meet, this hands a package user's files to root and the
+    # package silently loses every one of them.
+    #
+    # Ask the tree's own passwd before touching anything.
+    _clash = []
+    _pw = os.path.join(lfs, "etc", "passwd")
+    try:
+        with open(_pw, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) > 2 and parts[2].strip() == str(uid):
+                    _clash.append(parts[0])
+    except OSError:
+        pass
+    if _clash:
+        warn("REFUSING to hand files back: the host's build user is uid %d,"
+             % uid)
+        warn("and that is also %s in %s." % (", ".join(_clash), _pw))
+        note("  Selecting by uid cannot tell them apart, so this would give")
+        note("  that account's files to root and the package would lose them.")
+        note("  See what it owns:")
+        note("    find %s -xdev -uid %d | head" % (lfs, uid))
+        note("  Then renumber the HOST's lfs account -- it exists only to")
+        note("  build, so nothing of yours depends on its number:")
+        note("    usermod -u <free-uid> lfs      # on the host, then retry")
         return 0
     dirs = [os.path.join(lfs, d) for d in LFS_HANDOVER_DIRS
             if os.path.exists(os.path.join(lfs, d))]
@@ -5689,7 +5871,12 @@ def cmd_bs_gen_chroot_scripts(args):
         for nm, left in unresolved:
             sys.stderr.write("    %-18s %s\n"
                              % (nm, ", ".join("<%s>" % x for x in left)))
-    print(f"# step order -> {pkgusr_state(lfs, "progress", "steporder")}")
+    # SINGLE QUOTES INSIDE THE BRACES.  Reusing the f-string's own quote
+    # character is legal only from Python 3.12, and `lfs` is the one tool that
+    # runs on the HOST -- where Python is whatever the distribution ships
+    # (Debian 12: 3.11).  There it did not fail at this line, it failed to
+    # start at all, with a SyntaxError pointing at a debug print.
+    print(f"# step order -> {pkgusr_state(lfs, 'progress', 'steporder')}")
     write_chroot_env(lfs)
     install_helper(lfs)
     _install_collector_groups(lfs)
