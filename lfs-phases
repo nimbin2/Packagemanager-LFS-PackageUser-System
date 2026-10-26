@@ -34,7 +34,7 @@
 # scripts are also SOURCED by lfs-helper to read their metadata, and this file
 # comes along -- it must not shadow anything in the sourcing shell.
 
-PKGUSR_LIB_VERSION="1.14.369"
+PKGUSR_LIB_VERSION="1.14.370"
 
 _pp_build_id() {
     local f="${BASH_SOURCE[0]}"

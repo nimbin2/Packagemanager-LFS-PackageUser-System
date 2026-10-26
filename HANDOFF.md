@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.369  (lfs-backup has its own: 1.3.0)
-    lfs               b6b100b
-    lfs-helper        402d15d
-    packagemanager    6e5c15d
-    blfs              f478f74
-    lfs-phases        a6f25fb
+    all six tools at 1.14.370  (lfs-backup has its own: 1.3.0)
+    lfs               d3a1e85
+    lfs-helper        281f7c9
+    packagemanager    f142812
+    blfs              03457ff
+    lfs-phases        f299492
     lfs-kernel        f74f161   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
@@ -3780,6 +3780,17 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.370 -- SDL3_mixer
+
+- sway.stack: `git sdl3-mixer` (libsdl-org/SDL_mixer, ref=release-3.2.4 --
+  GitHub's latest release, read via the /releases/latest redirect), after
+  sdl3-image and sdl3-ttf.  CMake with tests and examples off.  Read from
+  the release's CMakeLists: built-in WAV/AIFF/VOC/AU, dr_flac, dr_mp3,
+  stb_vorbis, timidity; libFLAC/mpg123/vorbisfile/opusfile/xmp/gme/
+  fluidsynth/wavpack are optional and, without SDLMIXER_STRICT, a missing
+  one is a status message, not an error.  Not built here.
+- Noticed: SDL_image's latest release is 3.4.8; the stack pins 3.2.4.
 
 ## 1.14.369 -- fcron reinstall, run-parts, and `lfs-kernel promote`
 
