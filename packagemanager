@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.370"
+TOOL_VERSION = "1.14.371"
 
 
 def _build_id():
@@ -14130,6 +14130,15 @@ def _stack_git_script(entry, script_dir):
                             collector=collector_prefix().rstrip("_"))
     # pin the ref and the doneness signal into the generated header
     text = text.replace('git_ref=""', 'git_ref="%s"' % opts.get("ref", ""), 1)
+    # SUBMODULES ARE THE PROJECT'S SPARE COPIES, NOT ALWAYS ITS NEEDS.
+    # SDL_mixer registers eleven (flac, opus, vorbis, mpg123, ...) for builds
+    # that vendor them -- Android, MSVC -- and on this system every one of
+    # them is cloned and then ignored.  `submodules=no` clones without them;
+    # wl-mirror, whose protocols ARE its submodules, keeps the default.
+    if str(opts.get("submodules", "")).lower() in ("no", "0", "off", "false"):
+        text = re.sub(r'(?m)^(git_ref="[^"\n]*".*)$',
+                      lambda m: m.group(1) + '\ngit_submodules="0"                 # stack: submodules=no',
+                      text, count=1)
     text = text.replace('installed_program=""', 'installed_program="%s"' % prog, 1)
     # ...and `have=` is the entry's OWN statement of what proves it installed
     # -- the stack already uses it to skip an entry that is done.  It is the

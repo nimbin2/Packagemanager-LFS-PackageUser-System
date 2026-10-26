@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.370  (lfs-backup has its own: 1.3.0)
-    lfs               d3a1e85
-    lfs-helper        281f7c9
-    packagemanager    f142812
-    blfs              03457ff
-    lfs-phases        f299492
+    all six tools at 1.14.371  (lfs-backup has its own: 1.3.0)
+    lfs               63bf9b6
+    lfs-helper        d59f095
+    packagemanager    c96b7ee
+    blfs              8995b35
+    lfs-phases        b640eb0
     lfs-kernel        f74f161   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
@@ -3780,6 +3780,26 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.371 -- `submodules=no` for git entries
+
+The first sdl3-mixer clone pulled eleven submodules (flac, fluidsynth,
+libgme, libxmp, mpg123, ogg, opus, opusfile, tremor, vorbis, wavpack).
+They are SDL_mixer's copies for platforms without those libraries
+(SDLMIXER_VENDORED is ON only on Android/MSVC); here they are cloned and
+never built.
+
+- Stack option `submodules=no` -> the generated script carries
+  git_submodules="0" (on its own line after git_ref=); lfs-phases then
+  clones without --recurse-submodules and skips both `submodule update
+  --init --recursive` calls.  Default unchanged (wl-mirror's protocols ARE
+  its submodules).
+- sway.stack: submodules=no on sdl3-image, sdl3-ttf, sdl3-mixer (all three
+  ship external/ copies; vendoring is off on Linux).
+- Tested: generated scripts (wl-mirror without the line, sdl3-mixer with
+  it; both pass bash -n); a repo with one submodule cloned with the
+  lfs-phases lines -- default clones it, git_submodules=0 does not.
+- An existing clone keeps what it already downloaded.
 
 ## 1.14.370 -- SDL3_mixer
 

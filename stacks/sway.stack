@@ -1,5 +1,5 @@
 # sway.stack -- the Sway desktop: the compositor, its tools, your programs.
-# stack-version: 1.14.370
+# stack-version: 1.14.371
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -196,14 +196,16 @@ tar    dejavu-fonts url=https://downloads.sourceforge.net/dejavu/dejavu-fonts-tt
 # YOUR OWN PROGRAMS: the Sw* tools and the browser.  SDL3's image and font
 # libraries are here because only these use them.
 # ---------------------------------------------------------------------
-git    sdl3-image url=https://github.com/libsdl-org/SDL_image ref=release-3.2.4 have=/usr/lib/libSDL3_image.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release; cmake --build build" install="cmake --install build"
-git    sdl3-ttf   url=https://github.com/libsdl-org/SDL_ttf ref=release-3.2.2 have=/usr/lib/libSDL3_ttf.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release; cmake --build build" install="cmake --install build"
+git    sdl3-image url=https://github.com/libsdl-org/SDL_image ref=release-3.2.4 submodules=no have=/usr/lib/libSDL3_image.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release; cmake --build build" install="cmake --install build"
+git    sdl3-ttf   url=https://github.com/libsdl-org/SDL_ttf ref=release-3.2.2 submodules=no have=/usr/lib/libSDL3_ttf.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release; cmake --build build" install="cmake --install build"
 # SDL3_mixer: sound and music for SDL3 programs.  WAV/AIFF/VOC/AU, FLAC
 # (dr_flac), MP3 (dr_mp3), Ogg Vorbis (stb_vorbis) and MIDI (timidity) are
 # built in; libFLAC, mpg123, vorbisfile, opusfile, libxmp, game-music-emu,
 # fluidsynth and wavpack are used if they are installed and quietly left out
 # if not (only SDLMIXER_STRICT=ON makes a missing one an error).
-git    sdl3-mixer url=https://github.com/libsdl-org/SDL_mixer ref=release-3.2.4 have=/usr/lib/libSDL3_mixer.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DSDLMIXER_TESTS=OFF -DSDLMIXER_EXAMPLES=OFF; cmake --build build" install="cmake --install build"
+# submodules=no on all three: their external/ folders are copies of those
+# libraries for platforms without them (Android, MSVC), never built here.
+git    sdl3-mixer url=https://github.com/libsdl-org/SDL_mixer ref=release-3.2.4 submodules=no have=/usr/lib/libSDL3_mixer.so build="cmake -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DSDLMIXER_TESTS=OFF -DSDLMIXER_EXAMPLES=OFF; cmake --build build" install="cmake --install build"
 # Browser builds two programs, browser-mini and browser-big.  It was the
 # entry `minibrowser` until 1.14.357; an existing p_minibrowser is renamed
 # with:  packagemanager rename minibrowser browser --run
