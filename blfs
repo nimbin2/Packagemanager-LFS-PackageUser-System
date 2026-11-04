@@ -130,7 +130,7 @@ CACHE_VERSION = 56   # v56: a skipped build variant does not keep its install st
 # tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
 # of generated install scripts changes (phases, dispatcher, ...), and
 # CACHE_VERSION when the parsed/cached data structure changes.
-BLFS_VERSION = "1.14.372"
+BLFS_VERSION = "1.14.374"
 
 
 def _build_id():
@@ -3431,10 +3431,20 @@ def render_script(data, source_url, book_version=""):
     # let packagemanager's --reinstall actually force pip to reinstall: when
     # PM_REINSTALL=1 is set, pip install picks up --force-reinstall; otherwise the
     # expansion is empty and nothing changes.
+    # ONLY WHERE `pip install` IS A COMMAND.  Nmap's page patches its own
+    # Makefile with
+    #     sed -ri Makefile.in -e '/pip install/s#(ZENMAP|NDIFF)DIR\)/#&dist/*.whl#'
+    # and the expansion landed inside that pattern: `${` in an extended
+    # regex, and sed stopped on "Invalid preceding regular expression"
+    # before anything was built.  A command starts a line or follows
+    # && ; | ( then do -- optionally as `python3 -m pip` or under sudo.
+    _PIP_CMD = re.compile(r'(?m)((?:^|[;&|(]|\bthen\b|\bdo\b)[ \t]*'
+                          r'(?:sudo[ \t]+)?(?:python3?[ \t]+-m[ \t]+)?'
+                          r'pip3?[ \t]+install\b)')
+
     def _pip_reinstall(cmds):
-        return re.sub(r'\bpip3?\s+install\b',
-                      lambda m: m.group(0) + ' ${PM_REINSTALL:+--force-reinstall}',
-                      cmds or "")
+        return _PIP_CMD.sub(lambda m: m.group(1) + ' ${PM_REINSTALL:+--force-reinstall}',
+                            cmds or "")
     build_cmds = _pip_reinstall(build_cmds)
     build_cmds = _comment_own_program_demos(build_cmds,
                                             data.get("installed_content"))

@@ -112,7 +112,8 @@ tar    onnxruntime \
 # ORT=1 needs ORT=1's runtime above.  The same variables on `make install`,
 # so it does not rebuild with different ones.  v4l2loopback, the kernel side,
 # comes with the kernel (V4L2LOOPBACK=yes in /etc/pkgusr/kernel.conf).
-# At run time it also wants wf-recorder and slurp (sway.stack) and ncat.
+# At run time it also wants wf-recorder and slurp (sway.stack) and ncat
+# (nmap, network.stack).
 # Models are per user, after the install:  vcam-setup --models
 git    vcam \
        url=https://git.christianimmanuel.de/linux-system/webcam-loopback-manipulation-screensharing-and-stuff.git \

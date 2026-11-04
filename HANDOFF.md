@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.372  (lfs-backup has its own: 1.3.0)
-    lfs               45c8365
-    lfs-helper        ed12a49
-    packagemanager    7a9c615
-    blfs              33cc953
-    lfs-phases        463d079
+    all six tools at 1.14.374  (lfs-backup has its own: 1.3.0)
+    lfs               0674054
+    lfs-helper        fc2cefe
+    packagemanager    a1bac25
+    blfs              966119d
+    lfs-phases        07258a5
     lfs-kernel        f74f161   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
@@ -3780,6 +3780,31 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.374 -- `pip install` inside a sed pattern (nmap)
+
+Nmap-7.991 stopped before building: `sed: -e expression #2, char 48:
+Invalid preceding regular expression`.  The page patches its Makefile.in
+with `sed -ri ... -e '/pip install/s#(ZENMAP|NDIFF)DIR\)/#&dist/*.whl#'`,
+and render_script's _pip_reinstall appended
+`${PM_REINSTALL:+--force-reinstall}` after EVERY `pip3? install` -- inside
+that pattern too, where `${` is invalid ERE.
+
+- _pip_reinstall only rewrites `pip install` in command position: line
+  start or after && ; | ( then do, optionally `sudo` / `python3 -m`.
+  Tested: nmap's three sed lines unchanged and running correctly on a
+  sample Makefile.in; pip3 / make && pip3 / python3 -m pip / then pip /
+  sudo pip3 still get the flag; a quoted mention does not.
+- The failed attempt left the old script in p_nmap's home:
+  `install nmap --run --regenerate`.
+
+## 1.14.373 -- ncat
+
+- network.stack: `book nmap` after openssh, expect `command -v ncat`.  ncat
+  only exists as part of nmap's page (BLFS ch. 16, Nmap-7.993 in svn:
+  ncat, ndiff, nmap, nping, zenmap).  Recommended deps (libpcap,
+  liblinear, libssh2, Lua, PyGObject) are left to the plan -- without them
+  nmap builds bundled, older copies.  vcam-ctl needs ncat.
 
 ## 1.14.372 -- vcam + onnxruntime, `dev -h` is the recipe, KERNEL_NAME=vmlinuz
 

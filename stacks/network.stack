@@ -1,5 +1,5 @@
 # network.stack -- wired and wireless networking, for a SysV system.
-# stack-version: 1.14.320
+# stack-version: 1.14.373
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -71,6 +71,13 @@ book   dhcpcd                   # the DHCP client; SERVICE=dhcpcd in ifconfig.*
 # startable once both stacks have run, and `expect` below checks only what
 # this entry can be responsible for.
 book   openssh expect="test -x /usr/sbin/sshd"
+
+# ncat -- netcat with TLS and proxies, which vcam-ctl talks to vcam with.
+# It is part of nmap's page (ncat, nmap, nping, ndiff, zenmap); there is no
+# smaller package that has it.  The recommended libpcap, liblinear, libssh2,
+# Lua and PyGObject come in with it -- without them nmap builds its own,
+# older copies of the same libraries.
+book   nmap expect="command -v ncat >/dev/null"
 
 check  net-wifi                 # what is still missing to bring a link up
 
