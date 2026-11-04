@@ -1,5 +1,5 @@
 # vision.stack -- computer vision, kept out of the desktop stack.
-# stack-version: 1.14.320
+# stack-version: 1.14.372
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -86,3 +86,37 @@ git    opencv \
 #     -D OPENCV_EXTRA_MODULES_PATH=<path>/modules
 # to the build line above.  Written down rather than added, because an entry
 # that builds nothing on its own would be a lie about how that repo works.
+
+# ---------------------------------------------------------------------
+# vcam -- webcam loopback: filters a real camera into a v4l2loopback device
+# that browsers then use as the camera (and screen sharing into one).
+# YOUR OWN PROGRAM: make it a dev package after the first build --
+#     packagemanager dev -h
+# ---------------------------------------------------------------------
+#
+# ONNX RUNTIME FOR ORT=1, AS ITS OWN PACKAGE.  vcam's Makefile looks for it
+# in ORT_HOME, default ~/.local/share/vcam/onnxruntime of whoever builds --
+# for a package that is a folder in the package user's home, and the binary
+# would load libonnxruntime from there for ever (the Makefile sets an rpath
+# to ORT_HOME/lib).  So: Microsoft's prebuilt CPU release, unpacked to
+# /opt/onnxruntime, and vcam built against that.  Nothing to compile.
+# `packagemanager update onnxruntime` moves it to a newer release.
+tar    onnxruntime \
+       url=https://github.com/microsoft/onnxruntime/releases/download/v1.31.1/onnxruntime-linux-x64-1.31.1.tgz \
+       pkg=onnxruntime-linux-x64-1.31.1.tgz \
+       have=/opt/onnxruntime/include/onnxruntime_c_api.h \
+       build="true" \
+       install="install -d /opt/onnxruntime && cp -a include lib /opt/onnxruntime/"
+
+# The program itself.  OPENCV=1 needs opencv above (it probes opencv5 first);
+# ORT=1 needs ORT=1's runtime above.  The same variables on `make install`,
+# so it does not rebuild with different ones.  v4l2loopback, the kernel side,
+# comes with the kernel (V4L2LOOPBACK=yes in /etc/pkgusr/kernel.conf).
+# At run time it also wants wf-recorder and slurp (sway.stack) and ncat.
+# Models are per user, after the install:  vcam-setup --models
+git    vcam \
+       url=https://git.christianimmanuel.de/linux-system/webcam-loopback-manipulation-screensharing-and-stuff.git \
+       prog=vcam \
+       needs=ffmpeg,libpng \
+       build="make OPENCV=1 ORT=1 ORT_HOME=/opt/onnxruntime PREFIX=/usr" \
+       install="make OPENCV=1 ORT=1 ORT_HOME=/opt/onnxruntime PREFIX=/usr install"

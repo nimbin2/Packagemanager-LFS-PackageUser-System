@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.371  (lfs-backup has its own: 1.3.0)
-    lfs               63bf9b6
-    lfs-helper        d59f095
-    packagemanager    c96b7ee
-    blfs              8995b35
-    lfs-phases        b640eb0
+    all six tools at 1.14.372  (lfs-backup has its own: 1.3.0)
+    lfs               45c8365
+    lfs-helper        ed12a49
+    packagemanager    7a9c615
+    blfs              33cc953
+    lfs-phases        463d079
     lfs-kernel        f74f161   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
@@ -3780,6 +3780,28 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.372 -- vcam + onnxruntime, `dev -h` is the recipe, KERNEL_NAME=vmlinuz
+
+- kernel.conf ships KERNEL_NAME=vmlinuz (builds become the boot default;
+  the previous stays as vmlinuz_old).
+- vision.stack: `tar onnxruntime` (Microsoft's prebuilt CPU release
+  v1.31.1, onnxruntime-linux-x64-<ver>.tgz -> /opt/onnxruntime, build=true)
+  and `git vcam` (git.christianimmanuel.de/linux-system/webcam-loopback-
+  manipulation-screensharing-and-stuff.git): make OPENCV=1 ORT=1
+  ORT_HOME=/opt/onnxruntime PREFIX=/usr, same variables on install.  vcam's
+  Makefile defaults ORT_HOME to the BUILDER's ~/.local/share/vcam and sets
+  an rpath to it -- for a package user that would tie the binary to its
+  home.  Read from INSTALL.md and the Makefile; asset name by upstream's
+  convention (the release page did not list assets); not built here.
+- `packagemanager dev -h` (epilog) and a bare `dev` with nothing set up
+  print _DEV_HOWTO: stack entry -> dev --hub -> first build, then commit +
+  push local + update.
+- update for tar entries: a v-prefixed tag with a bare-version file name
+  (v1.31.1 / ...-1.31.1.tgz) now moves both, in the build and in the pin.
+- _github_latest_tag fallback keeps only version-like tags (onnxruntime has
+  `test-tag`, which sorted above every digit).  The redirect itself answers
+  403 from the sandbox now; on the machine it is the primary path.
 
 ## 1.14.371 -- `submodules=no` for git entries
 

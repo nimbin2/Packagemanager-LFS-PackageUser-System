@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.371"
+TOOL_VERSION = "1.14.372"
 
 
 def _build_id():
@@ -5023,6 +5023,9 @@ def _github_latest_tag(owner, repo):
     tags = [r.rsplit("/", 1)[-1] for _s, r in
             _ls_remote("https://github.com/%s/%s" % (owner, repo), "tags")]
     tags = [t for t in tags if not re.search(r"(rc|alpha|beta|nightly|dev)", t, re.I)]
+    # ...and only what reads as a version: microsoft/onnxruntime has a tag
+    # called `test-tag`, and a letter sorts above every digit
+    tags = [t for t in tags if re.match(r"^(v|release-)?\d", t)]
     return sorted(tags, key=_vsort_key)[-1] if tags else ""
 
 
@@ -5056,8 +5059,20 @@ def _update_tar_packages(args):
             continue
         printInfo("%s: pinned to %s, latest release is %s (installed: %s)"
                   % (name, tag, latest, inst))
+        # THE TAG AND THE FILE NAME MAY SPELL THE VERSION DIFFERENTLY.
+        # onnxruntime: .../download/v1.31.1/onnxruntime-linux-x64-1.31.1.tgz
+        # -- replacing only "v1.31.1" moved the folder and kept the old file
+        # name.  The bare version goes too.
+        _pairs = [(tag, latest)]
+        if tag[:1] == "v" and latest[:1] == "v":
+            _pairs.append((tag[1:], latest[1:]))
+
+        def _bump(v):
+            for a, b in _pairs:
+                v = v.replace(a, b)
+            return v
         new = {"kind": "tar", "target": name,
-               "opts": {k: (v.replace(tag, latest) if isinstance(v, str) else v)
+               "opts": {k: (_bump(v) if isinstance(v, str) else v)
                         for k, v in entry["opts"].items()}}
         if not args.run:
             printInfo("  would build %s from %s" % (latest, new["opts"]["url"]))
@@ -5077,7 +5092,7 @@ def _update_tar_packages(args):
                 if re.match(r"^\s*tar\s+%s(\s|$)" % re.escape(name), ln):
                     inside = True
                 if inside:
-                    ln = ln.replace(tag, latest)
+                    ln = _bump(ln)
                     if not ln.rstrip().endswith("\\"):
                         inside = False
                 out.append(ln)
@@ -5894,6 +5909,46 @@ DEV_SOURCES = "/etc/pkgusr/dev-sources.conf"
 
 DEV_HUB = "/srv/git"     # where `dev --hub` keeps the bare repositories
 
+# THE WHOLE RECIPE, IN ONE PLACE.  "I do not remember how to set it up" was
+# the question, and the answer was spread over a README section, a stack
+# comment and three earlier replies.  `dev -h` and a bare `dev` with nothing
+# set up both print this.
+_DEV_HOWTO = """\
+A program you develop on this machine, installed as a package.
+
+You work in your own checkout (~/Git/<Project>) as yourself.  A bare copy in
+/srv/git is what the package builds from; `git push local` decides what gets
+installed.  The installed files belong to the package user, as always.
+
+NEW PROJECT, ONCE
+  1. A git entry in a stack, with how to build it -- e.g. in
+     /etc/pkgusr/stacks/apps.stack:
+         git  <name>  url=<clone URL>  prog=<binary it installs> \\
+              build="make PREFIX=/usr" \\
+              install="make PREFIX=/usr install"
+     url= is only used until step 2 points the package at your hub.
+  2. The hub, from your checkout (as root; ~ means your desktop user):
+         packagemanager dev <name> --hub ~/Git/<Project> --run
+     creates /srv/git/<Project>.git, adds the remote `local` to the checkout,
+     and builds <name> from it from now on.
+  3. The first build:
+         packagemanager stack <stack> --only <name> --run
+
+EVERY CHANGE AFTER THAT
+  in the checkout:  git commit ...  &&  git push local <branch>
+  as root:          packagemanager update <name> --run
+
+WHERE THINGS STAND
+  packagemanager dev           installed, pushed, unpushed and uncommitted,
+                               per project
+  packagemanager dev <name>    the same for one
+
+ALSO
+  packagemanager dev <name> --off --run        back to its url=
+  packagemanager rename <old> <new> --run      rename a package
+  Only pushed commits are installed, never the working tree.
+"""
+
 
 def _dev_entries():
     """{account: (source, checkout)}.  A line is
@@ -6065,7 +6120,8 @@ def cmd_dev(args):
     if not args.name:
         printHeader("dev sources (%s)" % os.environ.get("PM_DEV_SOURCES", DEV_SOURCES))
         if not ent:
-            print("  none.  set one up:  packagemanager dev <package> --hub <checkout> --run")
+            print("  none yet.\n")
+            print("\n".join("  " + l if l else "" for l in _DEV_HOWTO.splitlines()))
             return 0
         for acct, (src, co) in sorted(ent.items()):
             pre = pkgusr_prefix()
@@ -16254,7 +16310,10 @@ def main():
     p.set_defaults(func=cmd_rename)
 
     p = sub.add_parser("dev", help="build a git package from your own local "
-                       "checkout (a program you develop here)")
+                       "checkout (a program you develop here)",
+                       description="Build a git package from your own checkout.",
+                       epilog=_DEV_HOWTO,
+                       formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("name", nargs="?")
     p.add_argument("path", nargs="?", help="the checkout, e.g. ~/dev/SwAS")
     p.add_argument("--off", action="store_true", help="back to its url=")
