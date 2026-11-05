@@ -1,0 +1,11 @@
+
+
+- introduce cgroups
+    -> u_users (shared_users) shall get cgroups at createn
+    -> cgroup for install/compile process?
+    -> easy creation of a temp cgrouped user
+    -> propper display of all cgroup config
+
+- recheck how we share xdg-runtime to shared_users
+    -> better restriction on what to share
+        -> need to know whats actually there^^
