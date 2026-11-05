@@ -135,3 +135,18 @@ git    nvtop \
        build="cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DUSE_LIBUDEV_OVER_LIBSYSTEMD=ON -DAMDGPU_SUPPORT=ON -DINTEL_SUPPORT=OFF -DNVIDIA_SUPPORT=OFF -DMSM_SUPPORT=OFF -DPANFROST_SUPPORT=OFF -DPANTHOR_SUPPORT=OFF -DV3D_SUPPORT=OFF -DMETAX_SUPPORT=OFF -DTPU_SUPPORT=OFF -DENFLAME_SUPPORT=OFF && cmake --build build" \
        install="cmake --install build" \
        expect="nvtop --version >/dev/null"
+
+# fastfetch -- system information summary.
+# Detects OS, kernel, CPU, GPU, memory, displays, DE/WM and more.
+#
+# Optional feature support depends on installed development libraries.
+# Missing optional dependencies disable their respective features.
+#
+# GCC 13+ required (C23).
+git    fastfetch \
+       url=https://github.com/fastfetch-cli/fastfetch.git \
+       ref=2.70.0 \
+       have=/usr/bin/fastfetch \
+       build="cmake -S . -B build -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DBUILD_FLASHFETCH=OFF -DBUILD_TESTS=OFF && cmake --build build --target fastfetch" \
+       install="cmake --install build" \
+       expect="test -x /usr/bin/fastfetch"
