@@ -11,13 +11,13 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.374  (lfs-backup has its own: 1.3.0)
-    lfs               0674054
-    lfs-helper        fc2cefe
-    packagemanager    a1bac25
-    blfs              966119d
-    lfs-phases        07258a5
-    lfs-kernel        f74f161   (no version line of its own)
+    all six tools at 1.14.375  (lfs-backup has its own: 1.3.0)
+    lfs               f800682
+    lfs-helper        736533c
+    packagemanager    82822c3
+    blfs              a743c2a
+    lfs-phases        6a52201
+    lfs-kernel        d117ca3   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
 
@@ -3780,6 +3780,43 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.375 -- the tree walk in parallel; libreoffice, openvpn, wireguard
+
+"# scanning the tree for what this step touched" sat for a long time after
+every step (fastfetch's failed install, here).  Three whole-tree walks end
+each step: the file snapshot, the directory snapshot and the touched walk.
+
+- lfs-helper `_pfind <top> <expr>`: the tree cut at the second level and
+  fed to parallel finds (xargs -P nproc, max 16, 16 starts per find, one
+  output file per find).  Same lines: a pruned start prunes (PF_NOSPLIT
+  is never cut into), -xdev by hand (another filesystem is evaluated as
+  itself, -maxdepth 0), cut levels evaluated as themselves.  Callers sort.
+  `PM_SCAN_JOBS=1` is the old single find.  Used by snapshot,
+  snapshot_dirs and the touched walk.
+- The touched walk now prunes /root and /home like both snapshots do
+  (never_adopt_list refuses them anyway).  It walked the desktop user's
+  whole home after every step -- probably most of the wait.
+- Tested here (2 cores, warm cache): old and new output byte-identical for
+  all three walks on the sandbox's / (260k files).  The speed-up there is
+  small; it needs cores and an NVMe.
+- apps.stack `book libreoffice`.  avoid.stack keeps `avoid libreoffice`
+  (harfbuzz recommends it), and a stack entry that NAMES an avoided package
+  now builds it: the entry's own target is taken out of the --ignore list
+  and the status count.  machine.conf [libreoffice]: bundled boost/nss/
+  clucene/redland/odbc, no java/cups/ldap/postgresql/gpgmepp,
+  --with-lang=de, and `__PREFIX__ = /usr`.
+- packagemanager: configure_args reaches `./autogen.sh` when a script has
+  no ./configure (libreoffice); flags are shlex-split, and the removal of
+  the book's flag takes a quoted value whole (--with-lang='fr en-GB').
+- machine.conf `__NAME__ = value` fills a book placeholder (<PREFIX> becomes
+  __PREFIX__ in a script); one left unfilled is warned about at generation.
+- network.stack: `book lzo`, `git libcap-ng` (v0.9.5, no BLFS page, no
+  release tarball), `tar openvpn` 2.7.9 (GitHub release asset),
+  `git wireguard-tools` v1.0.20260223.  Neither VPN is in BLFS.
+- lfs-kernel enable: `tun` (TUN=y), `wireguard` (WIREGUARD=m); shipped
+  kernel.conf carries both in CONFIG_SET.
+- Not built here: libreoffice, openvpn, libcap-ng, wireguard-tools.
 
 ## 1.14.374 -- `pip install` inside a sed pattern (nmap)
 

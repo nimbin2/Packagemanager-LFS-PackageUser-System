@@ -214,9 +214,10 @@ export LFS_DESKTOP_USER=<name>
 
 packagemanager stack sway --check-refs        # every git ref still exists?
 packagemanager stack sway --run               # desktop: includes wayland + media, then sway, foot, pipewire
-packagemanager stack apps --run               # zathura, imv -- programs, not the desktop
+packagemanager stack apps --run               # zathura, imv, gparted, libreoffice (hours, 11 GB)
 packagemanager stack network --check-refs
-packagemanager stack network --run            # wpa_supplicant, iptables-nft, net-tools
+packagemanager stack network --run            # wpa_supplicant, iptables-nft, openvpn, wireguard
+                                              #   (kernel: lfs-kernel enable tun wireguard)
 packagemanager stack services --run           # bootscripts, fcron, acpid, mytools, shell-env, app-users
 packagemanager stack dev --run                # gdb -- nothing needs it, so it goes last
 packagemanager stack tools --run              # trans, jq -- same: nothing needs them

@@ -1,5 +1,5 @@
 # network.stack -- wired and wireless networking, for a SysV system.
-# stack-version: 1.14.373
+# stack-version: 1.14.375
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -78,6 +78,40 @@ book   openssh expect="test -x /usr/sbin/sshd"
 # Lua and PyGObject come in with it -- without them nmap builds its own,
 # older copies of the same libraries.
 book   nmap expect="command -v ncat >/dev/null"
+
+# VPN -- OpenVPN and WireGuard.  Neither is a BLFS page.
+#
+# THE KERNEL FIRST: OpenVPN talks through /dev/net/tun (CONFIG_TUN), and
+# WireGuard IS a kernel module (CONFIG_WIREGUARD); the tools here only
+# configure it.  `lfs-kernel enable tun wireguard`, then rebuild the kernel.
+#
+# OpenVPN 2.7.9 (2026-11-05, the supported branch; 2.6 gets security fixes
+# only).  Its INSTALL names what Linux needs: OpenSSL (LFS), libnl-genl for
+# the in-kernel data channel (DCO, libnl is above), libcap-ng, and lzo/lz4
+# for compression (lz4 is LFS).  libcap-ng has no BLFS page either, and its
+# GitHub releases carry no tarball -- so it is a git entry, ahead of openvpn.
+book   lzo
+git    libcap-ng url=https://github.com/stevegrubb/libcap-ng.git ref=v0.9.5 \
+       have=/usr/lib/pkgconfig/libcap-ng.pc \
+       build="./autogen.sh && ./configure --prefix=/usr --disable-static --without-python3 && make" \
+       install="make install"
+tar    openvpn \
+       url=https://github.com/OpenVPN/openvpn/releases/download/v2.7.9/openvpn-2.7.9.tar.gz \
+       pkg=openvpn-2.7.9.tar.gz \
+       prog=openvpn \
+       build="./configure --prefix=/usr --sysconfdir=/etc && make" \
+       install="make install" \
+       expect="test -x /usr/sbin/openvpn"
+
+# wireguard-tools: `wg` and `wg-quick`.  v1.0.20260223 is the newest tag.
+# A plain Makefile in src/; systemd units off, bash completion on.  wg-quick
+# is a bash script: it uses ip (LFS), nft or iptables for its routing rules
+# (above), and resolvconf only if a config has a DNS= line.
+git    wireguard-tools url=https://git.zx2c4.com/wireguard-tools ref=v1.0.20260223 \
+       prog=wg \
+       build="make -C src" \
+       install="make -C src PREFIX=/usr WITH_BASHCOMPLETION=yes WITH_WGQUICK=yes WITH_SYSTEMDUNITS=no install" \
+       expect="command -v wg-quick >/dev/null"
 
 check  net-wifi                 # what is still missing to bring a link up
 

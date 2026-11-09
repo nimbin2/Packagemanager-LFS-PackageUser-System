@@ -1,6 +1,6 @@
-# apps.stack -- desktop applications: a document viewer, an image viewer and
-# a partition editor.
-# stack-version: 1.14.334
+# apps.stack -- desktop applications: a document viewer, an image viewer, a
+# partition editor and an office suite.
+# stack-version: 1.14.375
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -118,3 +118,19 @@ git    imv url=https://github.com/exec64/imv.git ref=v4.3.0 \
 book   gparted \
        ignore=lvm2 \
        expect="command -v gparted >/dev/null"
+
+# LIBREOFFICE -- a BLFS page, and the biggest build on this machine: about
+# 23 SBU at -j8 and 11 GB in its build tree, with ~80 small tarballs fetched
+# DURING the build (an internet connection is required, as the page says).
+#
+# avoid.stack keeps `avoid libreoffice`: harfbuzz RECOMMENDS it, and every
+# desktop plan would otherwise schedule it.  An entry that NAMES a package
+# builds it all the same (1.14.375), as `install libreoffice` always did.
+#
+# Its recommendations that avoid.stack refuses (boost, nss, clucene, redland,
+# unixodbc, openldap, postgresql, gpgmepp, cups, openjdk) would break the
+# book's --with-system-* line; machine.conf [libreoffice] turns each one into
+# LibreOffice's bundled copy or switches the feature off, and fills in the
+# page's <PREFIX> (/usr).  Languages: --with-lang there (en-US is always in).
+book   libreoffice \
+       expect="command -v libreoffice >/dev/null"

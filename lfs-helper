@@ -49,7 +49,7 @@ set -u
 # Bump on every change that alters behaviour.  `lfs-helper --version` makes it
 # possible to tell at a glance whether the copy inside the chroot is the one
 # that was just fixed -- guessing at that has wasted a lot of time.
-LFS_HELPER_VERSION="1.14.374"
+LFS_HELPER_VERSION="1.14.375"
 
 # A fingerprint of this file's own contents.  A hand-maintained version number
 # goes stale the moment someone forgets to bump it -- and the reason for
@@ -1055,6 +1055,67 @@ load_snapshot() {
 
 have_su() { command -v su >/dev/null 2>&1; }
 
+# _pfind <top> <find expression...> -- `find <top> <expression>`, as parallel finds.
+#
+# Every step ended with three walks over the whole tree (the file snapshot,
+# the directory snapshot, "# scanning the tree for what this step touched"),
+# each one find reading one directory after the other.  An NVMe, or a warm
+# cache, answers many directory reads at once.  The tree is cut at the second
+# level (/usr/lib/*, /usr/share/*, /etc/*, ...) and the pieces go to parallel
+# finds with the SAME expression; each find writes its own file, so lines
+# from parallel writers never tear.  The output is the same set of lines:
+#   - a start is tested by the expression too, so a pruned start prunes;
+#     PF_NOSPLIT lists the paths the expression prunes, never cut into
+#   - -xdev by hand: an entry on another filesystem (a mounted /boot, a
+#     tmpfs /run) is evaluated as itself only, as -xdev did
+#   - the levels that were cut are evaluated as themselves (-maxdepth 0)
+# Order differs; every caller sorts.  PM_SCAN_JOBS=1 gives the single walk.
+PF_NOSPLIT=()
+_pf_nosplit() {
+    local p
+    for p in "${PF_NOSPLIT[@]}"; do [ "$1" = "$p" ] && return 0; done
+    return 1
+}
+_pfind() {
+    local top="$1"; shift
+    local jobs="${PM_SCAN_JOBS:-$(nproc 2>/dev/null || echo 2)}"
+    [ "$jobs" -ge 1 ] 2>/dev/null || jobs=2
+    [ "$jobs" -gt 16 ] && jobs=16
+    if [ "$jobs" -le 1 ]; then find "$top" "$@"; return 0; fi
+    local out rootdev d c
+    out="$(mktemp -d "${TMPDIR:-/tmp}/lfs-walk.XXXXXX" 2>/dev/null)" \
+        || { find "$top" "$@"; return 0; }
+    rootdev="$(stat -c %d "$top" 2>/dev/null)"
+    local self=("$top")
+    : > "$out/starts"
+    while IFS= read -r -d '' d; do
+        if [ -L "$d" ] || [ ! -d "$d" ] || _pf_nosplit "$d"; then
+            [ "$(stat -c %d "$d" 2>/dev/null)" = "$rootdev" ] || [ -L "$d" ] || [ ! -d "$d" ] \
+                && { printf '%s\0' "$d" >> "$out/starts"; continue; }
+            self+=("$d"); continue
+        fi
+        self+=("$d")
+        [ "$(stat -c %d "$d" 2>/dev/null)" = "$rootdev" ] || continue
+        while IFS= read -r -d '' c; do
+            if [ ! -L "$c" ] && [ -d "$c" ] \
+                    && [ "$(stat -c %d "$c" 2>/dev/null)" != "$rootdev" ]; then
+                self+=("$c"); continue
+            fi
+            printf '%s\0' "$c" >> "$out/starts"
+        done < <(find "$d" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    done < <(find "$top" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+    find "${self[@]}" -maxdepth 0 "$@" > "$out/self"
+    # xargs puts the starts AFTER the fixed arguments: pass the expression
+    # with its length first, and put the starts back in front for find.
+    xargs -0 -r -P "$jobs" -n 16 bash -c \
+        'o="$(mktemp "$0/w.XXXXXX")" || exit 1; n="$1"; shift
+         exec find "${@:n+1}" "${@:1:n}" > "$o"' \
+        "$out" "$#" "$@" < "$out/starts"
+    rm -f "$out/starts"
+    cat "$out"/* 2>/dev/null
+    rm -rf "$out"
+}
+
 snapshot_dirs() {
     # PRUNE, DO NOT FILTER.  `-not -path "$SRCROOT/*"` hides a path AFTER find
     # has walked into it, so every scan still descended /usr/src -- every
@@ -1064,7 +1125,9 @@ snapshot_dirs() {
     # -prune does not descend.  The pruned directory itself is still listed,
     # exactly as the filter listed it.
     local r="${SNAP_ROOT%/}"
-    find "${SNAP_ROOT:-/}" -xdev \
+    local PF_NOSPLIT=("$SRCROOT" "$r/dev" "$r/proc" "$r/sys" "$r/run" "$r/tmp"
+                      "$r/sources" "$r/build" "$r/root" "$r/home")
+    _pfind "${SNAP_ROOT:-/}" -xdev \
         \( -path "$SRCROOT" -o -path "$r/dev" -o -path "$r/proc" \
            -o -path "$r/sys" -o -path "$r/run" -o -path "$r/tmp" \
            -o -path "$r/sources" -o -path "$r/build" \
@@ -1085,7 +1148,9 @@ snapshot() {
     # root's shell may not, so the two sides really can differ.
     local r="${SNAP_ROOT%/}"
     # pruned, not filtered -- see snapshot_dirs
-    find "${SNAP_ROOT:-/}" -xdev \
+    local PF_NOSPLIT=("$SRCROOT" "$r/dev" "$r/proc" "$r/sys" "$r/run" "$r/tmp"
+                      "$r/sources" "$r/build" "$r/root" "$r/home")
+    _pfind "${SNAP_ROOT:-/}" -xdev \
         \( -path "$SRCROOT" -o -path "$r/dev" -o -path "$r/proc" \
            -o -path "$r/sys" -o -path "$r/run" -o -path "$r/tmp" \
            -o -path "$r/sources" -o -path "$r/build" \
@@ -7024,9 +7089,17 @@ cmd_build() {
         # ONE pruned walk for both lists (it was two unpruned ones).  A
         # pruned directory is reported only as itself, as before: $SRCROOT,
         # sources, dev, proc, sys, run and tmp when newer; never the build root.
+        #
+        # Nor /root and /home: they belong to people, not packages (the two
+        # snapshot walks skip them, never_adopt_list refuses them).  This walk
+        # still went through all of them -- every git checkout, browser cache
+        # and download of the desktop user -- after every single step, only
+        # to find files nothing may adopt.  It was most of the wait.
         local _tw
-        _tw="$(find "${r:-/}" -xdev \
-                     \( -path "$_bld" \) -prune \
+        local PF_NOSPLIT=("$_bld" "$r/root" "$r/home" "$SRCROOT" "$r/sources" "$r/dev"
+                          "$r/proc" "$r/sys" "$r/run" "$r/tmp")
+        _tw="$(_pfind "${r:-/}" -xdev \
+                     \( -path "$_bld" -o -path "$r/root" -o -path "$r/home" \) -prune \
                      -o \( -path "$SRCROOT" -o -path "$r/sources" -o -path "$r/dev" \
                         -o -path "$r/proc" -o -path "$r/sys" -o -path "$r/run" \
                         -o -path "$r/tmp" \) -type d -newer "$stamp" -printf 'd %p\n' -prune \

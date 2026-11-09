@@ -1,5 +1,5 @@
 # avoid.stack -- what no stack on this machine builds, and why.
-# stack-version: 1.14.320
+# stack-version: 1.14.375
 #
 # An `avoid` entry does not build anything: it tells a dependency plan that
 # this machine will not have that package, so the plan stops walking into it
@@ -33,7 +33,7 @@
 # libxml2) must not be dropped by a blanket rule.  These are the branches
 # this desktop does not want, named one at a time, and everything they alone
 # pull in goes with them.
-avoid  libreoffice
+avoid  libreoffice           # reached through harfbuzz; apps.stack NAMES it, which builds it
 avoid  asymptote
 avoid  biber
 avoid  qt6
@@ -122,7 +122,7 @@ avoid  libcupsfilters        # cups   (avoided)
 avoid  libppd                # cups
 avoid  cups-filters          # cups
 avoid  exiv2                 # libkexiv2
-avoid  clucene               # libreoffice (avoided)
+avoid  clucene               # libreoffice (uses its bundled copy here)
 avoid  redland               # libreoffice
 avoid  rasqal                # redland
 avoid  raptor                # rasqal

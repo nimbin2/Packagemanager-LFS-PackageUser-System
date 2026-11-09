@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.374"
+TOOL_VERSION = "1.14.375"
 
 
 def _build_id():
@@ -2631,13 +2631,26 @@ def apply_machine_opts(anchor, script_path):
         pass
     _was_pristine = _before is not None and script_edited(_before) is False
     _apply_machine_opts_inner(anchor, script_path)
-    if _was_pristine:
-        try:
-            _after = open(script_path, encoding="utf-8", errors="replace").read()
-        except OSError:
-            return
-        if _after != _before:
-            _restamp_md5(script_path)
+    try:
+        _after = open(script_path, encoding="utf-8", errors="replace").read()
+    except (OSError, TypeError):
+        return
+    # A PLACEHOLDER NOBODY FILLED IN IS NOT A VALUE.  The book's <PREFIX>
+    # becomes __PREFIX__ in the script (bash would read <PREFIX> as a
+    # redirection); left alone, libreoffice would install into a directory
+    # called __PREFIX__.  Say it now, with the line that fills it in.
+    _left = sorted(set(re.findall(r"(?<![A-Za-z0-9_])__[A-Z][A-Z0-9_]*__(?![A-Za-z0-9_])",
+                                  "\n".join(l for l in _after.splitlines()
+                                            if not l.lstrip().startswith("#")))))
+    if _left:
+        printWarning("  %s: the book leaves %s for you to fill in -- the script"
+                     " would use %s literally" % (anchor, ", ".join(_left),
+                                                  "them" if len(_left) > 1 else "it"))
+        printWarning("    machine.conf:  [%s]" % anchor)
+        for _t in _left:
+            printWarning("                   %s = <value>" % _t)
+    if _was_pristine and _after != _before:
+        _restamp_md5(script_path)
 
 
 def _apply_machine_opts_inner(anchor, script_path):
@@ -2661,6 +2674,24 @@ def _apply_machine_opts_inner(anchor, script_path):
     #     ERROR: Unknown option: "needs".
     # One file, two readers: each must ignore what belongs to the other.
     opts.pop("needs", None)
+    # THE BOOK'S PLACEHOLDERS, FILLED IN.  `__PREFIX__ = /usr` under
+    # [libreoffice] replaces the token the page's <PREFIX> became.  Not a
+    # build option: taken out before anything below sees it.
+    _ph = {k: opts.pop(k) for k in list(opts)
+           if re.fullmatch(r"__[A-Z][A-Z0-9_]*__", k)}
+    if _ph:
+        _new = body
+        for _k, _v in _ph.items():
+            _new = re.sub(r"(?<![A-Za-z0-9_])%s(?![A-Za-z0-9_])" % re.escape(_k),
+                          lambda m, v=_v: v, _new)
+        if _new != body:
+            body = _new
+            with open(script_path, "w") as f:
+                f.write(body)
+            printInfo("  machine.conf [%s]: %s" % (anchor, ", ".join(
+                "%s=%s" % kv for kv in _ph.items())))
+        if not opts:
+            return
     # Same hazard, same answer: expect= is a post-install feature probe read
     # by the stack runner.  It belongs in a stack line, but this file is
     # where a key that is not a build option does damage, so drop it here too.
@@ -2768,8 +2799,13 @@ def _apply_machine_opts_inner(anchor, script_path):
     for _reserved in ("book",):
         opts.pop(_reserved, None)
     _conf_args = opts.pop("configure_args", None)
+    # LIBREOFFICE HAS NO ./configure LINE: the page runs ./autogen.sh with
+    # the configure options, and autogen.sh hands them on.  A script with
+    # both (`./autogen.sh && ./configure ...`) still gets them on configure.
+    _conf_cmd = "./configure" if "./configure" in body else (
+        "./autogen.sh" if "./autogen.sh" in body else None)
     if _conf_args:
-        if "./configure" not in body:
+        if not _conf_cmd:
             printWarning("  machine.conf has [%s] configure_args but the script"
                          " has no ./configure line -- not applied" % anchor)
         else:
@@ -2789,7 +2825,15 @@ def _apply_machine_opts_inner(anchor, script_path):
                 # the removed flag goes with it.  Deleting just the token left
                 #     ./configure --enable-nftables --prefix=/usr      \ \
                 # -- a backslash-escaped space, which is an argument.
-                for _flag in _conf_args.split():
+                # QUOTED VALUES ARE ONE FLAG.  libreoffice's page writes
+                # --with-lang='fr en-GB'; split on blanks that was a flag
+                # `--with-lang='fr` and a stray `en-GB'`, and the removal
+                # below cut the quote in half.
+                try:
+                    _flags = shlex.split(_conf_args)
+                except ValueError:
+                    _flags = _conf_args.split()
+                for _flag in _flags:
                     _m = re.match(r"^--(enable|disable|with|without)-(.+)$", _flag)
                     if not _m:
                         continue
@@ -2803,7 +2847,7 @@ def _apply_machine_opts_inner(anchor, script_path):
                     # kept it -- after ours, so configure took the book's.
                     # Both forms, any value, go before ours is put in.
                     _name = _m.group(2).split("=", 1)[0]
-                    _pat = re.compile(r"--(?:%s|%s)-%s(?:=[^\s\\]*)?(?=[\s\\]|$)"
+                    _pat = re.compile(r"--(?:%s|%s)-%s(?:=(?:'[^']*'|\"[^\"]*\"|[^\s\\]*))?(?=[\s\\]|$)"
                                       % (_m.group(1), _opp, re.escape(_name)))
                     _out = []
                     for _line in body.split("\n"):
@@ -2815,7 +2859,8 @@ def _apply_machine_opts_inner(anchor, script_path):
                             continue          # the line was only that flag
                         _out.append(_stripped)
                     body = "\n".join(_out)
-                body = re.sub(r"(\./configure\b)", r"\1 " + _conf_args, body, count=1)
+                body = re.sub(r"(%s)(?![\w.-])" % re.escape(_conf_cmd),
+                              lambda m: m.group(1) + " " + _conf_args, body, count=1)
             if _conf_args not in open(script_path).read():
                 with open(script_path, "w") as f:
                     f.write(body)
@@ -14912,7 +14957,10 @@ def cmd_stack(args):
                 # list reaches the installer (1.12.78) and never reached this
                 # display, so it reported 273 packages for a run that skips
                 # qt6, okular, LibreOffice, CUPS and the rest by name.
-                if any(anchor.lower() == a.lower() for a in avoid):
+                # ...except the entry itself: a package the stack NAMES is
+                # built, as on the command line (see build_install_plan).
+                if (anchor.lower() != e["target"].lower()
+                        and any(anchor.lower() == a.lower() for a in avoid)):
                     skipped_by_avoid.add(anchor)
                     continue
                 if anchor not in seen:
@@ -15045,9 +15093,16 @@ def cmd_stack(args):
             # which is what a stack file is for.
             if not _install_via_self(target, args.yes, recursive=True,
                                      required_only=(e["opts"].get("deps") == "required"),
+                                     # A NAMED ENTRY IS BUILT EVEN WHEN AVOIDED.
+                                     # avoid.stack keeps libreoffice out of
+                                     # every plan that reaches it as a
+                                     # recommendation (harfbuzz does); apps.stack
+                                     # names it.  Passing it to --ignore as well
+                                     # skipped the very package the entry is for.
                                      ignore=",".join(
                                          [x for x in [e["opts"].get("ignore")] if x]
-                                         + avoid) or None,
+                                         + [a for a in avoid
+                                            if a.lower() != target.lower()]) or None,
                                      ignore_prereqs=getattr(args, "ignore_prereqs",
                                                             False)):
                 printError("stack stopped at %r (%d of %d done).  Fix it and "
