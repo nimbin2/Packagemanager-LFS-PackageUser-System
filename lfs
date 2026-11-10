@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.375"
+LFS_VERSION = "1.14.376"
 
 
 def _build_id():

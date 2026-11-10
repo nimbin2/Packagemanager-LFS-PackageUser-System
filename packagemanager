@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.375"
+TOOL_VERSION = "1.14.376"
 
 
 def _build_id():
@@ -6130,7 +6130,32 @@ def _dev_status(name, acct, src, co):
     at_src = _git(src, "rev-parse", "--short", ref)
     out = ["    source     %s  (%s)" % (src, ref)]
     if not inst:
-        out.append("    installed  -        (not built from it yet)")
+        # SAY WHAT IS THERE INSTEAD.  vcam was built from the stack's url=
+        # before `dev vcam` linked it to the hub: its clone points at the
+        # other origin, so nothing matched and this said only "not built from
+        # it yet" -- next to a stack that says "installed".  Name the clone
+        # it was built from, and the one command that moves it over.
+        other = []
+        for base in (os.path.join(pkgusr_home(acct), "src"), pkgusr_home(acct)):
+            try:
+                for d in sorted(os.listdir(base)):
+                    c = os.path.join(base, d)
+                    if os.path.isdir(os.path.join(c, ".git")):
+                        other.append((c, _git(c, "remote", "get-url", "origin"),
+                                      _git(c, "rev-parse", "--short", "HEAD")))
+            except OSError:
+                continue
+            if other:
+                break
+        if other:
+            for c, url, head in other:
+                out.append("    installed  %-8s (built from %s -- not this source)"
+                           % (head or "?", url or c))
+        else:
+            out.append("    installed  -        (not built from it yet)")
+        if other:
+            out.append("    rebuild from this source:  packagemanager update %s --run"
+                       % name)
     else:
         out.append("    installed  %s" % inst)
     if at_src and inst and not at_src.startswith(inst[:7]) \

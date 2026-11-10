@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.375  (lfs-backup has its own: 1.3.0)
-    lfs               f800682
-    lfs-helper        736533c
-    packagemanager    82822c3
-    blfs              a743c2a
-    lfs-phases        6a52201
+    all six tools at 1.14.376  (lfs-backup has its own: 1.3.0)
+    lfs               106fd18
+    lfs-helper        a9dab9c
+    packagemanager    46eba25
+    blfs              a5e8f67
+    lfs-phases        f7826bd
     lfs-kernel        d117ca3   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
@@ -3780,6 +3780,15 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.376 -- `dev` names the clone a package was really built from
+
+vcam was built from vision.stack's url= (git.christianimmanuel.de) before
+`dev vcam` linked it to /srv/git.  Its clone's origin is the other URL, so
+nothing matched the dev source and `dev` said "installed - (not built from
+it yet)" while the stack said "installed".  Now: `installed <commit> (built
+from <origin> -- not this source)` and `rebuild from this source:
+packagemanager update vcam --run`.  Untested here (no package users).
 
 ## 1.14.375 -- the tree walk in parallel; libreoffice, openvpn, wireguard
 
