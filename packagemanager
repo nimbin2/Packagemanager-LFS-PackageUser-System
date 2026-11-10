@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.376"
+TOOL_VERSION = "1.14.380"
 
 
 def _build_id():
@@ -5153,6 +5153,15 @@ def _update_tar_packages(args):
     return done
 
 
+def _built_here(name):
+    """Has packagemanager ever built this package (an install script in its
+    home)?  `dev` creates the account before anything is built."""
+    try:
+        return any(f.startswith("install_") for f in os.listdir(pkgusr_home(name)))
+    except OSError:
+        return False
+
+
 def _install_git_packages(args):
     """Build the git packages among args.packages from their own scripts.
 
@@ -6047,17 +6056,23 @@ def _dev_trust(acct, path):
                         "git config --global --get-all safe.directory 2>/dev/null"
                         " | grep -qxF %s || git config --global --add safe.directory %s"
                         % (shlex.quote(sd), shlex.quote(sd))],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="/")
 
 
 def _dev_can_read(acct, path):
-    """Can the package account read this repository?  Asked as it."""
+    """Can the package account read this repository?  Asked as it.
+
+    FROM /, NOT FROM WHERE ROOT HAPPENS TO STAND.  `su` without `-` keeps the
+    caller's directory; run from /home/n76310/Git/<project>, which p_swas
+    may not enter, git died on its own working directory before it looked
+    at the repository -- and every source was reported NOT READABLE.  The
+    build itself logs in (`su -`) and starts in the account's home."""
     if not _can_su(acct):
         return None
     r = subprocess.run(["su", "-s", "/bin/sh", acct, "-c",
                         "git ls-remote %s HEAD >/dev/null 2>&1"
                         % shlex.quote(path)],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, cwd="/")
     return r.returncode == 0
 
 
@@ -6249,7 +6264,7 @@ def cmd_dev(args):
 
         def as_owner(cmd):
             return subprocess.run(["su", "-s", "/bin/sh", owner, "-c", cmd],
-                                  capture_output=True, text=True)
+                                  capture_output=True, text=True, cwd="/")
         if not os.path.isdir(hubdir):
             os.makedirs(hubdir, mode=0o755)
             shutil.chown(hubdir, user=owner)
@@ -7058,6 +7073,27 @@ def cmd_update(args):
             printInfo("    only those the book has moved past will appear in "
                       "the plan.")
             printInfo("    pick from them instead of taking all:  --select")
+    # A STACK GIT ENTRY NEVER BUILT HERE IS NOT A BOOK QUESTION.
+    # `update vcam --run`: vcam had a dev source and a vision.stack entry but
+    # no install script yet (made by hand before), so it was not "a git
+    # package", went to the book, and the answer was "vcam is NOT in the
+    # book".  Build it from its entry, as `install` would.
+    if not getattr(args, "local", None) and args.packages:
+        _first = [p for p in args.packages
+                  if not _built_here(p) and _stack_git_entry(p)
+                  and _stack_git_entry(p)["kind"] == "git"]
+        if _first:
+            printInfo("%s: never built by packagemanager -- building from the "
+                      "stack's git entry" % ", ".join(_first))
+            _ns = argparse.Namespace(**vars(args))
+            _ns.packages, _ns.reinstall = _first, True
+            for _k in ("test", "clean"):
+                if not hasattr(_ns, _k):
+                    setattr(_ns, _k, False)
+            _install_git_packages(_ns)
+            args.packages = [p for p in args.packages if p not in _first]
+            if not args.packages:
+                return
     # stack TARBALL packages (yt-dlp): their release, never the book
     if not getattr(args, "local", None) and args.packages:
         _tar_done = _update_tar_packages(args)
@@ -14760,14 +14796,23 @@ def cmd_stack(args):
 
     import shutil as _sh
 
-    def _git_installed(e):
-        """prog= on PATH, or have= (a file that only exists once it is
-        installed -- the signal for libraries, which put nothing on PATH)."""
+    def _git_found(e):
+        """What says it is there: prog= on PATH, or have= (a file that only
+        exists once it is installed -- the signal for libraries)."""
         have = e["opts"].get("have")
         if have and os.path.exists(have):
-            return True
+            return have
         prog = e["opts"].get("prog", e["target"])
-        return bool(prog and prog != "-" and _sh.which(prog))
+        return (prog and prog != "-" and _sh.which(prog)) or ""
+
+    def _git_installed(e):
+        """Found, AND built by packagemanager.
+
+        A vcam on PATH that `make install` put there by hand made the stack
+        say "installed" and skip it, while `dev` said "not built from it
+        yet" -- both right about different things.  No install script in the
+        package's home means no package built it: that is "to build"."""
+        return bool(_git_found(e)) and _built_here(e["target"])
 
     # Entries that finished in an earlier run are recorded and SKIPPED, so a
     # resume does not re-plan a 200-package dependency tree for a stage that
@@ -15139,6 +15184,13 @@ def cmd_stack(args):
                 printSuccess("  %s: already installed (--force rebuilds)"
                              % target)
             else:
+                _f = _git_found(e)
+                if _f and not _built_here(target):
+                    printWarning("  %s: %s is there, but no package built it "
+                                 "(installed by hand?) -- building it now; if"
+                                 " the install step cannot replace it, remove"
+                                 " the hand-installed files and re-run."
+                                 % (target, _f))
                 spath, _ = _stack_git_script(e, script_dir)
                 # THE SAME CHECKS AS A BOOK PACKAGE.
                 #

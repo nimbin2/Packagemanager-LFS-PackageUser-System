@@ -94,6 +94,29 @@ outside the stack stay on the default book. `packagemanager stack <name>
 | `lfs build-system snapshot restore <name> --run` | Put it back |
 | `lfs build-system restart --run` | Delete it all and start over |
 
+### A new system
+
+On a new partition:
+
+```sh
+mkfs.ext4 /dev/<part>               # or mkfs.btrfs; the tools never format
+lfs books                           # pick the book
+lfs build-system set-book 13.1-sysv
+lfs build-system session            # partition, mount, settings
+lfs build-system run
+```
+
+On a partition that held a build:
+
+```sh
+lfs build-system session
+lfs build-system chroot unmount --run
+lfs build-system restart --run      # keeps the tarballs in $LFS/sources
+lfs build-system run
+```
+
+`restart` refuses while anything is mounted inside `$LFS`.
+
 ---
 
 ## SysV on LFS 13.0+

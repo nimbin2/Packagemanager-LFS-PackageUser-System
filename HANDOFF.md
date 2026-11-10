@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.376  (lfs-backup has its own: 1.3.0)
-    lfs               106fd18
-    lfs-helper        a9dab9c
-    packagemanager    46eba25
-    blfs              a5e8f67
-    lfs-phases        f7826bd
+    all six tools at 1.14.380  (lfs-backup has its own: 1.3.0)
+    lfs               991304c
+    lfs-helper        8590ba3
+    packagemanager    a16f5f3
+    blfs              ae1270e
+    lfs-phases        5592d06
     lfs-kernel        d117ca3   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
@@ -3780,6 +3780,44 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.380 -- `lfs --help`: every command, and a new system start to finish
+
+The epilog left out build-system restart, verify, show, fix-ownership,
+manifests, version-check and the top-level search, script, sections.  All
+listed now, plus a "a new system, start to finish" group (mkfs yourself,
+set-book, session, run, build-all, bootstrap, lfs-kernel, restart).
+README: "A new system" -- a new partition, and one that held a build.
+
+## 1.14.379 -- `build-system restart` refuses with anything mounted inside $LFS
+
+restart refused only the chroot's dev/proc/sys/run.  shutil.rmtree does not
+stop at a mount: an ESP at $LFS/boot/efi or a bind mount would be emptied
+too.  Every mount point below $LFS (from /proc/self/mounts) now stops it,
+except $LFS/sources when the tarballs are kept.
+
+## 1.14.378 -- a git entry installed by hand is not "installed"
+
+vcam's binary was on PATH from a hand `make install`; p_vcam existed only
+because `dev vcam` made it (no src, no install script).  The stack said
+"already installed" and skipped it even with --only; `update vcam` found no
+script, asked the book, and stopped at "NOT in the book".
+- `_built_here(name)`: an install_* script in the package's home.
+- stack: `_git_installed` = found (prog=/have=) AND built here; otherwise
+  "to build", with a warning naming the hand-installed file it found.
+- update: a name never built here that has a stack git entry is built from
+  that entry (through _install_git_packages, reinstall=True), no book.
+Untested here (no package users).
+
+## 1.14.377 -- `dev` asked its readability question from root's cwd
+
+`packagemanager dev` run from /home/n76310/Git/<project> reported every hub
+source NOT READABLE.  `_dev_can_read` uses `su -s /bin/sh <acct>` (no `-`),
+which keeps the caller's directory; the package account cannot enter it and
+git fails on its own cwd before touching the repository.  `_dev_can_read`,
+`_dev_trust` and dev --hub's as_owner now run with cwd="/".  Builds were
+never affected (`su -` starts in the account's home).
+diag.stack: the machine's own `git fastfetch` entry (ref 2.70.0), shipped.
 
 ## 1.14.376 -- `dev` names the clone a package was really built from
 

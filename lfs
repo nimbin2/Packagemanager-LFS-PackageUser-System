@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.376"
+LFS_VERSION = "1.14.380"
 
 
 def _build_id():
@@ -5181,6 +5181,31 @@ def cmd_bs_restart(args):
 
     keep_sources = not args.wipe_sources
 
+    # NOR THROUGH ANY OTHER MOUNT.  rmtree does not stop at a filesystem
+    # boundary: an ESP mounted at $LFS/boot/efi for a kernel install, or a
+    # bind-mounted host directory, would be emptied with the tree.  A kept
+    # $LFS/sources may be a mount of its own.
+    _below = []
+    try:
+        with open("/proc/self/mounts") as _m:
+            for _l in _m:
+                _mp = _l.split()[1].replace("\\040", " ")
+                if not _mp.startswith(lfs.rstrip("/") + "/"):
+                    continue
+                _rel = _mp[len(lfs.rstrip("/")) + 1:]
+                if keep_sources and (_rel == "sources" or _rel.startswith("sources/")):
+                    continue
+                _below.append(_mp)
+    except OSError:
+        pass
+    if _below:
+        fail("\n! mounted inside %s: %s\n"
+             "  Deleting the tree would delete what is on those, too.\n"
+             "  Unmount them first:  umount %s\n"
+             % (lfs, ", ".join(sorted(_below)),
+                " ".join(sorted(_below, reverse=True))))
+        sys.exit(2)
+
     # Unpacked source trees are build scratch: a rebuild re-extracts every one
     # of them, and leaving hundreds of thousands of stale files behind makes
     # every later scan (ownership, orphans, manifests) slow and noisy.  The
@@ -7823,24 +7848,46 @@ def cmd_next(args):
 LFS_HELP_EPILOG = """\
 commands, by what you are doing:
 
+  a new system, start to finish (details: BUILD.md)
+    mkfs.ext4 /dev/<part>      format the partition yourself (or mkfs.btrfs);
+                               nothing here formats a disk
+    build-system set-book <b>  the book to build: `lfs books` lists them
+                               (13.1-sysv: lfs-sysvbook make --target 13.1-systemd)
+    build-system session       the interview: partition, mount, $LFS, prefixes,
+                               locale, login
+    build-system run           host check to chroot, then enters it
+    lfs-helper build-all       inside the chroot: chapters 7-9
+    packagemanager bootstrap --run
+                               inside: wget, Python modules, BLFS book
+    lfs-kernel --run           the kernel, from /etc/pkgusr/kernel.conf
+    build-system restart --run start over on the same partition: deletes the
+                               built tree, keeps the downloaded tarballs
+
   build a system -- everything about building lives under build-system
     build-system run           do all of it, from wherever you are, then
                                enter the chroot -- the only one you need
     build-system next          what is done, what comes next
     build-system list          every step and its state
+    build-system verify        what state the tree is in, is the toolchain usable
     build-system snapshot      save the build, or put it back
+    build-system restart       delete the built tree and start over (keeps the
+                               tarballs; --wipe-sources deletes those too)
     build-system session       mount the partition, set $LFS, ask for settings
     build-system set-book      which book to BUILD from
     build-system chroot        prepare / enter / resolv / unmount
     build-system install-tools hand over to packagemanager
-                               (session/layout/sync-tools/add-user/
+    build-system show <id>     print any section's commands
+                               (version-check/layout/sync-tools/add-user/
                                 get-sources/crosschain/gen-chroot-scripts
                                 are the individual steps `run` performs)
 
   manage packages on a machine (BLFS ones hand over to blfs)
     install [--reinstall]      build a package as its package user
     update                     what the book has a newer version of
+    search <name>              find a package or section in the book
+    script <name>              fetch a package's install script to edit
     packages / commands        list packages; print a section's commands
+    sections                   every section id and title
     set-default                which book to INSTALL from
 
   books
@@ -7849,7 +7896,9 @@ commands, by what you are doing:
 
   settings and repair
     config [--long]            every setting, grouped by what it affects
-    reset                      clear the settings and start fresh
+    reset                      clear the settings and start fresh (not the tree)
+    build-system fix-ownership give the tree back to the lfs user (after root)
+    build-system manifests     which files each package installed
 
 Inside the chroot, lfs-helper drives the build; `lfs` will tell you so.
 Dry run is the default everywhere; --run applies.
