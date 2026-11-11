@@ -34,7 +34,7 @@
 # scripts are also SOURCED by lfs-helper to read their metadata, and this file
 # comes along -- it must not shadow anything in the sourcing shell.
 
-PKGUSR_LIB_VERSION="1.14.380"
+PKGUSR_LIB_VERSION="1.14.392"
 
 _pp_build_id() {
     local f="${BASH_SOURCE[0]}"
@@ -720,7 +720,27 @@ _pp_phase_install() {
     _pp_enter_build || return 1
     _pp_warn_unbuilt
     install() { _pp_install_docs "$@"; }
-    install_pkg
+    # INSTALL ONE THING AT A TIME.  `make -jN install` of sed: install(1)
+    # writes the new /usr/bin/sed as a 0600 file and chmods it last; a
+    # parallel recipe that ran `sed` in that moment got
+    #     /bin/sh: line 4: /usr/bin/sed: Permission denied
+    # and the package was failed with a perfectly good sed in place.  Every
+    # package that installs a tool the install itself uses (sed, grep, gawk,
+    # bash, coreutils, make) can hit it.  An install is copying, not
+    # compiling: serial costs seconds.  Ninja and cmake --install ignore
+    # MAKEFLAGS.  PKGUSR_INSTALL_JOBS=N to override.
+    local _mf=" ${MAKEFLAGS:-} " _w _out="" _skipnum=0
+    for _w in $_mf; do
+        case "$_w" in
+            -j|--jobs) _skipnum=1; continue ;;
+            -j[0-9]*|--jobs=*) continue ;;
+            *[!0-9]*|"") ;;
+            *) [ "$_skipnum" = 1 ] && { _skipnum=0; continue; } ;;
+        esac
+        _skipnum=0
+        _out="$_out $_w"
+    done
+    MAKEFLAGS="${_out# } -j${PKGUSR_INSTALL_JOBS:-1}" install_pkg
 }
 
 _pp_phase_configure() {

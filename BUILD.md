@@ -412,6 +412,8 @@ A new BLFS release: `blfs fetch`, `packagemanager blfs set-default`,
 
 A new LFS release: `lfs-sysvbook make --target 13.1-systemd`, `check`, and
 start again from section 2 with `collector_import_file` set.
+`--udev target` builds udev from the new book's systemd with the old SysV
+recipe (newer, untested by any book); the default keeps the old systemd.
 
 ---
 

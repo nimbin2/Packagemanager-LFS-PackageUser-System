@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.380"
+LFS_VERSION = "1.14.392"
 
 
 def _build_id():
@@ -2519,7 +2519,13 @@ _TEST_DIAG_RE = re.compile(
     # test logs that do not exist and exits non-zero, and `set -e` then fails
     # the build -- reported as "phase 'build' FAILED" with make having
     # succeeded.
-    r'|\btestsuite\b|\btest_summary\b|^\s*ulimit\b',
+    r'|\btestsuite\b|\btest_summary\b|^\s*ulimit\b'
+    # GMP 6.3.0 in 13.1 counts the passes from every log there is:
+    #     cat $(find -name '*.log') | grep -c ^PASS
+    # Without a test run it counts 0 in config.log -- and grep -c exits 1 on
+    # a zero count, so the BUILD failed after a clean make, printing "0".
+    r'|find\s+(?:\.\s+)?-name\s+[\'"]?\\?\*\.log'
+    r'|grep\s+-c\s+[\'"]?\^?(?:PASS|FAIL|XFAIL)\b',
     re.M)
 
 # Scaffolding that exists only so the test suite can run: the books create a
@@ -2672,6 +2678,20 @@ def _crosschain_script_body(name, sid, pkgver, glob, cmds):
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
     build_cmds, install_cmds, config_cmds, test_cmds = \
         _split_crosschain_phases(cmds)
+    # SYSTEMD'S OWN -Werror AGAINST A NEWER GLIBC.  The SysV graft builds
+    # udev from the donor book's systemd (257.x) against the target's newer
+    # glibc and kernel headers.  systemd generates errno-to-name.h from them;
+    # an errno alias the old generator does not filter lands twice in one
+    # initializer, and systemd's own -Werror=override-init stops the build:
+    #     errno-to-name.h:71:23: error: initialized field overwritten
+    # The later entry wins either way -- it is a warning about a table, not
+    # a bug in udev.  Demoted to a plain warning; a no-op where it is absent.
+    if name.lower() in ("udev", "systemd") and "meson" in build_cmds:
+        build_cmds = (
+            "# lfs: systemd's -Werror=override-init vs a newer glibc's errno list\n"
+            "for _m in meson.build ../meson.build; do\n"
+            "    if [ -f \"$_m\" ]; then sed -i 's/-Werror=override-init/-Wno-override-init/' \"$_m\"; fi\n"
+            "done\n\n" + build_cmds)
     book = "LFS %s" % (load_config().get("default") or "?")
     L = []
     w = L.append
@@ -3718,10 +3738,40 @@ CHROOT_STEPS_7 = [
     ("gettext-tmp",    "ch-tools-gettext"),
     ("bison-tmp",      "ch-tools-bison"),
     ("perl-tmp",       "ch-tools-perl"),
+    ("zlib-tmp",       "ch-tools-zlib"),
+    ("mpdecimal-tmp",  "ch-tools-mpdecimal"),
     ("python-tmp",     "ch-tools-Python"),
     ("texinfo-tmp",    "ch-tools-texinfo"),
     ("util-linux-tmp", "ch-tools-util-linux"),
 ]
+
+
+def chroot_steps_7(secs):
+    """Chapter 7's package builds, FROM THE BOOK, in book order.
+
+    The list above was written for 12.x.  13.1 added Zlib and mpdecimal to
+    chapter 7, before Python -- and a fixed list never built them.  Python
+    7.12 then compiled without its zlib module, and chapter 8's pkgconf died
+    in the bundled meson: `import gzip` -> No module named 'zlib'.
+
+    A package section of chapter 7 is a ch-tools-* id with a "N.N. Name-ver"
+    title that comes AFTER 7.6 (createfiles) -- chapters 5 and 6 use the
+    same id prefix, so position decides.  `secs` is the book's sections in
+    order.  A book this cannot read falls back to the list above."""
+    out, inside = [], False
+    for sid, (title, sec) in secs.items():
+        if sid in ("ch-tools-createfiles", "ch-tools-creatingdirs"):
+            inside = True
+            continue
+        if not inside:
+            continue
+        if not sid.startswith("ch-tools-"):
+            if out:
+                break
+            continue
+        if _PKG_TITLE_RE.match(title.strip()) and sec["commands"]:
+            out.append((sid[len("ch-tools-"):].lower() + "-tmp", sid))
+    return out or list(CHROOT_STEPS_7)
 
 
 def write_chroot_env(lfs, quiet=False):
@@ -5636,7 +5686,8 @@ def cmd_bs_gen_chroot_scripts(args):
     book_raw = str(soup)
     secs = {sid: (title, sec) for sid, title, sec in iter_sections(soup)}
 
-    steps = list(CHROOT_INIT_STEPS) + list(CHROOT_STEPS_7)
+    steps_7 = chroot_steps_7(secs)
+    steps = list(CHROOT_INIT_STEPS) + steps_7
     if not args.chapter7_only:
         for sid, (title, sec) in secs.items():
             nv = package_name_version(sid, title)
@@ -5874,7 +5925,7 @@ def cmd_bs_gen_chroot_scripts(args):
             hint("#       lfs-helper undone %s" % f[:-3])
     # chapter 7's temporary tools are built as root, like the book does; the
     # package-user system takes over for the real chapter 8 packages.
-    root_steps = [n for n, _s in CHROOT_INIT_STEPS + CHROOT_STEPS_7
+    root_steps = [n for n, _s in CHROOT_INIT_STEPS + steps_7
                   if n in order]
     root_steps += [n for n, _s in cfg_steps_9
                    if n in order and n not in pkg_like_cfg]
@@ -6981,24 +7032,47 @@ def cmd_bs_install_tools(args):
     # the LFS store left the chroot with no BLFS book at all -- and every
     # `packagemanager install <pkg>` failed with "not found in book" when the
     # real problem was that there was no book to look in.
+    # A store that HOLDS a book, not one whose books/ merely exists: blfs
+    # creates /usr/share/blfs/books on every run (its writability probe), so
+    # an empty one there shadowed a real book in ~/.cache/blfs and nothing
+    # was copied -- while _blfs_book_on_host() said there was a book.
     _blfs_src = None
     for cand in (os.environ.get("BLFS_STORE"), "/usr/share/blfs",
                  os.path.expanduser("~/.cache/blfs")):
-        if cand and os.path.isdir(os.path.join(cand, "books")):
-            _blfs_src = os.path.join(cand, "books")
-            break
+        if not cand:
+            continue
+        _d = os.path.join(cand, "books")
+        try:
+            if any(f.endswith((".html", ".html.gz")) for f in os.listdir(_d)):
+                _blfs_src = _d
+                break
+        except OSError:
+            continue
     if _blfs_src:
         _blfs_dst = os.path.join(lfs, "usr", "share", "blfs", "books")
         os.makedirs(_blfs_dst, exist_ok=True)
         _n = 0
         for f in os.listdir(_blfs_src):
-            if not f.endswith((".html", ".html.gz")):
+            if not f.endswith((".html", ".html.gz", ".meta")):
                 continue
             d = os.path.join(_blfs_dst, f)
             if not os.path.isfile(d):
                 shutil.copy(os.path.join(_blfs_src, f), d)
                 _make_world_readable(d)
-                _n += 1
+                _n += 0 if f.endswith(".meta") else 1
+            # ...and a second copy in the tree's SOURCES.  The one in
+            # /usr/share/blfs can be gone by the time bootstrap runs; /sources
+            # is where bootstrap looks for everything else it needs.
+            if not f.endswith(".meta"):
+                # named so bootstrap can tell it from the LFS book
+                _sd = os.path.join(lfs, "sources",
+                                   f if "blfs" in f.lower() else "blfs-book-" + f)
+                if os.path.isdir(os.path.dirname(_sd)) and not os.path.isfile(_sd):
+                    try:
+                        shutil.copy(os.path.join(_blfs_src, f), _sd)
+                        _make_world_readable(_sd)
+                    except OSError:
+                        pass
         if _n:
             print("    %-22s -> /usr/share/blfs/books" % ("BLFS book" if _n == 1
                                                           else "BLFS books"))

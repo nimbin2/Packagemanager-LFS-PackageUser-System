@@ -49,7 +49,7 @@ set -u
 # Bump on every change that alters behaviour.  `lfs-helper --version` makes it
 # possible to tell at a glance whether the copy inside the chroot is the one
 # that was just fixed -- guessing at that has wasted a lot of time.
-LFS_HELPER_VERSION="1.14.380"
+LFS_HELPER_VERSION="1.14.392"
 
 # A fingerprint of this file's own contents.  A hand-maintained version number
 # goes stale the moment someone forgets to bump it -- and the reason for
@@ -286,6 +286,39 @@ mkstate() {
 }
 
 is_done()   { [ -f "$PROGRESS" ] && grep -qxF "$1" "$PROGRESS"; }
+
+# A PYTHON MODULE THAT IS PART OF PYTHON.  `No module named 'zlib'` is not a
+# package to install: Python compiles zlib, _bz2, _ssl ... only when the
+# library is there when PYTHON is built.  Prints the library, or nothing.
+_py_stdlib_lib() {
+    case "${1#_}" in
+        zlib|gzip|zipfile)  echo Zlib ;;
+        bz2)                echo Bzip2 ;;
+        lzma)               echo Xz ;;
+        ssl|hashlib)        echo OpenSSL ;;
+        ctypes)             echo Libffi ;;
+        sqlite3)            echo Sqlite ;;
+        decimal)            echo mpdecimal ;;
+        readline)           echo Readline ;;
+        curses)             echo Ncurses ;;
+        pyexpat|elementtree) echo Expat ;;
+        uuid)               echo Util-linux ;;
+        dbm|gdbm)           echo GDBM ;;
+    esac
+}
+# ...and how to rebuild Python here: chapter 7's temporary one while the
+# chroot build has not reached chapter 8's Python, else Python itself.
+_py_rebuild_cmd() {
+    local p8=""     # chapter 8's step is named from the book's id: Python
+    for p8 in Python python ""; do [ -n "$p8" ] && [ -f "$SCRIPTS/$p8.sh" ] && break; done
+    if [ -f "$SCRIPTS/python-tmp.sh" ] && { [ -z "$p8" ] || ! is_done "$p8"; }; then
+        echo "lfs-helper build python-tmp --phase all --force"
+    elif [ -n "$p8" ]; then
+        echo "lfs-helper build $p8 --phase all --force"
+    else
+        echo "packagemanager install python3 --reinstall --run"
+    fi
+}
 mark_done() { mkstate; is_done "$1" || echo "$1" >> "$PROGRESS"; }
 unmark()    { [ -f "$PROGRESS" ] && sed -i "\|^$1\$|d" "$PROGRESS"; }
 
@@ -3068,8 +3101,15 @@ share_new_dir_with_tree_owner() {
 # call: the shared-directory rule is right, but applying it unasked is not.
 # --yes (assume_yes) is that permission given in advance; without a terminal
 # the answer is NO, because silence is not consent.
+# A SECOND ARGUMENT `y` MAKES ENTER MEAN YES.  Creating an empty directory a
+# package's install line names (make-ca's /etc/cron.weekly before any cron
+# is installed) changes nothing that exists and is undone with rmdir; asking
+# it with [y/N] made the obvious answer the one that needed typing, and a
+# plain Enter failed the install.  The /etc/profile loop defaults to yes as
+# well (it only appends, with a backup).  No terminal is still NO either way.
 confirm_change() {
-    local what="$1" ans
+    local what="$1" def="${2:-n}" ans hint="[y/N]"
+    [ "$def" = y ] && hint="[Y/n]"
     if assume_yes; then
         warn "$what  (--yes)"
         return 0
@@ -3079,10 +3119,11 @@ confirm_change() {
     # the pipes, but the build's output goes through tee -- so a run that
     # looked hung was a prompt nobody could see.  Say it on BOTH: the log
     # shows what is being waited for, the terminal takes the answer.
-    warn "WAITING FOR AN ANSWER: $what  [y/N]"
+    warn "WAITING FOR AN ANSWER: $what  $hint"
     { say ""; say "  $what"; } > /dev/tty
-    printf '  do it? [y/N]: ' > /dev/tty
+    printf '  do it? %s: ' "$hint" > /dev/tty
     read -e -r ans < /dev/tty || return 1
+    [ -z "$ans" ] && ans="$def"
     case "$ans" in y|Y|yes) return 0 ;; *) warn "declined"; return 1 ;; esac
 }
 
@@ -3138,7 +3179,7 @@ create_missing_dirs_from_log() {
         _powner="$(stat -c %U "$_parent" 2>/dev/null)"
         if is_install_dir "$_parent" || [ "$_powner" = root ] || [ -z "$_powner" ]; then
             # under the system's own directories: the system's rule applies
-            confirm_change "create $target (root:install, group-writable) so '$user' can install into it" \
+            confirm_change "create $target (root:install, group-writable) so '$user' can install into it" y \
                 || continue
             if mkdir -p "$target" 2>/dev/null; then
                 set_install_dir_owner "$target" 2>/dev/null || true
@@ -3150,7 +3191,7 @@ create_missing_dirs_from_log() {
                 warn "could not create $target"
             fi
         else
-            confirm_change "create $target inside '$_powner''s tree, owned by '$user', and share it with a collector group" \
+            confirm_change "create $target inside '$_powner''s tree, owned by '$user', and share it with a collector group" y \
                 || continue
             # EVERY component we create, not just the last one.  mkdir -p
             # would leave the intermediates root:root -- the artifact that
@@ -7565,7 +7606,10 @@ cmd_build() {
             while IFS= read -r _am; do fail "!     $_am"; done < "$_AUTO_MODULES_LOG"
         fi
         fail "!   a python module is missing, not a permission: '$_pymod'"
-            if [ -n "$_pyprov" ]; then
+            if [ -n "$(_py_stdlib_lib "$_pymod")" ]; then
+                fail "!   it is part of Python, built only when $(_py_stdlib_lib "$_pymod") is"
+                fail "!   there when Python is: rebuild Python, then this package."
+            elif [ -n "$_pyprov" ]; then
                 fail "!   the BLFS page that provides it is '$_pyprov':"
                 fail "!     packagemanager install $_pyprov --run --recursive"
             else
@@ -8177,7 +8221,19 @@ cmd_build() {
         local _pymod
         _pymod="$(sed -n "s/.*ModuleNotFoundError: No module named '\([A-Za-z0-9_.-]*\)'.*/\1/p" \
                   "$log" 2>/dev/null | head -1)"
-        if [ -n "$_pymod" ]; then
+        if [ -n "$_pymod" ] && [ -n "$(_py_stdlib_lib "$_pymod")" ]; then
+            # 13.1 builds Zlib in chapter 7 before Python; a tree whose
+            # chapter 7 skipped it has a Python without zlib, and chapter 8's
+            # pkgconf (bundled meson: import gzip) is the first to notice.
+            fail "!"
+            fail "! '$_pymod' is part of Python itself.  Python compiles it only"
+            fail "! when $(_py_stdlib_lib "$_pymod") is installed when PYTHON is built,"
+            fail "! and this Python was built before it.  Installing"
+            fail "! $(_py_stdlib_lib "$_pymod") again changes nothing -- rebuild Python:"
+            fail "!   python3 -c 'import $_pymod'     # fails now"
+            fail "!   $(_py_rebuild_cmd)"
+            fail "! then retry this package (command below)."
+        elif [ -n "$_pymod" ]; then
             fail "!"
             fail "! The build needs the Python module '$_pymod', which is not"
             fail "! installed for the Python this system runs."
@@ -11454,18 +11510,32 @@ cmd_build_all() {
 # adding a menu entry to it is not something a build should do because nobody
 # said no.
 _say_what_is_yours_to_finish() {
+    # THE PACKAGE MANAGER FIRST.  This listed the kernel first, and lfs-kernel
+    # in a fresh chroot cannot download anything: wget, the CA certificates
+    # and the BLFS book are all BLFS, and `packagemanager bootstrap` is what
+    # brings them in -- from tarballs get-sources already put in /sources.
     say ""
-    say "# Two things are yours to finish, on purpose:"
+    say "# Three things are yours to finish, in this order:"
     say "#"
-    say "#   1. THE KERNEL.  build-all does not build one.  lfs-kernel does,"
+    say "#   1. THE PACKAGE MANAGER.  Not one download tool is installed yet:"
+    say "#      wget, the CA certificates (make-ca), the Python modules the"
+    say "#      tools read books with, and the BLFS book are all BLFS.  The"
+    say "#      tarballs are already in /sources:"
+    say "#          packagemanager bootstrap           # what it would do"
+    say "#          packagemanager bootstrap --run     # do it"
+    say "#      After that, HTTPS works in here (lfs-kernel, packagemanager)."
+    say "#"
+    say "#   2. THE KERNEL.  build-all does not build one.  lfs-kernel does,"
     say "#      as a package (p_linux), with its firmware and headers -- edit"
     say "#      /etc/pkgusr/kernel.conf first (VERSION, ESP, KERNEL_NAME,"
-    say "#      FIRMWARE_ONLY), then:"
-    say "#          lfs-kernel            # build + install the configured version"
+    say "#      FIRMWARE_ONLY; ESP must be THIS system's, mounted in here),"
+    say "#      then:"
+    say "#          lfs-kernel            # what it would build"
+    say "#          lfs-kernel --run      # build + install it"
     say "#          lfs-kernel verify     # is everything where the tools expect"
     say "#      Or by hand, book 10.3, from inside the chroot."
     say "#"
-    say "#   2. THE BOOTLOADER.  Nothing was written to any ESP, boot sector"
+    say "#   3. THE BOOTLOADER.  Nothing was written to any ESP, boot sector"
     say "#      or partition table, and your current bootloader is untouched."
     say "#      Add an entry for this system by hand, or let the tools add a"
     say "#      rEFInd entry beside your existing one:"
@@ -11650,7 +11720,10 @@ PROFEOF
     if [ -f "$f" ]; then
         # Offer, do not impose: /etc/profile is the administrator's file, and
         # appending to it is a change to the system like any other.
-        if confirm_change "append a loop to /etc/profile so it reads /etc/profile.d/*.sh (a backup is kept as /etc/profile.before-lfs-helper)"; then
+        # Enter means yes (1.14.391): without the loop nothing in profile.d
+        # -- locale, path helpers, every package's snippet -- reaches a
+        # login, the change only appends, and a backup is kept.
+        if confirm_change "append a loop to /etc/profile so it reads /etc/profile.d/*.sh (a backup is kept as /etc/profile.before-lfs-helper)" y; then
             cp -p "$f" "$f.before-lfs-helper" 2>/dev/null || true
             cat >> "$f" <<'PROFEOF'
 

@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.380"
+TOOL_VERSION = "1.14.392"
 
 
 def _build_id():
@@ -4650,6 +4650,16 @@ def _blfs_book_available():
         except OSError:
             continue
     return False
+
+
+def _blfs_book_in_sources(srcdir):
+    """A BLFS book html staged in the sources directory, newest name first."""
+    try:
+        cands = [f for f in os.listdir(srcdir)
+                 if re.search(r"(?i)blfs.*\.html(\.gz)?$", f)]
+    except OSError:
+        return None
+    return os.path.join(srcdir, sorted(cands)[-1]) if cands else None
 
 
 def _download_tool_available():
@@ -10475,6 +10485,18 @@ def cmd_setup(args):
                                       find_links=srcdir, no_deps=True,
                                       target=os.path.join(srcdir, fn)):
                 failed.append(dist)
+
+    # THE BOOK FROM /sources.  wget is looked up in the BLFS book, and the
+    # book in /usr/share/blfs is the host's copy from install-tools -- which
+    # a tree can reach without (none cached then, or lost since).  install-
+    # tools also puts it into the tree's sources; take it from there.
+    if todo_wget and not _blfs_book_available():
+        _bk = _blfs_book_in_sources(srcdir)
+        _bl = _find_blfs_cmd()
+        if _bk and _bl:
+            printHeader("2a. the BLFS book, from %s" % srcdir)
+            print("  $ blfs import %s" % _bk)
+            subprocess.call(_bl + ["import", _bk])
 
     if todo_wget:
         printHeader("2. a download tool")

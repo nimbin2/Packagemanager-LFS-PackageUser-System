@@ -11,15 +11,15 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.380  (lfs-backup has its own: 1.3.0)
-    lfs               991304c
-    lfs-helper        8590ba3
-    packagemanager    a16f5f3
-    blfs              ae1270e
-    lfs-phases        5592d06
-    lfs-kernel        d117ca3   (no version line of its own)
+    all six tools at 1.14.392  (lfs-backup has its own: 1.3.0)
+    lfs               ec08b7a
+    lfs-helper        e016164
+    packagemanager    9802301
+    blfs              efb2d95
+    lfs-phases        0f67f34
+    lfs-kernel        1226099   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
-    lfs-sysvbook      62ebe64   (1.0.0; untouched since it was written)
+    lfs-sysvbook      74538df   (1.0.2)
 
 **`BUILD.md` is the one document for building a whole system**, host to
 desktop, with what to configure before each step. README.md points at it.
@@ -3780,6 +3780,126 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.392 -- lfs-kernel in a chroot: the host's boot dir, and git first
+
+The new tree inherits the host's kernel.conf, so `lfs-kernel --run` in the
+chroot aimed at ESP=/boot/efi/EFI/NimGnu -- the host's boot directory on
+the shared EFI partition -- and would have replaced the host's vmlinuz.  It
+stopped only because git was missing, after a 150 MB download and config.
+- In a chroot with --run: $ESP and /proc/1/root$ESP being the same
+  directory (device:inode) with $KERNEL_NAME already in it refuses, and
+  says to give this system its own ESP directory.
+  LFS_KERNEL_SHARED_ESP_OK=1 overrides.
+- No git while FIRMWARE_FROM=git or V4L2LOOPBACK=yes: refused up front with
+  `packagemanager install git --run`.
+
+## 1.14.391 -- the /etc/profile loop defaults to yes too
+
+Asked.  `append a loop to /etc/profile so it reads /etc/profile.d/*.sh`
+now [Y/n]: it only appends, keeps a backup, and without it nothing in
+profile.d reaches a login.
+
+## 1.14.390 -- creating a missing directory: Enter means yes
+
+make-ca (bootstrap) installs update-pki.sh into /etc/cron.weekly, which a
+fresh system does not have; the repair asked "create /etc/cron.weekly ...
+[y/N]" and Enter declined it.  confirm_change takes a default as its second
+argument; both directory-creation prompts pass `y` ([Y/n]).  The
+/etc/profile edit keeps [y/N]; no terminal is still no.
+
+## 1.14.389 -- bootstrap: "no BLFS book" in a fresh tree
+
+`packagemanager bootstrap --run` after build-all: wheels fine, then
+"wget: there is no BLFS book on this system".  install-tools picked the
+first store whose books/ EXISTS -- blfs creates /usr/share/blfs/books on
+every run -- so an empty one shadowed a book in ~/.cache/blfs, while
+_blfs_book_on_host (which checks for html) said a book was there.
+- install-tools: the first store that HOLDS an .html/.html.gz; copies the
+  .meta too; and stages a second copy in $LFS/sources (blfs-book-<name>
+  when the name lacks "blfs").
+- bootstrap: before wget, with no book in the store, `blfs import`s a
+  *blfs*.html from the sources dir (`_blfs_book_in_sources`).
+Cause on the user's tree not confirmed (asked for the two listings).
+
+## 1.14.388 -- build-all's last words: bootstrap first
+
+`_say_what_is_yours_to_finish` listed the kernel first; lfs-kernel in a
+fresh chroot cannot download (no wget, no CA certificates).  Now three
+steps in order: `packagemanager bootstrap [--run]`, the kernel (ESP must
+be this system's, mounted in the chroot), the bootloader.
+
+## 1.14.387 -- lfs-kernel in a new system's chroot: the book's kernel
+
+`lfs-kernel` in the chroot: "could not reach https://www.kernel.org/
+releases.json" while ping worked.  No wget (BLFS) and no CA certificates
+(make-ca, BLFS) yet.  Now: `_no_https_why` says which, `_sources_kernel`
+takes the newest linux-*.tar.* in $SOURCES_DIR or /sources (the book's
+chapter 10 kernel), and the build copies linux-$VERSION.tar.xz from there
+before trying to download it.
+
+## 1.14.386 -- lfs-sysvbook 1.0.2: `make --udev target`
+
+Asked: build the new udev instead of patching the old one.  `--udev target`
+keeps the donor's udev recipe and replaces every mention of its systemd
+version (title, tarballs, man pages, docdir) with the target's, read from
+the two headings ("Udev from Systemd-257.8", "Systemd-260.1"); the udev
+section's files are then matched against donor+target URLs, so the
+target's systemd tarballs stay in the wget-list.  Default stays `donor`.
+Version swap tested on a synthetic section; no real book here.  The old
+recipe's seds may not fit a newer systemd -- untested by any book.
+
+## 1.14.385 -- udev (graft) vs 13.1's glibc: -Werror=override-init
+
+13.1-sysv chapter 8 udev (the donor's systemd 257.x, transplanted) failed:
+`errno-to-name.h:71:23: error: initialized field overwritten
+[-Werror=override-init]` -- the old generator lets a new errno alias in
+twice.  gen-chroot-scripts now starts udev/systemd build phases (when they
+use meson) by turning -Werror=override-init into -Wno-override-init in
+meson.build / ../meson.build.  Not built here.
+
+## 1.14.384 -- lfs-sysvbook 1.0.1: the graft keeps .zip downloads
+
+13.1-sysv chapter 8 SQLite: `python3 -m zipfile -e ../sqlite-doc-3530400.zip .`
+-> FileNotFoundError.  The graft builds its wget-list/md5sums from chapter
+3's links, and its regex took tar.*, tgz and patch only -- the doc zip was
+never downloaded.  url_map_from_book, FILE_TOKEN and match_urls' stem now
+take .zip (and .tbz2).  An existing graft has to be made again
+(`lfs-sysvbook make ...`); or put the zip into $LFS/sources by hand.
+
+## 1.14.383 -- the install phase runs serially
+
+sed (chapter 8) failed its install with `/bin/sh: line 4: /usr/bin/sed:
+Permission denied` and a good sed in place (p_sed 0755 afterwards):
+install(1) writes the new file 0600 and chmods it last, and a parallel
+recipe ran sed in that window.  lfs-phases `_pp_phase_install` now runs
+install_pkg with every -j/--jobs removed from MAKEFLAGS and -j1 added
+(PKGUSR_INSTALL_JOBS overrides).  Ninja and cmake --install ignore MAKEFLAGS.
+
+## 1.14.382 -- GMP's pass count is a test step
+
+13.1's GMP page counts passes with `cat $(find -name '*.log') | grep -c ^PASS`
+(it used to awk a tee'd gmp-check-log, which the artifact rule caught).  Left
+in the build phase without a test run, it counted 0 in config.log and
+`grep -c` exits 1 on zero: build FAILED after a clean make, printing "0".
+_TEST_DIAG_RE now also takes `find -name '*.log'` and `grep -c ^PASS/FAIL`;
+binutils' `grep '^FAIL:' $(find -name '*.log')` moves to the tests with it.
+
+## 1.14.381 -- chapter 7 read from the book (13.1 added Zlib, mpdecimal)
+
+Fresh 13.1-sysv build: chapter 8's pkgconf (bundled meson-1.12.0, wrap.py
+`import gzip`) died with No module named 'zlib'.  13.1 builds Zlib (7.10)
+and mpdecimal (7.11) in chapter 7 before Python (7.12); CHROOT_STEPS_7 was a
+fixed 12.x list, so Python 7.12 compiled without zlib.
+- lfs `chroot_steps_7(secs)`: ch-tools-* package sections after 7.6, in
+  book order, named <id suffix>-tmp; the fixed list (now with zlib-tmp,
+  mpdecimal-tmp) is only the fallback.  gen-chroot-scripts and root_steps
+  use it.
+- lfs-helper `_py_stdlib_lib` / `_py_rebuild_cmd`: a missing module that is
+  part of Python (zlib, _ssl, _ctypes, _bz2, ...) now says "rebuild Python"
+  (python-tmp before chapter 8's Python, else Python), not "packagemanager
+  install zlib" -- which does not exist inside the chroot build anyway.
+A tree already past this: rebuild python-tmp (zlib from 8.6 is there now).
 
 ## 1.14.380 -- `lfs --help`: every command, and a new system start to finish
 

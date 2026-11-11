@@ -232,6 +232,28 @@ _releases() {   # "<moniker> <version>" per line, in kernel.org's order
 }
 _latest_stable() { _releases | awk '$1=="stable"{print $2; exit}'; }
 
+# THE KERNEL THE BOOK ALREADY DOWNLOADED.  Inside a new system's chroot there
+# is a network (ping works) but no way to use it over HTTPS: wget is BLFS,
+# and so are the CA certificates (make-ca).  The LFS book's own kernel
+# tarball sits in /sources already -- the one chapter 10 builds.
+_sources_kernel() {   # newest linux-X.Y[.Z].tar.* in the sources store
+    local d
+    for d in "${SOURCES_DIR:-}" /sources; do
+        [ -n "$d" ] && [ -d "$d" ] || continue
+        ls -1 "$d"/linux-[0-9]*.tar.* 2>/dev/null
+    done | sed -n 's|.*/linux-\([0-9][0-9.]*[0-9]\)\.tar\..*|\1|p' | sort -V | tail -n1
+}
+_no_https_why() {
+    if ! command -v wget >/dev/null 2>&1; then
+        echo "wget is not installed yet (it is BLFS: packagemanager bootstrap)"
+    elif [ ! -s /etc/pki/tls/certs/ca-bundle.crt ] && [ ! -s /etc/ssl/certs/ca-certificates.crt ] \
+            && [ ! -s /etc/ssl/ca-bundle.crt ]; then
+        echo "there are no CA certificates yet (make-ca, BLFS), so HTTPS cannot be verified"
+    else
+        echo "kernel.org did not answer over HTTPS"
+    fi
+}
+
 # `verify` inspects what is on disk, so it must not fetch: resolving
 # "latest" would ask kernel.org for a version it is never going to look at,
 # and fail on a machine with no network while reporting on one that is
@@ -255,8 +277,14 @@ elif [ "${_FWONLY:-0}" = 1 ] && [ "$VERSION" = latest ]; then
     fi
 elif [ "$VERSION" = latest ]; then
     VERSION="$(_latest_stable)"
-    [ -n "$VERSION" ] || { echo "!! could not reach $MIRROR_JSON -- set VERSION in $CONF"; exit 1; }
-    echo "# newest stable on kernel.org: $VERSION"
+    if [ -n "$VERSION" ]; then
+        echo "# newest stable on kernel.org: $VERSION"
+    else
+        echo "# cannot ask kernel.org: $(_no_https_why)"
+        VERSION="$(_sources_kernel)"
+        [ -n "$VERSION" ] || { echo "!! and no linux-*.tar.* in /sources either -- set VERSION in $CONF"; exit 1; }
+        echo "# using the book's kernel from /sources: $VERSION"
+    fi
 fi
 
 # THE KERNEL IS A PACKAGE.  Its sources belong in its own account's home,
@@ -1153,6 +1181,46 @@ if [ "${_VERIFY:-0}" != 1 ] \
     echo "#   /lib/modules      (modules_install and depmod write here)"
     echo "#   /proc/config.gz   (shared with the host: the RUNNING kernel)"
     echo "#   set CONFIG_FROM=file:<path> in $CONF to start from another config"
+
+    # THE HOST'S BOOT DIRECTORY IS NOT THIS TREE'S.  One EFI partition is
+    # usually shared by every system on the disk, and a new tree inherits the
+    # host's kernel.conf -- ESP=/boot/efi/EFI/NimGnu, the directory the HOST
+    # boots from.  Installing here would move the host's vmlinuz to
+    # vmlinuz_old and put this tree's kernel in its place, with its modules
+    # in this tree's /lib/modules where the host will not find them.
+    # Same directory = same device and inode, seen from the host's root.
+    if [ "${_RUN:-0}" = 1 ] && [ "${_VERIFY:-0}" != 1 ] \
+       && [ "${LFS_KERNEL_SHARED_ESP_OK:-0}" != 1 ]; then
+        _esp_here="$(stat -c %d:%i "$ESP" 2>/dev/null)"
+        _esp_host="$(stat -c %d:%i "/proc/1/root$ESP" 2>/dev/null)"
+        if [ -n "$_esp_here" ] && [ "$_esp_here" = "$_esp_host" ] \
+           && [ -e "$ESP/${KERNEL_NAME:-vmlinuz}" ]; then
+            echo "!! $ESP is the directory the HOST boots from, and"
+            echo "   $ESP/${KERNEL_NAME:-vmlinuz} is the host's kernel."
+            echo "   Installing would replace it with this tree's kernel."
+            echo "   Give this system its own directory on the ESP, in $CONF:"
+            echo "       ESP=${ESP%/*}/<name-for-this-system>"
+            echo "   and add a boot entry for it.  (Meant it?  LFS_KERNEL_SHARED_ESP_OK=1)"
+            exit 1
+        fi
+    fi
+fi
+
+# NO GIT, NO FIRMWARE CLONE -- SAY SO BEFORE THE DOWNLOAD AND THE CONFIG, NOT
+# AFTER.  A fresh system has no git (it is BLFS), and the firmware step came
+# after fetching 150 MB and configuring the tree.
+if [ "${_RUN:-0}" = 1 ] && [ "${_VERIFY:-0}" != 1 ] && ! command -v git >/dev/null 2>&1; then
+    _needs_git=""
+    [ "${FIRMWARE_FROM:-none}" = git ] && _needs_git="the firmware (FIRMWARE_FROM=git)"
+    case "${V4L2LOOPBACK:-no}" in yes|1|true)
+        _needs_git="${_needs_git:+$_needs_git and }v4l2loopback" ;;
+    esac
+    if [ -n "$_needs_git" ]; then
+        echo "!! git is not installed, and $_needs_git is cloned with it."
+        echo "     packagemanager install git --run"
+        echo "   (or set FIRMWARE_FROM=none / V4L2LOOPBACK=no in $CONF)"
+        exit 1
+    fi
 fi
 
 # ---- verify: is everything where it should be? ---------------------------
@@ -2092,6 +2160,14 @@ fi
 # --------------------------------------------------------------------------
 install -d "$SRC"
 if [ ! -d "$tree" ]; then
+    # the sources store first: no download for a tarball already on disk
+    if [ ! -f "$tarball" ]; then
+        for _st in "${SOURCES_DIR:-}" /sources; do
+            [ -n "$_st" ] && [ -f "$_st/linux-$VERSION.tar.xz" ] || continue
+            echo "# taking linux-$VERSION.tar.xz from $_st"
+            cp "$_st/linux-$VERSION.tar.xz" "$tarball" && break
+        done
+    fi
     [ -f "$tarball" ] || {
         echo "# fetching $MIRROR_TAR/v$major.x/linux-$VERSION.tar.xz"
         wget -q --show-progress -O "$tarball.part" \

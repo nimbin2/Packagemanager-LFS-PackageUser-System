@@ -47,7 +47,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 
 
 def _build_id():
@@ -140,7 +140,9 @@ FLAG_PATCHES = [
 CREATEFILES_ID = "ch-tools-createfiles"
 SYSTEMD_ACCOUNT_LINE = re.compile(r"(?m)^systemd-[^\n]*\n?")
 
-FILE_TOKEN = re.compile(r"([A-Za-z0-9_.+-]+\.(?:tar\.[a-z0-9]+|tgz|patch))")
+# .zip too: 13.0 added SQLite, whose documentation is a zip
+# (sqlite-doc-3530400.zip) the page unpacks with `python3 -m zipfile`.
+FILE_TOKEN = re.compile(r"([A-Za-z0-9_.+-]+\.(?:tar\.[a-z0-9]+|tgz|tbz2|zip|patch))")
 
 
 # --------------------------------------------------------------------------- #
@@ -218,7 +220,7 @@ def match_urls(url_map, wanted, label):
     A 'file' token matches its exact basename; a 'token' (Name-Version)
     matches a basename whose stem normalises to the same string."""
     def stem(name):
-        s = re.sub(r"\.(tar\.[a-z0-9]+|tgz|patch)$", "", name)
+        s = re.sub(r"\.(tar\.[a-z0-9]+|tgz|tbz2|zip|patch)$", "", name)
         return _norm(re.sub(r"-src$", "", s))
 
     out, missing = {}, []
@@ -249,7 +251,10 @@ def url_map_from_book(path):
         html = f.read()
     urls = [(m.start(), m.group(1)) for m in
             re.finditer(r'href=\s*"(https?://[^"]+?'
-                        r'\.(?:tar\.[a-z0-9]+|tgz|patch))"', html)]
+                        # ...and .zip: without it the graft's wget-list
+                        # silently lost sqlite-doc-*.zip, and chapter 8's
+                        # SQLite died on `../sqlite-doc-3530400.zip`.
+                        r'\.(?:tar\.[a-z0-9]+|tgz|tbz2|zip|patch))"', html)]
     md5s = [(m.start(), m.group(1)) for m in
             re.finditer(r'MD5 sum:\s*(?:<[^>]+>\s*)*([0-9a-f]{32})', html)]
     out, mi = {}, 0
@@ -328,6 +333,37 @@ def cmd_make(args):
     target = load_soup(t_path)
     warnings = []
 
+    # -- --udev target: the donor's udev recipe, the TARGET's systemd ------- #
+    # The donor's udev is the last version a SysV book was tested with, but
+    # it is old against the target's glibc and kernel headers (257.x vs 13.1
+    # failed on -Werror=override-init).  This keeps the donor's commands and
+    # swaps every mention of its systemd version for the target's, so the
+    # tarball, the man pages and the docdir all move together.  The recipe
+    # was never tested by the book at the new version: opt-in.
+    udev_from_target = getattr(args, "udev", "donor") == "target"
+    if udev_from_target:
+        d_tp, d_ct = unit(donor, "ch-system-udev", d_label)
+        t_tp, _t_ct = unit(target, "ch-system-systemd", t_label)
+        dm = re.search(r"Systemd-(\d[\w.]*)", title_of(d_tp))
+        tm = re.search(r"Systemd-(\d[\w.]*)", title_of(t_tp))
+        if not dm or not tm:
+            raise SystemExit("! --udev target: cannot read the systemd version "
+                             "from the donor's udev or the target's systemd "
+                             "heading")
+        d_sv, t_sv = dm.group(1), tm.group(1)
+        n = 0
+        for part in (d_tp, d_ct):
+            for node in list(part.find_all(string=True)):
+                if d_sv in str(node):
+                    node.replace_with(str(node).replace(d_sv, t_sv))
+                    n += 1
+        print(f"udev  : the donor's recipe at the TARGET's systemd "
+              f"{d_sv} -> {t_sv} ({n} mention(s))")
+        warnings.append(f"udev builds systemd {t_sv} with the {d_label} "
+                        f"recipe (written for {d_sv}) -- not tested by any "
+                        f"book; if it fails, make the book again without "
+                        f"--udev target")
+
     # -- collect the file needs BEFORE surgery moves nodes around ----------- #
     donor_urls = url_map_from_book(d_path)
     target_urls = url_map_from_book(t_path)
@@ -344,7 +380,10 @@ def cmd_make(args):
     for _after, dids in INSERT_AFTER:
         for did in dids:
             add_files |= files_of(*unit(donor, did, d_label))
-    added, missing = match_urls(donor_urls, add_files, d_label)
+    # with --udev target the udev section names the TARGET's tarballs
+    added, missing = match_urls(dict(donor_urls, **target_urls)
+                                if udev_from_target else donor_urls,
+                                add_files, d_label)
     added = {b: v for b, v in added.items()
              if b not in target_urls or b in dropped}
 
@@ -621,6 +660,10 @@ def main():
                    help="cached systemd book version (default: 13.0-systemd)")
     p.add_argument("--donor-file", help="local donor html instead of the store")
     p.add_argument("--target-file", help="local target html instead of the store")
+    p.add_argument("--udev", choices=("donor", "target"), default="donor",
+                   help="udev's systemd version: the donor's, as its book "
+                        "tested it (default), or the target's, with the "
+                        "donor's recipe (newer, untested)")
     p.add_argument("--out", help="version label for the result "
                                  "(default: target with -systemd -> -sysv)")
     p.add_argument("--outdir", help="write here instead of the lfs store")
