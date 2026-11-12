@@ -5,7 +5,7 @@
 #   webcam enable    load v4l2loopback (video0 "vcam", video5 "vcam-mirror")
 #                    and uvcvideo, then start vcam if it is installed
 #   webcam disable   stop vcam, unload everything again
-#   webcam start     start vcam only (modules already loaded)
+#   webcam start     start vcam (loads the modules first if they are not)
 #   webcam stop      stop vcam only
 #   webcam status    modules, devices, vcam
 #
@@ -25,6 +25,22 @@ desktop_user() {
     printf '%s' "$u"
 }
 
+# THE USER'S DESKTOP SESSION, FOR vcam's SCREEN CAPTURE.  su from root
+# gives vcam a bare environment: no WAYLAND_DISPLAY, so it took this for X11
+# ("[screen] X11: ffmpeg x11grab") and screen sharing showed nothing.  The
+# running session's own variables are in /proc/<pid>/environ of any of the
+# user's processes that has WAYLAND_DISPLAY (sway, normally) -- copy those.
+session_env() {   # <user> -> VAR=value lines, empty without a session
+    local u="$1" p
+    for p in $(pgrep -u "$u" -x sway) $(pgrep -u "$u"); do
+        [ -r "/proc/$p/environ" ] || continue
+        tr '\0' '\n' 2>/dev/null < "/proc/$p/environ" | grep -q '^WAYLAND_DISPLAY=' || continue
+        tr '\0' '\n' 2>/dev/null < "/proc/$p/environ" \
+            | grep -E '^(WAYLAND_DISPLAY|XDG_RUNTIME_DIR|DISPLAY|SWAYSOCK|DBUS_SESSION_BUS_ADDRESS|XDG_SESSION_TYPE|XDG_CURRENT_DESKTOP)='
+        return 0
+    done
+}
+
 vcam_Start() {
     command -v vcam >/dev/null 2>&1 || return 0          # not installed: nothing to start
     if pgrep -x vcam >/dev/null 2>&1; then
@@ -38,13 +54,29 @@ vcam_Start() {
         [ -e "$VCAM_IN" ] && break
         sleep 0.5
     done
-    [ -e "$VCAM_IN" ] || { echo "!! no camera at $VCAM_IN -- vcam not started (VCAM_IN in /etc/sysconfig/vcam)"; return 1; }
+    if [ ! -e "$VCAM_IN" ]; then
+        echo "!! no camera at $VCAM_IN -- vcam not started"
+        ls /dev/video* >/dev/null 2>&1 \
+            && echo "   video devices now: $(echo /dev/video*)  (set VCAM_IN in /etc/sysconfig/vcam)" \
+            || echo "   no /dev/video* at all: is the camera switched on / plugged in?  webcam status"
+        return 1
+    fi
     local log="/tmp/vcam-$u.log"
     if [ "$(id -un)" = "$u" ]; then
         setsid nohup vcam -i "$VCAM_IN" $VCAM_ARGS >"$log" 2>&1 < /dev/null &
     else
-        ( cd / && runuser -u "$u" -- setsid nohup vcam -i "$VCAM_IN" $VCAM_ARGS \
-            >"$log" 2>&1 < /dev/null & )
+        # su, not runuser: LFS builds util-linux with --disable-runuser
+        # (Shadow's su is the one there is).  The log is opened as root
+        # here, so it is the user's file only by name -- fine for /tmp.
+        local cmd envs="" line
+        while IFS= read -r line; do
+            [ -n "$line" ] && envs="$envs $(printf %q "$line")"
+        done < <(session_env "$u")
+        if [ -z "$envs" ]; then
+            echo "# no desktop session of $u running: vcam starts without screen capture"
+        fi
+        cmd="cd / && exec env$envs setsid vcam -i $(printf %q "$VCAM_IN") $VCAM_ARGS"
+        su -s /bin/sh "$u" -c "$cmd" >"$log" 2>&1 < /dev/null &
     fi
     sleep 1
     if pgrep -x vcam >/dev/null 2>&1; then
@@ -65,11 +97,16 @@ vcam_Stop() {
     pkill -9 -x vcam
 }
 
-cam_Enable() {
+cam_Modules() {
     modprobe v4l2loopback video_nr=0,5 exclusive_caps=1,1 card_label=vcam,vcam-mirror
     modprobe uvc &&
-    modprobe uvcvideo &&
-    vcam_Start
+    modprobe uvcvideo
+}
+cam_Loaded() {
+    lsmod | grep -q '^uvcvideo ' && lsmod | grep -q '^v4l2loopback '
+}
+cam_Enable() {
+    cam_Modules && vcam_Start
 }
 cam_Disable() {
     vcam_Stop       # it holds the devices: unloading would fail as "in use"
@@ -88,6 +125,12 @@ case "$1" in
         cam_Disable
         ;;
     "start")
+        # `start` alone used to expect the modules loaded already -- and
+        # said only "no camera at /dev/video1".  Load them if they are not.
+        if ! cam_Loaded; then
+            echo "# camera modules not loaded -- loading them first"
+            cam_Modules || exit 1
+        fi
         vcam_Start
         ;;
     "stop")

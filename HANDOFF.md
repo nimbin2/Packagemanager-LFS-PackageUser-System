@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.399  (lfs-backup has its own: 1.3.0)
-    lfs               40cfda1
-    lfs-helper        d86fa00
-    packagemanager    93877c4
-    blfs              bd8d590
-    lfs-phases        1bd75b3
+    all six tools at 1.14.403  (lfs-backup has its own: 1.3.0)
+    lfs               4d79687
+    lfs-helper        2e04969
+    packagemanager    2029c5e
+    blfs              7b85615
+    lfs-phases        b4fb20a
     lfs-kernel        1199115   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      74538df   (1.0.2)
@@ -3780,6 +3780,36 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.403 -- webcam: vcam gets the desktop session's environment
+
+Started from the script, vcam's screen capture fell back to X11 ("ffmpeg
+x11grab") and showed nothing; started by the user it worked.  su from root
+gives a bare environment -- no WAYLAND_DISPLAY.  `session_env <user>` copies
+WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DISPLAY, SWAYSOCK, DBUS_SESSION_BUS_ADDRESS,
+XDG_SESSION_TYPE, XDG_CURRENT_DESKTOP from /proc/<pid>/environ of the
+user's sway (or any process of theirs that has WAYLAND_DISPLAY) into
+`env ... vcam`.  No session: says so, starts without screen capture.
+
+## 1.14.402 -- webcam: su, not runuser
+
+`webcam enable`: "runuser: command not found" -- LFS builds util-linux
+with --disable-runuser.  vcam now starts via `su -s /bin/sh <user> -c
+"cd / && exec setsid vcam ..."` (Shadow's su), in the background.
+
+## 1.14.401 -- `stack <entry>` says which stack holds it
+
+`packagemanager stack mytools`: "no stack file".  mytools is the `cfg
+mytools` line of services.stack.  cmd_stack now scans the stacks for an
+entry of that name and prints `packagemanager stack <stack> --only <name>
+--run`; a name from install_mytools' SOURCES (webcam) points at mytools.
+
+## 1.14.400 -- `webcam start` loads the modules if they are not
+
+`webcam start` with nothing loaded: "no camera at /dev/video1" and no
+/dev/video* at all.  start now loads the modules first (cam_Modules) when
+uvcvideo/v4l2loopback are not in lsmod; the no-camera message lists the
+video devices there are, or says there are none.
 
 ## 1.14.399 -- `webcam enable` starts vcam
 

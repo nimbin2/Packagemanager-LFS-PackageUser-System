@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.399"
+TOOL_VERSION = "1.14.403"
 
 
 def _build_id():
@@ -14666,6 +14666,44 @@ def cmd_stack(args):
     if not path:
         printError("no stack file for %r (looked in ., /etc/pkgusr/stacks, "
                    "stacks/ beside this tool)" % args.name)
+        # AN ENTRY, NOT A STACK.  `stack mytools` -- mytools is the
+        # `cfg mytools` line in services.stack.  Say which stack holds it.
+        found = []
+        for d in ("/etc/pkgusr/stacks",
+                  os.path.join(os.path.dirname(os.path.abspath(__file__)), "stacks")):
+            try:
+                names = sorted(f for f in os.listdir(d) if f.endswith(".stack"))
+            except OSError:
+                continue
+            for f in names:
+                st = f[:-len(".stack")]
+                if st == "avoid" or st in [x[0] for x in found]:
+                    continue
+                try:
+                    ents = _parse_stack_file(os.path.join(d, f))
+                except Exception:
+                    continue
+                for e in ents:
+                    if e.get("target", "").lower() == args.name.lower():
+                        found.append((st, e.get("kind", "?")))
+                        break
+        for st, kind in found:
+            printInfo("  %r is a `%s` entry in %s.stack:" % (args.name, kind, st))
+            printInfo("    packagemanager stack %s --only %s --run"
+                      % (st, args.name))
+        # ...or one of YOUR tools: a SOURCES line of mytools (webcam).
+        if not found:
+            for d in ("/etc/pkgusr/stacks",
+                      os.path.join(os.path.dirname(os.path.abspath(__file__)), "stacks")):
+                try:
+                    txt = open(os.path.join(d, "mytools", "install_mytools")).read()
+                except OSError:
+                    continue
+                if re.search(r"(?m)^'\w+\|%s\|" % re.escape(args.name), txt):
+                    printInfo("  %r is one of your tools (mytools, in services.stack);"
+                              " mytools installs them all:" % args.name)
+                    printInfo("    packagemanager stack services --only mytools --run")
+                    break
         sys.exit(1)
     try:
         entries = _parse_stack_file(path)
