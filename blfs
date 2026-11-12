@@ -130,7 +130,7 @@ CACHE_VERSION = 56   # v56: a skipped build variant does not keep its install st
 # tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
 # of generated install scripts changes (phases, dispatcher, ...), and
 # CACHE_VERSION when the parsed/cached data structure changes.
-BLFS_VERSION = "1.14.395"
+BLFS_VERSION = "1.14.396"
 
 
 def _build_id():
@@ -4301,6 +4301,18 @@ Dry run is the default everywhere; --run applies.
 """
 
 
+
+def cmd_overview(args):
+    """`blfs overview`: the same screen as `packagemanager overview` -- every
+    setting, which book is used for what, and where everything is stored."""
+    import shutil as _sh, subprocess as _sp
+    pm = _sh.which("packagemanager")
+    if not pm:
+        print("packagemanager is not installed; `blfs` alone knows only its own"
+              " settings -- see its config/books commands.")
+        return 1
+    return _sp.call([pm, "overview"])
+
 def main():
     # Pre-parse the book selectors from anywhere in argv (before OR after the
     # subcommand), so both `blfs --book-file X script vim` and
@@ -4379,6 +4391,11 @@ def main():
                    help="only pages this machine has a package user for -- "
                         "what differs AND concerns you")
     p.set_defaults(func=cmd_diff_init)
+
+    p = sub.add_parser("overview", aliases=["where"],
+                       help="everything at once: settings, which book is used "
+                            "for what, where it is stored")
+    p.set_defaults(func=cmd_overview)
 
     p = sub.add_parser("books", help="list/inspect books")
     p.add_argument("--discover", action="store_true", help="probe the live site")

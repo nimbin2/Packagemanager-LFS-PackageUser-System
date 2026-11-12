@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.395  (lfs-backup has its own: 1.3.0)
-    lfs               ef9d9f9
-    lfs-helper        8a80fff
-    packagemanager    0704cc8
-    blfs              b6c7f1a
-    lfs-phases        3e6894b
+    all six tools at 1.14.396  (lfs-backup has its own: 1.3.0)
+    lfs               65b2a39
+    lfs-helper        ab5bce3
+    packagemanager    26c6d01
+    blfs              165ff9a
+    lfs-phases        c893b42
     lfs-kernel        1226099   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      74538df   (1.0.2)
@@ -3780,6 +3780,20 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.396 -- `overview` (alias `where`) in packagemanager, lfs and blfs
+
+Asked: "hard to memorize where everything is stored and what is set", and
+whether BLFS is patched to SysV on the fly (it is not).  `packagemanager
+overview`: tool versions, the machine's init, which book is used for what
+(LFS build book -- a lfs-sysvbook graft when -sysv on 13.x --, LFS core
+packages, BLFS) with an explicit note when the BLFS book is the systemd
+edition on SysV (used as written, systemctl skipped, `blfs diff-init`),
+every settings file and store with "-" for missing, and the tree's paths
+under lfs_mount.  `lfs overview` / `blfs overview` run it.  The init
+mismatch warning is not printed before it (it says so itself).
+`packagemanager info` keeps its meaning (package users).  README: the
+command under "Names and places", and the BLFS-not-grafted note.
 
 ## 1.14.395 -- tar's relative paths are not directories at /
 

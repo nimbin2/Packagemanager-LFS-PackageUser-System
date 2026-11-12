@@ -142,6 +142,11 @@ position and is correct.
 For a newer release later: `lfs-sysvbook make --target 13.1-systemd`.
 `check` fails loudly if a future book layout breaks a rule.
 
+BLFS is not grafted. On a SysV machine the systemd BLFS book is used as
+written: a `systemctl` line becomes a visible skip, boot scripts come from
+blfs-bootscripts. `blfs diff-init` lists pages whose configure differs
+between the editions.
+
 ---
 
 ## Install scripts
@@ -379,6 +384,12 @@ Everything is dry-run by default. `--run` applies.
 ---
 
 ## Names and places
+
+Lost track of what is set and where it lives? One screen, read-only:
+
+```sh
+packagemanager overview      # same as: lfs overview, blfs overview
+```
 
 Three kinds of account share one passwd file, so each carries a prefix.
 Without one a package called `man` or `news` collides with a real account.

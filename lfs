@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.395"
+LFS_VERSION = "1.14.396"
 
 
 def _build_id():
@@ -7970,6 +7970,9 @@ commands, by what you are doing:
     sources                    a package's download URLs
 
   settings and repair
+    overview                   EVERYTHING at once: tools, which book is used
+                               for what, where every setting and store lives
+                               (same in blfs and packagemanager)
     config [--long]            every setting, grouped by what it affects
     reset                      clear the settings and start fresh (not the tree)
     build-system fix-ownership give the tree back to the lfs user (after root)
@@ -8087,6 +8090,18 @@ def _refuse_inside_chroot(cmd, sub=None):
     sys.exit(2)
 
 
+
+def cmd_overview(args):
+    """`lfs overview`: the same screen as `packagemanager overview` -- every
+    setting, which book is used for what, and where everything is stored."""
+    import shutil as _sh, subprocess as _sp
+    pm = _sh.which("packagemanager")
+    if not pm:
+        print("packagemanager is not installed; `lfs` alone knows only its own"
+              " settings -- see its config/books commands.")
+        return 1
+    return _sp.call([pm, "overview"])
+
 def main():
     ap = argparse.ArgumentParser(prog="lfs", description="LFS book tool "
                                  "(cache + follow one book)")
@@ -8127,6 +8142,11 @@ def main():
     p.add_argument("--run", action="store_true", help="delete (default: dry run)")
     p.add_argument("--yes", action="store_true", help="skip the confirmation")
     p.set_defaults(func=cmd_reset)
+
+    p = sub.add_parser("overview", aliases=["where"],
+                       help="everything at once: settings, which book is used "
+                            "for what, where it is stored")
+    p.set_defaults(func=cmd_overview)
 
     p = sub.add_parser("config", help="show or change settings (paths, $LFS, "
                        "LFS_TGT, mirror, ...)")

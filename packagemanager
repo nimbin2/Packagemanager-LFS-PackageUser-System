@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.395"
+TOOL_VERSION = "1.14.396"
 
 
 def _build_id():
@@ -16302,6 +16302,124 @@ def _current_blfs_book():
     return ""
 
 
+# ---------------------------------------------------------------------------
+# overview: what is set, which book is used for what, and where it all lives
+# ---------------------------------------------------------------------------
+#
+# "it feels like its getting hard to memorize where everything is stored and
+# what is set."  Four tools, three config files, two book stores, /etc/pkgusr
+# with half a dozen files -- each answered by a different command.  This is
+# all of it on one screen, read-only and offline.  `lfs overview` and
+# `blfs overview` print the same.
+
+def _ov_version(tool):
+    exe = shutil.which(tool)
+    if not exe:
+        return "not installed"
+    try:
+        out = subprocess.run([exe, "--version"], capture_output=True,
+                             text=True, timeout=10).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "?"
+    return (out.splitlines() or ["?"])[0]
+
+
+def _ov_json(path):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def _ov_path(label, path, note=""):
+    mark = "  " if os.path.exists(path) else "- "
+    print("    %s%-22s %s%s" % (mark, label, path,
+                                ("   " + note) if note else ""))
+
+
+def cmd_overview(args):
+    have_systemd = (os.path.isdir("/run/systemd/system")
+                    or bool(shutil.which("systemctl")))
+    init = "systemd" if have_systemd else "SysV"
+
+    printHeader("tools")
+    for t in ("lfs", "lfs-helper", "blfs", "packagemanager", "lfs-sysvbook",
+              "lfs-backup"):
+        print("    %-16s %s" % (t, _ov_version(t)))
+    print("    %-16s %s" % ("lfs-kernel",
+                            "installed" if shutil.which("lfs-kernel") else "not installed"))
+
+    printHeader("this machine")
+    print("    init           %s" % init)
+    print("    hostname       %s" % (os.uname().nodename))
+
+    # ---- books ----------------------------------------------------------
+    lstore = os.environ.get("LFS_STORE") or "/usr/share/lfs"
+    lcfg = _ov_json(os.path.join(lstore, "config.json")) or {}
+    bstore = os.environ.get("BLFS_STORE") or "/usr/share/blfs"
+    bcfg = _ov_json(os.path.join(bstore, "config.json")) or {}
+    blfs_book = _current_blfs_book() or bcfg.get("default") or "?"
+    bb_systemd = "systemd" in blfs_book.lower()
+
+    printHeader("books -- which one is used for what")
+    build = lcfg.get("build_book") or "-"
+    print("    LFS, building a new system     %s%s" % (
+        build, "   (a SysV GRAFT made by lfs-sysvbook)" if build.endswith("-sysv")
+        and not build.startswith(("12.", "11.")) else ""))
+    print("    LFS, core packages here        %s" % (lcfg.get("default") or "-"))
+    print("    BLFS, every other package      %s" % blfs_book)
+    print()
+    if bb_systemd and not have_systemd:
+        pm = load_config().get("init_mismatch_ok")
+        print("    The BLFS book is the SYSTEMD edition on a SysV machine.  It is")
+        print("    NOT converted to SysV: its scripts run as the book wrote them,")
+        print("    and a `systemctl` line becomes a visible skip.  Boot scripts")
+        print("    come from blfs-bootscripts where a page has one.  Pages whose")
+        print("    configure differs between the editions:  blfs diff-init")
+        print("    (mismatch accepted: %s)" % (pm or "not yet -- asked on install"))
+    elif not bb_systemd and have_systemd:
+        print("    The BLFS book is the SysV edition on a systemd machine.")
+    else:
+        print("    The BLFS book matches this machine's init (%s)." % init)
+
+    # ---- where things are -------------------------------------------------
+    printHeader("settings  (- = not there)")
+    _ov_path("lfs settings", os.path.join(lstore, "config.json"), "lfs config")
+    _ov_path("blfs settings", os.path.join(bstore, "config.json"), "blfs set-default")
+    _ov_path("packagemanager", CONFIG_PATH, "packagemanager config")
+    _ov_path("machine options", os.path.join(PKGUSR_ETC, "stacks", "machine.conf"),
+             "per package: configure/meson/placeholders")
+    _ov_path("package fixes", os.path.join(PKGUSR_ETC, "stacks", "package-fixes.conf"))
+    _ov_path("stacks", os.path.join(PKGUSR_ETC, "stacks"), "packagemanager stack")
+    _ov_path("dev sources", os.path.join(PKGUSR_ETC, "dev-sources.conf"),
+             "packagemanager dev")
+    _ov_path("setuid/setgid", os.path.join(PKGUSR_ETC, "stacks", "setid.conf"))
+    _ov_path("kernel", os.path.join(PKGUSR_ETC, "kernel.conf"), "lfs-kernel")
+    _ov_path("backup", os.path.join(PKGUSR_ETC, "backup.conf"), "lfs-backup")
+
+    printHeader("stores")
+    _ov_path("LFS books", os.path.join(lstore, "books"), "lfs books")
+    _ov_path("BLFS books", os.path.join(bstore, "books"), "blfs books")
+    _ov_path("BLFS scripts", "/tmp/packagemanager/install_files",
+             "regenerated each run")
+    _ov_path("package users", pkgusr_roots()[0] if pkgusr_roots() else "/usr/src/pkgusr",
+             "one home per package: script, log, src")
+    _ov_path("sources (here)", "/sources")
+    mnt = lcfg.get("lfs_mount")
+    if mnt:
+        print()
+        print("    the system being built (%s):" % mnt)
+        _ov_path("sources", os.path.join(mnt, "sources"))
+        _ov_path("build scripts", os.path.join(mnt, "usr/src/lfs-pkgusr/scripts"))
+        _ov_path("build logs", os.path.join(mnt, "usr/src/lfs-pkgusr/logs"))
+        _ov_path("its settings", os.path.join(mnt, "etc/pkgusr"))
+
+    print()
+    printInfo("Details:  lfs config  |  blfs books  |  packagemanager config  |"
+              "  lfs-kernel status")
+
+
 def _warn_init_mismatch():
     """The BLFS book's init flavour should match the system's.
 
@@ -16468,6 +16586,11 @@ def main():
     p.add_argument("--no-book", action="store_true",
                    help="don't look up book details for not-installed packages")
     p.set_defaults(func=cmd_info)
+
+    p = sub.add_parser("overview", aliases=["where"],
+                       help="what is set, which book is used for what, and "
+                            "where everything is stored (read-only)")
+    p.set_defaults(func=cmd_overview)
 
     # ---- the rest (stubbed for now) ----
     p = sub.add_parser("check", help="report install state of a package")
@@ -17198,7 +17321,8 @@ def main():
     restore_wget_verification()
     _hint_generate_ca_bundle()
     ensure_wget_workaround()
-    _warn_init_mismatch()
+    if getattr(args, "func", None) is not cmd_overview:   # it says so itself
+        _warn_init_mismatch()
     warn_if_tools_are_stale()
     _STATE["verbose"] = getattr(args, "verbose", False)
     # first run: ask for the group-name prefixes (once), unless we're already
