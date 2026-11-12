@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.392  (lfs-backup has its own: 1.3.0)
-    lfs               ec08b7a
-    lfs-helper        e016164
-    packagemanager    9802301
-    blfs              efb2d95
-    lfs-phases        0f67f34
+    all six tools at 1.14.395  (lfs-backup has its own: 1.3.0)
+    lfs               ef9d9f9
+    lfs-helper        8a80fff
+    packagemanager    0704cc8
+    blfs              b6c7f1a
+    lfs-phases        3e6894b
     lfs-kernel        1226099   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      74538df   (1.0.2)
@@ -3780,6 +3780,35 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.395 -- tar's relative paths are not directories at /
+
+git's install, `(cd '/usr/lib/perl5/5.44/site_perl' && tar xof -)`, failed
+with `./Git: Cannot mkdir: Permission denied` and
+`./FromCPAN/Mail: Cannot mkdir: No such file or directory`; the repair
+asked to "create /FromCPAN" -- missing_dirs_from_log matched from the slash
+in "./FromCPAN".  An absolute path must now start a word (not after ".",
+a letter, "~" or "-").  The real cause, site_perl not writable, is what
+unwritable_dirs_from_log already resolves through the preceding cd.
+
+## 1.14.394 -- a tool installed by the repair is on a LOGIN's PATH
+
+git 2.56 (bootstrap stage 6) needs cargo, which its page does not list;
+the repair installed rust, then stopped: "'cargo' is still not on PATH".
+rust lives in /opt/rustc-<ver>, on PATH through /etc/profile.d/rustc.sh --
+for the next login, not the running shell.  _install_missing_tool now asks
+`env -i bash -lc "command -v <tool>"` and prepends that directory (not the
+login's whole PATH: bash's default contains ".").  The retry builds via
+`su -`, which reads profile.d anyway.
+
+## 1.14.393 -- bootstrap stage 6: git
+
+lfs-kernel's firmware is a git clone and a fresh system has no git.
+`_bootstrap_finish` now installs git (--recursive: BLFS recommends curl,
+which https clones need) after the certificates; state, status lines,
+dry-run steps and "complete" all know six stages.  lfs-helper's closing
+message and `lfs --help` mention it.  (1.14.392 already refuses an
+lfs-kernel --run without git, before downloading.)
 
 ## 1.14.392 -- lfs-kernel in a chroot: the host's boot dir, and git first
 

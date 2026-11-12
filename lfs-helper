@@ -49,7 +49,7 @@ set -u
 # Bump on every change that alters behaviour.  `lfs-helper --version` makes it
 # possible to tell at a glance whether the copy inside the chroot is the one
 # that was just fixed -- guessing at that has wasted a lot of time.
-LFS_HELPER_VERSION="1.14.392"
+LFS_HELPER_VERSION="1.14.395"
 
 # A fingerprint of this file's own contents.  A hand-maintained version number
 # goes stale the moment someone forgets to bump it -- and the reason for
@@ -2769,7 +2769,22 @@ _install_missing_tool() {   # <log> -- returns 0 when something was installed
     note "#   $prov provides it -- installing that first, then trying again."
     if PM_IN_TOOL_REPAIR=1 packagemanager install "$prov" --run --recursive --yes; then
         command -v "$tool" >/dev/null 2>&1 && return 0
-        warn "!! $prov installed and '$tool' is still not on PATH -- stopping"
+        # ON PATH FOR A LOGIN, NOT FOR THIS SHELL.  rust installs into
+        # /opt/rustc-<ver> and puts /opt/rustc/bin on PATH through
+        # /etc/profile.d/rustc.sh -- read by the next login, and this shell
+        # started before it existed.  The retry runs the build through a
+        # fresh `su -` login, which DOES read it.  So ask a login shell where
+        # the tool is, and add THAT directory here (not the login's whole
+        # PATH: bash's built-in default has a "." in it).
+        local _lp
+        _lp="$(env -i HOME=/root TERM=dumb bash -lc "command -v '$tool'" 2>/dev/null | head -n1)"
+        case "$_lp" in
+            /*) note "# '$tool' is on a login's PATH (/etc/profile.d): $_lp"
+                export PATH="${_lp%/*}:$PATH"
+                return 0 ;;
+        esac
+        warn "!! $prov installed and '$tool' is still not on PATH, not even a"
+        warn "   login's -- stopping.  Look for it:  ls /opt/*/bin/$tool"
         return 1
     fi
     warn "!! could not install $prov, which provides '$tool'"
@@ -2888,8 +2903,14 @@ missing_dirs_from_log() {
         case "$d" in /*) [ -e "$d" ] || printf '%s\n' "$d" ;; esac
       done
 
+      # AN ABSOLUTE PATH STARTS A WORD.  tar's errors are RELATIVE to the
+      # `cd` before them -- "./FromCPAN/Mail: Cannot mkdir: No such file or
+      # directory" -- and matching from the slash read that as /FromCPAN, so
+      # git's install asked to create /FromCPAN at the root.  The real cause
+      # was the permission on site_perl, which the grant (it reads the cd)
+      # handles.  A slash after ".", a letter, "~" or "-" is mid-path.
       grep "No such file or directory" "$log" 2>/dev/null \
-        | grep -oE "/[^ '\"()]+" \
+        | grep -oE "(^|[^.A-Za-z0-9_~-])/[^ '\"()]+" | sed 's|^[^/]||' \
         | while IFS= read -r d; do
         d="${d%:}"
         [ -e "$d" ] && continue
@@ -11519,8 +11540,9 @@ _say_what_is_yours_to_finish() {
     say "#"
     say "#   1. THE PACKAGE MANAGER.  Not one download tool is installed yet:"
     say "#      wget, the CA certificates (make-ca), the Python modules the"
-    say "#      tools read books with, and the BLFS book are all BLFS.  The"
-    say "#      tarballs are already in /sources:"
+    say "#      tools read books with, the BLFS book and git (lfs-kernel's"
+    say "#      firmware is a git clone) are all BLFS.  What it needs first is"
+    say "#      already in /sources:"
     say "#          packagemanager bootstrap           # what it would do"
     say "#          packagemanager bootstrap --run     # do it"
     say "#      After that, HTTPS works in here (lfs-kernel, packagemanager)."

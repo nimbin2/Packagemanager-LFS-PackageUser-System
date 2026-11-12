@@ -188,7 +188,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.392"
+TOOL_VERSION = "1.14.395"
 
 
 def _build_id():
@@ -10310,6 +10310,7 @@ def _bootstrap_state():
         "book": _blfs_book_available(),
         "make_ca": _make_ca_installed(),
         "ca": _have_ca_bundle(),
+        "git": shutil.which("git"),
         "unverified": _wgetrc_is_weakened(),
     }
 
@@ -10373,6 +10374,8 @@ _BOOTSTRAP_STAGES = [
                 "every package lookup fails the same way: not found"),
     ("make_ca", "make-ca, for certificates",
                 "downloads stay unverified"),
+    ("git",     "git, with curl for https",
+                "lfs-kernel's firmware and every git stack entry cannot clone"),
     ("ca",      "a CA certificate bundle",
                 "make-ca is installed but has generated nothing"),
 ]
@@ -10399,7 +10402,7 @@ def cmd_setup(args):
     print()
     print("  A freshly booted LFS system has no download tool, no Python")
     print("  modules to read a book with, no BLFS book and no certificates.")
-    print("  These are the five things between here and a working `blfs`:")
+    print("  These are the six things between here and a working system:")
     print()
     print("%s1. book-parsing modules     %d of %d installed"
           % (mark(not todo_wheels), n_wheels, len(st["wheels"])))
@@ -10411,6 +10414,8 @@ def cmd_setup(args):
           "installed" if st["make_ca"] else "not installed"))
     print("%s5. CA certificates          %s" % (mark(st["ca"]),
           "present" if st["ca"] else "no bundle generated yet"))
+    print("%s6. git                      %s" % (mark(st["git"]),
+          "installed" if st["git"] else "not installed"))
     print()
     print("  site-packages : %s" % (st["site"] or "NOT FOUND -- is Python installed?"))
     print("  sources       : %s" % srcdir)
@@ -10530,8 +10535,8 @@ def _bootstrap_report(failed):
         printInfo("Fix them and run it again -- it skips what is already done.")
         sys.exit(1)
     st = _bootstrap_state()
-    if st["book"] and st["make_ca"] and st["ca"]:
-        printSuccess("Bootstrap complete -- all five stages done.")
+    if st["book"] and st["make_ca"] and st["ca"] and st["git"]:
+        printSuccess("Bootstrap complete -- all six stages done.")
         # THE STARTUP HELPERS BELONG TO THE BOOTSTRAP.  BLFS packages drop
         # /etc/profile.d snippets that call pathprepend, which LFS does not
         # provide -- rust's snippet failed on every package-user login.
@@ -10642,6 +10647,19 @@ def _bootstrap_finish(st, yes):
                 failed.append("certificates")
         else:
             restore_wget_verification()
+
+    # 6. GIT.  Not needed to read a book, but the next thing anyone runs is
+    # lfs-kernel, whose firmware is a git clone -- and it stopped there,
+    # after a 150 MB download and a configured tree.  Every git entry in a
+    # stack needs it too.  BLFS recommends curl with it (https clones), and
+    # --recursive takes the recommendations.  Needs the certificates.
+    if not shutil.which("git"):
+        printHeader("6. git")
+        if "certificates" in failed or "make-ca" in failed:
+            printWarning("  Skipped: no certificates, so nothing can be fetched safely.")
+            failed.append("git")
+        elif not _install_via_self("git", yes, recursive=True):
+            failed.append("git")
     return failed
 
 
@@ -10744,7 +10762,7 @@ def _bootstrap_next_steps(st):
 
     `--run` does these (see _bootstrap_finish); this is what to expect.
     """
-    if st["book"] and st["make_ca"] and st["ca"]:
+    if st["book"] and st["make_ca"] and st["ca"] and st["git"]:
         print()
         printSuccess("Bootstrap complete -- nothing is left to do.")
         printInfo("Try it:  blfs order <pkg>   /   packagemanager install <pkg>")
@@ -10775,6 +10793,12 @@ def _bootstrap_next_steps(st):
         print("         /usr/sbin/make-ca -g --force")
         print("     The tools re-enable certificate checking on their own once")
         print("     a bundle exists.")
+    n += 1
+    if not st["git"]:
+        print()
+        print("  %d. git (with curl, for https).  lfs-kernel clones the" % n)
+        print("     firmware with it, and so does every git stack entry.")
+        print("         packagemanager install git --run --recursive")
     print()
     pass
 

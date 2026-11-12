@@ -60,7 +60,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.392"
+LFS_VERSION = "1.14.395"
 
 
 def _build_id():
@@ -7932,7 +7932,8 @@ commands, by what you are doing:
     build-system run           host check to chroot, then enters it
     lfs-helper build-all       inside the chroot: chapters 7-9
     packagemanager bootstrap --run
-                               inside: wget, Python modules, BLFS book
+                               inside: wget, Python modules, BLFS book,
+                               certificates, git
     lfs-kernel --run           the kernel, from /etc/pkgusr/kernel.conf
     build-system restart --run start over on the same partition: deletes the
                                built tree, keeps the downloaded tarballs
