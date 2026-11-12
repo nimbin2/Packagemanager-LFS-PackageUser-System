@@ -1,11 +1,78 @@
 #!/bin/bash
+#
+# webcam -- load the camera modules on demand, and start vcam on them.
+#
+#   webcam enable    load v4l2loopback (video0 "vcam", video5 "vcam-mirror")
+#                    and uvcvideo, then start vcam if it is installed
+#   webcam disable   stop vcam, unload everything again
+#   webcam start     start vcam only (modules already loaded)
+#   webcam stop      stop vcam only
+#   webcam status    modules, devices, vcam
+#
+# vcam runs as the DESKTOP USER, never as root: /etc/pkgusr/desktop-user,
+# or whoever called sudo.  Its log: /tmp/vcam-<user>.log.
+# Options for vcam (default: camera /dev/video1 -> loopback /dev/video0):
+#     /etc/sysconfig/vcam      VCAM_ARGS="--res 1280x720 -f 30"
+
+[ -r /etc/sysconfig/vcam ] && . /etc/sysconfig/vcam
+VCAM_ARGS="${VCAM_ARGS:-}"
+VCAM_IN="${VCAM_IN:-/dev/video1}"
+
+desktop_user() {
+    local u="${SUDO_USER:-}"
+    [ -z "$u" ] && [ -r /etc/pkgusr/desktop-user ] && u="$(head -n1 /etc/pkgusr/desktop-user)"
+    [ -z "$u" ] && [ "$(id -u)" != 0 ] && u="$(id -un)"
+    printf '%s' "$u"
+}
+
+vcam_Start() {
+    command -v vcam >/dev/null 2>&1 || return 0          # not installed: nothing to start
+    if pgrep -x vcam >/dev/null 2>&1; then
+        echo "vcam is already running"; return 0
+    fi
+    local u i
+    u="$(desktop_user)"
+    [ -n "$u" ] || { echo "!! no desktop user to run vcam as (/etc/pkgusr/desktop-user)"; return 1; }
+    # the camera appears a moment after uvcvideo loads
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        [ -e "$VCAM_IN" ] && break
+        sleep 0.5
+    done
+    [ -e "$VCAM_IN" ] || { echo "!! no camera at $VCAM_IN -- vcam not started (VCAM_IN in /etc/sysconfig/vcam)"; return 1; }
+    local log="/tmp/vcam-$u.log"
+    if [ "$(id -un)" = "$u" ]; then
+        setsid nohup vcam -i "$VCAM_IN" $VCAM_ARGS >"$log" 2>&1 < /dev/null &
+    else
+        ( cd / && runuser -u "$u" -- setsid nohup vcam -i "$VCAM_IN" $VCAM_ARGS \
+            >"$log" 2>&1 < /dev/null & )
+    fi
+    sleep 1
+    if pgrep -x vcam >/dev/null 2>&1; then
+        echo "vcam started as $u ($VCAM_IN -> loopback), log: $log"
+    else
+        echo "!! vcam exited at once -- see $log"; return 1
+    fi
+}
+
+vcam_Stop() {
+    pgrep -x vcam >/dev/null 2>&1 || return 0
+    pkill -x vcam
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        pgrep -x vcam >/dev/null 2>&1 || return 0
+        sleep 0.3
+    done
+    pkill -9 -x vcam
+}
 
 cam_Enable() {
     modprobe v4l2loopback video_nr=0,5 exclusive_caps=1,1 card_label=vcam,vcam-mirror
     modprobe uvc &&
-    modprobe uvcvideo
+    modprobe uvcvideo &&
+    vcam_Start
 }
 cam_Disable() {
+    vcam_Stop       # it holds the devices: unloading would fail as "in use"
     modprobe -r uvcvideo &&
     modprobe -r uvc &&
     modprobe -r v4l2loopback &&
@@ -21,16 +88,21 @@ case "$1" in
         cam_Disable
         ;;
     "start")
-        echo "Do it from user space!"
+        vcam_Start
         ;;
     "stop")
-        echo "Do it from user space!"
+        vcam_Stop
+        ;;
+    "status")
+        lsmod | grep -E '^(uvcvideo|v4l2loopback|videodev) ' || echo "camera modules: not loaded"
+        ls -l /dev/video* 2>/dev/null || echo "no /dev/video*"
+        pgrep -a -x vcam || echo "vcam: not running"
         ;;
     "test")
         ffmpeg -f alsa -i hw:1,0 -f video4linux2 -s 320x240 -i /dev/video0 /tmp/out.mpg
         ;;
     *)
-        echo "Usage: $0 {enable|disable|start|test}"
+        echo "Usage: $0 {enable|disable|start|stop|status|test}"
         exit 1
         ;;
 esac

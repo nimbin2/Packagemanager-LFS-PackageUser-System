@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.398  (lfs-backup has its own: 1.3.0)
-    lfs               677ad4c
-    lfs-helper        e07a167
-    packagemanager    6efe167
-    blfs              53995f4
-    lfs-phases        c83839a
+    all six tools at 1.14.399  (lfs-backup has its own: 1.3.0)
+    lfs               40cfda1
+    lfs-helper        d86fa00
+    packagemanager    93877c4
+    blfs              bd8d590
+    lfs-phases        1bd75b3
     lfs-kernel        1199115   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      74538df   (1.0.2)
@@ -3780,6 +3780,16 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.399 -- `webcam enable` starts vcam
+
+stacks/mytools/webcam: after the modules, `enable` starts vcam (if it is
+installed) as the desktop user (SUDO_USER, else /etc/pkgusr/desktop-user)
+via runuser+setsid, waiting up to 5 s for the camera ($VCAM_IN, default
+/dev/video1) to appear; log /tmp/vcam-<user>.log.  `disable` stops vcam
+first (it holds the devices).  `start`/`stop` now run/stop vcam alone,
+`status` shows modules, devices and vcam.  Options: /etc/sysconfig/vcam
+(VCAM_ARGS, VCAM_IN).  Not run here (no camera).
 
 ## 1.14.398 -- mytools: webcam and microphone switches
 
