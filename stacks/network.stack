@@ -84,6 +84,8 @@ book   nmap expect="command -v ncat >/dev/null"
 # THE KERNEL FIRST: OpenVPN talks through /dev/net/tun (CONFIG_TUN), and
 # WireGuard IS a kernel module (CONFIG_WIREGUARD); the tools here only
 # configure it.  `lfs-kernel enable tun wireguard`, then rebuild the kernel.
+# tun is a module (TUN=m): add `tun` to /etc/sysconfig/modules so it is
+# loaded at boot, or OpenVPN finds no /dev/net/tun.
 #
 # OpenVPN 2.7.9 (2026-11-05, the supported branch; 2.6 gets security fixes
 # only).  Its INSTALL names what Linux needs: OpenSSL (LFS), libnl-genl for

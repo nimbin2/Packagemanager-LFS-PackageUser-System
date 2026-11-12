@@ -1,0 +1,51 @@
+#!/bin/bash
+
+case "$1" in
+    "enable")
+        modprobe snd_acp_config
+        modprobe snd_soc_dmic 
+
+        modprobe snd_acp3x_rn
+        modprobe snd_rn_pci_acp3x
+        modprobe snd_acp3x_rn
+        modprobe snd_acp3x_pdm_dma
+        ;;
+    "disable")
+        modprobe -r snd_acp3x_rn
+        modprobe -r snd_rn_pci_acp3x
+        modprobe -r snd_acp3x_rn
+        modprobe -r snd_pci_acp6x
+        modprobe -r snd_sof_amd_rembrandt
+        modprobe -r snd_sof_amd_acp63
+        modprobe -r snd_rpl_pci_acp6x
+        modprobe -r snd_pci_ps
+
+        modprobe -r snd_acp_config
+        modprobe -r snd_soc_dmic 
+
+        modprobe -r snd_acp3x_pdm_dma
+        ;;
+    "test")
+        arecord -D plughw:2,0 -f S16_LE -r 44100 -d 3 -vv /tmp/test.wav && aplay /tmp/test.wav
+        ;;
+    "test-default")
+        arecord -f S16_LE -r 44100 -d 3 -vv test-mic.wav && aplay test-mic.wav
+        ;;
+    "reroute")
+        shift 1;
+        case "$1" in
+            "disable")
+                modprobe -r snd_aloop
+                ;;
+            *)
+                modprobe snd_aloop
+                ;;
+        esac
+        ;;
+    *)
+        echo "Usage: $0 {enable|disable|test}"
+        exit 1
+        ;;
+esac
+
+exit 0

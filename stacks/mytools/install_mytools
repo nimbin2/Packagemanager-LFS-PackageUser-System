@@ -17,15 +17,17 @@ url=''
 link=''
 pkg=''
 md5_sum=''
-info='Personal scripts and programs: the seatd-user wrapper, sway_start, the wifi script, and the sway helper programs.'
+info='Personal scripts and programs: the seatd-user wrapper, sway_start, the wifi script, the webcam and microphone switches, and the sway helper programs.'
 installed_content=('installed_programs')
-installed_programs='wifi, sway_start'
+installed_programs='wifi, sway_start, webcam, microphone'
 
 # ---------------------------------------------------------------------------
 # SOURCES -- one line per thing.  Fields, separated by '|':
 #     kind   raw   = a single file, installed as-is
 #            tar   = a tarball; unpacked, then BUILD runs in its directory
 #            git   = a repository; cloned, then BUILD runs in it
+#            file  = a file shipped NEXT TO THIS SCRIPT (stacks/mytools/),
+#                    url is its name there; installed as-is
 #     name   what it is called once installed
 #     url    where it comes from  (a file:// path works offline)
 #     dest   where it goes        (a directory, or empty for /usr/bin)
@@ -40,6 +42,11 @@ installed_programs='wifi, sway_start'
 SOURCES=(
 'raw|wifi|https://git.christianimmanuel.de/scripts/raw/Administration/wifi|/usr/bin|'
 'raw|sway_start|https://git.christianimmanuel.de/scripts/raw/Administration/sway_start|/usr/bin|'
+# Camera and microphone stay unloaded until switched on: `webcam enable`,
+# `microphone enable` load the modules, `disable` removes them again.  Root
+# runs them (modprobe), so they go to /usr/sbin, where they were by hand.
+'file|webcam|webcam|/usr/sbin|'
+'file|microphone|microphone|/usr/sbin|'
 'tar|seatd-user|https://git.christianimmanuel.de/sway/seatd-user/archive/seatd-user.tar.gz|/usr/bin|gcc seatd-user.c -DSEATD_USER=$DESKTOP_USER -o $OUT/seatd-$DESKTOP_USER'
 # The sway helpers.  They are separate package users today; move them here by
 # uncommenting, then `packagemanager remove swas swov swbr browser`.
@@ -72,6 +79,10 @@ build_pkg() {
         case "$kind" in
             raw)
                 wget -q -O "$OUT/$nm" "$url" || { echo "!! fetch failed: $url"; return 1; }
+                chmod 755 "$OUT/$nm" ;;
+            file)
+                local _here="${PKGUSR_ETC:-/etc/pkgusr}/stacks/mytools"
+                cp -f "$_here/$url" "$OUT/$nm" || { echo "!! missing $_here/$url"; return 1; }
                 chmod 755 "$OUT/$nm" ;;
             tar)
                 rm -rf "$d"; mkdir -p "$d"

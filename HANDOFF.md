@@ -11,13 +11,13 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.396  (lfs-backup has its own: 1.3.0)
-    lfs               65b2a39
-    lfs-helper        ab5bce3
-    packagemanager    26c6d01
-    blfs              165ff9a
-    lfs-phases        c893b42
-    lfs-kernel        1226099   (no version line of its own)
+    all six tools at 1.14.398  (lfs-backup has its own: 1.3.0)
+    lfs               677ad4c
+    lfs-helper        e07a167
+    packagemanager    6efe167
+    blfs              53995f4
+    lfs-phases        c83839a
+    lfs-kernel        1199115   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      74538df   (1.0.2)
 
@@ -3780,6 +3780,20 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.398 -- mytools: webcam and microphone switches
+
+The user's /sbin/webcam and /sbin/microphone (modprobe on/off for
+v4l2loopback+uvcvideo and the AMD ACP mic modules) ship verbatim in
+stacks/mytools/; install_mytools gets a `file` kind (a file next to the
+script, from $PKGUSR_ETC/stacks/mytools) and installs both to /usr/sbin.
+On the host the hand-placed root-owned copies must go first (sticky dir).
+
+## 1.14.397 -- TUN=m by default
+
+Asked.  kernel.conf CONFIG_SET and `lfs-kernel enable tun` now TUN=m; the
+comments (kernel.conf, enable table, network.stack) say to add `tun` to
+/etc/sysconfig/modules, since nothing on SysV loads it otherwise.
 
 ## 1.14.396 -- `overview` (alias `where`) in packagemanager, lfs and blfs
 

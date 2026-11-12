@@ -1,0 +1,38 @@
+#!/bin/bash
+
+cam_Enable() {
+    modprobe v4l2loopback video_nr=0,5 exclusive_caps=1,1 card_label=vcam,vcam-mirror
+    modprobe uvc &&
+    modprobe uvcvideo
+}
+cam_Disable() {
+    modprobe -r uvcvideo &&
+    modprobe -r uvc &&
+    modprobe -r v4l2loopback &&
+    modprobe -r videobuf2_memops &&
+    modprobe -r videodev
+}
+
+case "$1" in
+    "enable")
+        cam_Enable
+        ;;
+    "disable")
+        cam_Disable
+        ;;
+    "start")
+        echo "Do it from user space!"
+        ;;
+    "stop")
+        echo "Do it from user space!"
+        ;;
+    "test")
+        ffmpeg -f alsa -i hw:1,0 -f video4linux2 -s 320x240 -i /dev/video0 /tmp/out.mpg
+        ;;
+    *)
+        echo "Usage: $0 {enable|disable|start|test}"
+        exit 1
+        ;;
+esac
+
+exit 0
