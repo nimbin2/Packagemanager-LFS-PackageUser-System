@@ -1,17 +1,14 @@
-1.14.441: lfs-kernel knows the ThinkPad P14s Gen 6 AMD; firmware built into the image
+1.14.442: one kernel.conf for both laptops; lfs-kernel disable
 
-- lfs-kernel: hardware rows for Ryzen AI 300 laptops -- amdgpu-strix,
-  amd-npu, mt7925, bluetooth-mtk, amd-audio, amd-mic, amd-laptop -- and a
-  machine row, thinkpad-p14s-gen6-amd, that enables them all (@name rows)
-- GPU, Wi-Fi, Bluetooth, speaker/HDMI audio and the platform drivers are
-  BUILT IN; the camera (UVC) and the internal microphones (AMD ACP) are
-  modules, so they can be switched by loading/unloading
-- lfs-kernel/kernel.conf: FIRMWARE_BUILTIN -- patterns matched against the
-  installed firmware become CONFIG_EXTRA_FIRMWARE (no initramfs: a built-in
-  driver needs its blobs inside the image); a row's fifth field fills it;
-  a built-in amdgpu with no amdgpu blob stops the build
-- the MT7925 and Ryzen AI NPU firmware directories are added to
-  FIRMWARE_ONLY by the rows; README: one line for the machine profile
+- lfs-kernel: with FIRMWARE_BUILTIN in use, the firmware the BUILDING
+  machine's built-in drivers need is added for that build: amdgpu by the
+  GPU's PCI id (Raven .. Strix Halo APUs), btusb by an Intel radio's USB
+  id (8265 .. AX211), AMD microcode by CPU family -- so the P14s profile
+  built on a T14 (Renoir, AX200) still brings up its GPU and Bluetooth.
+  An AMD GPU it does not know is named, with what to do
+- lfs-kernel disable <name>: takes a name's (or a machine's) symbols out
+  of CONFIG_SET and its patterns out of FIRMWARE_BUILTIN
+- the built-in firmware patterns are no longer globbed by the shell
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_011fX6Wu4ytSyonAjwWr4mSA

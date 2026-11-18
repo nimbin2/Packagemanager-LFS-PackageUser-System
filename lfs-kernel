@@ -1,5 +1,5 @@
 #!/bin/bash
-# AI-modified: Claude Opus 5.5 (1.14.441)
+# AI-modified: Claude Opus 5.5 (1.14.442)
 # lfs-kernel -- build and install a kernel.
 #
 #   lfs-kernel                 what a build would do (nothing is built)
@@ -17,6 +17,7 @@
 #                              make the test kernel (vmlinuz_new) the one that
 #                              boots; the current one stays as vmlinuz_old
 #   lfs-kernel enable --list   hardware this tool knows by name
+#   lfs-kernel disable <name>  take a name's symbols/built-in firmware out again
 #   lfs-kernel enable ath9k-htc
 #                              put what that hardware needs into kernel.conf
 #   lfs-kernel modules [text]  what this kernel has, and what is loaded
@@ -104,6 +105,10 @@ case "${1:-}" in
     enable)
         # hardware by name: what symbols it needs, written into kernel.conf
         shift; _ENABLE=1; _ENARGS=("$@") ;;
+    disable)
+        # the reverse: its symbols out of CONFIG_SET, its built-in firmware
+        # out of FIRMWARE_BUILTIN -- back to what the source config says
+        shift; _DISABLE=1; _ENARGS=("$@") ;;
     modules|mods)
         # what this kernel actually has, and what is loaded
         shift; _MODCMD=1; _MODARGS=("$@") ;;
@@ -161,7 +166,7 @@ case "${1:-}" in
         case "$1" in
             latest|[0-9]*.[0-9]*) _CLI_VERSION="$1" ;;
             *)  echo "!! lfs-kernel: '$1' is neither a command nor a version."
-                echo "   commands: status, list, enable, modules, load,"
+                echo "   commands: status, list, enable, disable, modules, load,"
                 echo "             config, search, firmware, verify, detect-esp"
                 echo "   a version looks like 7.2.6, or the word latest."
                 case "$1" in
@@ -260,7 +265,7 @@ _no_https_why() {
 # and fail on a machine with no network while reporting on one that is
 # perfectly installed.
 if [ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
-   || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
+   || [ "${_ENABLE:-0}" = 1 ] || [ "${_DISABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
    || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ] \
    || [ "${_PROMOTE:-0}" = 1 ]; then
     :
@@ -297,20 +302,20 @@ acct="p_$PKG"
 # `verify` must not CREATE anything -- a report that makes an account is not
 # a report.  It only reads $acct's home below.
 if [ "${_VERIFY:-0}" != 1 ] && [ "${_CFGCMD:-0}" != 1 ] \
-   && [ "${_ENABLE:-0}" != 1 ] && [ "${_MODCMD:-0}" != 1 ] \
+   && [ "${_ENABLE:-0}" != 1 ] && [ "${_DISABLE:-0}" != 1 ] && [ "${_MODCMD:-0}" != 1 ] \
    && [ "${_STATUS:-0}" != 1 ] && [ -z "${_LOADCMD:-}" ] \
    && [ "${_PROMOTE:-0}" != 1 ] \
    && ! id "$acct" >/dev/null 2>&1; then
     packagemanager add-user "$PKG" || { echo "!! could not create $acct"; exit 1; }
 fi
 [ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
-    || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
+    || [ "${_ENABLE:-0}" = 1 ] || [ "${_DISABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
     || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ] \
     || [ "${_PROMOTE:-0}" = 1 ] \
     || lfs-helper fix-home "$acct" --run >/dev/null 2>&1 || true
 SRC="$(getent passwd "$acct" 2>/dev/null | cut -d: -f6)/src"
 [ "${_VERIFY:-0}" = 1 ] || [ "${_CFGCMD:-0}" = 1 ] \
-    || [ "${_ENABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
+    || [ "${_ENABLE:-0}" = 1 ] || [ "${_DISABLE:-0}" = 1 ] || [ "${_MODCMD:-0}" = 1 ] \
     || [ "${_STATUS:-0}" = 1 ] || [ -n "${_LOADCMD:-}" ] \
     || [ "${_PROMOTE:-0}" = 1 ] \
     || install -d -o "$acct" -g "$acct" -m 755 "$SRC"
@@ -734,6 +739,51 @@ _kdev_list() {
     echo "# or a symbol:  lfs-kernel enable ATH9K_HTC"
     echo "# what is set:  lfs-kernel config show        modules: lfs-kernel modules"
 }
+
+# DISABLE: what `enable <name>` wrote, taken out again.  The symbols leave
+# CONFIG_SET (the source config's own answer applies again), the patterns
+# leave FIRMWARE_BUILTIN.  FIRMWARE_ONLY is left alone: firmware on disk
+# that nothing loads costs nothing, and another name may share it.
+if [ "${_DISABLE:-0}" = 1 ]; then
+    _args=("${_ENARGS[@]}")
+    [ "${#_args[@]}" -gt 0 ] || { echo "!! lfs-kernel disable <name>   (names: lfs-kernel enable --list)"; exit 1; }
+    _exp=()
+    for _a in "${_args[@]}"; do
+        _row="$(_kdev_line "$_a")"
+        [ -n "$_row" ] || { echo "!! '$_a' is not a name in the table (lfs-kernel enable --list)"; exit 1; }
+        case "$(printf '%s' "$_row" | cut -d'|' -f2)" in
+            @*) for _m in $(printf '%s' "$_row" | cut -d'|' -f2); do _exp+=("${_m#@}"); done ;;
+            *)  _exp+=("$_a") ;;
+        esac
+    done
+    _dsyms=""; _dfwb=""
+    for _a in "${_exp[@]}"; do
+        _row="$(_kdev_line "$_a")"
+        _dsyms="$_dsyms $(printf '%s' "$_row" | cut -d'|' -f2)"
+        _dfwb="$_dfwb $(printf '%s' "$_row" | cut -d'|' -f5)"
+        echo "# $_a: out"
+    done
+    _new=""
+    for _w in ${CONFIG_SET:-}; do
+        _keep=1
+        for _i in $_dsyms; do [ "${_i%%=*}" = "${_w%%=*}" ] && _keep=0; done
+        [ "$_keep" = 1 ] && _new="$_new $_w"
+    done
+    _new="${_new# }"
+    [ "$_new" = "${CONFIG_SET:-}" ] || _conf_set_var CONFIG_SET "$_new" || exit 1
+    set -f
+    _newb=""
+    for _w in ${FIRMWARE_BUILTIN:-}; do
+        case " $_dfwb " in *" $_w "*) ;; *) _newb="$_newb $_w" ;; esac
+    done
+    set +f
+    _newb="${_newb# }"
+    [ "$_newb" = "${FIRMWARE_BUILTIN:-}" ] || _conf_set_var FIRMWARE_BUILTIN "$_newb" || exit 1
+    echo
+    echo "# nothing is built yet.  Apply it:  lfs-kernel --run"
+    echo "# (or take the whole file back: the kernel.conf.bak-* beside it)"
+    exit 0
+fi
 
 if [ "${_ENABLE:-0}" = 1 ]; then
     [ -d "$tree" ] || tree="$(_kcfg_tree)"
@@ -2397,10 +2447,81 @@ fi
 # what matches becomes CONFIG_EXTRA_FIRMWARE -- replacing whatever list the
 # source config carried (the running kernel's is for the running machine's
 # hardware).  A built-in amdgpu with no amdgpu blob stops the build.
+# ...AND WHAT THE MACHINE BUILDING IT NEEDS.  The rows name one machine's
+# blobs; the same kernel.conf builds for the laptop it runs on too.  With
+# amdgpu and btusb built in, a ThinkPad T14 (Renoir GPU, Intel AX200
+# Bluetooth) would boot with neither -- their firmware was never in the
+# image.  So, for the built-in drivers, the hardware HERE is looked up and
+# its blobs are added for this build (not written to kernel.conf):
+#   amdgpu      by the GPU's PCI id         (APUs: Raven .. Strix Halo)
+#   btusb       by an Intel radio's USB id  (8265 .. AX211)
+#   microcode   by the CPU family           (AMD 17h / 19h / 1Ah)
+_running_builtin_fw() {
+    local d id
+    if grep -q '^CONFIG_DRM_AMDGPU=y' "$tree/.config"; then
+        for d in /sys/bus/pci/devices/*; do
+            [ "$(cat "$d/vendor" 2>/dev/null)" = 0x1002 ] || continue
+            case "$(cat "$d/class" 2>/dev/null)" in 0x03*) ;; *) continue ;; esac
+            id="$(cat "$d/device" 2>/dev/null)"; id="${id#0x}"
+            case "$id" in
+                15dd|15d8)      echo "amdgpu/raven_* amdgpu/raven2_* amdgpu/picasso_*" ;;
+                1636|164c)      echo "amdgpu/renoir_*" ;;
+                1638|15e7)      echo "amdgpu/green_sardine_*" ;;
+                1681)           echo "amdgpu/yellow_carp_*" ;;
+                164e)           echo "amdgpu/gc_10_3_6_* amdgpu/psp_13_0_5_* amdgpu/dcn_3_1_5* amdgpu/vcn_3_1_2* amdgpu/sdma_5_2_6*" ;;
+                15bf|15c8|1900|1901)
+                                echo "amdgpu/gc_11_0_[14]_* amdgpu/psp_13_0_[4]_* amdgpu/dcn_3_1_4* amdgpu/vcn_4_0_2* amdgpu/sdma_6_0_1*" ;;
+                150e|1114|1586) echo "amdgpu/gc_11_5_* amdgpu/psp_14_0_* amdgpu/sdma_6_1_* amdgpu/vcn_4_0_[56]* amdgpu/dcn_3_5* amdgpu/vpe_6_1_*" ;;
+                *) echo "!!amdgpu:1002:$id" ;;
+            esac
+        done
+    fi
+    if grep -q '^CONFIG_BT_HCIBTUSB=y' "$tree/.config"; then
+        for d in /sys/bus/usb/devices/*; do
+            [ "$(cat "$d/idVendor" 2>/dev/null)" = 8087 ] || continue
+            case "$(cat "$d/idProduct" 2>/dev/null)" in
+                0a2b) echo "intel/ibt-12-*" ;;
+                0aaa) echo "intel/ibt-17-*" ;;
+                0025) echo "intel/ibt-18-*" ;;
+                0026) echo "intel/ibt-19-*" ;;
+                0029) echo "intel/ibt-20-*" ;;
+                0032) echo "intel/ibt-0041-*" ;;
+                0033) echo "intel/ibt-0040-*" ;;
+            esac
+        done
+    fi
+    if grep -q '^vendor_id.*AuthenticAMD' /proc/cpuinfo 2>/dev/null; then
+        case "$(awk -F: '/^cpu family/ {gsub(/ /,"",$2); print $2; exit}' /proc/cpuinfo)" in
+            23) echo "amd-ucode/microcode_amd_fam17h.bin" ;;
+            25) echo "amd-ucode/microcode_amd_fam19h.bin" ;;
+            26) echo "amd-ucode/microcode_amd_fam1ah.bin" ;;
+        esac
+    fi
+}
+_FB_HERE=""
+if [ -n "${FIRMWARE_BUILTIN:-}" ]; then
+    _FB_HERE="$(_running_builtin_fw | sort -u | tr '\n' ' ')"
+    set -f
+    for _x in $_FB_HERE; do
+        case "$_x" in
+            '!!amdgpu:'*)
+                echo "!! amdgpu is BUILT IN, and this machine's GPU (${_x#!!amdgpu:}) is not"
+                echo "   one this tool knows the firmware of -- it is NOT in the image, so"
+                echo "   amdgpu will not bring this GPU up.  Its blobs: lfs-kernel firmware"
+                echo "   --missing on a kernel with amdgpu as a module, then add them to"
+                echo "   FIRMWARE_BUILTIN in $CONF." ;;
+        esac
+    done
+    _FB_HERE="$(printf '%s\n' $_FB_HERE | grep -v '^!!' | tr '\n' ' ')"
+    set +f
+    [ -n "${_FB_HERE// /}" ] && echo "# FIRMWARE_BUILTIN: + this machine's own: $_FB_HERE"
+fi
 if [ -n "${FIRMWARE_BUILTIN:-}" ]; then
     _fbd=/lib/firmware
     _fbl=""; _fbmiss=""
-    for _p in $FIRMWARE_BUILTIN; do
+    # the patterns are for compgen below, not for this shell's cwd
+    set -f; _fbarr=($FIRMWARE_BUILTIN $_FB_HERE); set +f
+    for _p in "${_fbarr[@]}"; do
         _hits="$(cd "$_fbd" 2>/dev/null && compgen -G "$_p")"
         [ -n "$_hits" ] || { _fbmiss="$_fbmiss $_p"; continue; }
         for _h in $_hits; do
