@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# AI-modified: Claude Opus 5.5 (1.14.431)
 # -*- coding: utf-8 -*-
 #
 # lfs -- Linux From Scratch book tool (follow one cached book)
@@ -60,7 +61,7 @@ except ImportError:
         "      packagemanager pip install beautifulsoup4\n")
     sys.exit(2)
 
-LFS_VERSION = "1.14.403"
+LFS_VERSION = "1.14.440"
 
 
 def _build_id():
@@ -3635,6 +3636,7 @@ def _auto_file_block(soup_or_raw, sid, dest_path):
     Returns a single shell command that writes the file, or None.
     """
     import re as _re
+    import shutil
     raw = soup_or_raw if isinstance(soup_or_raw, str) else str(soup_or_raw)
     i = raw.find('id="%s"' % sid)
     if i < 0:
@@ -4667,6 +4669,95 @@ def _run_banner(step, steps, cmd=None):
 _STACK_VERSION_RE = re.compile(r"^#\s*stack-version:\s*(\S+)", re.M)
 
 
+def _merge_machine_conf(src, dst):
+    """Add to dst what src has and dst lacks; change nothing that is there.
+
+    machine.conf is the machine's own choice of build options, so the chroot
+    refresh never touched an existing one -- and so it never received a
+    section shipped after it was first placed.  webkitgtk was built with the
+    book's -D USE_WOFF2=OFF because `USE_WOFF2 = ON` (shipped) never reached
+    the chroot's file, and the stack's feature check failed after a
+    nine-thousand-file build.
+
+    A key the chroot's file already has -- whatever its value -- is the
+    machine's choice and stays.  A missing key is inserted under its section
+    header, a missing section is appended whole, each marked as added.
+    Returns ["section.key", ...] for what was added."""
+    import re as _re
+    import shutil
+
+    def parse(text):
+        secs, cur = {}, None
+        tl = text.splitlines()
+        for i, line in enumerate(tl):
+            m = _re.match(r"\s*\[([^\]]+)\]\s*$", line)
+            if m:
+                cur = m.group(1).strip()
+                secs.setdefault(cur, {"line": i, "keys": {}})
+                continue
+            m = _re.match(r"([A-Za-z0-9_.+-]+)\s*=", line)
+            if m and cur is not None:
+                # a value continues on indented lines (configparser's rule)
+                body = [line]
+                for nxt in tl[i + 1:]:
+                    if nxt[:1] in (" ", "\t") and nxt.strip() \
+                            and not nxt.lstrip().startswith(("#", ";")):
+                        body.append(nxt)
+                    else:
+                        break
+                secs[cur]["keys"].setdefault(m.group(1).lower(), "\n".join(body))
+        return secs
+
+    try:
+        st = open(src, encoding="utf-8", errors="replace").read()
+        dt = open(dst, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return []
+    ss, ds = parse(st), parse(dt)
+    lines = dt.splitlines()
+    added, inserts, appends = [], {}, []
+    for sec, info in ss.items():
+        if sec not in ds:
+            # the whole section, as shipped, comments and all
+            sl = st.splitlines()
+            start = info["line"]
+            end = len(sl)
+            for j in range(start + 1, len(sl)):
+                if _re.match(r"\s*\[[^\]]+\]\s*$", sl[j]):
+                    end = j
+                    break
+            # leading comments above the next header belong to the next
+            # section; keep this section's body only
+            while end > start + 1 and sl[end - 1].lstrip().startswith("#"):
+                end -= 1
+            appends.append("\n".join(sl[start:end]).rstrip())
+            added += ["%s.%s" % (sec, k) for k in info["keys"]] or [sec]
+            continue
+        for k, line in info["keys"].items():
+            if k not in ds[sec]["keys"]:
+                inserts.setdefault(ds[sec]["line"], []).append(line)
+                added.append("%s.%s" % (sec, k))
+    if not added:
+        return []
+    out = []
+    for i, line in enumerate(lines):
+        out.append(line)
+        if i in inserts:
+            out.append("# added by lfs install-tools (shipped, missing here):")
+            out.extend(inserts[i])
+    text = "\n".join(out).rstrip() + "\n"
+    for block in appends:
+        text += "\n# section added by lfs install-tools (shipped, missing here)\n" \
+                + block + "\n"
+    try:
+        shutil.copy2(dst, dst + ".bak")
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError:
+        return []
+    return added
+
+
 def _stack_version(path):
     """The version a stack file declares, if it declares one."""
     try:
@@ -4754,6 +4845,7 @@ def _refresh_chroot_tools(lfs, quiet=False):
     # the user's own choice of build options, so it is only placed when it
     # does not exist yet.
     refreshed_stacks = []
+    _stacks_waiting = []
     # WHERE THE STACKS ACTUALLY ARE.
     #
     # This looked only beside the running tool -- and the running tool is
@@ -4841,8 +4933,24 @@ def _refresh_chroot_tools(lfs, quiet=False):
                 if not os.path.isfile(src_f):
                     continue
                 if fn == "machine.conf" and os.path.exists(dst_f):
-                    continue            # the machine's own options: never overwritten
+                    # the machine's own options: never overwritten -- but
+                    # what it LACKS is added (see _merge_machine_conf)
+                    _shipped = os.path.join(_stack_src, ".shipped", fn)
+                    _from = _shipped if os.path.isfile(_shipped) else (
+                        src_f + ".new" if os.path.isfile(src_f + ".new") else src_f)
+                    _added = _merge_machine_conf(_from, dst_f)
+                    if _added:
+                        refreshed_stacks.append("machine.conf (+%d option(s):"
+                                                " %s)" % (len(_added),
+                                                          ", ".join(_added[:6])
+                                                          + (" ..." if len(_added) > 6 else "")))
+                    continue
                 if os.path.exists(dst_f) and _md5(src_f) == _md5(dst_f):
+                    if fn.endswith(".stack"):     # record it: ours, unedited
+                        _r = os.path.join(_stack_dst, ".shipped", fn)
+                        if not (os.path.isfile(_r) and _md5(_r) == _md5(src_f)):
+                            os.makedirs(os.path.dirname(_r), exist_ok=True)
+                            shutil.copy2(src_f, _r)
                     continue            # already current
                 # NEVER GO BACKWARDS.  A stack file edited in the chroot, or
                 # one from a newer release, must not be replaced by an older
@@ -4862,8 +4970,27 @@ def _refresh_chroot_tools(lfs, quiet=False):
                 # back over it.  Same rule as `make install`: an existing
                 # file that differs is theirs, and the incoming one waits
                 # beside it.
+                # ...BUT "DIFFERS" IS NOT "EDITED".  With no record of
+                # what was shipped, every stack the chroot had from an
+                # EARLIER release differed too -- so libnice's new ref,
+                # SDL3 from git and webrtc-audio-processing's flag all sat
+                # in .new files nobody looked at, and the build kept failing
+                # on what had already been fixed.  The chroot now keeps the
+                # same record as `make install` (.shipped/): a file that
+                # still matches what was shipped last is ours to update.
+                _rec = os.path.join(_stack_dst, ".shipped", fn)
                 if fn.endswith(".stack") and os.path.exists(dst_f):
+                    if os.path.isfile(_rec) and _md5(_rec) == _md5(dst_f):
+                        shutil.copy2(src_f, dst_f)
+                        shutil.copy2(src_f, _rec)
+                        try:
+                            os.remove(dst_f + ".new")
+                        except OSError:
+                            pass
+                        refreshed_stacks.append(fn + " (updated -- not edited)")
+                        continue
                     shutil.copy2(src_f, dst_f + ".new")
+                    _stacks_waiting.append(fn)
                     if not quiet:
                         print("# %s differs in the chroot -- kept it, new one"
                               " is %s.new" % (fn, fn))
@@ -4871,9 +4998,27 @@ def _refresh_chroot_tools(lfs, quiet=False):
                 shutil.copy2(src_f, dst_f)
                 if fn.endswith(".sh"):
                     os.chmod(dst_f, 0o755)
+                if fn.endswith(".stack"):
+                    os.makedirs(os.path.dirname(_rec), exist_ok=True)
+                    shutil.copy2(src_f, _rec)
                 refreshed_stacks.append(fn)
             if refreshed_stacks and not quiet:
                 print("# refreshed in the chroot: %s" % ", ".join(refreshed_stacks))
+            # SAY IT AT THE END, WHERE IT IS READ.  One line per file in
+            # the middle of the refresh scrolled past; the fixes in those
+            # files are what the next build needs.
+            if _stacks_waiting:
+                print("")
+                print("! %d stack file(s) in the chroot differ from the new"
+                      " ones, so they were KEPT:" % len(_stacks_waiting))
+                for fn in _stacks_waiting:
+                    print("!     %s   (new: %s.new)" % (fn, fn))
+                print("! Inside the chroot, compare and take each one you did"
+                      " not edit on purpose:")
+                for fn in _stacks_waiting:
+                    print("!     diff /etc/pkgusr/stacks/%s{,.new}" % fn)
+                    print("!     packagemanager stack %s --take-new"
+                          % fn[:-len(".stack")])
         except OSError as e:
             fail("! could not refresh the stacks: %s" % e)
 
@@ -7051,13 +7196,43 @@ def cmd_bs_install_tools(args):
     if _blfs_src:
         _blfs_dst = os.path.join(lfs, "usr", "share", "blfs", "books")
         os.makedirs(_blfs_dst, exist_ok=True)
+        # THE HOST'S CHOICE OF BOOK GOES WITH THE BOOKS.  Without a
+        # config.json the tree's blfs picked by init: SysV -> "stable-sysv",
+        # which BLFS 13 does not publish, so it fell back to "a cached book"
+        # -- an svn snapshot weeks old -- and SDL3 asked for
+        # SDL3-3.4.18-upstream_fixes-1.patch, gone from the svn patches
+        # (svn is at 3.4.20).  The host builds from its set default; so does
+        # the tree.  A default the tree already set is kept.
+        _hcfg = os.path.join(os.path.dirname(_blfs_src), "config.json")
+        _tcfg = os.path.join(os.path.dirname(_blfs_dst), "config.json")
+        try:
+            _hdef = json.load(open(_hcfg)).get("default")
+        except (OSError, ValueError):
+            _hdef = None
+        try:
+            _tc = json.load(open(_tcfg))
+        except (OSError, ValueError):
+            _tc = {}
+        if _hdef and not _tc.get("default"):
+            _tc["default"] = _hdef
+            try:
+                with open(_tcfg, "w") as _f:
+                    json.dump(_tc, _f, indent=2)
+                _make_world_readable(_tcfg)
+                print("    %-22s -> %s (the host's)" % ("BLFS default book", _hdef))
+            except OSError:
+                pass
         _n = 0
         for f in os.listdir(_blfs_src):
             if not f.endswith((".html", ".html.gz", ".meta")):
                 continue
             d = os.path.join(_blfs_dst, f)
-            if not os.path.isfile(d):
-                shutil.copy(os.path.join(_blfs_src, f), d)
+            # A NEWER HOST COPY REPLACES THE TREE'S.  A book the host re-made
+            # (blfs 1.14.411 re-stitches the svn book so page links resolve)
+            # never reached a tree that already had one of that name.
+            _s = os.path.join(_blfs_src, f)
+            if not os.path.isfile(d) or os.path.getmtime(_s) > os.path.getmtime(d) + 1:
+                shutil.copy2(_s, d)
                 _make_world_readable(d)
                 _n += 0 if f.endswith(".meta") else 1
             # ...and a second copy in the tree's SOURCES.  The one in
@@ -7067,9 +7242,11 @@ def cmd_bs_install_tools(args):
                 # named so bootstrap can tell it from the LFS book
                 _sd = os.path.join(lfs, "sources",
                                    f if "blfs" in f.lower() else "blfs-book-" + f)
-                if os.path.isdir(os.path.dirname(_sd)) and not os.path.isfile(_sd):
+                if os.path.isdir(os.path.dirname(_sd)) and (
+                        not os.path.isfile(_sd)
+                        or os.path.getmtime(_s) > os.path.getmtime(_sd) + 1):
                     try:
-                        shutil.copy(os.path.join(_blfs_src, f), _sd)
+                        shutil.copy2(_s, _sd)
                         _make_world_readable(_sd)
                     except OSError:
                         pass

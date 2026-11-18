@@ -1,4 +1,5 @@
 #!/bin/bash
+# AI-modified: Claude Opus 5.5 (1.14.440)
 # fonts.sh -- icon, patched and Noto fonts, from release archives.
 #
 # None of these is a BLFS page, so the URLs and versions are OURS to keep
@@ -44,7 +45,7 @@ noto-sans|https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSans
 noto-serif|https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSerif/NotoSerif-Regular.ttf|NotoSerif-Regular.ttf
 noto-serif|https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSerif/NotoSerif-Bold.ttf|NotoSerif-Bold.ttf
 noto-mono|https://github.com/googlefonts/noto-fonts/raw/main/hinted/ttf/NotoSansMono/NotoSansMono-Regular.ttf|NotoSansMono-Regular.ttf
-noto-emoji|https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf|NotoColorEmoji.ttf
+noto-emoji|https://github.com/googlefonts/noto-emoji/raw/main/2D/fonts/NotoColorEmoji.ttf https://github.com/googlefonts/noto-emoji/raw/main/fonts/NotoColorEmoji.ttf|NotoColorEmoji.ttf
 FONTS
 }
 
@@ -75,17 +76,28 @@ while IFS='|' read -r name url glob; do
     dest="$FONTDIR/$name"
     # ALREADY THERE IS DONE.  This step runs on every stack replay, and
     # re-downloading a font nobody changed is time spent for nothing.
-    if [ -d "$dest" ] && [ -n "$(ls -A "$dest" 2>/dev/null)" ]; then
-        note "$name: already installed ($(ls -1 "$dest" | wc -l) file(s))"
+    # ...BY ITS FILES, NOT ITS DIRECTORY.  noto-sans has three lines (Regular,
+    # Bold, Italic) into one directory: once Regular was there the other two
+    # were "already installed" and never fetched.
+    if [ -d "$dest" ] && (cd "$dest" && compgen -G "$glob" >/dev/null 2>&1); then
+        note "$name: already installed ($(cd "$dest" && compgen -G "$glob" | wc -l) file(s) for '$glob')"
         continue
     fi
     tmp="$(mktemp -d)"
-    note "$name: fetching $(basename "$url")"
-    if ! wget -q -O "$tmp/archive" "$url"; then
+    # SEVERAL URLS, FIRST THAT ANSWERS.  noto-emoji moved its fonts from
+    # fonts/ to 2D/fonts/ and the old path stopped answering; the table may
+    # list the new place and the old, separated by spaces.
+    _got=""
+    for _u in $url; do
+        note "$name: fetching $(basename "$_u")"
+        if wget -q -O "$tmp/archive" "$_u"; then _got="$_u"; break; fi
+    done
+    if [ -z "$_got" ]; then
         warn "$name: could not download"
-        note "   $url"
+        for _u in $url; do note "   $_u"; done
         rm -rf "$tmp"; continue
     fi
+    url="$_got"
     # a bare .ttf is not an archive: NotoColorEmoji is published as the font
     case "$url" in
         *.ttf|*.otf)

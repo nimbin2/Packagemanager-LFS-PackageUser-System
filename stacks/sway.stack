@@ -1,5 +1,6 @@
 # sway.stack -- the Sway desktop: the compositor, its tools, your programs.
-# stack-version: 1.14.371
+# stack-version: 1.14.439
+# AI-modified: Claude Opus 5.5 (1.14.439)
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -34,14 +35,24 @@ book   alsa-utils
 book   pipewire
 book   wireplumber
 
-# 8. SDL3 for the Sw* tools.
+# 8. SDL3 for the Sw* tools -- from git, like SDL_image/ttf/mixer below.
 #
-# SDL3 dlopens libasound rather than linking it, so ldd says nothing; the
-# name it will dlopen is in the binary, and that is what to look for.
-# the glob matters: SDL3 installs libSDL3.so.0.<n> and a bare libSDL3.so
-# symlink only when the -devel side is there, so naming one path makes the
-# probe fail for the wrong reason
-book   sdl3 expect="strings /usr/lib/libSDL3.so* 2>/dev/null | grep -q libasound"
+# The book's SDL3 lags the release and needs a BLFS patch whose URL goes
+# away with the next version (SDL3-3.4.18-upstream_fixes-1.patch: 404).
+# A package a stack builds from git is built from git in EVERY plan that
+# reaches it (ffmpeg's, via sdl2-compat), in the book's order.
+# HAVE_GETRESUID/GID=1: what that BLFS patch is about -- the cmake check
+# misses glibc's getresuid, and the fallback then clashes with unistd.h
+# (fixed upstream on main, c15b6a1; not in 3.4.20).
+#
+# SDL3 dlopens libasound and libwayland-client rather than linking them,
+# so ldd says nothing; the names it will dlopen are in the binary.
+# the glob matters: libSDL3.so.0.<n>, and a bare libSDL3.so only with -devel
+git    sdl3 url=https://github.com/libsdl-org/SDL ref=release-3.4.20 submodules=no \
+       have=/usr/lib/pkgconfig/sdl3.pc \
+       expect="strings /usr/lib/libSDL3.so* 2>/dev/null | grep -q libasound && strings /usr/lib/libSDL3.so* 2>/dev/null | grep -q libwayland-client" \
+       build="cmake -B build -G Ninja -W no-author -D CMAKE_INSTALL_PREFIX=/usr -D CMAKE_BUILD_TYPE=Release -D SDL_TEST_LIBRARY=OFF -D SDL_TESTS=OFF -D SDL_EXAMPLES=OFF -D SDL_STATIC=OFF -D SDL_RPATH=OFF -D HAVE_GETRESUID=1 -D HAVE_GETRESGID=1; ninja -C build" \
+       install="ninja -C build install"
 
 
 # ---------------------------------------------------------------------
@@ -117,9 +128,16 @@ git    wl-clipboard url=https://github.com/bugaevc/wl-clipboard ref=v2.2.1 \
 # Its codecs come from ffmpeg, which is entry 1b, and the default is
 # libx264 -- so gst10-plugins-ugly's x264 is not what it uses; ffmpeg's own
 # libx264 support is.
+#
+# FFMPEG 8 REMOVED AVCodec.pix_fmts / .sample_fmts / .ch_layouts, and v0.6.0
+# (and master, as of 2026-11) still read them:
+#     frame-writer.cpp:195: error: 'const AVCodec' has no member named 'pix_fmts'
+# patches/wf-recorder-0.6.0-ffmpeg8.patch reads the same lists through
+# avcodec_get_supported_config() (FFmpeg >= 7.1), the old fields below that.
+# Applied once: a kept source tree already has it.
 git    wf-recorder url=https://github.com/ammen99/wf-recorder.git \
        ref=v0.6.0 prog=wf-recorder \
-       build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
+       build="grep -q wfr_pix_fmts src/frame-writer.cpp || patch -Np1 -i ${PKGUSR_ETC:-/etc/pkgusr}/stacks/patches/wf-recorder-0.6.0-ffmpeg8.patch; meson setup build --prefix=/usr --buildtype=release; ninja -C build" \
        install="ninja -C build install" \
        expect="ldd /usr/bin/wf-recorder 2>/dev/null | grep -qE 'libpulse|libpipewire'"
 

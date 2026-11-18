@@ -1,4 +1,5 @@
 # lfs-pkgusr -- install the package-user toolchain.
+# AI-modified: Claude Opus 5.5 (1.14.428)
 #
 #   make install                    -> /usr
 #   make install PREFIX=/usr/local  -> /usr/local
@@ -113,6 +114,11 @@ install:
 	        $(INSTALL) -m 644 "$$f" "$$d" && cp -f "$$f" "$$r" \
 	        && rm -f "$$d.new" \
 	        && echo "    $$b (updated -- you had not edited it)"; \
+	    elif [ "$${b%.sh}" != "$$b" ]; then \
+	        cp -f "$$d" "$$d.bak"; \
+	        $(INSTALL) -m 755 "$$f" "$$d" && cp -f "$$f" "$$r" \
+	        && rm -f "$$d.new" \
+	        && echo "    $$b (updated -- a check/cfg script is tool code; yours is $$b.bak)"; \
 	    else \
 	        $(INSTALL) -m 644 "$$f" "$$d.new" \
 	        && echo "    $$b -> KEPT YOURS; new version saved as $$d.new"; \

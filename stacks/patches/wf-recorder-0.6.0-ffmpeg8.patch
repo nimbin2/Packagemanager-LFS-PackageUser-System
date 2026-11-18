@@ -1,0 +1,132 @@
+wf-recorder 0.6.0 with FFmpeg 8/9: AVCodec.pix_fmts, .sample_fmts and .ch_layouts
+were removed (deprecated in FFmpeg 7.1 for avcodec_get_supported_config).
+Reads the lists through that call when libavcodec >= 61.13.100.
+AI-created: Claude Opus 5.5 (lfs-pkgusr 1.14.439)
+
+diff --git a/src/frame-writer.cpp b/src/frame-writer.cpp
+index ad526f8..ed02e8e 100644
+--- a/src/frame-writer.cpp
++++ b/src/frame-writer.cpp
+@@ -13,6 +13,38 @@
+ 
+ #define HAVE_CH_LAYOUT (LIBAVUTIL_VERSION_INT >= AV_VERSION_INT(57, 28, 100))
+ 
++/* FFmpeg 7.1 (libavcodec 61.13.100) replaced AVCodec.pix_fmts, .sample_fmts
++ * and .ch_layouts with avcodec_get_supported_config(); FFmpeg 8 removed the
++ * fields.  These read the list either way. */
++#if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 13, 100)
++static const AVPixelFormat *wfr_pix_fmts(const AVCodec *c)
++{
++    const void *p = nullptr;
++    avcodec_get_supported_config(nullptr, c, AV_CODEC_CONFIG_PIX_FORMAT, 0, &p, nullptr);
++    return (const AVPixelFormat *)p;
++}
++static const AVSampleFormat *wfr_sample_fmts(const AVCodec *c)
++{
++    const void *p = nullptr;
++    avcodec_get_supported_config(nullptr, c, AV_CODEC_CONFIG_SAMPLE_FORMAT, 0, &p, nullptr);
++    return (const AVSampleFormat *)p;
++}
++#if HAVE_CH_LAYOUT
++static const AVChannelLayout *wfr_ch_layouts(const AVCodec *c)
++{
++    const void *p = nullptr;
++    avcodec_get_supported_config(nullptr, c, AV_CODEC_CONFIG_CHANNEL_LAYOUT, 0, &p, nullptr);
++    return (const AVChannelLayout *)p;
++}
++#endif
++#else
++static const AVPixelFormat *wfr_pix_fmts(const AVCodec *c) { return c->pix_fmts; }
++static const AVSampleFormat *wfr_sample_fmts(const AVCodec *c) { return c->sample_fmts; }
++#if HAVE_CH_LAYOUT
++static const AVChannelLayout *wfr_ch_layouts(const AVCodec *c) { return c->ch_layouts; }
++#endif
++#endif
++
+ static const AVRational US_RATIONAL{1,1000000} ;
+ 
+ // av_register_all was deprecated in 58.9.100, removed in 59.0.100
+@@ -192,21 +224,21 @@ AVPixelFormat FrameWriter::handle_buffersink_pix_fmt(const AVCodec *codec)
+     auto in_fmt = get_input_format();
+ 
+     /* For codecs such as rawvideo no supported formats are listed */
+-    if (!codec->pix_fmts)
++    if (!wfr_pix_fmts(codec))
+         return in_fmt;
+ 
+     /* If the codec supports getting the appropriate RGB format
+      * directly, we want to use it since we don't have to convert data */
+-    if (is_fmt_supported(in_fmt, codec->pix_fmts))
++    if (is_fmt_supported(in_fmt, wfr_pix_fmts(codec)))
+         return in_fmt;
+ 
+     /* Choose the format supported by the codec which best approximates the
+      * input fmt. */
+     AVPixelFormat best_format = AV_PIX_FMT_NONE;
+-    for (int i = 0; codec->pix_fmts[i] != AV_PIX_FMT_NONE; i++) {
++    for (int i = 0; wfr_pix_fmts(codec)[i] != AV_PIX_FMT_NONE; i++) {
+         int loss = 0;
+         best_format = av_find_best_pix_fmt_of_2(best_format,
+-            codec->pix_fmts[i], in_fmt, false, &loss);
++            wfr_pix_fmts(codec)[i], in_fmt, false, &loss);
+     }
+     return best_format;
+ }
+@@ -518,16 +550,16 @@ void FrameWriter::init_video_stream()
+ static uint64_t get_codec_channel_layout(const AVCodec *codec)
+ {
+     int i = 0;
+-    if (!codec->ch_layouts)
++    if (!wfr_ch_layouts(codec))
+         return AV_CH_LAYOUT_STEREO;
+     while (1) {
+-        if (!av_channel_layout_check(&codec->ch_layouts[i]))
++        if (!av_channel_layout_check(&wfr_ch_layouts(codec)[i]))
+             break;
+-        if (codec->ch_layouts[i].u.mask == AV_CH_LAYOUT_STEREO)
+-            return codec->ch_layouts[i].u.mask;
++        if (wfr_ch_layouts(codec)[i].u.mask == AV_CH_LAYOUT_STEREO)
++            return wfr_ch_layouts(codec)[i].u.mask;
+         i++;
+     }
+-    return codec->ch_layouts[0].u.mask;
++    return wfr_ch_layouts(codec)[0].u.mask;
+ }
+ #else
+ static uint64_t get_codec_channel_layout(const AVCodec *codec)
+@@ -549,20 +581,20 @@ static uint64_t get_codec_channel_layout(const AVCodec *codec)
+ static enum AVSampleFormat get_codec_auto_sample_fmt(const AVCodec *codec)
+ {
+     int i = 0;
+-    if (!codec->sample_fmts)
++    if (!wfr_sample_fmts(codec))
+         return av_get_sample_fmt(FALLBACK_AUDIO_SAMPLE_FMT);
+     while (1) {
+-        if (codec->sample_fmts[i] == -1)
++        if (wfr_sample_fmts(codec)[i] == -1)
+             break;
+-        if (av_get_bytes_per_sample(codec->sample_fmts[i]) >= 2)
+-            return codec->sample_fmts[i];
++        if (av_get_bytes_per_sample(wfr_sample_fmts(codec)[i]) >= 2)
++            return wfr_sample_fmts(codec)[i];
+         i++;
+     }
+-    return codec->sample_fmts[0];
++    return wfr_sample_fmts(codec)[0];
+ }
+ 
+ bool check_fmt_available(const AVCodec *codec, AVSampleFormat fmt){
+-    for (const enum AVSampleFormat *sample_ptr = codec -> sample_fmts; *sample_ptr != -1; sample_ptr++)
++    for (const enum AVSampleFormat *sample_ptr = wfr_sample_fmts(codec); *sample_ptr != -1; sample_ptr++)
+     {
+         if (*sample_ptr == fmt)
+         {
+@@ -579,7 +611,7 @@ static enum AVSampleFormat convert_codec_sample_fmt(const AVCodec *codec, std::s
+     {
+         std::cerr << "Failed to find the given sample format: " << requested_fmt << std::endl;
+         std::exit(-1);
+-    } else if (!codec->sample_fmts || check_fmt_available(codec, converted_fmt))
++    } else if (!wfr_sample_fmts(codec) || check_fmt_available(codec, converted_fmt))
+     {
+         std::cerr << "Using sample format " << av_get_sample_fmt_name(converted_fmt) << " for audio codec " << codec->name << std::endl;
+         return converted_fmt;

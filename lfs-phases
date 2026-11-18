@@ -1,4 +1,5 @@
 #!/bin/bash
+# AI-modified: Claude Opus 5.5 (1.14.419)
 # lfs-phases -- the shared phase runner sourced by every generated install
 # script.  The script holds what is specific to the package: its variables at
 # the top and its commands in build_pkg / install_pkg / configure_pkg /
@@ -34,7 +35,7 @@
 # scripts are also SOURCED by lfs-helper to read their metadata, and this file
 # comes along -- it must not shadow anything in the sourcing shell.
 
-PKGUSR_LIB_VERSION="1.14.403"
+PKGUSR_LIB_VERSION="1.14.440"
 
 _pp_build_id() {
     local f="${BASH_SOURCE[0]}"
@@ -199,6 +200,26 @@ _pp_mirrors_for() {
     esac
     # the LFS mirror of last resort keeps most BLFS sources by filename
     [ -n "${pkgusr_book_mirror:-}" ] && printf '%s\n' "${pkgusr_book_mirror%/}/$f"
+    # A BOOK PATCH NO LONGER IN ITS BOOK'S PATCH DIRECTORY.  The svn patch
+    # directory keeps only the current patches (SDL3-3.4.18-upstream_fixes-1
+    # was gone once svn moved to 3.4.20); LFS keeps every patch it ever
+    # published under patches/downloads/<package>/.
+    case "$u" in
+        *linuxfromscratch.org/patches/*.patch)
+            local pst="${f%%-[0-9]*}"
+            printf '%s\n' "https://www.linuxfromscratch.org/patches/downloads/$pst/$f"
+            [ "$pst" != "$(printf '%s' "$pst" | tr 'A-Z' 'a-z')" ] && \
+                printf '%s\n' "https://www.linuxfromscratch.org/patches/downloads/$(printf '%s' "$pst" | tr 'A-Z' 'a-z')/$f"
+            ;;
+    esac
+    # ...and the BLFS "conglomeration" mirror, one directory per package.
+    # Lua: www.lua.org answered with "Unable to establish SSL connection" --
+    # its TLS no longer meets a fresh OpenSSL's defaults, three tries alike.
+    # A different server is the only retry that can help; the md5 from the
+    # book still has to match, so the source does not matter.
+    local stem="${f%%-[0-9]*}"
+    [ -n "$stem" ] && [ "$stem" != "$f" ] && \
+        printf '%s\n' "https://ftp.osuosl.org/pub/blfs/conglomeration/$stem/$f"
     return 0
 }
 
@@ -637,8 +658,27 @@ _pp_phase_build() {
     build_pkg
 }
 
+# NOTHING THE BUILD STARTED OUTLIVES IT.
+#
+# Xwayland's test setup runs `../hw/vfb/Xvfb $DISPLAY &`, then `cd xts`
+# failed and the phase exited -- with Xvfb still running and holding the
+# log pipe open, so the package looked finished and nothing came for 20
+# minutes.  A server left behind by a build is never wanted.
+_pp_kill_bg() {
+    local _bg
+    _bg="$(jobs -p 2>/dev/null)"
+    [ -n "$_bg" ] || return 0
+    echo "# stopping what the build left running in the background:" \
+         "$(ps -o comm= -p $_bg 2>/dev/null | tr '\n' ' ')" >&2
+    kill $_bg 2>/dev/null
+    sleep 1
+    kill -9 $_bg 2>/dev/null
+    return 0
+}
+
 _pp_build_exit() {
     local rc=$?
+    _pp_kill_bg
     if [ "$rc" = 0 ] || [ "$PWD" != "$_pp_here" ]; then
         pwd > "$_pp_cwd_marker" 2>/dev/null || true
     fi

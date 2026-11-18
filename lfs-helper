@@ -1,4 +1,5 @@
 #!/bin/bash
+# AI-modified: Claude Opus 5.5 (1.14.438)
 
 # --------------------------------------------------------------------------- #
 # Read ourselves ONCE, before doing anything.
@@ -49,7 +50,7 @@ set -u
 # Bump on every change that alters behaviour.  `lfs-helper --version` makes it
 # possible to tell at a glance whether the copy inside the chroot is the one
 # that was just fixed -- guessing at that has wasted a lot of time.
-LFS_HELPER_VERSION="1.14.403"
+LFS_HELPER_VERSION="1.14.440"
 
 # A fingerprint of this file's own contents.  A hand-maintained version number
 # goes stale the moment someone forgets to bump it -- and the reason for
@@ -1904,6 +1905,11 @@ _package_providing() {
         sassc)                         echo "sassc" ;;
         asciidoc|asciidoctor)          echo "asciidoc" ;;
         docbook2*|db2*)                echo "docbook-utils" ;;
+        rst2man|rst2man.py|rst2html*|rst2*) echo "docutils" ;;
+        sphinx-build)                  echo "sphinx" ;;
+        gi-docgen)                     echo "gi-docgen" ;;
+        gtkdoc-*)                      echo "gtk-doc" ;;
+        xmlto)                         echo "xmlto" ;;
         *)                             echo "" ;;
     esac
 }
@@ -2676,11 +2682,25 @@ unwritable_dirs_from_log() {
         | while IFS= read -r _cp; do
               if [ -d "$_cp" ]; then echo "$_cp"; else echo "${_cp%/*}"; fi
           done | sort -u)"
+    # ...IN EITHER QUOTES, AND THE DIRECTORY THAT EXISTS.
+    #     mkdir: cannot create directory ‘/usr/share/cmake/bash-completion/’:
+    #     Permission denied
+    # coreutils quotes with ‘’ in a UTF-8 locale, and the trailing slash
+    # made "the parent" the directory itself -- bash-completion's repair
+    # found nothing and ran one empty round.  The quotes are normalised,
+    # trailing slashes dropped, and the answer is the nearest directory
+    # that EXISTS above the one that could not be made: that is the one
+    # that refused.
     local _instdirs=""
     _instdirs="$(tail -c 524288 "$log" 2>/dev/null \
+        | sed "s/‘/'/g; s/’/'/g" \
         | grep -aoE "cannot create (regular file|directory) '/[^']+'" \
         | sed "s/.*'\(\/[^']*\)'.*/\1/" \
-        | sed 's|/[^/]*$||' | sort -u)"
+        | sed 's|/*$||; s|/[^/]*$||' \
+        | while IFS= read -r _ip; do
+              while [ -n "$_ip" ] && [ ! -d "$_ip" ]; do _ip="${_ip%/*}"; done
+              [ -n "$_ip" ] && echo "$_ip"
+          done | sort -u)"
 
     # (plain awk: match() with a capture array is a gawk extension)
     _cdpaths="$(tail -c 524288 "$log" 2>/dev/null | awk '
@@ -2738,10 +2758,13 @@ _missing_tool_from_log() {
     local log="$1" t
     [ -f "$log" ] || return 1
     t="$(tail -c 262144 "$log" 2>/dev/null | grep -aoE \
-          "configure: error: [A-Za-z0-9_.+-]+ (not found|is required|missing)|configure: error: (Cannot|cannot) find [A-Za-z0-9_.+-]+|Program [A-Za-z0-9_.+-]+ not found|[A-Za-z0-9_.+-]+: command not found" \
+          "configure: error: [A-Za-z0-9_.+-]+ (not found|is required|missing)|configure: error: (Cannot|cannot) find [A-Za-z0-9_.+-]+|Program [A-Za-z0-9_.+-]+ not found|[A-Za-z0-9_.+-]+: command not found|Problem encountered: No [A-Za-z0-9_.+-]+ found" \
         | head -n1)"
     [ -n "$t" ] || return 1
     case "$t" in
+        # gdk-pixbuf: "ERROR: Problem encountered: No rst2man found, but man
+        # pages were explicitly enabled" -- a program, named by the build
+        "Problem encountered: No "*) t="${t#Problem encountered: No }"; t="${t%% *}" ;;
         "configure: error: "*"not found"|"configure: error: "*"is required"|"configure: error: "*"missing")
             t="${t#configure: error: }"; t="${t%% *}" ;;
         "configure: error: "*find*)  t="${t##*find }" ;;
@@ -2751,15 +2774,26 @@ _missing_tool_from_log() {
     esac
     # a path, a version, an empty match: not a program name
     case "$t" in ""|/*|[0-9]*) return 1 ;; esac
+    # "cannot find GL library" names a LIBRARY: xdriinfo was told "no BLFS
+    # page provides 'GL'" because GL is no program.  _install_missing_dep
+    # reads that wording.
+    tail -c 262144 "$log" 2>/dev/null | grep -aqiE "cannot find $t librar" && return 1
     printf '%s' "$t"
 }
 
 _install_missing_tool() {   # <log> -- returns 0 when something was installed
     local log="$1" tool prov
-    [ "${PM_IN_TOOL_REPAIR:-0}" = 1 ] && return 1     # one level only
+    # THREE LEVELS, NOT ONE.  gst-plugins-rs needed gtk4; gtk4's rebuild
+    # (a repair) needed gstreamer-play-1.0 -- and inside a repair nothing
+    # was repaired, so it stopped with the cure printed.  Depth is counted
+    # and capped, so a chain still ends.
+    [ "${PM_IN_TOOL_REPAIR:-0}" -ge 3 ] && return 1
     tool="$(_missing_tool_from_log "$log")" || return 1
     command -v "$tool" >/dev/null 2>&1 && return 1    # it is here; not this
     prov="$(packagemanager provider "$tool" 2>/dev/null | head -n1)"
+    # the book's command index misses build tools a page installs under a
+    # module's name (rst2man is docutils): the short list knows them
+    [ -n "$prov" ] || prov="$(_package_providing "$tool")"
     if [ -z "$prov" ]; then
         warn "!! this build needs '$tool', and no BLFS page provides it."
         warn "   Install it yourself, then run the same command again."
@@ -2767,7 +2801,7 @@ _install_missing_tool() {   # <log> -- returns 0 when something was installed
     fi
     note "# this build needs '$tool', which the book's commands never name."
     note "#   $prov provides it -- installing that first, then trying again."
-    if PM_IN_TOOL_REPAIR=1 packagemanager install "$prov" --run --recursive --yes; then
+    if PM_IN_TOOL_REPAIR=$(( ${PM_IN_TOOL_REPAIR:-0} + 1 )) packagemanager install "$prov" --run --recursive --yes; then
         command -v "$tool" >/dev/null 2>&1 && return 0
         # ON PATH FOR A LOGIN, NOT FOR THIS SHELL.  rust installs into
         # /opt/rustc-<ver> and puts /opt/rustc/bin on PATH through
@@ -2788,6 +2822,310 @@ _install_missing_tool() {   # <log> -- returns 0 when something was installed
         return 1
     fi
     warn "!! could not install $prov, which provides '$tool'"
+    return 1
+}
+
+# A LIBRARY THE BUILD NEEDS AND THE PLAN DID NOT PUT BEFORE IT.
+#
+#     Run-time dependency harfbuzz found: NO  (tried pkg-config and cmake)
+#     ../meson.build:281:15: ERROR: Dependency 'harfbuzz' is required but not found.
+#
+# pango, 5 packages into a 30-package plan: harfbuzz is a book package,
+# the plan's cycle-breaking (freetype <-> harfbuzz) had dropped it, and the
+# answer printed under the failure was "packagemanager install harfbuzz
+# --run --recursive" -- a command the tool can run itself.  The same three
+# wordings as the report below: meson's, pkg-config's (autotools), cmake's.
+# Install a package OF THAT NAME (or its pkg-config base, libdrm_intel ->
+# libdrm) when the book has one, and run the phase again.  One level only,
+# as with tools.
+_missing_dep_from_log() {
+    local log="$1" t
+    [ -f "$log" ] || return 1
+    t="$(tail -c 262144 "$log" 2>/dev/null | grep -aoE \
+          "Dependency [\"'][A-Za-z0-9_.+-]+[\"'] (is required but )?not found|Package requirements \(([A-Za-z0-9_.+-]+)|No package '[A-Za-z0-9_.+-]+' found|Package '[A-Za-z0-9_.+-]+' not found|Cannot find [A-Za-z0-9_.+-]+ headers|package configuration file provided by \"[A-Za-z0-9_.+-]+\"|[Cc]annot find [A-Za-z0-9_.+-]+ library|Invalid version, need '[A-Za-z0-9_.+-]+'" \
+        | head -n1)"
+    [ -n "$t" ] || return 1
+    t="$(printf '%s' "$t" | sed -E "s/^Dependency [\"']//; s/[\"'] (is required|not found).*//;
+                                s/^Package requirements \(//;
+                                s/^No package '//; s/' found\$//;
+                                s/^Package '//; s/' not found\$//;
+                                s/^[Cc]annot find //; s/ headers\$//; s/ library\$//;
+                                s/^Invalid version, need '//; s/'\$//;
+                                s/^package configuration file provided by \"//; s/\"\$//")"
+    case "$t" in ""|[0-9]*|*/*) return 1 ;; esac
+    printf '%s' "$t"
+}
+
+# pkg-config module -> the packages that provide it, in the order to try.
+# The module name is rarely the package name: GLU stopped on
+#     ERROR: Dependency "gl" not found (tried pkg-config and system)
+# and there is no package "gl".  With machine.conf's glvnd=enabled it is
+# libglvnd's (a stack entry); without, Mesa's.  Tried in order until
+# pkg-config finds the module.
+_pc_providers() {
+    case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+        gl|egl|glesv1_cm|glesv2|glx|opengl|libglvnd) echo "libglvnd mesa" ;;
+        gbm|dri|osmesa|vulkan-*driver*)               echo "mesa" ;;
+        x11|x11-xcb|xext|xrender|xfixes|xi|xrandr|xcursor|xinerama|xcomposite|\
+        xdamage|xtst|xshmfence|xxf86vm|xkbfile|xt|xmu|xpm|xaw7|xft|xscrnsaver|\
+        xv|xvmc|xres|ice|sm|xau|xdmcp|xkbcommon-x11|xxf86dga|xfont2|fontenc)
+                                                      echo "xorg7-lib libxkbcommon" ;;
+        xcb|xcb-*)                                    echo "libxcb xcb-utilities" ;;
+        xproto|xorgproto|*proto)                      echo "xorgproto" ;;
+        xkbcommon)                                    echo "libxkbcommon" ;;
+        wayland-client|wayland-server|wayland-egl|wayland-cursor|wayland-scanner)
+                                                      echo "wayland" ;;
+        glib-2.0|gobject-2.0|gio-2.0|gio-unix-2.0|gmodule-2.0|gthread-2.0)
+                                                      echo "glib2" ;;
+        gtk+-3.0|gdk-3.0|gail-3.0)                    echo "gtk3" ;;
+        gtk4)                                         echo "gtk4" ;;
+        pangocairo|pangoft2)                          echo "pango" ;;
+        cairo|cairo-*)                                echo "cairo" ;;
+        freetype2)                                    echo "freetype2" ;;
+        dbus-1)                                       echo "dbus" ;;
+        libpulse|libpulse-*)                          echo "pulseaudio" ;;
+        alsa)                                         echo "alsa-lib" ;;
+        vulkan)                                       echo "vulkan-loader" ;;
+        libpipewire-*|libspa-*)                       echo "pipewire" ;;
+        libsystemd|libelogind)                        echo "elogind" ;;
+        nice)                                         echo "libnice" ;;
+        # gstreamer's libraries live in its plugin sets; gtk4 asked for
+        # gstreamer-play-1.0 and was told to install "gstreamer-play"
+        gstreamer-play-1.0|gstreamer-player-1.0|gstreamer-webrtc-1.0|gstreamer-codecparsers-1.0|gstreamer-mpegts-1.0|gstreamer-transcoder-1.0|gstreamer-wayland-1.0|gstreamer-va-1.0|gstreamer-plugins-bad-1.0|gstreamer-*-bad-1.0)
+                                                      echo "gst10-plugins-bad" ;;
+        gstreamer-video-1.0|gstreamer-audio-1.0|gstreamer-app-1.0|gstreamer-pbutils-1.0|gstreamer-tag-1.0|gstreamer-gl-1.0|gstreamer-allocators-1.0|gstreamer-rtp-1.0|gstreamer-sdp-1.0|gstreamer-rtsp-1.0|gstreamer-riff-1.0|gstreamer-fft-1.0|gstreamer-plugins-base-1.0)
+                                                      echo "gst10-plugins-base" ;;
+        gstreamer-1.0|gstreamer-base-1.0|gstreamer-controller-1.0|gstreamer-net-1.0|gstreamer-check-1.0)
+                                                      echo "gstreamer10" ;;
+        libtiff-4|libtiff|libtiffxx)                  echo "tiff" ;;
+        libxml-2.0)                                   echo "libxml2" ;;
+        libjpeg)                                      echo "libjpeg-turbo" ;;
+        libsrtp2|libsrtp)                             echo "libsrtp" ;;
+        webrtc-audio-processing*)                     echo "webrtc-audio-processing" ;;
+        gdk-pixbuf-2.0)                               echo "gdk-pixbuf" ;;
+        gobject-introspection-1.0)                    echo "gobject-introspection" ;;
+    esac
+}
+
+# IS IT HERE?  pkg-config knows modules, and spells them in lower case
+# ("SDL3" -> sdl3.pc).  cmake's wordings ask for headers or a config file:
+#     Cannot find SDL3 headers: configure with -DCMAKE_PREFIX_PATH=...
+# sdl2-compat's find_path(NAMES SDL3/SDL.h) -- p_sdl3 counted as installed,
+# /usr/include/SDL3 was not there.  A .pc file without the headers is not
+# the package, so the headers decide when it is headers that were asked for.
+# 'uint8_t' DOES NOT NAME A TYPE.
+#
+# GCC 13 stopped pulling <cstdint> in through other headers, and the
+# compiler says so itself: "this is probably fixable by adding
+# '#include <cstdint>'".  webrtc-audio-processing v2.1 stopped on
+# trace_event.h with that, and the helper explained the flag and gave up.
+# The flag is the same every time, so the retry carries it:
+#     CXXFLAGS="... -include cstdint"   (C: CFLAGS="... -include stdint.h")
+# meson, cmake and configure all read them when the build dir is set up,
+# and the build phase sets it up fresh.
+_stdint_type() {   # <log> -> the type, when the log has the error
+    local t
+    # alternatives, not a bracket: ‘ and ’ are several bytes, and in the C
+    # locale a bracket expression takes them one byte at a time
+    t="$(grep -aoE "error: (‘|'|\`)(u?int[0-9a-z_]*_t|uintptr_t|intptr_t)(’|'|\`) (does not name a type|has not been declared|was not declared)" \
+         "$1" 2>/dev/null | head -n1 | grep -oE "u?int[0-9a-z_]*_t|uintptr_t|intptr_t" | head -n1)"
+    [ -n "$t" ] || return 1
+    printf '%s' "$t"
+}
+
+_stdint_env() {   # <log> <envpass> -> " CXXFLAGS='...'" once
+    local log="$1" ep="$2" t var inc cur
+    t="$(_stdint_type "$log")" || return 1
+    # the compiler's own note names the header: <cstdint> for C++,
+    # <stdint.h> for C
+    if grep -aqE "<cstdint>|Compiling C\+\+ object|\.(cc|cpp|cxx)(\.o)?[:( ]" "$log" 2>/dev/null; then
+        var=CXXFLAGS; inc="-include cstdint"
+    else
+        var=CFLAGS; inc="-include stdint.h"
+    fi
+    case "$ep" in *"$inc"*) return 1 ;; esac         # tried already
+    cur="$(printf '%s' "$(build_env_pairs)$ep" | grep -oE "$var='[^']*'" | tail -n1 \
+           | sed -E "s/^$var='//; s/'\$//")"
+    note >&2 "# '$t' does not name a type (GCC 13+: <cstdint> is no longer"
+    note >&2 "#   included for you) -- retrying with $var+=\"$inc\""
+    note >&2 "#   to keep it: machine.conf [$(unprefix_pkg_user "${name:-pkg}")]"
+    note >&2 "#     $([ "$var" = CXXFLAGS ] && echo "cpp_args = -include cstdint" || echo "c_args = -include stdint.h")"
+    printf " %s='%s'" "$var" "${cur:+$cur }$inc"
+}
+
+# THE NAMES A PACKAGE MIGHT GO BY, given the pkg-config module it ships.
+# gtk4 asked for libtiff-4; the book's page is `tiff`.  The helper tried
+# libtiff-4, liblibtiff-4, libtiff, tiff-4 -- never the name with BOTH the
+# lib prefix and the API version taken off.  Most-specific first:
+#     libtiff-4 -> libtiff-4 liblibtiff-4 libtiff tiff-4 tiff
+#     nice      -> nice libnice
+_dep_name_forms() {   # <dep>
+    local d="$1" nov nolib
+    nov="$(printf '%s' "$d" | sed -E 's/[-_]?[0-9][0-9.]*$//')"
+    nolib="${d#lib}"
+    printf '%s\n' "$d" "lib$d" "$nov" "${d%%[-_.]*}" "$nolib" \
+        "$(printf '%s' "$nolib" | sed -E 's/[-_]?[0-9][0-9.]*$//')" \
+        | awk 'NF && !seen[$0]++'
+}
+
+# "Enchant is needed for ENABLE_SPELLCHECK" -- a feature that is ON by
+# default and needs a package this machine does not have.  Two ways out, and
+# which one depends on whether the package was left out ON PURPOSE (it is in
+# avoid.stack: then the feature goes OFF in machine.conf).
+_feature_needs_hint() {   # <log>
+    local line dep key pkg av=""
+    line="$(grep -aoE "[A-Za-z0-9_.+-]+ is (needed|required) for (ENABLE|USE)_[A-Z0-9_]+" "$1" 2>/dev/null | head -n1)"
+    [ -n "$line" ] || return 0
+    dep="$(printf '%s' "$line" | awk '{print $1}')"
+    key="$(printf '%s' "$line" | awk '{print $NF}')"
+    pkg="$(unprefix_pkg_user "${name:-pkg}")"
+    grep -qiE "^avoid[[:space:]]+$dep([[:space:]]|\$)" \
+        "${ETC:-/etc}"/pkgusr/stacks/avoid.stack 2>/dev/null && av=1
+    fail "!"
+    fail "! '$key' is on by default and needs '$dep', which is not installed."
+    if [ -n "$av" ]; then
+        fail "! avoid.stack leaves $dep out on purpose -- so turn the feature off:"
+    else
+        fail "! Either turn the feature off:"
+    fi
+    fail "!     ${ETC:-/etc}/pkgusr/stacks/machine.conf"
+    fail "!     [$pkg]"
+    fail "!     $key = OFF"
+    if [ -z "$av" ]; then
+        fail "! or install what it needs:"
+        fail "!     packagemanager install $(printf '%s' "$dep" | tr 'A-Z' 'a-z') --run --recursive"
+    fi
+    fail "!   then: packagemanager install $pkg --run --regenerate"
+    return 0
+}
+
+_stack_pin_hint() {   # <log>
+    local line dep have need cand f ln ent url ref newest
+    line="$(grep -aoE "[Dd]ependency \"?[A-Za-z0-9_.+-]+\"?( for [a-z]+ machine)? found: NO\.? [Ff]ound [0-9][0-9.]* but need:? '[^']+'" \
+            "$1" 2>/dev/null | head -n1)"
+    [ -n "$line" ] || return 0
+    dep="$(printf '%s' "$line" | sed -E 's/^[Dd]ependency "?([A-Za-z0-9_.+-]+)"? .*/\1/')"
+    have="$(printf '%s' "$line" | sed -E 's/.*[Ff]ound ([0-9][0-9.]*) but.*/\1/')"
+    need="$(printf '%s' "$line" | sed -E "s/.*need:? '([^']+)'.*/\1/")"
+    for cand in $(_pc_providers "$dep") $(_dep_name_forms "$dep"); do
+        f="$(grep -lE "^(git|tar)[[:space:]]+$cand([[:space:]]|\$)" \
+               "${ETC:-/etc}"/pkgusr/stacks/*.stack 2>/dev/null | head -n1)"
+        [ -n "$f" ] && { ent="$cand"; break; }
+    done
+    fail "!"
+    fail "! '$dep' is $have here and this build needs $need."
+    if [ -z "$ent" ]; then
+        fail "!   packagemanager update $(_dep_name_forms "$dep" | sed -n 3p) --run"
+        return 0
+    fi
+    ln="$(grep -nE "^(git|tar)[[:space:]]+$ent([[:space:]]|\$)" "$f" | head -n1 | cut -d: -f1)"
+    ref="$(sed -n "${ln}p" "$f" | grep -oE "(ref|pkg)=[^[:space:]]+" | head -n1)"
+    url="$(sed -n "${ln}p" "$f" | grep -oE "url=[^[:space:]]+" | head -n1 | cut -d= -f2-)"
+    fail "! $ent is PINNED by the stack, so rebuilding it rebuilds $have:"
+    fail "!     $f:$ln   ${ref:-(no ref=)}"
+    case "$url" in
+        *.git|*github.com/*|*gitlab*)
+            newest="$(timeout 20 git ls-remote --tags --refs "$url" 2>/dev/null \
+                      | sed 's|.*refs/tags/||' | grep -E '[0-9]' | grep -viE 'rc|alpha|beta|pre' \
+                      | sort -V | tail -n1)"
+            [ -n "$newest" ] && fail "!   the repository's newest release tag: $newest" ;;
+    esac
+    fail "! Raise ref= there, then:"
+    fail "!   packagemanager install $ent --run --reinstall"
+    return 0
+}
+
+_dep_present() {   # <name>
+    local d="$1" l req
+    l="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+    # "Invalid version, need 'nice' ['>=0.1.23'] found '0.1.22'": there,
+    # but too old -- present only at the version asked for
+    req="$(grep -aoE "need '$d' \['[^']+'\]" "${log:-/dev/null}" 2>/dev/null \
+           | head -n1 | sed -E "s/.*\['([^']+)'\]/\1/; s/^(>=|<=|==|!=|>|<|=)/\1 /")"
+    if [ -n "$req" ]; then
+        pkg-config --exists "$d $req" 2>/dev/null
+        return
+    fi
+    if grep -aqE "Cannot find $d headers" "${log:-/dev/null}" 2>/dev/null; then
+        [ -d "/usr/include/$d" ] || [ -d "/usr/include/$l" ]
+        return
+    fi
+    # "cannot find GL library", after
+    #     checking for library containing glXGetProcAddressARB... no
+    # gl.pc was there (libglvnd); libGL had no GLX -- libglvnd was built
+    # before the X libraries.  The library is there when the symbol
+    # configure looked for links against it.
+    if grep -aqiE "cannot find $d librar" "${log:-/dev/null}" 2>/dev/null; then
+        local sym
+        sym="$(grep -aoE 'checking for library containing [A-Za-z_][A-Za-z0-9_]*\.\.\. no' \
+               "$log" 2>/dev/null | tail -n1 | awk '{print $5}' | sed 's/\.\.\.$//')"
+        if [ -n "$sym" ]; then
+            printf 'char %s(void);\nint main(void){return %s()!=0;}\n' "$sym" "$sym" \
+                | cc -x c - -o /dev/null -l"$d" >/dev/null 2>&1
+            return
+        fi
+        ldconfig -p 2>/dev/null | grep -qE "lib$d\.so"
+        return
+    fi
+    pkg-config --exists "$d" 2>/dev/null || pkg-config --exists "$l" 2>/dev/null \
+        || ls -d /usr/lib/cmake/"$d"* /usr/lib/cmake/"$l"* >/dev/null 2>&1
+}
+
+_install_missing_dep() {   # <log> -- returns 0 when something was installed
+    local log="$1" dep cand
+    # THREE LEVELS, NOT ONE.  gst-plugins-rs needed gtk4; gtk4's rebuild
+    # (a repair) needed gstreamer-play-1.0 -- and inside a repair nothing
+    # was repaired, so it stopped with the cure printed.  Depth is counted
+    # and capped, so a chain still ends.
+    [ "${PM_IN_TOOL_REPAIR:-0}" -ge 3 ] && return 1
+    dep="$(_missing_dep_from_log "$log")" || return 1
+    _dep_present "$dep" && return 1                    # it is here; not this
+    # a book page, OR a stack's git/tar entry: libglvnd is no BLFS page but
+    # a `git libglvnd` line in sway.stack -- and mesa, pulled in early by
+    # ffmpeg's plan with machine.conf's glvnd=enabled, stopped on
+    #     ERROR: Dependency "libglvnd" not found (tried pkg-config and cmake)
+    # `packagemanager install` builds a stack entry from that line.
+    local _anchors
+    _anchors="$(blfs versions 2>/dev/null | cut -f1
+                sed -nE 's/^(git|tar)[[:space:]]+([A-Za-z0-9_.+-]+).*/\2/p' \
+                    "${ETC:-/etc}"/pkgusr/stacks/*.stack 2>/dev/null)"
+    [ -n "$_anchors" ] || return 1
+    local _tried=""
+    for cand in $(_pc_providers "$dep") $(_dep_name_forms "$dep"); do
+        [ -n "$cand" ] || continue
+        case " $_tried " in *" $cand "*) continue ;; esac
+        _tried="$_tried $cand"
+        # the anchor as the book/stack spells it: "Cannot find SDL3
+        # headers" is the stack's `git sdl3`, and `install SDL3` missed it
+        cand="$(printf '%s\n' "$_anchors" | grep -ixF "$cand" | head -n1)"
+        [ -n "$cand" ] || continue
+        note "# this build needs '$dep', and the plan did not build"
+        note "#   it first.  '$cand' provides it -- installing that, then trying again."
+        # --book-of: the requester's page was written against its OWN book
+        # (mpv from svn wants libplacebo >= 7.387.0, the default book has
+        # 7.360.1) -- a dependency that book has newer comes from it
+        if PM_IN_TOOL_REPAIR=$(( ${PM_IN_TOOL_REPAIR:-0} + 1 )) packagemanager install "$cand" --run --recursive --yes ${name:+--book-of "$name"}; then
+            _dep_present "$dep" && return 0
+            # THERE, BUT BUILT WITHOUT IT.  libglvnd built before the X
+            # libraries existed has no GLX -- and no gl.pc.  Its build
+            # decided that from what was installed then; rebuilding it now
+            # decides again.
+            note "#   $cand is there without '$dep' -- it was built before what it"
+            note "#   needs for that existed.  Rebuilding $cand."
+            # --recursive too: what it lacked may be a dependency the book
+            # names and the plan never built (Mesa without libX11); installed
+            # dependencies are left alone, only the named one is rebuilt
+            if PM_IN_TOOL_REPAIR=$(( ${PM_IN_TOOL_REPAIR:-0} + 1 )) packagemanager install "$cand" --run --reinstall --recursive --yes ${name:+--book-of "$name"} \
+               && _dep_present "$dep"; then
+                return 0
+            fi
+            note "#   still no '$dep' from $cand -- trying the next provider"
+            continue
+        fi
+        warn "!! could not install $cand, which this build needs"
+        return 1
+    done
+    warn "!! '$dep': none of${_tried} provided it"
     return 1
 }
 
@@ -5597,7 +5935,12 @@ create_service_accounts_from_script() {
         # tripped over the quoted comment in
         #     useradd -d /dev/null -c "Fcron User" -g fcron ... fcron
         # and produced 'User" fcron'
-        name="$(printf '%s' "${line%%&&*}" | awk '{print $NF}')"
+        # ...and the end of the COMMAND, not of the line: since script
+        # format v21 a chain ends in `|| exit $?`, and openssh's page
+        # became "creating system user '$?'" -- the name was the exit code
+        line="${line%%&&*}"
+        line="${line%%||*}"
+        name="$(printf '%s' "$line" | awk '{print $NF}')"
         [ -n "$name" ] || continue
         case "$line" in
             *groupadd*)
@@ -5902,8 +6245,23 @@ lease_files() {
         [ "$u" = "$owner" ] && continue
         if [ "$u" = root ]; then
             if ! grep -qxF "$p" "$man" 2>/dev/null; then
-                detail "#   $p is root's and $owner's manifest does not claim it -- left alone"
-                continue
+                # ...UNLESS THE PAGE ITSELF REWRITES IT.  elogind's page:
+                # "the /etc/nsswitch.conf file that was installed in LFS must
+                # be altered.  Overwrite the file as the root user" -- LFS
+                # made it as root, no manifest will ever claim it, and the
+                # configure died on Permission denied.  A plain root file in
+                # /etc that THIS package's configure writes by name is lent
+                # for the phase; the lease gives root back its ownership
+                # afterwards, with the new content.  Not setid, not outside
+                # /etc, not a link.
+                if [ -f "$p" ] && [ ! -L "$p" ] && [ ! -u "$p" ] && [ ! -g "$p" ] \
+                   && case "$p" in /etc/*) true ;; *) false ;; esac \
+                   && printf '%s\n' "$_cfg_targets" | grep -qxF "$p"; then
+                    detail "#   $p is root's; $owner's configure rewrites it, as its page says -- lending it"
+                else
+                    detail "#   $p is root's and $owner's manifest does not claim it -- left alone"
+                    continue
+                fi
             fi
             # A MANIFEST CLAIM IS NOT ENOUGH FOR ROOT'S FILES.  Manifests are
             # built by time window, and a long phase swallowed what root
@@ -5929,6 +6287,18 @@ lease_files() {
                 # reclaim its own su; for anyone else a setid file is the
                 # system's, not a package's.
                 _sp="$(_setid_pkg_for "$p" 2>/dev/null)"
+                # ...OR ITS GROUP SAYS SO.  A setid file this package asked
+                # for itself (`install -m 4711`, refused, applied by
+                # `lfs-helper setid`) is root:<package user> -- the group
+                # keeps the installer.  openssh's ssh-keysign is not in
+                # setid.conf, so its rebuild could not replace it:
+                #     install: cannot remove '/usr/libexec/ssh-keysign':
+                #     Operation not permitted
+                # su is root:p_shadow and shadow is its provider either way;
+                # a file of ANOTHER package's group stays locked.
+                if [ -z "$_sp" ] && [ "$(stat -c %G "$p" 2>/dev/null)" = "$owner" ]; then
+                    _sp="$(unprefix_pkg_user "$owner")"
+                fi
                 if [ -z "$_sp" ] || [ "$_sp" != "$(unprefix_pkg_user "$owner")" ]; then
                     warn "#   $p is setuid/setgid and ${_sp:-no package} installs it -- not leasing it to $owner"
                     continue
@@ -7396,8 +7766,13 @@ cmd_build() {
     grep -qE "use -D[A-Za-z0-9_.-]+=" "$log" 2>/dev/null && _perm_ish=1
     # ...nor "configure: error: itstool not found", which names a package to
     # install.
-    grep -qE "configure: error: [A-Za-z0-9_.+-]+ (not found|is required|missing)|configure: error: (Cannot|cannot) find |Program [A-Za-z0-9_.+-]+ not found|: command not found" \
+    grep -qE "configure: error: [A-Za-z0-9_.+-]+ (not found|is required|missing)|configure: error: (Cannot|cannot) find |Program [A-Za-z0-9_.+-]+ not found|: command not found|Problem encountered: No [A-Za-z0-9_.+-]+ found" \
          "$log" 2>/dev/null && _perm_ish=1
+    # ...nor "Dependency 'harfbuzz' is required but not found": a book
+    # package the plan did not build first.
+    [ "${PM_IN_TOOL_REPAIR:-0}" -lt 3 ] && _missing_dep_from_log "$log" >/dev/null && _perm_ish=1
+    # ...nor "'uint8_t' does not name a type": the compiler names the fix
+    _stdint_type "$log" >/dev/null && _perm_ish=1
     # SAY WHY THERE WAS NO RETRY.  cmake failed twice on the same missing
     # directory with no attempt and no explanation, which left the only
     # evidence -- "did the loop run?" -- invisible.  A decision not to act is
@@ -7430,17 +7805,21 @@ cmd_build() {
         # a shared index the package must rewrite (install-info on
         # /usr/share/info/dir) is not a grant problem: give it the shared
         # treatment and let the retry proceed
-        if grep -qE "Operation not permitted for|Permission denied" "$log" 2>/dev/null; then
-            _before_share="$(stat -c %U:%G:%a "$(shared_files_list | head -n1)" 2>/dev/null)"
+        if grep -qE "Operation not permitted for|Permission denied|For permission problems, try rerunning as root" "$log" 2>/dev/null; then
+            # counted, not sampled: the first file of the list stood for
+            # all of them, and the mime tree is not in that list
+            SHARED_FIXED=0
             share_shared_files
-            [ "$_before_share" != "$(stat -c %U:%G:%a "$(shared_files_list | head -n1)" 2>/dev/null)" ] \
-                && _fixed_something=1
+            [ "${SHARED_FIXED:-0}" -gt 0 ] && _fixed_something=1
         fi
         create_missing_dirs_from_log "$log" "$owner" && _fixed_something=1
         _meson_opt_from_log "$log" "$s" "$name" && _fixed_something=1
         _ldc_env="$(_ldconfig_from_log "$log" "$envpass")" \
             && { envpass="$envpass$_ldc_env"; _LDCONFIG_OVERRIDDEN=1; _fixed_something=1; }
+        _std_env="$(_stdint_env "$log" "$envpass")" \
+            && { envpass="$envpass$_std_env"; _fixed_something=1; }
         _install_missing_tool "$log" && _fixed_something=1
+        _install_missing_dep "$log" && _fixed_something=1
         # the package's own leftovers from a previous install of the same
         # version: removing them IS the fix, and it counts as one, so the
         # phase is retried
@@ -7502,10 +7881,19 @@ cmd_build() {
         # doing again was the install step.  The log says which inner phase
         # failed (`!! phase 'install' FAILED`); both compound phases should
         # use it.
+        # A CONFIGURE FAILURE RETRIES FROM INSTALL.
+        #
+        # docbook-xml's install could not create xml-dtd-4.5 (Permission
+        # denied), but the failing command sat inside an && chain, so the
+        # install phase ended in success.  configure then failed on the
+        # missing directory, the grant was made -- and the retry ran
+        # configure alone, which cannot create what install never did.
+        # Install is cheap and repeatable; the build is what retrying spares.
         case "$phase" in
             all|update)
                 case "${LAST_FAILED_PHASE:-}" in
-                    install|configure) _retry_phase="$LAST_FAILED_PHASE" ;;
+                    install)   _retry_phase=install ;;
+                    configure) _retry_phase=install ;;
                 esac ;;
         esac
         say ""
@@ -7611,6 +7999,11 @@ cmd_build() {
         _pymod="$(grep -aoE "Cannot import '[a-zA-Z0-9_.]+'|No module named '[a-zA-Z0-9_.]+'" \
                   "$log" 2>/dev/null | head -n1 | cut -d"'" -f2)"
         if [ -n "$_pymod" ]; then
+            # the PACKAGE, not the submodule: a build backend is named as
+            # 'hatchling.build', 'setuptools.build_meta', 'flit_core.buildapi'
+            # and none of those matched -- yt-dlp got "packagemanager search
+            # hatchling.build" instead of the page
+            case "$_pymod" in poetry.core*) ;; *) _pymod="${_pymod%%.*}" ;; esac
             case "$_pymod" in
                 mesonpy)        _pyprov="meson_python" ;;
                 setuptools_scm) _pyprov="setuptools_scm" ;;
@@ -7702,11 +8095,10 @@ cmd_build() {
         # cure is one flag, and it is the same flag every time -- worth saying
         # outright rather than leaving "put a build flag somewhere".
         local _stdint
-        _stdint="$(sed -n "s/.*error: [\`'‘]\(u\?int[0-9_a-z]*_t\|uintptr_t\|intptr_t\|size_t\)['’\`].*does not name a type.*/\1/p" \
-                   "$log" 2>/dev/null | head -1)"
+        _stdint="$(_stdint_type "$log")"
         if [ -n "$_stdint" ]; then
             local _lang="c_args" _key
-            grep -qE "\.(cc|cpp|cxx|hpp|hh):" "$log" 2>/dev/null && _lang="cpp_args"
+            grep -aqE "<cstdint>|Compiling C\+\+ object|\.(cc|cpp|cxx)(\.o)?[:( ]" "$log" 2>/dev/null && _lang="cpp_args"
             fail "!"
             fail "! '$_stdint' does not name a type: this is the GCC 13+ change"
             fail "! -- <cstdint> is no longer pulled in by other headers, and"
@@ -7723,6 +8115,15 @@ cmd_build() {
             fail "!   (an autotools package takes the same thing as"
             fail "!    configure_args = CXXFLAGS=-include\\ cstdint)"
         fi
+        # A STACK PIN THAT IS TOO OLD.
+        #
+        #     Run-time dependency nice found: NO. Found 0.1.22 but need: '>= 0.1.23'
+        # libnice is `git libnice ... ref=0.1.22` in media.stack: rebuilding
+        # it builds 0.1.22 again.  The version is in the stack file, so the
+        # stack file is what to change -- say which one, which line, and what
+        # the repository's newest tag is.
+        _stack_pin_hint "$log"
+        _feature_needs_hint "$log"
         # AN UNDECLARED SYMBOL USUALLY BELONGS TO SOMEONE ELSE.
         #
         # cairo stopped on FC_HINT_NONE, FC_RGBA_RGB and ten more, all of them
@@ -8084,9 +8485,20 @@ cmd_build() {
             # so name that instead, and let the fallback note stay quiet.
             local _dep_guess=""
             if [ -z "$_dep_provider" ]; then
-                _dep_guess="${_dep%-[0-9]*}"
-                [ "$_dep_guess" = "$_dep" ] && _dep_guess="${_dep%%[0-9]*}"
-                [ "$_dep_guess" = "$_dep" ] && _dep_guess=""
+                # the name the BOOK uses: libtiff-4 is the page `tiff`, which
+                # `packagemanager search tiff` found and "libtiff" did not
+                local _g _bk
+                _bk="$(blfs versions 2>/dev/null | cut -f1)"
+                for _g in $(_pc_providers "$_dep") $(_dep_name_forms "$_dep"); do
+                    [ "$_g" = "$_dep" ] && continue
+                    _g="$(printf '%s\n' "$_bk" | grep -ixF "$_g" | head -n1)"
+                    [ -n "$_g" ] && { _dep_guess="$_g"; break; }
+                done
+                if [ -z "$_dep_guess" ]; then
+                    _dep_guess="${_dep%-[0-9]*}"
+                    [ "$_dep_guess" = "$_dep" ] && _dep_guess="${_dep%%[0-9]*}"
+                    [ "$_dep_guess" = "$_dep" ] && _dep_guess=""
+                fi
             fi
             fail "!"
             if [ -n "$_dep_provider" ]; then
@@ -8145,7 +8557,9 @@ cmd_build() {
                 # to the first separator, and its .pc being present while the
                 # asked-for one is not is the tell.
                 _pcbase="${_dep%%[-_.]*}"
-                if [ -n "$_pcbase" ] && [ "$_pcbase" != "$_dep" ] \
+                # ...unless the dependency is a package of its own: grim's
+                # bash-completion was told to rebuild BASH
+                if [ -z "$_dep_provider" ] && [ -n "$_pcbase" ] && [ "$_pcbase" != "$_dep" ] \
                    && timeout 10 find "${SNAP_ROOT%/}/usr/lib" -maxdepth 3 \
                         -name "$_pcbase.pc" 2>/dev/null | grep -q .; then
                     fail "! '$_dep' is missing, but '$_pcbase' IS installed."
@@ -10858,7 +11272,18 @@ cmd_pm_install() {
     # plan dropped it as current: spirv-llvm-translator then asked for LLVM 22
     # and found 21.1.8.  So the first time through, the old install_last's
     # version becomes the marker, and a failure leaves it there.
+    #
+    # ...ONLY FOR A PACKAGE THAT IS ON DISK.  install_last is also what a
+    # FAILED first attempt leaves (it is copied before the build).  webkitgtk
+    # failed on Ruby at 19:05, was retried at 19:18 -- and this read the
+    # 19:05 copy as "the installed version", wrote the marker, the build
+    # failed again, and the next plan skipped webkitgtk as installed with
+    # not one file of it on the system.  A real earlier install has a
+    # manifest (pkg.lst, or -- for most -- $MANIFESTS/<name>.files); without
+    # one there is nothing to record.
     if [ ! -s "$home/.pkgusr-installed" ] && [ -f "$home/install_last" ] \
+       && { [ -s "$home/pkg.lst" ] \
+            || [ -s "$MANIFESTS/$(unprefix_pkg_user "$user_name").files" ]; } \
        && ! [ "$install_script" -ef "$home/install_last" ]; then
         local _was
         _was="$(sed -n "s/^name_version=['\"]\{0,1\}\([^'\"]*\).*/\1/p" "$home/install_last" 2>/dev/null | head -n1)"
@@ -11943,6 +12368,27 @@ shared_files_list() {
 # only one package ever writes does NOT belong here; it belongs to that
 # package.
 
+# WHOLE TREES THAT ARE GENERATED, NOT INSTALLED.
+#
+# update-mime-database does not write one index: it regenerates all of
+# /usr/share/mime -- mime.cache, globs, magic, aliases ... and one XML file
+# per type under application/, image/, text/ ...  -- each through a temp
+# file and a rename.  The tree belonged to p_shared-mime-info, which ran it
+# first, and gtk4's install (meson runs update-mime-database) stopped on
+#     Failed to write XML file; For permission problems, try rerunning as root
+# with mime.cache itself already shared.  The rule is the same as for the
+# single files, applied to the tree: root:install, group-writable, never
+# sticky.  packages/ is the exception -- packages INSTALL their .xml there,
+# and those files are theirs.
+shared_trees_list() {
+    printf '%s\n' "${SNAP_ROOT%/}/usr/share/mime"
+}
+
+# what a shared tree keeps as its packages' own (pruned from the treatment)
+_shared_tree_prune() {
+    case "$1" in */usr/share/mime) printf '%s\n' "$1/packages" ;; esac
+}
+
 # The directories those files live in.  They may NOT be sticky -- see below.
 shared_file_dirs() {
     local f d
@@ -11959,6 +12405,12 @@ shared_file_dirs() {
         case "$d" in */usr/lib/perl5/*) continue ;; esac
         printf '%s\n' "$d"
     done < <(shared_files_list) | sort -u
+    local t pr
+    while IFS= read -r t; do
+        [ -d "$t" ] || continue
+        pr="$(_shared_tree_prune "$t")"
+        find "$t" ${pr:+-path "$pr" -prune -o} -type d -print 2>/dev/null
+    done < <(shared_trees_list)
 }
 
 # Apply the rule to whichever of them exist.  Idempotent; safe to repeat.
@@ -11996,7 +12448,19 @@ share_shared_files() {
             real_chmod g+w,o-t "$d" 2>/dev/null && n=$((n + 1))
         fi
     done < <(shared_file_dirs)
+    local t pr
+    while IFS= read -r t; do
+        [ -d "$t" ] || continue
+        pr="$(_shared_tree_prune "$t")"
+        while IFS= read -r f; do
+            if ! { [ "$(stat -c %U:%G "$f" 2>/dev/null)" = "root:install" ] && [ -w "$f" ]; }; then
+                real_chown root:install "$f" 2>/dev/null || continue
+                real_chmod 664 "$f" 2>/dev/null && n=$((n + 1))
+            fi
+        done < <(find "$t" ${pr:+-path "$pr" -prune -o} -type f -print 2>/dev/null)
+    done < <(shared_trees_list)
     [ "$n" -gt 0 ] && detail "# $n shared path(s) fixed (root:install, group-writable, not sticky)"
+    SHARED_FIXED=$(( ${SHARED_FIXED:-0} + n ))
     return 0
 }
 

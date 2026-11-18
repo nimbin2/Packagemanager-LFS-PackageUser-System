@@ -11,12 +11,12 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.403  (lfs-backup has its own: 1.3.0)
-    lfs               4d79687
-    lfs-helper        2e04969
-    packagemanager    2029c5e
-    blfs              7b85615
-    lfs-phases        b4fb20a
+    all six tools at 1.14.440  (lfs-backup has its own: 1.3.0)
+    lfs               f11230c
+    lfs-helper        c982fa7
+    packagemanager    a620e2b
+    blfs              6bcc322
+    lfs-phases        86e049c
     lfs-kernel        1199115   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      74538df   (1.0.2)
@@ -3780,6 +3780,145 @@ nested-repo-path to flat-request, absent), the ownership failure, and blocks
   updates them in place.
 - Not run: the regression suite (sandbox slot).  `bash -n` / `py_compile`
   and `--version` only.
+
+## 1.14.414 -- the tree builds from the host's book, not a stale svn copy
+
+SDL3 in the chroot: SDL3-3.4.18-upstream_fixes-1.patch 404 everywhere; svn
+is at 3.4.20.  The tree had no /usr/share/blfs/config.json, so blfs picked
+by init: "stable-sysv" -- which BLFS 13 does not publish -- and fell back
+to "a cached book": the svn snapshot install-tools had copied, weeks old.
+- lfs install-tools writes the host's BLFS default into the tree's
+  config.json when the tree has none.
+- blfs: falling back to a cached svn/combined book older than 3 days says
+  how old it is and to `blfs set-default`.
+- lfs-phases mirrors: a linuxfromscratch.org/patches/*.patch is also tried
+  at patches/downloads/<stem>/ (every patch LFS published; checked: SDL3/
+  exists, mixed case) and its lowercase form.
+
+## 1.14.413 -- dangling dependency links resolved by title, in any book
+
+The chroot's BLFS book is the stitched svn book IMPORTED from the host
+(no tarball there to re-stitch), so 1.14.411 could not reach it: still
+"Out-of-book / missing: libclc, profile, x7lib", mesa before libX11, and
+the gl repair rebuilt mesa straight into the same x11 error.
+- blfs `_resolve_deps_by_title`: after build_packages, a dep whose anchor
+  is no section is matched by title (link "Xorg-Libraries" == section
+  "Xorg Libraries"; numbering and trailing versions ignored); one unique
+  hit replaces the anchor.  PACKAGES_FORMAT 2 rebuilds older caches;
+  PLAN_VERSION 2 drops cached plans.
+- the provider rebuild in _install_missing_dep is --reinstall --recursive
+  (missing deps built, installed ones left alone).
+- _warn_unknown_meson_opts ignores our own keys (needs, expect, book,
+  __NAME__): "machine.conf [mesa]: 'needs' is not an option" was noise.
+Title match tested on a mock (x7lib -> xorg7-lib, profile ->
+postlfs-config-profile).
+
+## 1.14.412 -- the dependency repair maps pkg-config names to packages
+
+GLU: `Dependency "gl" not found` -- no package is called gl; with
+machine.conf glvnd=enabled gl.pc is libglvnd's (a stack entry), else
+Mesa's.  `_pc_providers` maps the common modules (gl/egl/glesv2/glx/opengl,
+x11 & co, xcb-*, *proto, wayland-*, glib-2.0, gtk+-3.0, cairo, pango,
+dbus-1, libpulse, alsa, vulkan, ...) to book anchors / stack entries, tried
+before the name itself.  A provider that is installed but still does not
+give the module (libglvnd built before the X libraries: no GLX, no gl.pc)
+is rebuilt once (--reinstall), then the next provider is tried.
+
+## 1.14.411 -- the stitched svn book: a page link is the page's section id
+
+The new system uses the development (svn) BLFS book, stitched from the
+chunked tarball.  _chunked_to_anchors turned a link to a page without a
+fragment (`../x/x7lib.html`) into `#x7lib` -- but that page's id is
+`xorg7-lib`.  So every "Xorg Libraries" dependency was "Out-of-book /
+missing" (with docbook, profile, xorg-env), mesa was planned before libX11,
+and failed `Dependency "x11" not found` (the 1.14.409 repair then guessed a
+package named "x").
+- build_combined_book: a first pass maps each page file name to the id in
+  its first h1/h2 anchor (`_page_id`); links use that.  Tested on a two-
+  page tarball: x7lib.html -> #xorg7-lib.
+- COMBINED_FORMAT = 2 in the meta; ensure_book re-stitches an older
+  combined book from the tarball it already has, without downloading.
+- lfs install-tools copies a BLFS book (store and $LFS/sources) again when
+  the host's copy is newer.
+
+## 1.14.410 -- the missing-dependency repair knows stack entries too
+
+mesa, pulled in by ffmpeg's plan on a fresh system, with machine.conf
+glvnd=enabled: `ERROR: Dependency "libglvnd" not found (tried pkg-config
+and cmake)`.  libglvnd is a `git` entry (wayland.stack), not a book page,
+and that wording ("not found" without "is required but") was not matched.
+_missing_dep_from_log takes both; _install_missing_dep's candidates are
+book anchors AND git/tar entry names from $ETC/pkgusr/stacks/*.stack.
+
+## 1.14.409 -- a missing library the book has is installed and retried
+
+pango (5/30 of a fresh system's plan): meson "Dependency 'harfbuzz' is
+required but not found"; the freetype<->harfbuzz cycle had let the plan
+put pango first.  The failure printed `packagemanager install harfbuzz
+--run --recursive` -- now lfs-helper does it:
+- `_missing_dep_from_log`: meson "Dependency 'X' is required but not
+  found", "Package requirements (X", "No package 'X' found", "Package 'X'
+  not found".
+- `_install_missing_dep`: unless pkg-config already finds X, the first of
+  X, X up to [-_.], X without lib that is a book anchor (`blfs versions`)
+  is installed --recursive (PM_IN_TOOL_REPAIR=1, one level), and the
+  phase retried.  The gate lets these failures into the loop.
+- package-fixes.conf [pango] needs = harfbuzz.
+Detector tested on the four wordings; the install path not run here.
+
+## 1.14.408 -- machine options reach every script that runs
+
+vala failed on libgvc although package-fixes.conf has [vala]
+--disable-valadoc: its script had a bare `./configure --prefix=/usr`.
+resolve_script had three ways out and applied the options on two -- the
+CACHED branch (a script generated earlier into script_dir, reused because
+"version-keyed = safe") returned without apply_machine_opts.  Now:
+- the cached branch applies them;
+- the plan loop applies them again right before run_pm_install, to the
+  path handed over AND the package home's copy (idempotent).
+Tested: a vala-shaped script gets `./configure --disable-valadoc --prefix=/usr`,
+twice applied stays once.
+
+## 1.14.407 -- a second server for BLFS sources
+
+Lua in the new system's chroot: www.lua.org -> "Unable to establish SSL
+connection", three tries alike (its TLS vs a fresh OpenSSL, presumably).
+The book mirror line is not written for the svn-combined book (version
+"unknown"), so there was nothing else to try.  _pp_mirrors_for now also
+offers https://ftp.osuosl.org/pub/blfs/conglomeration/<stem>/<file>
+(stem = file name up to "-<digit>"); the book's md5 still has to match.
+The directory naming could not be checked from here (robots).
+
+## 1.14.406 -- removed means not installed; the Xorg env sets itself
+
+1. `remove elogind` (user kept), then `stack sway`: "elogind 257.16
+   current", "Nothing to do".  pkg.lst was deleted, but state fell back to
+   install_last's name_version and the page's declared paths (/etc/elogind
+   stays).  remove now renames install_last to install_last.removed (kept,
+   not read) and `_forget_in_stacks` drops "<kind> <name>" from every
+   progress/stacks/*.done.
+2. A fresh system's ffmpeg plan refused: XORG_PREFIX / XORG_CONFIG unset.
+   The script env check now writes the book's defaults (/usr and the
+   standard flag list) into build.env and says so; other variables
+   (QT6PREFIX, TEXLIVE_PREFIX) still stop the plan.
+
+## 1.14.405 -- the lease lends a root /etc file the page rewrites
+
+elogind's page overwrites /etc/nsswitch.conf ("installed in LFS ...
+Overwrite the file as the root user"): root:root, claimed by no manifest,
+so lease_files left it alone and configure died on Permission denied.  A
+plain (not setid, not a link) root-owned file under /etc that this
+package's configure_pkg writes by name is now lent for the phase even
+without a manifest claim; lease_settle gives root its ownership back.
+
+## 1.14.404 -- blfs script v20: no dangling && before a closing brace (elogind)
+
+elogind's configure_pkg ended with `cat > /etc/nsswitch.conf << "EOF" &&`,
+its heredoc, and only comments after: `syntax error near unexpected token
+}'.  _repair_dangling_operators counted the heredoc body and terminator as
+"an active line after it".  It now marks command lines first (heredoc
+bodies/terminators are not) and judges by those.  SCRIPT_VERSION 20 so
+pristine scripts regenerate.
 
 ## 1.14.403 -- webcam: vcam gets the desktop session's environment
 

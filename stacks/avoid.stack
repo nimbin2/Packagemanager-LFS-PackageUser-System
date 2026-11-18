@@ -1,4 +1,5 @@
 # avoid.stack -- what no stack on this machine builds, and why.
+# AI-modified: Claude Opus 5.5 (1.14.429)
 # stack-version: 1.14.375
 #
 # An `avoid` entry does not build anything: it tells a dependency plan that
@@ -106,7 +107,9 @@ avoid  geoclue2
 # bootscript), so the two files contradicted each other: an `avoid` entry
 # and a `book` entry for one package, and whichever a plan saw first won.
 # Removed in 1.14.241 -- it is wanted.
-avoid  ruby
+# ruby: webkitgtk (media.stack) REQUIRES it ("Ruby 2.5 or higher is
+# required"), so it is not avoided any more -- since 1.14.429 a required
+# edge would build it anyway, and an avoid entry that never holds misleads.
 avoid  aspell
 avoid  enchant
 avoid  gnome-keyring

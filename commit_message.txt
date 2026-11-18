@@ -1,0 +1,11 @@
+1.14.440: fonts -- noto-emoji's new path, and every line of a font set
+
+- stacks/fonts.sh: NotoColorEmoji moved to 2D/fonts/ in googlefonts/noto-emoji;
+  a table line may list several URLs (first that answers is used), the new
+  path first and the old one after
+- stacks/fonts.sh: "already installed" is decided per line by its file
+  pattern, not by the directory being non-empty -- noto-sans' Bold and
+  Italic were skipped once Regular was there
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_011fX6Wu4ytSyonAjwWr4mSA

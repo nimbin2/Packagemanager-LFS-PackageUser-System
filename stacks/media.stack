@@ -1,5 +1,6 @@
 # media.stack -- codecs, gstreamer, the WebRTC chain, webkitgtk, mpv, yt-dlp.
-# stack-version: 1.14.345
+# AI-modified: Claude Opus 5.5 (1.14.437)
+# stack-version: 1.14.437
 #
 # WHAT THIS MACHINE NEVER BUILDS is in avoid.stack, included by every stack
 # here: the exclusions are a property of the machine, not of one stack.
@@ -99,12 +100,16 @@ book   gst10-plugins-good expect="gst-inspect-1.0 v4l2src >/dev/null 2>&1 && gst
 # UNTESTED -- the build lines follow each project's README, and none of these
 # has been built here.  Expect to adjust them; that is what the stack file is
 # for.
-git    libnice url=https://gitlab.freedesktop.org/libnice/libnice.git ref=0.1.22 have=/usr/lib/pkgconfig/nice.pc build="meson setup build --prefix=/usr --buildtype=release -Dgtk_doc=disabled; ninja -C build" install="ninja -C build install"
+# libnice 0.1.23: gst-plugins-bad 1.28 wants it (0.1.22 was too old).
+# webrtc-audio-processing v2.1 predates GCC 15: <cstdint> is no longer
+# pulled in (trace_event.h: 'uint8_t' does not name a type).  Upstream fixed
+# it after v2.1 (MR 58, e9c78dc); until a release has it, -include cstdint.
+git    libnice url=https://gitlab.freedesktop.org/libnice/libnice.git ref=0.1.23 have=/usr/lib/pkgconfig/nice.pc build="meson setup build --prefix=/usr --buildtype=release -Dgtk_doc=disabled; ninja -C build" install="ninja -C build install"
 git    libsrtp url=https://github.com/cisco/libsrtp.git ref=v2.6.0 have=/usr/lib/pkgconfig/libsrtp2.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
 # ref: 1.0.0 does not exist upstream (checked: the tags are 0.9.3.0, 0.9.4.0,
 # 0.9.5.0).  0.9.5.0 has meson.build, so the build line below still applies.
 git    usrsctp url=https://github.com/sctplab/usrsctp.git ref=0.9.5.0 have=/usr/lib/pkgconfig/usrsctp.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
-git    webrtc-audio-processing url=https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git ref=v2.1 have=/usr/lib/pkgconfig/webrtc-audio-processing-2.pc build="meson setup build --prefix=/usr --buildtype=release; ninja -C build" install="ninja -C build install"
+git    webrtc-audio-processing url=https://gitlab.freedesktop.org/pulseaudio/webrtc-audio-processing.git ref=v2.1 have=/usr/lib/pkgconfig/webrtc-audio-processing-2.pc build="meson setup build --prefix=/usr --buildtype=release -Dcpp_args='-include cstdint'; ninja -C build" install="ninja -C build install"
 
 book   gst10-plugins-bad \
        expect="gst-inspect-1.0 webrtcbin >/dev/null 2>&1 && gst-inspect-1.0 dtlssrtpenc >/dev/null 2>&1 && gst-inspect-1.0 srtpenc >/dev/null 2>&1"
@@ -242,8 +247,11 @@ book   mpv
 # hatchling` line does not mean "make sure it is there": it asked the book,
 # planned a chain of newer python modules (vcs_versioning, which wants a
 # newer `packaging`) and stopped before yt-dlp ever started (1.14.314).  If
-# it IS missing, the build stops on `BackendUnavailable: Cannot import
-# 'hatchling.build'`, which lfs-helper recognises and names the page for.
+# it IS missing -- a fresh system: "BackendUnavailable: Cannot import
+# 'hatchling.build'" -- the wheel is built with pip's build isolation
+# instead: pip fetches hatchling into a throwaway environment for this one
+# build and installs nothing of it.  yt-dlp itself comes from GitHub
+# anyway; the backend is a build tool, not part of the system.
 # ffmpeg is
 # not a build dependency but yt-dlp needs it at RUNTIME to merge separate
 # video and audio streams -- it comes from wayland.stack.  With yt-dlp on PATH,
@@ -258,6 +266,6 @@ tar    yt-dlp \
        url=https://github.com/yt-dlp/yt-dlp/releases/download/2026.08.19/yt-dlp.tar.gz \
        pkg=yt-dlp-2026.08.19.tar.gz \
        have=/usr/bin/yt-dlp \
-       build="pip3 wheel -w dist --no-build-isolation --no-deps --no-cache-dir ." \
+       build="if python3 -c 'import hatchling.build' 2>/dev/null; then pip3 wheel -w dist --no-build-isolation --no-deps --no-cache-dir .; else pip3 wheel -w dist --no-deps --no-cache-dir .; fi" \
        install="pip3 install --no-index --find-links=dist --no-cache-dir --no-user --no-deps --force-reinstall yt-dlp" \
        expect="yt-dlp --version >/dev/null 2>&1"

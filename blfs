@@ -2,6 +2,7 @@
 #
 # blfs -- offline BLFS book parser / install-script generator.
 # Copyright (C) 2025  packagemanager contributors
+# AI-modified: Claude Opus 5.5 (1.14.429)
 #
 # This program is free software; you can redistribute it and/or modify it under
 # the terms of the GNU General Public License as published by the Free Software
@@ -130,7 +131,7 @@ CACHE_VERSION = 56   # v56: a skipped build variant does not keep its install st
 # tool + generated-script format versions.  Bump SCRIPT_VERSION when the shape
 # of generated install scripts changes (phases, dispatcher, ...), and
 # CACHE_VERSION when the parsed/cached data structure changes.
-BLFS_VERSION = "1.14.403"
+BLFS_VERSION = "1.14.440"
 
 
 def _build_id():
@@ -148,7 +149,10 @@ def _build_id():
     except OSError:
         return "unknown"
 
-SCRIPT_VERSION = 19   # v19: a test line chained into the build block is dropped
+SCRIPT_VERSION = 22   # v22: Xwayland's test-framework setup block is a test block
+#   v21: a failing step inside an && chain fails the phase (docbook)
+#   v20: a heredoc ending a block keeps no dangling && (elogind)
+#   v19: a test line chained into the build block is dropped
 
 
 def _tty_out():
@@ -405,6 +409,19 @@ def discover_dir(selector, listing=False):
         # is exactly what someone needs told.
         warn("note: no book matched '%s'; using the cached %s"
              % (selector, os.path.basename(pick)))
+        # A CACHED SVN SNAPSHOT AGES OUT FROM UNDER ITS PATCHES.  The svn
+        # patch directory holds the CURRENT patches only: a snapshot from
+        # weeks ago asks for SDL3-3.4.18-upstream_fixes-1.patch while svn is
+        # at 3.4.20 -- a 404 on every mirror.  Say how old it is.
+        if re.search(r"svn|combined", os.path.basename(pick), re.I):
+            try:
+                _age = (time.time() - os.path.getmtime(pick)) / 86400
+                if _age > 3:
+                    warn("      it is an svn snapshot, %d days old: patches it names may be"
+                         " gone from the svn patch directory." % _age)
+                    warn("      Pick a book on purpose:  blfs set-default <version>   (blfs books)")
+            except OSError:
+                pass
         try:
             _pv = parse_book_filename(os.path.basename(pick))[0]
             _others = [(parse_book_filename(os.path.basename(c))[0], c)
@@ -673,10 +690,35 @@ def _safe_extract(tar, dest):
         tar.extractall(dest)
 
 
-def _chunked_to_anchors(html):
+# Bump when the stitched book changes shape: ensure_book rebuilds an older one.
+COMBINED_FORMAT = 2
+
+
+def _page_id(html):
+    """The section id a chunked page is about: the anchor in its first h1/h2
+    heading (xorg7-lib for x7lib.html), else its first id at all."""
+    m = re.search(r'<h[12][^>]*>\s*<a\s+(?:id|name)="([^"]+)"', html, re.I)
+    if not m:
+        m = re.search(r'<div class="(?:sect1|chapter|part)"[^>]*\bid="([^"]+)"', html, re.I)
+    if not m:
+        m = re.search(r'\bid="([^"]+)"', html)
+    return m.group(1) if m else None
+
+
+def _chunked_to_anchors(html, page_ids=None):
     """Rewrite chunked cross-reference hrefs ('../gtk3/gtk3.html#gtk3', 'x.html')
     to nochunks-style in-page anchors ('#gtk3'), so dependency resolution works
-    on the stitched single page."""
+    on the stitched single page.
+
+    A LINK TO A PAGE IS A LINK TO THE PAGE'S SECTION ID, NOT ITS FILE NAME.
+    Mesa's "Xorg Libraries" link is `../x/x7lib.html` -- no fragment -- and
+    the page's id is `xorg7-lib`.  Taking the file name made it "#x7lib",
+    which is nothing, so the plan listed x7lib under "Out-of-book / missing"
+    and built mesa before libX11:
+        ../meson.build:2315:14: ERROR: Dependency "x11" not found
+    The same for docbook, profile, xorg-env.  page_ids maps each file name to
+    the id its page really has."""
+    page_ids = page_ids or {}
     def repl(m):
         href = m.group(1)
         if href.startswith(("http://", "https://", "mailto:", "ftp:", "#")):
@@ -687,7 +729,7 @@ def _chunked_to_anchors(html):
         base = os.path.basename(href)
         if base.endswith((".html", ".xhtml")):
             base = base.rsplit(".", 1)[0]
-        anchor = frag or base
+        anchor = frag or page_ids.get(base) or base
         return f'href="#{anchor}"' if anchor else m.group(0)
     return re.sub(r'href="([^"]+)"', repl, html)
 
@@ -710,17 +752,26 @@ def build_combined_book(tarball_path, combined_path):
     if not html_files:
         raise RuntimeError(f"no HTML pages inside {tarball_path}")
 
+    # first pass: which id each page is about (x7lib -> xorg7-lib)
+    bodies, page_ids = [], {}
+    for h in html_files:
+        try:
+            txt = open(h, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        body = re.search(r"<body[^>]*>(.*)</body>", txt, re.S | re.I)
+        txt = body.group(1) if body else txt
+        base = os.path.basename(h).rsplit(".", 1)[0]
+        pid = _page_id(txt)
+        if pid and pid != base:
+            page_ids[base] = pid
+        bodies.append(txt)
+
     tmp = combined_path + ".part"
     with open(tmp, "w", encoding="utf-8") as out:
         out.write("<!DOCTYPE html><html><body>\n")
-        for h in html_files:
-            try:
-                txt = open(h, encoding="utf-8", errors="replace").read()
-            except OSError:
-                continue
-            body = re.search(r"<body[^>]*>(.*)</body>", txt, re.S | re.I)
-            txt = body.group(1) if body else txt
-            out.write(_chunked_to_anchors(txt))
+        for txt in bodies:
+            out.write(_chunked_to_anchors(txt, page_ids))
             out.write("\n")
         out.write("</body></html>\n")
     os.replace(tmp, combined_path)
@@ -739,9 +790,15 @@ def ensure_book(selector, quiet=False):
                                 selector.replace("/", "_") + "-combined-nochunks.html")
         have_tar = os.path.exists(local) and os.path.getsize(local) > 0
         have_combined = os.path.exists(combined) and os.path.getsize(combined) > 0
-        if have_tar and have_combined and \
+        _fmt_ok = _load_meta(combined).get("combined_format") == COMBINED_FORMAT
+        if have_tar and have_combined and _fmt_ok and \
                 (time.time() - os.path.getmtime(combined)) < SVN_MIN_RECHECK:
             return combined
+        # an older stitch (page links by file name) is rebuilt from the
+        # tarball already here -- no download for that
+        if have_tar and have_combined and not _fmt_ok and not quiet:
+            print("Re-stitching %s: page links now resolve to the page's own id"
+                  % os.path.basename(combined))
         if not have_tar:
             if not quiet:
                 print(f"Fetching dev book ({selector}) archive: {url}")
@@ -757,7 +814,8 @@ def ensure_book(selector, quiet=False):
             print(f"Unpacking + stitching {os.path.basename(local)} ...")
         build_combined_book(local, combined)
         _save_meta(combined, {"url": url, "selector": selector, "version": version,
-                              "is_svn": True, "fetched": time.time()})
+                              "is_svn": True, "fetched": time.time(),
+                              "combined_format": COMBINED_FORMAT})
         # THE OLD DOWNLOADS ARE NOT BOOKS.  Each day's svn tarball is only the
         # source of the combined book, which was just rebuilt from the newest
         # one -- four of them sat in the store as "? version ?" entries.  Keep
@@ -900,6 +958,46 @@ def _book_version_of(book):
         return ""
 
 
+# Bump when build_packages' output changes: an older on-disk cache is rebuilt.
+PACKAGES_FORMAT = 2
+
+
+def _title_key(t):
+    """'8.2. Xorg Libraries' / 'Xorg-Libraries' / 'Mesa-26.2.3' -> 'xorg libraries' / 'mesa'."""
+    t = re.sub(r"^\s*\d+(\.\d+)*\.\s*", "", t or "")
+    t = t.replace("-", " ").replace("_", " ")
+    t = re.sub(r"\s+\d[\w.+]*$", "", t.strip())          # trailing version
+    return " ".join(t.lower().split())
+
+
+def _resolve_deps_by_title(packages):
+    """A dependency link that names no section, matched by its title.
+
+    A book stitched from chunked pages before 1.14.411 turned the page link
+    `x7lib.html` into `#x7lib`; the section is `xorg7-lib`.  Such a book can
+    no longer be re-stitched where it was only imported (the new system's
+    chroot), and "Out-of-book / missing: libclc, profile, x7lib" meant mesa
+    was planned before libX11.  The link still carries the page's TITLE
+    ("Xorg Libraries"), and so does the section: one unique match is the
+    same page.  Ambiguous or absent: left as it was."""
+    by_title = {}
+    for a, data in packages.items():
+        k = _title_key(data.get("title", ""))
+        if k:
+            by_title.setdefault(k, set()).add(a)
+    fixed = 0
+    for data in packages.values():
+        for d in data.get("deps", []):
+            a = d.get("anchor")
+            if not a or a in packages or d.get("external"):
+                continue
+            hits = by_title.get(_title_key(d.get("title", "")), ())
+            if len(hits) == 1:
+                d["anchor"] = next(iter(hits))
+                fixed += 1
+    return fixed
+
+
 def build_packages(soup):
     """Extract data for every resolvable package/module in the book."""
     packages = {}
@@ -910,6 +1008,7 @@ def build_packages(soup):
         group = module_group(pkg["content"]) if pkg["is_module"] else None
         packages[anchor] = extract_package_data(
             pkg["content"], pkg["is_module"], group, anchor)
+    _resolve_deps_by_title(packages)
     return packages
 
 
@@ -931,7 +1030,8 @@ def get_book(args, rebuild=False):
         try:
             with open(cache_file) as f:
                 cached = json.load(f)
-            if cached.get("stamp") == stamp:
+            if cached.get("stamp") == stamp \
+                    and cached.get("format") == PACKAGES_FORMAT:
                 return Book(path, cached["packages"])
         except Exception:
             pass
@@ -945,7 +1045,8 @@ def get_book(args, rebuild=False):
     sys.stderr.write(f"done ({len(packages)} packages, {time.time() - t0:.1f}s)\n")
     try:
         with open(cache_file, "w") as f:
-            json.dump({"stamp": stamp, "packages": packages}, f)
+            json.dump({"stamp": stamp, "format": PACKAGES_FORMAT,
+                       "packages": packages}, f)
     except Exception:
         pass                                   # read-only store: just skip caching
     book = Book(path, packages)
@@ -1583,6 +1684,14 @@ _TEST_BLOCK_RE = re.compile(
     # the only thing marking it as such is the sentence above it.
     r"|\bif you (wish|want) to run the test"
     r"|\bbefore running the test"
+    # Xwayland 24.1.13 splits it in two blocks: "Running the tests involves
+    # downloading two other frameworks ..." (piglit, xts, a background Xvfb)
+    # and "Then the tests can be run with: ... ninja test".  Neither sentence
+    # matched, the setup ran in the BUILD phase, `cd xts` failed, and the
+    # Xvfb it had started in the background kept the log pipe open: the
+    # package sat "finished" for 20 minutes.
+    r"|\brunning the tests?\b"
+    r"|\bthe tests? (can|may) be run\b"
     r"|\bfor the test suite\b", re.I)
 
 # THE COMMANDS SAY WHAT THEY ARE, AND PROSE IS A SECOND-HAND ACCOUNT.
@@ -1616,6 +1725,8 @@ _TEST_CONTENT_RE = re.compile(
     | \.test\(\)                                    # numpy.test()
     | ^\s*python3?\s+-m\s+venv\b                    # a throwaway test venv
     | ^\s*source\s+\S*testenv/bin/activate
+    | ^\s*git\s+clone\s+\S*(piglit|/xts|test-?suite)\S*  # fetching a test framework
+    | \b(XTEST_DIR|PIGLIT_DIR)=                       # pointing a run at one
     """)
 
 
@@ -1955,13 +2066,24 @@ def _extra_deps_for(anchor):
         m = {}
         try:
             import configparser
-            cp = configparser.ConfigParser()
-            cp.read(_EXTRA_DEPS_PATH)
-            for sect in cp.sections():
-                v = cp[sect].get("needs", "")
-                if v.strip():
-                    m[sect.lower()] = [x.strip() for x in
-                                       re.split(r"[,\s]+", v) if x.strip()]
+            # machine.conf too: an option chosen there brings its
+            # dependency with it (gst10-plugins-bad webrtc=enabled needs
+            # libnice -- configure stopped on 'Dependency "nice" not found')
+            for f in (_EXTRA_DEPS_PATH, os.environ.get(
+                    "PM_MACHINE_CONF", "/etc/pkgusr/stacks/machine.conf")):
+                cp = configparser.ConfigParser(strict=False,
+                                               interpolation=None)
+                try:
+                    cp.read(f)
+                except configparser.Error:
+                    continue
+                for sect in cp.sections():
+                    v = cp[sect].get("needs", "")
+                    if v.strip():
+                        m.setdefault(sect.lower(), [])
+                        m[sect.lower()] += [x.strip() for x in
+                                            re.split(r"[,\s]+", v)
+                                            if x.strip()]
         except Exception:
             m = {}
         _extra_deps_for._map = m
@@ -2005,9 +2127,17 @@ def walk_deps(book, anchor, kinds=("required", "recommended"), ignore=()):
             # the user had asked for -- silently, until cmake said "Ruby 2.5
             # or higher is required" after everything else had built.
             # Skipping is still correct; saying nothing is not.
+            #
+            # ...AND SAYING IT WAS NOT ENOUGH.  The warning scrolled past
+            # above a 9-package plan, webkitgtk downloaded and stopped on
+            # Ruby anyway, an hour of the stack later.  An avoid list says
+            # "never pull this in for its own sake"; a REQUIRED edge from a
+            # package being built is the one reason that outranks it.  It
+            # is built, and reported as built.
             if kind == "required" and parent:
                 ignored_required.append((parent, a))
-            return
+            else:
+                return
         visited.add(a)
         data = book.get(a)
         if data is None:
@@ -3049,14 +3179,152 @@ def _repair_dangling_operators(cmds):
     after it loses the operator.
     """
     lines = (cmds or "").splitlines()
+    # HEREDOC BODIES ARE NOT COMMANDS.  elogind's configuration ends with
+    #     cat > /etc/nsswitch.conf << "EOF" &&
+    #     passwd: files elogind ...
+    #     EOF
+    # and nothing after it: the body and the EOF line looked like "an active
+    # line after it", so the && stayed, and bash read `&& }`.  Mark which
+    # lines are commands (heredoc bodies and terminators are not) and judge
+    # by those.
+    is_cmd = [False] * len(lines)
+    term = None
     for i, line in enumerate(lines):
-        if line.strip().startswith("#") or not re.search(r"(&&|\|\||\|)\s*$", line):
+        if term is not None:
+            if line.strip() == term or (line.lstrip("\t") == term):
+                term = None
             continue
-        nxt = next((l for l in lines[i + 1:]
-                    if l.strip() and not l.strip().startswith("#")), None)
-        if nxt is None:
+        st = line.strip()
+        if not st or st.startswith("#"):
+            continue
+        is_cmd[i] = True
+        m = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", line)
+        if m:
+            term = m.group(2)
+    for i, line in enumerate(lines):
+        if not is_cmd[i] or not re.search(r"(&&|\|\||\|)\s*$", line):
+            continue
+        if not any(is_cmd[i + 1:]):
             lines[i] = re.sub(r"\s*(&&|\|\||\|)\s*$", "", line)
     return "\n".join(lines)
+
+
+# first words of a chain that is a QUESTION, not a step: `[ -e x ] && rm x`
+# is allowed to be false, and must stay that way
+_CHAIN_TESTS = {"[", "[[", "test", "!", "grep", "egrep", "fgrep", "command",
+                "type", "which", "hash", "getent", "id", "pgrep", "pidof",
+                "cmp", "diff", "ls", "false", "true", "mountpoint",
+                "systemctl", "pkg-config", "if", "while", "until", "elif",
+                "for", "case", "select"}
+_CHAIN_NO_TAIL = ("then", "do", "else", "{", "(", "in", ";;", ";", "&", "|",
+                  "\\", "&&", "||")
+
+
+def _scan_line(line):
+    """(code, comment_at): the line with quoted text blanked, and where an
+    unquoted comment starts (or -1)."""
+    out, q, i, n = [], None, 0, len(line)
+    while i < n:
+        c = line[i]
+        if q:
+            if c == "\\" and q == '"' and i + 1 < n:
+                out.append("  "); i += 2; continue
+            if c == q:
+                q = None
+            out.append(" " if c != q else c)
+            i += 1
+            continue
+        if c == "\\" and i + 1 < n:
+            out.append("  "); i += 2; continue
+        if c in "'\"":
+            q = c
+            out.append(c)
+        elif c == "#" and (i == 0 or line[i - 1] in " \t;"):
+            return "".join(out), i
+        else:
+            out.append(c)
+        i += 1
+    return "".join(out), -1
+
+
+def _fail_fast_chains(cmds):
+    r"""A failing step in a `&&` chain must fail the phase.
+
+    The phases run under set -e, and set -e does not look inside an && list:
+    only its LAST command can stop the shell.  DocBook-4.5's install is
+        install -v -d -m755 /usr/share/xml/docbook/xml-dtd-4.5 &&
+        install -v -d -m755 /etc/xml &&
+        cp -v -af ... /usr/share/xml/docbook/xml-dtd-4.5
+    followed by more commands.  The first install hit "Permission denied",
+    the chain stopped, the shell carried on, and the phase ENDED IN SUCCESS
+    with no files copied.  The failure surfaced one phase later as
+        could not open .../xml-dtd-4.5/catalog.xml for saving
+    and the repair loop granted the directory and retried only `configure`,
+    which cannot create what `install` never did.
+
+    Every chain that is a sequence of steps gets `|| exit $?` on its last
+    line.  A chain that is a question (`[ -e x ] && rm x`), or that already
+    has an `||`, is left alone.  The result is checked with bash -n; if it
+    does not parse, the block is returned unchanged.
+    """
+    if not cmds or "&&" not in cmds:
+        return cmds
+    lines = cmds.split("\n")
+    out = list(lines)
+    term = None
+    run = []                       # (index, code, comment_at) of one chain
+
+    def close(run):
+        if not run:
+            return
+        codes = [c for _i, c, _k in run]
+        joined = " ".join(codes)
+        if "&&" not in joined or "||" in joined:
+            return
+        first = codes[0].strip().split()
+        if not first or first[0] in _CHAIN_TESTS or "=" in first[0] \
+                or first[0].endswith("()"):
+            return
+        i, code, cat = run[-1]
+        tail = code.rstrip()
+        if not tail or tail.endswith(_CHAIN_NO_TAIL):
+            return
+        last_word = tail.split()[-1]
+        if last_word in ("then", "do", "else", "in", "{"):
+            return
+        line = lines[i]
+        if cat >= 0:
+            out[i] = line[:cat].rstrip() + " || exit $?  " + line[cat:]
+        else:
+            out[i] = line.rstrip() + " || exit $?"
+
+    for i, line in enumerate(lines):
+        if term is not None:
+            if line.strip() == term or line.lstrip("\t") == term:
+                term = None
+            continue
+        st = line.strip()
+        if not st or st.startswith("#"):
+            if run and not run[-1][1].rstrip().endswith(("&&", "||", "|", "\\")):
+                close(run); run = []
+            continue
+        code, cat = _scan_line(line)
+        m = re.search(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1", line)
+        if m:
+            term = m.group(2)
+        run.append((i, code, cat))
+        if not code.rstrip().endswith(("&&", "||", "|", "\\")):
+            close(run); run = []
+    close(run)
+    new = "\n".join(out)
+    if new == cmds:
+        return cmds
+    try:
+        ok = subprocess.run(["bash", "-n"], input="f() {\n%s\n:\n}\n" % new,
+                            text=True, capture_output=True).returncode == 0
+    except OSError:
+        ok = False
+    return new if ok else cmds
 
 
 def _comment_orphan_pip_installs(cmds, context=""):
@@ -3498,6 +3766,10 @@ def render_script(data, source_url, book_version=""):
     build_cmds = _repair_dangling_operators(build_cmds)
     install_root = _repair_dangling_operators(install_root)
     config_cmds = _repair_dangling_operators(config_cmds)
+    # and then: a step that fails inside a chain fails the phase
+    build_cmds = _fail_fast_chains(build_cmds)
+    install_root = _fail_fast_chains(install_root)
+    config_cmds = _fail_fast_chains(config_cmds)
     data["config_cmds"] = config_cmds
     _known = {"pkg", "link", "name", "name_version", "url", "md5_sum", "info",
               "git_ref", "installed_program", "BUILD_ROOT"}

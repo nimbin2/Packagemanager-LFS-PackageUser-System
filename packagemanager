@@ -2,6 +2,7 @@
 #
 # packagemanager -- manage packages under the LFS/BLFS "pkgusr" model.
 # Copyright (C) 2025  packagemanager contributors
+# AI-modified: Claude Opus 5.5 (1.14.436)
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -188,7 +189,7 @@ TMP_DIR = "/tmp/packagemanager"
 CONFIG_PATH = os.environ.get("PKGUSR_CONFIG", "/etc/pkgusr/packagemanager.conf")
 # Version stamps.  Bump PLAN_VERSION when the cached dry-run plan structure
 # changes (so stale plans are ignored); TOOL_VERSION is the program version.
-TOOL_VERSION = "1.14.403"
+TOOL_VERSION = "1.14.440"
 
 
 def _build_id():
@@ -206,7 +207,8 @@ def _build_id():
     except OSError:
         return "unknown"
 
-PLAN_VERSION = 1
+PLAN_VERSION = 3   # 3: a required dependency outranks avoid (webkitgtk -> ruby)
+#                    2: page links resolved by title (x7lib -> xorg7-lib)
 _DEFAULT_CONFIG = {"collector_prefix": "sysgroup", "user_prefix": "u",
                    "pkgusr_prefix": "p", "cfguser_prefix": "cfg",
                    "main_user": ""}
@@ -792,6 +794,54 @@ def _book_path_for(selector, refresh=False):
     return _BOOK_PATHS[selector] or None
 
 
+# PACKAGES THAT MUST MATCH ANOTHER PACKAGE'S MAJOR VERSION.
+#
+# LLVM 23.1.0 came from the svn book; the default book is 13.1-systemd now,
+# which has SPIRV-LLVM-Translator 22.1.5 and libclc 22.1.8, and the build
+# stopped on
+#     Could not find a configuration file for package "LLVM" that is
+#     compatible with requested version "22.1.0" ... version: 23.1.0
+# These are released in lock-step with LLVM: the right page is the one
+# written for the LLVM that is INSTALLED, in whichever book has it.
+_LOCKSTEP = {"spirv-llvm-translator": "llvm", "libclc": "llvm"}
+_LOCKSTEP_BOOK = {}
+
+
+def _major(v):
+    m = re.match(r"v?(\d+)", v or "")
+    return m.group(1) if m else None
+
+
+def _lockstep_book(anchor):
+    """The book whose page for `anchor` matches the installed major version
+    of what it is locked to, when the default book's does not; else None."""
+    base = _LOCKSTEP.get((anchor or "").lower())
+    if not base:
+        return None
+    if anchor in _LOCKSTEP_BOOK:
+        return _LOCKSTEP_BOOK[anchor]
+    _LOCKSTEP_BOOK[anchor] = None
+    u = gather_user(base)
+    want = _major(u.version) if u.state == "installed" else None
+    if not want:
+        return None
+    if _major(_nv_version(default_book_version(anchor) or "")) == want:
+        return None
+    sels = ["svn"] + sorted(set(_stack_book_map().values()) - {"svn"})
+    for sel in sels:
+        path = _book_path_for(sel)
+        nv = _map_lookup(_versions_for(path), [anchor]) if path else None
+        if nv and _major(_nv_version(nv)) == want:
+            printInfo("  %s: %s %s is installed, so %s comes from the %s book"
+                      " (%s)" % (anchor, base, u.version, anchor, sel, nv))
+            _LOCKSTEP_BOOK[anchor] = path
+            return path
+    printWarning("  %s must match %s %s, and no book on disk has a %s for"
+                 " %s.x" % (anchor, base, u.version, anchor, want))
+    printInfo("    get the book that has it:  blfs fetch svn")
+    return None
+
+
 def _book_override(anchor):
     """The book this package should be read from, or None.
 
@@ -806,6 +856,9 @@ def _book_override(anchor):
         _BOOK_FOR_PKG[anchor] = (_book_path_for(sel) or sel) if sel else ""
     if _BOOK_FOR_PKG[anchor]:
         return _BOOK_FOR_PKG[anchor]
+    _lk = _lockstep_book(anchor)
+    if _lk:
+        return _lk
     if _PLAN_BOOK and not _map_lookup(_versions_for(""), [anchor]) \
             and _map_lookup(_versions_for(_PLAN_BOOK), [anchor]):
         return _PLAN_BOOK
@@ -1750,6 +1803,10 @@ def _prewarm_scripts(plan, script_dir, force_regen=False):
     """
     wanted = []
     for anchor, nv, _reason in plan:
+        # one pass reads ONE book (run_blfs picks it from the first name):
+        # a package with a book of its own is written on its own, from it
+        if _book_override(anchor):
+            continue
         local = os.path.join(pkgusr_home(pkgusr_name(anchor)), f"install_{nv}")
         if os.path.isfile(local) and not force_regen:
             continue                                  # the user's own copy wins
@@ -1882,14 +1939,12 @@ def _report_ignored_required(steps):
     if not pairs:
         return
     print()
-    printWarning("%d package(s) in this plan REQUIRE something the ignore list"
-                 " excludes:" % len(pairs))
+    printWarning("%d avoided package(s) are built anyway -- something in this"
+                 " plan REQUIRES them:" % len(pairs))
     for w, d in pairs:
-        printWarning("  %-20s requires %s, which is ignored" % (w, d))
-    printWarning("  They will fail where they need it.  Either drop it from the")
-    printWarning("  ignore list (in the stack file, or --ignore), or install it:")
-    printWarning("    packagemanager install %s --run --recursive"
-                 % " ".join(sorted({d for _w, d in pairs})))
+        printWarning("  %-20s <- required by %s" % (d, w))
+    printInfo("  (avoid.stack keeps a package out of plans that merely want it;"
+              " a hard requirement outranks it)")
     print()
 
 
@@ -2081,6 +2136,15 @@ def resolve_script(user, name_version, script_dir, assume_yes=False,
             printInfo(f"  cached script is from blfs {_cv}, this is {_gv} "
                       f"-- regenerating")
         else:
+            # THE CACHED SCRIPT GETS THE OPTIONS TOO -- THE THIRD WAY OUT.
+            # vala's script came from here: generated earlier into
+            # script_dir (by a plan or `blfs script`, which know nothing of
+            # machine.conf), reused as "version-keyed = safe", and copied to
+            # the package's home with a bare `./configure --prefix=/usr` --
+            # while package-fixes.conf said --disable-valadoc.  configure
+            # then died on libgvc, exactly as the fix's own comment warns.
+            # The merge is idempotent; every path out of here applies it.
+            apply_machine_opts(user, cached)
             _check_script_prereqs(user, cached)
             return cached
 
@@ -2242,6 +2306,27 @@ def _warn_unset_env(anchor, script_path):
     _build_env = _read_build_env()
     missing = [n for n in dict.fromkeys(_ENV_GUARD_RE.findall(body))
                if not (_build_env.get(n) or os.environ.get(n))]
+    # THE XORG BUILD ENVIRONMENT HAS ONE ANSWER HERE.  A fresh system's
+    # ffmpeg plan stopped on "XORG_PREFIX / XORG_CONFIG are not set" -- the
+    # book's "Xorg Build Environment" page gives /usr and the flag list
+    # below, and that is what this machine always used.  Set them, say so,
+    # and go on; `packagemanager env --set` changes them.  Only these two:
+    # QT6PREFIX or TEXLIVE_PREFIX are real choices.
+    _auto = [n for n in missing if n in ("XORG_PREFIX", "XORG_CONFIG")]
+    if _auto:
+        _vals = dict(_build_env)
+        for n in _auto:
+            _vals[n] = _ENV_SUGGESTIONS[n]
+        try:
+            _write_build_env(_vals)
+            for n in _auto:
+                printInfo("  %s was not set: using the book's default, %s=%s"
+                          % (n, n, _ENV_SUGGESTIONS[n]))
+            printInfo("    (in %s; change it: packagemanager env --set %s=...)"
+                      % (BUILD_ENV_FILE, _auto[0]))
+            missing = [n for n in missing if n not in _auto]
+        except OSError as e:
+            printWarning("  could not write %s: %s" % (BUILD_ENV_FILE, e))
     if not missing:
         return
     # once per VARIABLE, like the build tools -- the rest goes in the summary
@@ -2574,7 +2659,15 @@ def _warn_unknown_meson_opts(anchor, opts):
                "c_args", "cpp_args", "c_link_args", "cpp_link_args",
                "b_lto", "b_ndebug", "werror", "optimization", "strip",
                "auto_features", "backend", "jobs", "configure_args"}
-    bad = {k: v for k, v in opts.items() if k not in known and k not in builtin}
+    # ...and the keys that are OURS, not meson's: package-fixes.conf's
+    # `needs` (mesa: glslang rust-bindgen libclc) is an edge for the plan,
+    # `expect`/`book` steer the install, __NAME__ fills a placeholder.  The
+    # build never sees them -- warning "'needs' is not an option of this
+    # package" on every mesa build was noise about our own file.
+    ours = {"needs", "expect", "book"}
+    bad = {k: v for k, v in opts.items()
+           if k not in known and k not in builtin and k not in ours
+           and not re.fullmatch(r"__[A-Z][A-Z0-9_]*__", k)}
     if not bad:
         return opts
     for k in sorted(bad):
@@ -4606,6 +4699,8 @@ def cmd_dependencies(args):
         if kind and parent:
             origin = f"   ({kind} by {nv_of.get(parent, parent)})"
         print(f"  {nv:<30} {state}{origin}")
+    _keep = set(_settle_config_pages([m for m, _k, _p in missing], False))
+    missing = [x for x in missing if x[0] in _keep]
     if missing:
         print()
         printWarning("Out-of-book / missing (handle manually):")
@@ -4763,7 +4858,36 @@ def _install_finished(u):
     if getattr(u, "pkg_list", None):
         return True
     home = getattr(u, "home", "") or ""
-    return bool(home) and os.path.isfile(os.path.join(home, ".pkgusr-installed"))
+    # (1.14.432 also distrusted a marker beside an empty pkg.lst -- wrong:
+    # most packages record their files in $STATE/manifests/<name>.files, not
+    # pkg.lst, and 47 installed packages were planned for rebuild.  The bad
+    # marker is now prevented where it was written, in lfs-helper.)
+    if not home or not os.path.isfile(os.path.join(home, ".pkgusr-installed")):
+        return False
+    # A marker with NO manifest in EITHER place is the one that bug left
+    # (webkitgtk: marker at 19:18, nothing on disk).  Both places are read.
+    _name = os.path.basename(home.rstrip("/"))
+    _pkg = unprefix_pkgusr(_name)
+    # WHERE THE STATE IS.  1.14.433 looked in dirname(BASE_DIR) -- but
+    # BASE_DIR is /usr/src (the root the account kinds hang under), so that
+    # was /usr/lfs-pkgusr, no manifest was ever found, and 46 installed
+    # packages were planned again.  lfs-helper's STATE is $SRCROOT/lfs-pkgusr.
+    _cands = [os.environ.get("LFS_PKGUSR_DIR") or "",
+              os.path.join(BASE_DIR, "lfs-pkgusr"),
+              os.path.join(os.path.dirname(os.path.dirname(home.rstrip("/"))),
+                           "lfs-pkgusr"),
+              "/usr/src/lfs-pkgusr"]
+    _states = [c for c in dict.fromkeys(_cands) if c and os.path.isdir(c)]
+    for _m in [os.path.join(st, "manifests", n + ".files")
+               for st in _states for n in dict.fromkeys((_pkg, _name))]:
+        try:
+            if os.path.getsize(_m) > 0:
+                return True
+        except OSError:
+            pass
+    # no manifest anywhere: trust the marker only where the tracker never
+    # ran (a home without a log/ directory is from before it)
+    return not os.path.isdir(os.path.join(home, "log"))
 
 
 def build_install_plan(args):
@@ -4823,12 +4947,53 @@ def build_install_plan(args):
         # everything; a dependency the stack does not own is judged -- and
         # built, if missing -- against the book it always reads.
         if _PLAN_BOOK and _book_override(anchor) != _PLAN_BOOK:
-            nv = default_book_version(anchor) or nv
+            # ...UNLESS THE REQUESTER'S BOOK HAS IT NEWER.  mpv is read from
+            # svn; its plan built libplacebo from the default book (7.360.1)
+            # and mpv's svn page asks for >= 7.387.0.  A page is written
+            # against the versions in ITS book: a dependency that book has
+            # newer is taken from it.  (Installed dependencies are still not
+            # moved -- that is --update-deps, or the repair, which asks
+            # with --book-of.)
+            _dnv = default_book_version(anchor)
+            _pnv = _map_lookup(_versions_for(_PLAN_BOOK), [anchor])
+            if not _book_override(anchor) and _pnv and (
+                    not _dnv or _vsort_key(_nv_version(_pnv))
+                    > _vsort_key(_nv_version(_dnv))):
+                _BOOK_FOR_PKG[anchor] = _PLAN_BOOK
+                nv = _pnv
+            else:
+                nv = _dnv or nv
+        # ...and a lock-step package is the version of ITS book
+        _lk = _lockstep_book(anchor)
+        if _lk:
+            nv = _map_lookup(_versions_for(_lk), [anchor]) or nv
         u = gather_user(anchor)
         _done = u.state == "installed" and _install_finished(u)
         if u.state == "installed" and not _done:
             # recorded, but nothing says the install ever finished
             build_install_plan.unproven.append(anchor)
+        # a package a stack builds from git/tar has no book version to be
+        # behind: `update <name>` moves it, not the book
+        _se = _stack_source_map().get(anchor.lower())
+        if _se and u.state == "installed" and _se["kind"] == "git" \
+                and not _is_git_package(anchor):
+            # BUILT FROM THE BOOK, AND THE STACK SAYS GIT.  sdl3's book
+            # build counted as installed and had no /usr/include/SDL3;
+            # sdl2-compat, next in the plan, stopped on "Cannot find SDL3
+            # headers".  The stack's source is the one to have: rebuild it
+            # here, before what needs it.
+            plan.append((anchor, nv, "update"))
+            return
+        _reinstall_this = args.reinstall and anchor in _named
+        _stale = _stack_ref_stale(anchor) if (_se and _done) else None
+        if _stale:
+            printInfo("  %s: built from %s, the stack now says %s -- rebuilding"
+                      % (anchor, _stale[0], _stale[1]))
+            plan.append((anchor, nv, "update"))
+            return
+        if _done and _se and not _reinstall_this:
+            build_install_plan.already.add(anchor)
+            return
         up_to_date = (_done and (not u.version or u.version == nv))
         if up_to_date:
             build_install_plan.already.add(anchor)
@@ -4845,7 +5010,12 @@ def build_install_plan(args):
             build_install_plan.already.add(anchor)
             build_install_plan.behind.append((anchor, u.version or "?", nv))
             return
-        if args.reinstall:
+        # --reinstall IS FOR WHAT WAS NAMED.  lfs-helper rebuilds a provider
+        # with `install gtk4 --reinstall --recursive` (--recursive so a
+        # missing dependency is built too).  --reinstall reached every
+        # dependency, so the plan was 98 packages, and gdk-pixbuf -- installed
+        # and fine -- was rebuilt and failed 60 packages in.
+        if _reinstall_this:
             plan.append((anchor, nv, "reinstall" if up_to_date else
                          ("update" if u.state == "installed" else "new")))
         elif not up_to_date:
@@ -4857,6 +5027,8 @@ def build_install_plan(args):
         set_status(f"working out what {target} needs ...")
         _PLAN_BOOK = None
         _tb = _book_override(target)
+        if not _tb and getattr(args, "book_of", None):
+            _tb = _book_override(args.book_of)
         _PLAN_BOOK = _tb if _tb and os.path.isfile(_tb) else None
         if not getattr(args, "recursive", False):
             # DEFAULT: just this package, no dependency walk
@@ -4902,11 +5074,39 @@ def build_install_plan(args):
                 _explain_not_in_book(target)
                 _not_found.append(target)
                 continue
-            missing_all.extend(m for m, _, _ in missing)
+            # A NAME THE BOOK DOES NOT HAVE AND A STACK BUILDS.
+            #
+            # gst10-plugins-bad is configured with webrtc=enabled and needs
+            # libnice, which media.stack builds from git -- after -bad.  But
+            # adwaita-icon-theme's plan reached -bad first, and stopped on
+            #     ERROR: Dependency "nice" not found
+            # A `needs` edge to a stack entry came back as "missing"; it is
+            # placed in the plan now, right before what needs it, and built
+            # from its stack entry.
+            _srcm = _stack_source_map()
+            _stack_before = {}
+            for m, mk, mp in missing:
+                if m.lower() in _srcm and mp:
+                    _stack_before.setdefault(mp, []).append((m, mk))
+            # AN INSTALLED NAME IS NOT MISSING.  webkitgtk's plan (read from
+            # the svn book) listed "docbook, libclc" as out-of-book: libclc
+            # left the svn book (mesa takes an external one), and both were
+            # installed and working.  "Install these manually" about
+            # something installed is noise that hides the real ones.
+            missing_all.extend(m for m, _, mp in missing
+                               if not (m.lower() in _srcm and mp)
+                               and gather_user(m).state != "installed")
             for anchor, nv, kind, parent in order:
+                for _m, _mk in _stack_before.pop(anchor, []):
+                    consider(_srcm[_m.lower()]["target"], _m,
+                             _mk or "required", anchor)
                 consider(anchor, nv,
                          "requested" if not parent else (kind or "required"),
                          parent or target)
+            for _p, _ms in _stack_before.items():     # parent not in order
+                for _m, _mk in _ms:
+                    consider(_srcm[_m.lower()]["target"], _m,
+                             _mk or "required", _p)
             if getattr(args, "dependents", False):    # also rebuild reverse deps
                 for danchor, dnv in book_rdeps(
                         target, args.ignore_recommended, args.optional).items():
@@ -5021,6 +5221,23 @@ def install_local(name, path, run, yes, verb="install", test=False, clean=False)
     if clean:
         _clean_after_install(name, old_paths, t0)
     printSuccess(f"Done -- {name} {verb}ed.  logs: {_pkg_log_dir(name)}")
+
+
+def _stack_source_map():
+    """{name: entry} for every git/tar entry of the installed stacks, read
+    once per run (a plan asks for each of its packages)."""
+    if not hasattr(_stack_source_map, "_m"):
+        m = {}
+        d = STACK_DIR if "STACK_DIR" in globals() else "/etc/pkgusr/stacks"
+        for f in sorted(glob.glob(os.path.join(d, "*.stack"))):
+            try:
+                for r in _parse_stack_file(f):
+                    if r["kind"] in ("git", "tar"):
+                        m.setdefault(r["target"].lower(), r)
+            except (ValueError, OSError):
+                continue
+        _stack_source_map._m = m
+    return _stack_source_map._m
 
 
 def _stack_git_entry(name, with_file=False):
@@ -5193,11 +5410,24 @@ def _install_git_packages(args):
         if not is_git and not entry:
             continue
         done.append(name)
-        if entry and not script:
+        # entry is only set when the home's script is NOT a git one -- none
+        # yet, or one the book wrote before the stack moved to git (sdl3):
+        # either way the stack entry is what to build
+        if entry:
             script, _ = _stack_git_script(
                 entry, os.path.join(TMP_DIR, "stack_files"))
         u = gather_user(name)
-        if u.state == "installed" and not args.reinstall:
+        _stale = _stack_ref_stale(name)
+        if _stale:
+            printInfo("  %s: built from %s, the stack says %s -- rebuilding"
+                      % (name, _stale[0], _stale[1]))
+            entry = entry or _stack_git_entry(name)
+            if entry:
+                script, _ = _stack_git_script(
+                    entry, os.path.join(TMP_DIR, "stack_files"))
+        if u.state == "installed" and not args.reinstall and not _stale \
+                and not (entry and entry["kind"] == "git"
+                         and _canonical_script_path(name)):
             printSuccess("%s: installed (a %s package).  Rebuild it: "
                          "--reinstall [--clean];  new commits: update %s"
                          % (name, entry["kind"] if entry else "git", name))
@@ -5210,6 +5440,62 @@ def _install_git_packages(args):
                       test=getattr(args, "test", False),
                       clean=getattr(args, "clean", False))
     return done
+
+
+def _profile_page_done():
+    try:
+        prof = open("/etc/profile", errors="replace").read()
+    except OSError:
+        return False
+    return ("profile.d" in prof
+            and os.path.isfile("/etc/profile.d/00-path-functions.sh"))
+
+
+# BOOK PAGES THAT ARE SETTINGS, NOT PACKAGES.
+#
+# "Out-of-book / missing (install these manually): postlfs-config-profile,
+# xorg-env" -- on every plan, on a system where both were done.  They are
+# pages of the book (The Bash Shell Startup Files, the Xorg build
+# environment) that packages link to as dependencies; they have no tarball,
+# so the planner cannot place them and called them missing.  What each page
+# sets up is checkable, and each has a command here that does it.
+#   name: (what it is, is it done?, the command that does it)
+_CONFIG_PAGES = {
+    "postlfs-config-profile": ("/etc/profile and its path helpers",
+                               _profile_page_done,
+                               ["lfs-helper", "install-profile"]),
+    # set per build: XORG_PREFIX/XORG_CONFIG go into build.env with the
+    # book's values the first time a script asks for them
+    "xorg-env": ("XORG_PREFIX / XORG_CONFIG", lambda: True, None),
+}
+
+
+def _settle_config_pages(missing, run):
+    """Take settings pages out of `missing`: done ones silently, the others
+    done now (with --run) or named with their command."""
+    left = []
+    for m in missing or []:
+        page = _CONFIG_PAGES.get(m) or _CONFIG_PAGES.get(m.lower())
+        if not page:
+            left.append(m)
+            continue
+        what, done, cmd = page
+        if done():
+            continue
+        if run and cmd:
+            printInfo("  %s (%s) is not set up -- running: %s"
+                      % (m, what, " ".join(cmd)))
+            try:
+                subprocess.run(cmd)
+            except OSError as e:
+                printWarning("  could not run %s: %s" % (cmd[0], e))
+            if done():
+                continue
+        printWarning("  %s is a settings page of the book (%s), not a package."
+                     % (m, what))
+        if cmd:
+            printInfo("    set it up:  %s" % " ".join(cmd))
+    return left
 
 
 def cmd_install(args, _replanned=False):
@@ -5232,6 +5518,7 @@ def cmd_install(args, _replanned=False):
         return
 
     plan, missing, why, not_found = build_install_plan(args)
+    missing = _settle_config_pages(missing, args.run)
     if missing:
         printWarning("Out-of-book / missing (install these manually): "
                      + ", ".join(sorted(set(missing))))
@@ -5343,10 +5630,27 @@ def cmd_install(args, _replanned=False):
                      " installed -- they are skipped."
                      % (_done, _done + len(plan)))
     print()
-    _prewarm_scripts(plan, script_dir,
+    # A STACK THAT BUILDS A PACKAGE FROM GIT BUILDS IT FROM GIT EVERYWHERE.
+    # sway.stack has `git sdl3`, but ffmpeg's plan reached SDL3 first (via
+    # sdl2-compat) and built the BOOK's SDL3 -- from a patch URL that had
+    # already rotated away.  The plan keeps the book's ORDER (SDL3 after
+    # what it recommends); only the SOURCE comes from the stack entry.
+    _srcmap = _stack_source_map()
+    _from_stack = {a for a, _n, _r in plan if a.lower() in _srcmap}
+    _prewarm_scripts([r for r in plan if r[0] not in _from_stack], script_dir,
                      force_regen=getattr(args, "regenerate", False))
     steps = []                                       # (anchor, nv, reason, path)
     for anchor, nv, reason in plan:
+        if anchor in _from_stack:
+            _e = _srcmap[anchor.lower()]
+            path, _ = _stack_git_script(_e, os.path.join(TMP_DIR, "stack_files"))
+            apply_machine_opts(anchor, path)
+            _check_script_prereqs(anchor, path)
+            nv = "%s (%s %s)" % (anchor, _e["kind"],
+                                 _e["opts"].get("ref")
+                                 or os.path.basename(_e["opts"].get("url", "")))
+            steps.append((anchor, nv, reason, path))
+            continue
         path = resolve_script(anchor, nv, script_dir,
                               assume_yes=args.yes,
                               force_regen=getattr(args, "regenerate", False))
@@ -5435,6 +5739,15 @@ def cmd_install(args, _replanned=False):
         old_paths = _pkglist_paths(anchor) if cleaning else None
         t0 = time.time()
         penv = {**env, "PM_NO_REFRESH": "1"} if cleaning else env
+        # LAST CHANCE, EVERY STEP: the machine's options in the script that
+        # actually runs -- the one handed over AND the copy in the package's
+        # home, which the engine prefers when it exists.  However the script
+        # was found (generated, cached, a copy from a failed run), vala gets
+        # its --disable-valadoc here.  Idempotent.
+        apply_machine_opts(anchor, path)
+        _home_copy = os.path.join(pkgusr_home(anchor), os.path.basename(path))
+        if _home_copy != path and os.path.isfile(_home_copy):
+            apply_machine_opts(anchor, _home_copy)
         result = run_pm_install(anchor, path, penv)
         add_run_entry(run_log, anchor, "install", result.returncode == 0,
                       result.returncode, _pkg_log_dir(anchor))
@@ -5478,7 +5791,9 @@ def cmd_install(args, _replanned=False):
             sys.exit(result.returncode)
         if getattr(args, "clean", False):
             _clean_after_install(anchor, old_paths, t0)
-        _maybe_remove_old_sources(anchor, nv, getattr(args, "keep_sources", False))
+        if anchor not in _from_stack:              # a clone is not a tarball
+            _maybe_remove_old_sources(anchor, nv,
+                                      getattr(args, "keep_sources", False))
     clear_status()
     printSuccess(f"Done -- {total} package(s) installed.")
     # THE PATTERN HAS TO BE A REAL PATH.
@@ -6826,6 +7141,28 @@ def _is_git_package(name):
     clones/pulls) rather than a book tarball."""
     p = (_canonical_script_path(name)
          or os.path.join(pkgusr_home(name), f"install_{name}"))
+    # WHAT WAS INSTALLED LAST, NOT WHICH SCRIPT SORTS FIRST.  After sdl3
+    # moved from the book to git its home holds both scripts, and the book's
+    # install_SDL3-3.4.18 is the one _canonical_script_path finds -- so a
+    # finished git build still read as "built from the book" and was
+    # rebuilt on every run.  .pkgusr-installed names the build that finished.
+    home = pkgusr_home(name)
+    try:
+        inst = open(os.path.join(home, ".pkgusr-installed")).read().strip()
+    except OSError:
+        inst = ""
+    if inst:
+        if inst.endswith("-git"):
+            return True
+        try:
+            for f in sorted(os.listdir(home)):
+                q = os.path.join(home, f)
+                if f.startswith("install_") and f != "install_last" \
+                        and os.path.isfile(q) and _script_name_version(q) == inst:
+                    p = q
+                    break
+        except OSError:
+            pass
     if not p or not os.path.isfile(p):
         return False
     try:
@@ -6834,6 +7171,50 @@ def _is_git_package(name):
         return False
     return bool(re.search(r'is_git="?1"?', t)
                 or re.search(r'\bgit\s+(clone|pull|fetch)\b', t))
+
+
+def _installed_script(name):
+    """The install script of the build that FINISHED (.pkgusr-installed
+    names it), or None."""
+    home = pkgusr_home(name)
+    try:
+        inst = open(os.path.join(home, ".pkgusr-installed")).read().strip()
+        for f in sorted(os.listdir(home)):
+            q = os.path.join(home, f)
+            if f.startswith("install_") and f != "install_last" \
+                    and os.path.isfile(q) and _script_name_version(q) == inst:
+                return q
+    except OSError:
+        pass
+    return None
+
+
+def _stack_ref_stale(name):
+    """(built_ref, stack_ref) when a git package was built from a different
+    ref than its stack entry now names; else None.
+
+    libnice: media.stack moved to ref=0.1.23 (by hand, then in 1.14.421),
+    p_libnice was built from 0.1.22 -- and stayed "installed", so nothing
+    rebuilt it, and gst-plugins-bad stopped on
+        Invalid version, need 'nice' ['>=0.1.23'] found '0.1.22'
+    The stack file is the statement of what to have; a different ref built
+    is out of date exactly like a lower version is."""
+    e = _stack_source_map().get((name or "").lower())
+    if not e or e["kind"] != "git":
+        return None
+    want = (e["opts"].get("ref") or "").strip()
+    if not want:
+        return None
+    p = _installed_script(e["target"])
+    if not p:
+        return None
+    try:
+        have = _script_var(open(p, errors="replace").read(20000), "git_ref")
+    except OSError:
+        return None
+    if have and have != want:
+        return (have, want)
+    return None
 
 
 # A plan entry whose "script" is this is built by `lfs`, not by us: the LFS
@@ -8883,6 +9264,21 @@ def remove_one(name, args):
                 os.remove(os.path.join(home, fname))
             except OSError:
                 pass
+        # REMOVED MEANS NOT INSTALLED -- FOR EVERYONE WHO ASKS AFTERWARDS.
+        # `remove elogind`, then `stack sway`: "elogind 257.16 current" and
+        # "Nothing to do -- everything is installed", with its 687 files gone.
+        # Without pkg.lst the state falls back to install_last (a version was
+        # recorded) and to the page's declared paths -- and /etc/elogind,
+        # which remove leaves (config), was still there.  install_last is
+        # kept (it is the script to reinstall from) but renamed, so nothing
+        # reads it as "installed"; and every stack forgets the entry.
+        _il = os.path.join(home, "install_last")
+        if os.path.lexists(_il):
+            try:
+                os.replace(_il, _il + ".removed")
+            except OSError as e:
+                printWarning(f"  could not set aside {_il}: {e}")
+        _forget_in_stacks(name)
         printSuccess(f"{name} uninstalled (user kept" +
                      (f", {home} kept)." if has_home else ")."))
 
@@ -14389,6 +14785,28 @@ def _stack_done_set(stack_path):
         return set()
 
 
+def _forget_in_stacks(name):
+    """A removed package is no longer done in any stack's record."""
+    d = os.path.dirname(_stack_state_file("x.stack"))
+    try:
+        files = [os.path.join(d, f) for f in os.listdir(d) if f.endswith(".done")]
+    except OSError:
+        return
+    for f in files:
+        try:
+            lines = open(f).read().splitlines()
+        except OSError:
+            continue
+        keep = [l for l in lines
+                if l.strip().split(" ", 1)[-1].lower() != name.lower()]
+        if len(keep) != len(lines):
+            try:
+                with open(f, "w") as fh:
+                    fh.write("".join(l + "\n" for l in keep))
+            except OSError:
+                pass
+
+
 def _stack_mark_done(stack_path, key):
     f = _stack_state_file(stack_path)
     try:
@@ -14770,6 +15188,24 @@ def cmd_stack(args):
                           " will be built." % len(entries))
                 print()
                 _new = None
+        # ...AND BESIDE THE STACKS IT INCLUDES.  sway.stack pulls in
+        # media.stack, wayland.stack ...; a media.stack.new carrying
+        # libnice 0.1.23 was never mentioned while sway.stack ran.
+        try:
+            _inc_new = sorted(
+                f for f in glob.glob(os.path.join(os.path.dirname(path),
+                                                   "*.stack.new"))
+                if f != path + ".new")
+        except OSError:
+            _inc_new = []
+        if _inc_new:
+            printWarning("%d other stack file(s) have a newer shipped version"
+                         " waiting:" % len(_inc_new))
+            for f in _inc_new:
+                b = os.path.basename(f)[:-len(".stack.new")]
+                printWarning("    %-16s diff %s{,.new}   take: packagemanager"
+                             " stack %s --take-new" % (b, f[:-4], b))
+            print()
         if _new and os.path.isfile(_new):
             # WHAT DIFFERS, NOT HOW MANY.  The notice printed
             #     (149 entries, this file has 149)
@@ -14864,6 +15300,9 @@ def cmd_stack(args):
                              " Drop --no-git to include them.")
     if not getattr(args, "status", False):
         printHeader("stack: %s  (%d entries)" % (os.path.basename(path), len(entries)))
+        # WHICH TOOL IS TALKING.  Two runs in a row came from the release
+        # before the fix, and nothing in a stack's output said so.
+        printInfo("  packagemanager %s (build %s)" % (TOOL_VERSION, _build_id()))
         if avoid:
             # AVOID WAS ONLY A MESSAGE.  It printed "never built by this
             # stack" and then passed nothing to the installer, so the
@@ -14896,7 +15335,18 @@ def cmd_stack(args):
         say "installed" and skip it, while `dev` said "not built from it
         yet" -- both right about different things.  No install script in the
         package's home means no package built it: that is "to build"."""
-        return bool(_git_found(e)) and _built_here(e["target"])
+        if not (_git_found(e) and _built_here(e["target"])):
+            return False
+        # BUILT, BUT FROM THE BOOK.  sdl3 was a book entry and became a git
+        # one; the library is there and p_sdl3 has an install script, so the
+        # entry said "installed" and the switch never happened.  A git entry
+        # is installed when its package was built from a clone.
+        if e["kind"] == "git" and not _is_git_package(e["target"]):
+            return False
+        # built, from git -- but from another ref than the stack names now
+        if e["kind"] == "git" and _stack_ref_stale(e["target"]):
+            return False
+        return True
 
     # Entries that finished in an earlier run are recorded and SKIPPED, so a
     # resume does not re-plan a 200-package dependency tree for a stage that
@@ -15817,8 +16267,7 @@ def cmd_disown(args):
             # which defaults to /usr/src/lfs-pkgusr.  It is the list the LEASE
             # reads, so leaving the path in it re-arms the whole thing.
             _state = (os.environ.get("LFS_PKGUSR_DIR")
-                      or os.path.join(os.path.dirname(BASE_DIR.rstrip("/")) or "/usr/src",
-                                      "lfs-pkgusr"))
+                      or os.path.join(BASE_DIR, "lfs-pkgusr"))
             for man in dict.fromkeys(
                     [os.path.join(_state, "manifests", pkg + ".files"),
                      os.path.join("/usr/src/lfs-pkgusr/manifests", pkg + ".files")]):
@@ -16702,6 +17151,9 @@ def main():
     p.add_argument("--update-deps", action="store_true",
                    help="also rebuild dependencies that are installed but "
                         "older than the book (default: leave them alone)")
+    p.add_argument("--book-of", metavar="PKG",
+                   help="read the named package(s) from the book PKG is read "
+                        "from (lfs-helper uses it when PKG needs a newer one)")
     p.add_argument("-f", "--force", action="store_true",
                    help="(deprecated: non-recursive is now the default; kept for "
                         "compatibility)")
