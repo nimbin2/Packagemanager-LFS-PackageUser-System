@@ -1,4 +1,5 @@
 #!/bin/bash
+# AI-modified: Claude Opus 5.5 (1.14.441)
 # lfs-kernel -- build and install a kernel.
 #
 #   lfs-kernel                 what a build would do (nothing is built)
@@ -686,9 +687,11 @@ fi
 # the machine connects the two.  menuconfig will not either: it wants the
 # symbol you do not know yet.
 #
-# Each line is:  <name>|<symbols>|<firmware>|<what it is>
+# Each line is:  <name>|<symbols>|<firmware>|<what it is>[|<built-in firmware>]
 # `enable <name>` puts the symbols into CONFIG_SET and the firmware into
-# FIRMWARE_ONLY, both in kernel.conf, both backed up.  A symbol this kernel
+# FIRMWARE_ONLY, both in kernel.conf, both backed up.  A BUILT-IN driver
+# asks for its firmware before / is mounted (there is no initramfs), so the
+# fifth field names the files that go INTO the image: FIRMWARE_BUILTIN.  A symbol this kernel
 # refuses is reported by the build, which reads every CONFIG_SET entry back.
 _KDEV_TABLE='
 ath9k-htc|WLAN_VENDOR_ATH=y ATH9K_HTC=m|ath9k_htc htc_9271*|Atheros AR9271/AR7010 USB wifi (TP-Link TL-WN722N v1, Alfa AWUS036NHA)
@@ -709,6 +712,14 @@ tun|TUN=m|-|TUN/TAP devices, /dev/net/tun (OpenVPN; load it: tun in /etc/sysconf
 usb-serial|USB_SERIAL=m USB_SERIAL_CP210X=m USB_SERIAL_FTDI_SIO=m USB_SERIAL_CH341=m|-|USB serial adapters (CP210x, FTDI, CH340)
 v4l2-usb|MEDIA_SUPPORT=m MEDIA_USB_SUPPORT=y USB_VIDEO_CLASS=m|-|USB webcams (UVC)
 wireguard|WIREGUARD=m|-|WireGuard VPN (wireguard-tools: wg, wg-quick)
+amdgpu-strix|DRM=y DRM_AMDGPU=y DRM_AMD_DC=y HSA_AMD=y|amdgpu|AMD Radeon 840M-890M (Ryzen AI 300: Strix/Krackan Point, RDNA 3.5), BUILT IN -- its firmware goes into the image|amdgpu/gc_11_5_* amdgpu/psp_14_0_[0-5]_* amdgpu/sdma_6_1_* amdgpu/vcn_4_0_[56]* amdgpu/dcn_3_5* amdgpu/vpe_6_1_*
+amd-npu|DRM_ACCEL=y DRM_ACCEL_AMDXDNA=m|amdnpu|AMD Ryzen AI NPU (XDNA2), a module; useful with a userspace runtime (XRT)
+mt7925|CFG80211=y MAC80211=y RFKILL=y WLAN_VENDOR_MEDIATEK=y MT7925E=y|mediatek/mt7925|MediaTek MT7925 Wi-Fi 7, BUILT IN (firmware and regulatory.db in the image)|mediatek/mt7925/WIFI_* regulatory.db regulatory.db.p7s
+bluetooth-mtk|RFKILL=y BT=y BT_HCIBTUSB=y BT_HCIBTUSB_MTK=y BT_RFCOMM=y BT_BNEP=y|mediatek/mt7925|MediaTek Bluetooth (the MT7925 combo card), BUILT IN|mediatek/mt7925/BT_*
+amd-audio|SOUND=y SND=y SND_HDA_INTEL=y SND_HDA_CODEC_REALTEK=y SND_HDA_CODEC_HDMI=y|-|speakers, headphone jack and HDMI/DP audio (Realtek HDA codec), BUILT IN
+amd-mic|SND_SOC_AMD_ACP_COMMON=m SND_AMD_ASOC_ACP70=m SND_SOC_AMD_LEGACY_MACH=m SND_AMD_ACP_CONFIG=m SND_SOC_AMD_ACP63_TOPLEVEL=m SND_SOC_AMD_PS=m SND_SOC_AMD_PS_MACH=m|-|the internal digital microphones (AMD ACP 6.3/7.0/7.1), MODULES -- load/unload to switch the mic
+amd-laptop|I2C=y HID=y HWMON=y ACPI_BATTERY=y THINKPAD_ACPI=y ACPI_VIDEO=y BACKLIGHT_CLASS_DEVICE=y RFKILL=y AMD_PMC=y AMD_SFH_HID=y SENSORS_K10TEMP=y X86_AMD_PSTATE=y AMD_IOMMU=y PINCTRL_AMD=y I2C_DESIGNWARE_PLATFORM=y I2C_HID=y I2C_HID_ACPI=y HID_MULTITOUCH=y USB4=y TYPEC=y USB_ROLE_SWITCH=y TYPEC_UCSI=y UCSI_ACPI=y TCG_TPM=y TCG_CRB=y BLK_SED_OPAL=y|amd-ucode|Ryzen AI laptop platform, BUILT IN: s2idle suspend (PMC), sensors, touchpad (I2C HID), USB4/Type-C, TPM, Opal SSD, ThinkPad keys/battery/fan, CPU microcode in the image|amd-ucode/microcode_amd_fam1a*
+thinkpad-p14s-gen6-amd|@amdgpu-strix @amd-npu @mt7925 @bluetooth-mtk @amd-audio @amd-mic @amd-laptop @v4l2-usb @nvme|-|ThinkPad P14s Gen 6 AMD, Ryzen AI 9 HX PRO 370: drivers built in; camera and microphone as modules
 '
 
 _kdev_line() {   # <name> -- the table line, or empty
@@ -730,13 +741,27 @@ if [ "${_ENABLE:-0}" = 1 ]; then
     if [ "${#_args[@]}" = 0 ] || [ "${_args[0]}" = "--list" ] || [ "${_args[0]}" = "list" ]; then
         _kdev_list; exit 0
     fi
-    _syms=""; _fw=""; _unknown=""
+    # A MACHINE IS A LIST OF PARTS.  A row whose symbols are @names stands
+    # for those rows: `enable thinkpad-p14s-gen6-amd` enables the GPU, NPU,
+    # Wi-Fi, Bluetooth, audio, platform and camera rows in one go.
+    _exp=()
+    for _a in "${_args[@]}"; do
+        _row="$(_kdev_line "$_a")"
+        case "$(printf '%s' "$_row" | cut -d'|' -f2)" in
+            @*) echo "# $_a: $(printf '%s' "$_row" | cut -d'|' -f4)"
+                for _m in $(printf '%s' "$_row" | cut -d'|' -f2); do _exp+=("${_m#@}"); done ;;
+            *)  _exp+=("$_a") ;;
+        esac
+    done
+    _args=("${_exp[@]}")
+    _syms=""; _fw=""; _fwb=""; _unknown=""
     for _a in "${_args[@]}"; do
         _row="$(_kdev_line "$_a")"
         if [ -n "$_row" ]; then
             _syms="$_syms $(printf '%s' "$_row" | cut -d'|' -f2)"
             _f="$(printf '%s' "$_row" | cut -d'|' -f3)"
             [ "$_f" = "-" ] || _fw="$_fw $_f"
+            _fwb="$_fwb $(printf '%s' "$_row" | cut -d'|' -f5)"
             echo "# $_a: $(printf '%s' "$_row" | cut -d'|' -f4)"
             continue
         fi
@@ -762,7 +787,10 @@ if [ "${_ENABLE:-0}" = 1 ]; then
         echo "   lfs-kernel enable SYM=m             # if you are sure"
         exit 1
     fi
-    # merge into CONFIG_SET, last value wins, order kept
+    # merge into CONFIG_SET, last value wins, order kept -- and the same
+    # symbol named twice by one machine (RFKILL=y by Wi-Fi AND Bluetooth)
+    # is one entry
+    _syms="$(printf '%s\n' $_syms | awk -F= '{v[$1]=$0; if (!($1 in o)) {o[$1]=++n; k[n]=$1}} END {for (i=1;i<=n;i++) printf "%s ", v[k[i]]}')"
     _new=""
     for _w in ${CONFIG_SET:-}; do
         _keep=1
@@ -784,6 +812,17 @@ if [ "${_ENABLE:-0}" = 1 ]; then
             [ "$_fwnew" = "${FIRMWARE_ONLY:-}" ] \
                 || _conf_set_var FIRMWARE_ONLY "$_fwnew"
         fi
+    fi
+    # the files a BUILT-IN driver needs inside the image
+    _fwb="$(printf '%s' "$_fwb" | xargs -n1 2>/dev/null | awk 'NF && !s[$0]++' | tr '\n' ' ')"
+    if [ -n "${_fwb// /}" ]; then
+        _fwbnew="${FIRMWARE_BUILTIN:-}"
+        for _f in $_fwb; do
+            case " $_fwbnew " in *" $_f "*) ;; *) _fwbnew="$_fwbnew $_f" ;; esac
+        done
+        _fwbnew="${_fwbnew# }"
+        [ "$_fwbnew" = "${FIRMWARE_BUILTIN:-}" ] \
+            || _conf_set_var FIRMWARE_BUILTIN "$_fwbnew"
     fi
     echo
     echo "# nothing is built yet.  Apply it:"
@@ -2347,6 +2386,44 @@ if [ "$_fw_ok" = 0 ]; then
     echo "   embed any (no CONFIG_EXTRA_FIRMWARE), so the kernel will build."
     echo "   The drivers that wanted it will fail at run time until it is"
     echo "   installed -- re-run lfs-kernel once FIRMWARE_ONLY is right."
+fi
+
+# FIRMWARE_BUILTIN: WHAT A BUILT-IN DRIVER NEEDS, INSIDE THE IMAGE.
+#
+# There is no initramfs.  A driver built into the kernel probes before / is
+# mounted, asks for its firmware, finds no /lib/firmware yet, and gives up:
+# a built-in amdgpu without its blobs is a black screen.  The patterns in
+# FIRMWARE_BUILTIN are matched against the firmware just installed, and
+# what matches becomes CONFIG_EXTRA_FIRMWARE -- replacing whatever list the
+# source config carried (the running kernel's is for the running machine's
+# hardware).  A built-in amdgpu with no amdgpu blob stops the build.
+if [ -n "${FIRMWARE_BUILTIN:-}" ]; then
+    _fbd=/lib/firmware
+    _fbl=""; _fbmiss=""
+    for _p in $FIRMWARE_BUILTIN; do
+        _hits="$(cd "$_fbd" 2>/dev/null && compgen -G "$_p")"
+        [ -n "$_hits" ] || { _fbmiss="$_fbmiss $_p"; continue; }
+        for _h in $_hits; do
+            [ -f "$_fbd/$_h" ] && _fbl="$_fbl $_h"
+        done
+    done
+    _fbl="$(printf '%s\n' $_fbl | awk 'NF && !s[$0]++' | tr '\n' ' ' | sed 's/ $//')"
+    # The patterns cover a FAMILY (every Ryzen AI 300 GPU variant), so one
+    # matching nothing is normal and only said.  What stops the build is a
+    # built-in amdgpu with no amdgpu blob at all: that is a black screen.
+    if [ -n "$_fbmiss" ]; then
+        echo "# FIRMWARE_BUILTIN: nothing in $_fbd matches (not embedded):"
+        for _p in $_fbmiss; do echo "#     $_p"; done
+    fi
+    if grep -q '^CONFIG_DRM_AMDGPU=y' "$tree/.config" \
+       && ! printf '%s\n' $_fbl | grep -q '^amdgpu/'; then
+        echo "!! amdgpu is BUILT IN, and no amdgpu firmware matched FIRMWARE_BUILTIN"
+        echo "   in $_fbd -- the display would stay black.  Is 'amdgpu' in"
+        echo "   FIRMWARE_ONLY?  lfs-kernel enable amdgpu-strix  does both."
+        exit 1
+    fi
+    echo "# FIRMWARE_BUILTIN: $(echo $_fbl | wc -w) file(s) go into the image"
+    _as_pkg "./scripts/config --set-str EXTRA_FIRMWARE '$_fbl' --set-str EXTRA_FIRMWARE_DIR $_fbd && make olddefconfig" >/dev/null || exit 1
 fi
 
 # FIRMWARE BUILT INTO THE KERNEL MUST BE ON DISK.

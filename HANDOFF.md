@@ -11,13 +11,13 @@ book, because BLFS published no SysV edition for 13.0.  CORRECTED
 reads it (`from-book svn`), which for this machine is the better match: its
 pages carry SysV commands, not systemctl.
 
-    all six tools at 1.14.440  (lfs-backup has its own: 1.3.0)
-    lfs               f11230c
-    lfs-helper        c982fa7
-    packagemanager    a620e2b
-    blfs              6bcc322
-    lfs-phases        86e049c
-    lfs-kernel        1199115   (no version line of its own)
+    all six tools at 1.14.441  (lfs-backup has its own: 1.3.0)
+    lfs               48ae918
+    lfs-helper        124d02e
+    packagemanager    34e19fd
+    blfs              2fb2d27
+    lfs-phases        0ce04eb
+    lfs-kernel        3954698   (no version line of its own)
     lfs-backup        c73acaa   (1.3.0; replaces lfs-config)
     lfs-sysvbook      74538df   (1.0.2)
 

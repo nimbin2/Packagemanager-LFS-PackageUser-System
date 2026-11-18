@@ -1,11 +1,17 @@
-1.14.440: fonts -- noto-emoji's new path, and every line of a font set
+1.14.441: lfs-kernel knows the ThinkPad P14s Gen 6 AMD; firmware built into the image
 
-- stacks/fonts.sh: NotoColorEmoji moved to 2D/fonts/ in googlefonts/noto-emoji;
-  a table line may list several URLs (first that answers is used), the new
-  path first and the old one after
-- stacks/fonts.sh: "already installed" is decided per line by its file
-  pattern, not by the directory being non-empty -- noto-sans' Bold and
-  Italic were skipped once Regular was there
+- lfs-kernel: hardware rows for Ryzen AI 300 laptops -- amdgpu-strix,
+  amd-npu, mt7925, bluetooth-mtk, amd-audio, amd-mic, amd-laptop -- and a
+  machine row, thinkpad-p14s-gen6-amd, that enables them all (@name rows)
+- GPU, Wi-Fi, Bluetooth, speaker/HDMI audio and the platform drivers are
+  BUILT IN; the camera (UVC) and the internal microphones (AMD ACP) are
+  modules, so they can be switched by loading/unloading
+- lfs-kernel/kernel.conf: FIRMWARE_BUILTIN -- patterns matched against the
+  installed firmware become CONFIG_EXTRA_FIRMWARE (no initramfs: a built-in
+  driver needs its blobs inside the image); a row's fifth field fills it;
+  a built-in amdgpu with no amdgpu blob stops the build
+- the MT7925 and Ryzen AI NPU firmware directories are added to
+  FIRMWARE_ONLY by the rows; README: one line for the machine profile
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 Claude-Session: https://claude.ai/code/session_011fX6Wu4ytSyonAjwWr4mSA

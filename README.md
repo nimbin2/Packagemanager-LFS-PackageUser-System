@@ -467,6 +467,7 @@ lfs-kernel promote --run        # the test kernel (vmlinuz_new) becomes vmlinuz;
 lfs-kernel enable --list        # hardware this tool knows by name
 lfs-kernel enable ath9k-htc     # its symbols into CONFIG_SET, its firmware
                                 # into FIRMWARE_ONLY -- kernel.conf, backed up
+lfs-kernel enable thinkpad-p14s-gen6-amd   # a whole machine at once
 lfs-kernel modules [text]       # what this kernel has, and what is loaded
 lfs-kernel config               # where the next .config comes from
 lfs-kernel config search atheros           # symbols by name or prompt
